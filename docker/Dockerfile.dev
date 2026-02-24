@@ -1,0 +1,43 @@
+ARG PG_MAJOR=17
+FROM rust:1-bookworm
+
+ARG PG_MAJOR=17
+
+# Install PG server + dev headers from PGDG, plus gosu for privilege dropping
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gnupg2 curl ca-certificates lsb-release gosu \
+    && echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        postgresql-${PG_MAJOR} \
+        postgresql-server-dev-${PG_MAJOR} \
+        pkg-config libssl-dev libclang-dev clang \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/usr/lib/postgresql/${PG_MAJOR}/bin:${PATH}"
+ENV PG_MAJOR=${PG_MAJOR}
+
+RUN cargo install cargo-pgrx --version "0.17.0" --locked
+
+# Non-root user (initdb refuses root; pgrx test needs initdb)
+RUN useradd -m -s /bin/bash builder \
+    && mkdir -p /build/pg_cocoon \
+    && chown -R builder:builder /build /usr/local/cargo \
+        /usr/share/postgresql/${PG_MAJOR}/extension \
+        /usr/lib/postgresql/${PG_MAJOR}/lib
+
+# Run pgrx init as builder (writes to builder's home)
+USER builder
+ENV CARGO_HOME=/usr/local/cargo
+ENV USER=builder
+RUN cargo pgrx init --pg${PG_MAJOR}=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config
+
+# Switch back to root for entrypoint (drops to builder after fixing permissions)
+USER root
+WORKDIR /build/pg_cocoon
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

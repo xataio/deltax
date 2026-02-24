@@ -9,27 +9,35 @@ A PostgreSQL extension for time-series data, built on native declarative partiti
 - **`time_bucket()`**: Bucket timestamps into uniform intervals for aggregation
 - **`first()` / `last()`**: Aggregates that return values associated with the earliest/latest timestamp
 
-## Building
+## Development
 
 Requires Docker.
 
-Build the runtime image:
-
 ```sh
-docker build --target runtime -t pg_cocoon .
+make test                      # run pgrx tests
+make build                     # compile the extension
+make clippy                    # run clippy
+make cargo CMD="fmt --check"   # arbitrary cargo command
 ```
 
-## Running tests
+## Manual testing
 
 ```sh
-docker build --target test -t pg_cocoon-test .
-docker run --rm pg_cocoon-test
+make run    # start postgres with the extension (port 5432)
+make psql   # connect to the running instance
+```
+
+## Build runtime image
+
+```sh
+make image  # builds pg_cocoon:pg17
 ```
 
 ## Quick start
 
 ```sh
-docker run -d --name pg_cocoon -p 5432:5432 -e POSTGRES_PASSWORD=postgres pg_cocoon
+make run
+# in another terminal:
 psql -h localhost -U postgres -c "CREATE EXTENSION pg_cocoon;"
 ```
 
