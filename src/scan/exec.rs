@@ -8,7 +8,7 @@ use std::time::Instant;
 use crate::compression::{self, CompressionType, CompressedColumnRef};
 use super::SyncStatic;
 
-/// Static CustomExecMethods struct.
+/// Static CustomExecMethods struct for CocoonDecompress.
 pub(crate) static CUSTOM_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
         CustomName: super::CUSTOM_NAME.as_ptr(),
@@ -24,6 +24,24 @@ pub(crate) static CUSTOM_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
         InitializeWorkerCustomScan: None,
         ShutdownCustomScan: None,
         ExplainCustomScan: Some(super::explain::explain_custom_scan),
+    });
+
+/// Static CustomExecMethods struct for CocoonAppend.
+pub(crate) static COCOON_APPEND_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
+    SyncStatic(pg_sys::CustomExecMethods {
+        CustomName: super::COCOON_APPEND_NAME.as_ptr(),
+        BeginCustomScan: Some(begin_cocoon_append),
+        ExecCustomScan: Some(exec_custom_scan),
+        EndCustomScan: Some(end_custom_scan),
+        ReScanCustomScan: Some(rescan_custom_scan),
+        MarkPosCustomScan: None,
+        RestrPosCustomScan: None,
+        EstimateDSMCustomScan: None,
+        InitializeDSMCustomScan: None,
+        ReInitializeDSMCustomScan: None,
+        InitializeWorkerCustomScan: None,
+        ShutdownCustomScan: None,
+        ExplainCustomScan: Some(super::explain::explain_cocoon_append),
     });
 
 // Epoch offset: microseconds between Unix epoch (1970-01-01) and PG epoch (2000-01-01).
@@ -55,10 +73,15 @@ pub(super) struct DecompressState {
     /// 0-based column indices that the query needs. true = needed.
     /// Empty means decompress all (safety fallback).
     needed_cols: Vec<bool>,
+    /// Precomputed indices where needed_cols[i] == true, for sparse iteration.
+    needed_col_indices: Vec<usize>,
     /// Per-segment memory context (child of es_query_cxt, reset per segment).
     segment_mcxt: pg_sys::MemoryContext,
     /// Timing: wall-clock durations for profiling (accumulated across calls).
     pub(super) timing: ScanTiming,
+    /// Whether EXPLAIN ANALYZE is active (enables per-call timing).
+    /// Set lazily on first exec call (PG sets PlanState.instrument after BeginCustomScan).
+    instrument: Option<bool>,
 }
 
 /// Wall-clock timing for the decompress scan phases.
@@ -166,6 +189,150 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
         );
 
         // Box and store as raw pointer in custom_ps
+        let state_box = Box::new(state);
+        let state_ptr = Box::into_raw(state_box);
+        (*node).custom_ps = state_ptr as *mut pg_sys::List;
+    }
+}
+
+/// CreateCustomScanState callback for CocoonAppend.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn create_cocoon_append_state(
+    cscan: *mut pg_sys::CustomScan,
+) -> *mut pg_sys::Node {
+    unsafe {
+        let css = pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScanState>())
+            as *mut pg_sys::CustomScanState;
+
+        (*css).ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
+        (*css).methods = &COCOON_APPEND_EXEC_METHODS.0;
+
+        // Copy custom_private for use in BeginCustomScan
+        (*css).custom_ps = (*cscan).custom_private;
+
+        css as *mut pg_sys::Node
+    }
+}
+
+/// BeginCustomScan callback for CocoonAppend: load segments from all companion tables.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn begin_cocoon_append(
+    node: *mut pg_sys::CustomScanState,
+    _estate: *mut pg_sys::EState,
+    _eflags: i32,
+) {
+    unsafe {
+        let custom_private = (*node).custom_ps;
+        if custom_private.is_null() {
+            pgrx::error!("pg_cocoon: missing companion table OIDs in CocoonAppend state");
+        }
+
+        let list_len = (*custom_private).length as i32;
+
+        // Parse companion OIDs (before sentinel -1) and needed column indices (after sentinel)
+        let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
+        let mut needed_indices: Vec<usize> = Vec::new();
+        let mut found_sentinel = false;
+        for i in 0..list_len {
+            let val = pg_sys::list_nth_int(custom_private, i);
+            if val == -1 {
+                found_sentinel = true;
+                continue;
+            }
+            if found_sentinel {
+                needed_indices.push(val as usize);
+            } else {
+                companion_oids.push(pg_sys::Oid::from(val as u32));
+            }
+        }
+
+        if companion_oids.is_empty() {
+            pgrx::error!("pg_cocoon: CocoonAppend has no companion tables");
+        }
+
+        // Get first companion table name for metadata
+        let first_name = {
+            let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
+            if name_ptr.is_null() {
+                pgrx::error!(
+                    "pg_cocoon: companion table not found for OID {}",
+                    u32::from(companion_oids[0])
+                );
+            }
+            std::ffi::CStr::from_ptr(name_ptr)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        // Load metadata via SPI from first companion table
+        let t0 = Instant::now();
+        let meta = Spi::connect(|client| load_metadata(&client, &first_name));
+        let metadata_us = t0.elapsed().as_micros() as u64;
+
+        // Build needed_cols and needed_col_indices
+        let num_cols = meta.col_names.len();
+        let (needed_cols, needed_col_indices) = {
+            let mut nc = vec![false; num_cols];
+            let mut nci = Vec::new();
+            for &idx in &needed_indices {
+                if idx < num_cols {
+                    nc[idx] = true;
+                    nci.push(idx);
+                }
+            }
+            (nc, nci)
+        };
+
+        // Load segments from ALL companion tables via heap scan
+        let t1 = Instant::now();
+        let mut all_segments: Vec<SegmentData> = Vec::new();
+        for &oid in &companion_oids {
+            let segs = load_segments_heap(oid, &meta.col_names, &meta.segment_by, &needed_cols);
+            all_segments.extend(segs);
+        }
+        let heap_scan_us = t1.elapsed().as_micros() as u64;
+
+        let compressed_bytes: u64 = all_segments
+            .iter()
+            .map(|s| s.compressed_blobs.iter().map(|b| b.len() as u64).sum::<u64>())
+            .sum();
+
+        let mut state = DecompressState {
+            col_names: meta.col_names,
+            col_types: meta.col_types,
+            col_typmods: meta.col_typmods,
+            segment_by: meta.segment_by,
+            current_segment: Vec::new(),
+            current_row_count: 0,
+            row_cursor: 0,
+            segment_index: 0,
+            segments_data: all_segments,
+            needed_cols,
+            needed_col_indices,
+            segment_mcxt: std::ptr::null_mut(),
+            timing: ScanTiming {
+                metadata_us,
+                heap_scan_us,
+                decompress_us: 0,
+                emit_us: 0,
+                rows_emitted: 0,
+                rows_filtered: 0,
+                segments_decompressed: 0,
+                compressed_bytes,
+            },
+            instrument: None,
+        };
+
+        // Create per-segment memory context
+        let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
+        state.segment_mcxt = pg_sys::AllocSetContextCreateInternal(
+            query_ctx,
+            c"CocoonSegment".as_ptr(),
+            pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
+            pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
+            pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
+        );
+
         let state_box = Box::new(state);
         let state_ptr = Box::into_raw(state_box);
         (*node).custom_ps = state_ptr as *mut pg_sys::List;
@@ -443,16 +610,18 @@ fn load_decompress_state(
     let meta = Spi::connect(|client| load_metadata(&client, companion_name));
     let metadata_us = t0.elapsed().as_micros() as u64;
 
-    // Build needed_cols from needed_indices
+    // Build needed_cols and needed_col_indices from needed_indices
     let num_cols = meta.col_names.len();
-    let needed_cols = {
+    let (needed_cols, needed_col_indices) = {
         let mut nc = vec![false; num_cols];
+        let mut nci = Vec::new();
         for &idx in needed_indices {
             if idx < num_cols {
                 nc[idx] = true;
+                nci.push(idx);
             }
         }
-        nc
+        (nc, nci)
     };
 
     // Phase 2: Direct heap scan for segment data (bypasses SPI overhead)
@@ -478,6 +647,7 @@ fn load_decompress_state(
         segment_index: 0,
         segments_data,
         needed_cols,
+        needed_col_indices,
         segment_mcxt: std::ptr::null_mut(),
         timing: ScanTiming {
             metadata_us,
@@ -489,6 +659,7 @@ fn load_decompress_state(
             segments_decompressed: 0,
             compressed_bytes,
         },
+        instrument: None, // set lazily on first exec call
     }
 }
 
@@ -507,12 +678,16 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
         let qual = (*node).ss.ps.qual;
         let proj_info = (*node).ss.ps.ps_ProjInfo;
 
+        let instrument = *state.instrument.get_or_insert_with(|| {
+            !(*node).ss.ps.instrument.is_null()
+        });
+        let t_call = if instrument { Some(Instant::now()) } else { None };
+
         loop {
             // If current segment has more rows, try the next one
             if !state.current_segment.is_empty() {
                 let seg_rows = state.current_row_count;
                 if state.row_cursor < seg_rows {
-                    let t_emit = Instant::now();
                     fill_slot(scan_slot, state);
                     state.row_cursor += 1;
 
@@ -523,7 +698,6 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                     if !qual.is_null() && !exec_qual(qual, econtext) {
                         // Reset per-tuple memory context on filtered rows
                         pg_sys::MemoryContextReset((*econtext).ecxt_per_tuple_memory);
-                        state.timing.emit_us += t_emit.elapsed().as_micros() as u64;
                         state.timing.rows_filtered += 1;
                         continue; // skip this row, try next
                     }
@@ -534,8 +708,10 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                     } else {
                         scan_slot
                     };
-                    state.timing.emit_us += t_emit.elapsed().as_micros() as u64;
                     state.timing.rows_emitted += 1;
+                    if let Some(t) = t_call {
+                        state.timing.emit_us += t.elapsed().as_micros() as u64;
+                    }
                     return result;
                 }
             }
@@ -553,7 +729,7 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
                 continue;
             }
 
-            let t_decompress = Instant::now();
+            let t_decompress = if instrument { Some(Instant::now()) } else { None };
 
             // Reset segment memory context — frees all varlena from previous segment
             pg_sys::MemoryContextReset(state.segment_mcxt);
@@ -600,7 +776,9 @@ pub unsafe extern "C-unwind" fn exec_custom_scan(
 
             pg_sys::MemoryContextSwitchTo(old_ctx);
 
-            state.timing.decompress_us += t_decompress.elapsed().as_micros() as u64;
+            if let Some(t) = t_decompress {
+                state.timing.decompress_us += t.elapsed().as_micros() as u64;
+            }
             state.timing.segments_decompressed += 1;
 
             state.current_segment = decompressed;
@@ -763,14 +941,18 @@ unsafe fn fill_slot(
         pg_sys::ExecClearTuple(slot);
 
         let ncols = state.col_names.len();
-        for col_idx in 0..ncols {
-            if !state.needed_cols[col_idx] {
-                (*slot).tts_isnull.add(col_idx).write(true);
-                continue;
+        if state.needed_col_indices.is_empty() {
+            // COUNT(*) fast path: no columns needed, just mark all null
+            std::ptr::write_bytes((*slot).tts_isnull, true as u8, ncols);
+        } else {
+            // Set all columns to null first (one memset)
+            std::ptr::write_bytes((*slot).tts_isnull, true as u8, ncols);
+            // Then fill only needed columns
+            for &col_idx in &state.needed_col_indices {
+                let (datum, is_null) = state.current_segment[col_idx][state.row_cursor];
+                (*slot).tts_isnull.add(col_idx).write(is_null);
+                (*slot).tts_values.add(col_idx).write(datum);
             }
-            let (datum, is_null) = state.current_segment[col_idx][state.row_cursor];
-            (*slot).tts_isnull.add(col_idx).write(is_null);
-            (*slot).tts_values.add(col_idx).write(datum);
         }
 
         pg_sys::ExecStoreVirtualTuple(slot);

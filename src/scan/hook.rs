@@ -5,6 +5,7 @@ use std::sync::atomic::Ordering;
 
 use super::PREV_HOOK;
 use super::path;
+use super::cost;
 
 thread_local! {
     /// Cache of partition OID → companion table OID (or InvalidOid if not compressed).
@@ -34,15 +35,23 @@ pub unsafe extern "C-unwind" fn cocoon_set_rel_pathlist(
             }
         }
 
+        // Only handle regular tables
+        if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
+            return;
+        }
+
+        // Check if this is the parent of a partitioned table (for CocoonAppend)
+        if (*rel).reloptkind == pg_sys::RelOptKind::RELOPT_BASEREL && (*rte).inh {
+            if let Some(companion_oids) = collect_compressed_children(root, rti) {
+                path::add_cocoon_append_path(root, rel, &companion_oids);
+                return;
+            }
+        }
+
         // Only process base relations and child member relations (partitions)
         if (*rel).reloptkind != pg_sys::RelOptKind::RELOPT_BASEREL
             && (*rel).reloptkind != pg_sys::RelOptKind::RELOPT_OTHER_MEMBER_REL
         {
-            return;
-        }
-
-        // Only handle regular tables
-        if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
             return;
         }
 
@@ -66,6 +75,75 @@ pub unsafe extern "C-unwind" fn cocoon_set_rel_pathlist(
 
         // Add the custom decompress path
         path::add_decompress_path(root, rel, companion_oid);
+    }
+}
+
+/// Collect companion OIDs for all compressed children of a partitioned parent.
+///
+/// Iterates `root->append_rel_list` for children of `parent_rti`.
+/// - If a child has a compressed companion, adds its OID to the list.
+/// - If a child has no companion AND has uncompressed rows (reltuples > 0),
+///   returns None (cannot use CocoonAppend).
+/// - Empty partitions (reltuples <= 0) are safely skipped.
+///
+/// Returns `Some(companion_oids)` if we found at least one compressed child
+/// and no uncompressed data; `None` otherwise.
+unsafe fn collect_compressed_children(
+    root: *mut pg_sys::PlannerInfo,
+    parent_rti: pg_sys::Index,
+) -> Option<Vec<pg_sys::Oid>> {
+    unsafe {
+        let list = (*root).append_rel_list;
+        if list.is_null() {
+            return None;
+        }
+
+        let len = (*list).length;
+        let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
+
+        for i in 0..len {
+            let node = pg_sys::list_nth(list, i) as *const pg_sys::AppendRelInfo;
+            if node.is_null() {
+                continue;
+            }
+
+            if (*node).parent_relid != parent_rti {
+                continue;
+            }
+
+            let child_rti = (*node).child_relid;
+            let child_rte = *(*root).simple_rte_array.add(child_rti as usize);
+            let child_oid = (*child_rte).relid;
+
+            // Check if this child has a compressed companion
+            let companion_oid = COMPRESSED_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                if let Some(&oid) = cache.get(&child_oid) {
+                    return oid;
+                }
+                let oid = check_compressed_partition(child_oid);
+                cache.insert(child_oid, oid);
+                oid
+            });
+
+            if companion_oid != pg_sys::InvalidOid {
+                companion_oids.push(companion_oid);
+            } else {
+                // Not compressed — check if partition has data
+                let reltuples = cost::get_reltuples(child_oid);
+                if reltuples > 0.0 {
+                    // Uncompressed partition with data — cannot use CocoonAppend
+                    return None;
+                }
+                // Empty partition, safe to skip
+            }
+        }
+
+        if companion_oids.is_empty() {
+            None
+        } else {
+            Some(companion_oids)
+        }
     }
 }
 

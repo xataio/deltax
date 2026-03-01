@@ -54,7 +54,7 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
 }
 
 /// Get reltuples from pg_class for a relation OID.
-unsafe fn get_reltuples(rel_oid: pg_sys::Oid) -> f64 {
+pub(super) unsafe fn get_reltuples(rel_oid: pg_sys::Oid) -> f64 {
     unsafe {
         let tuple = pg_sys::SearchSysCache1(
             pg_sys::SysCacheIdentifier::RELOID as i32,

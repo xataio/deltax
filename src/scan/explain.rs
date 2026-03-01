@@ -15,7 +15,32 @@ pub unsafe extern "C-unwind" fn explain_custom_scan(
         let value = c"Compressed (CocoonDecompress)";
         pg_sys::ExplainPropertyText(label.as_ptr(), value.as_ptr(), es);
 
-        // Show timing breakdown for EXPLAIN ANALYZE
+        explain_timing(node, es);
+    }
+}
+
+/// ExplainCustomScan callback for CocoonAppend.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn explain_cocoon_append(
+    node: *mut pg_sys::CustomScanState,
+    _ancestors: *mut pg_sys::List,
+    es: *mut pg_sys::ExplainState,
+) {
+    unsafe {
+        let label = c"Storage";
+        let value = c"Compressed (CocoonAppend)";
+        pg_sys::ExplainPropertyText(label.as_ptr(), value.as_ptr(), es);
+
+        explain_timing(node, es);
+    }
+}
+
+/// Shared timing/stats output for EXPLAIN ANALYZE.
+unsafe fn explain_timing(
+    node: *mut pg_sys::CustomScanState,
+    es: *mut pg_sys::ExplainState,
+) {
+    unsafe {
         if (*es).analyze {
             let state_ptr = (*node).custom_ps as *const DecompressState;
             if !state_ptr.is_null() {

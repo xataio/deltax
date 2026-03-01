@@ -17,6 +17,9 @@ static PREV_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 /// Custom scan method name (NUL-terminated, static lifetime).
 const CUSTOM_NAME: &std::ffi::CStr = c"CocoonDecompress";
 
+/// CocoonAppend custom scan method name.
+const COCOON_APPEND_NAME: &std::ffi::CStr = c"CocoonAppend";
+
 /// Wrapper to make pg_sys structs with raw pointers usable in statics.
 /// Safety: the static structs only contain function pointers and const string pointers
 /// that are valid for the entire backend lifetime.
