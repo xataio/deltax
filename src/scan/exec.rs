@@ -26,6 +26,24 @@ pub(crate) static CUSTOM_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
         ExplainCustomScan: Some(super::explain::explain_custom_scan),
     });
 
+/// Static CustomExecMethods struct for CocoonCount (COUNT(*) pushdown).
+pub(crate) static COCOON_COUNT_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
+    SyncStatic(pg_sys::CustomExecMethods {
+        CustomName: super::COCOON_COUNT_NAME.as_ptr(),
+        BeginCustomScan: Some(begin_count_scan),
+        ExecCustomScan: Some(exec_count_scan),
+        EndCustomScan: Some(end_count_scan),
+        ReScanCustomScan: Some(rescan_count_scan),
+        MarkPosCustomScan: None,
+        RestrPosCustomScan: None,
+        EstimateDSMCustomScan: None,
+        InitializeDSMCustomScan: None,
+        ReInitializeDSMCustomScan: None,
+        InitializeWorkerCustomScan: None,
+        ShutdownCustomScan: None,
+        ExplainCustomScan: Some(super::explain::explain_count_scan),
+    });
+
 /// Static CustomExecMethods struct for CocoonAppend.
 pub(crate) static COCOON_APPEND_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
@@ -123,6 +141,34 @@ struct SegmentData {
     row_count: i32,
     min_time: Option<i64>,
     max_time: Option<i64>,
+}
+
+/// State for CocoonCount (COUNT(*) pushdown).
+pub(super) struct CountScanState {
+    pub(super) total_count: i64,
+    returned: bool,
+    pub(super) metadata_us: u64,
+    pub(super) heap_scan_us: u64,
+    pub(super) total_segments: u64,
+}
+
+/// CreateCustomScanState callback for CocoonCount.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn create_count_scan_state(
+    cscan: *mut pg_sys::CustomScan,
+) -> *mut pg_sys::Node {
+    unsafe {
+        let css = pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScanState>())
+            as *mut pg_sys::CustomScanState;
+
+        (*css).ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
+        (*css).methods = &COCOON_COUNT_EXEC_METHODS.0;
+
+        // Copy custom_private for use in BeginCustomScan
+        (*css).custom_ps = (*cscan).custom_private;
+
+        css as *mut pg_sys::Node
+    }
 }
 
 /// CreateCustomScanState callback.
@@ -380,6 +426,150 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
         let state_box = Box::new(state);
         let state_ptr = Box::into_raw(state_box);
         (*node).custom_ps = state_ptr as *mut pg_sys::List;
+    }
+}
+
+/// BeginCustomScan callback for CocoonCount: load segment metadata and sum row counts.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn begin_count_scan(
+    node: *mut pg_sys::CustomScanState,
+    _estate: *mut pg_sys::EState,
+    _eflags: i32,
+) {
+    unsafe {
+        let custom_private = (*node).custom_ps;
+        if custom_private.is_null() {
+            pgrx::error!("pg_cocoon: missing companion table OIDs in CocoonCount state");
+        }
+
+        let list_len = (*custom_private).length as i32;
+
+        // Parse companion OIDs (before sentinel -1)
+        let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
+        for i in 0..list_len {
+            let val = pg_sys::list_nth_int(custom_private, i);
+            if val == -1 {
+                break;
+            }
+            companion_oids.push(pg_sys::Oid::from(val as u32));
+        }
+
+        if companion_oids.is_empty() {
+            pgrx::error!("pg_cocoon: CocoonCount has no companion tables");
+        }
+
+        // Get first companion table name for metadata
+        let first_name = {
+            let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
+            if name_ptr.is_null() {
+                pgrx::error!(
+                    "pg_cocoon: companion table not found for OID {}",
+                    u32::from(companion_oids[0])
+                );
+            }
+            std::ffi::CStr::from_ptr(name_ptr)
+                .to_string_lossy()
+                .into_owned()
+        };
+
+        // Load metadata via SPI from first companion table
+        let t0 = Instant::now();
+        let meta = Spi::connect(|client| load_metadata(&client, &first_name));
+        let metadata_us = t0.elapsed().as_micros() as u64;
+
+        // Build needed_cols as all-false (no columns needed for COUNT(*))
+        let num_cols = meta.col_names.len();
+        let needed_cols = vec![false; num_cols];
+
+        // Load segments from all companion tables and sum row counts
+        let t1 = Instant::now();
+        let mut total_count: i64 = 0;
+        let mut total_segments: u64 = 0;
+        for &oid in &companion_oids {
+            let segs = load_segments_heap(
+                oid,
+                &meta.col_names,
+                &meta.segment_by,
+                &needed_cols,
+                &meta.time_column,
+            );
+            for seg in &segs {
+                total_count += seg.row_count as i64;
+            }
+            total_segments += segs.len() as u64;
+        }
+        let heap_scan_us = t1.elapsed().as_micros() as u64;
+
+        let state = CountScanState {
+            total_count,
+            returned: false,
+            metadata_us,
+            heap_scan_us,
+            total_segments,
+        };
+
+        let state_box = Box::new(state);
+        let state_ptr = Box::into_raw(state_box);
+        (*node).custom_ps = state_ptr as *mut pg_sys::List;
+    }
+}
+
+/// ExecCustomScan callback for CocoonCount: return one row with the count.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn exec_count_scan(
+    node: *mut pg_sys::CustomScanState,
+) -> *mut pg_sys::TupleTableSlot {
+    unsafe {
+        let scan_slot = (*node).ss.ss_ScanTupleSlot;
+        let state = &mut *((*node).custom_ps as *mut CountScanState);
+
+        if !state.returned {
+            pg_sys::ExecClearTuple(scan_slot);
+            (*scan_slot).tts_values.add(0).write(pg_sys::Datum::from(state.total_count as usize));
+            (*scan_slot).tts_isnull.add(0).write(false);
+            pg_sys::ExecStoreVirtualTuple(scan_slot);
+            state.returned = true;
+            return scan_slot;
+        }
+
+        // EOF — return empty slot
+        pg_sys::ExecClearTuple(scan_slot);
+        scan_slot
+    }
+}
+
+/// EndCustomScan callback for CocoonCount: cleanup state.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn end_count_scan(
+    node: *mut pg_sys::CustomScanState,
+) {
+    unsafe {
+        let state_ptr = (*node).custom_ps as *mut CountScanState;
+        if !state_ptr.is_null() {
+            let state = Box::from_raw(state_ptr);
+            let total_us = state.metadata_us + state.heap_scan_us;
+            pgrx::log!(
+                "pg_cocoon CocoonCount timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  | \
+                 total_count={} segments={}",
+                total_us as f64 / 1000.0,
+                state.metadata_us as f64 / 1000.0,
+                state.heap_scan_us as f64 / 1000.0,
+                state.total_count,
+                state.total_segments,
+            );
+            (*node).custom_ps = std::ptr::null_mut();
+        }
+    }
+}
+
+/// ReScanCustomScan callback for CocoonCount: reset returned flag.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn rescan_count_scan(
+    node: *mut pg_sys::CustomScanState,
+) {
+    unsafe {
+        let state = &mut *((*node).custom_ps as *mut CountScanState);
+        state.returned = false;
     }
 }
 

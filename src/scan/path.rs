@@ -142,6 +142,147 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
 }
 
 // ============================================================================
+// CocoonCount: COUNT(*) aggregate pushdown
+// ============================================================================
+
+/// Static CustomPathMethods for CocoonCount.
+static COCOON_COUNT_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
+    SyncStatic(pg_sys::CustomPathMethods {
+        CustomName: super::COCOON_COUNT_NAME.as_ptr(),
+        PlanCustomPath: Some(plan_count_star_path),
+        ReparameterizeCustomPathByChild: None,
+    });
+
+/// Static CustomScanMethods for CocoonCount.
+static COCOON_COUNT_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
+    SyncStatic(pg_sys::CustomScanMethods {
+        CustomName: super::COCOON_COUNT_NAME.as_ptr(),
+        CreateCustomScanState: Some(super::exec::create_count_scan_state),
+    });
+
+/// Add a CocoonCount custom path to the grouped relation's pathlist.
+///
+/// This replaces the Aggregate → Scan pipeline with a single CustomScan
+/// that returns the pre-computed row count from segment metadata.
+pub unsafe fn add_count_star_path(
+    _root: *mut pg_sys::PlannerInfo,
+    output_rel: *mut pg_sys::RelOptInfo,
+    companion_oids: &[pg_sys::Oid],
+) {
+    unsafe {
+        let cpath =
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomPath>()) as *mut pg_sys::CustomPath;
+
+        (*cpath).path.type_ = pg_sys::NodeTag::T_CustomPath;
+        (*cpath).path.pathtype = pg_sys::NodeTag::T_CustomScan;
+        (*cpath).path.parent = output_rel;
+        (*cpath).path.pathtarget = (*output_rel).reltarget;
+
+        // Very low cost — metadata-only scan, no decompression
+        (*cpath).path.rows = 1.0;
+        (*cpath).path.startup_cost = 1.0;
+        (*cpath).path.total_cost = 2.0;
+        (*cpath).path.parallel_workers = 0;
+        (*cpath).path.parallel_aware = false;
+        (*cpath).path.parallel_safe = false;
+
+        // Store companion OIDs in custom_private
+        let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
+        for &oid in companion_oids {
+            private_list = pg_sys::lappend_oid(private_list, oid);
+        }
+        (*cpath).custom_private = private_list;
+
+        (*cpath).custom_paths = std::ptr::null_mut();
+        (*cpath).custom_restrictinfo = std::ptr::null_mut();
+        (*cpath).methods = &COCOON_COUNT_PATH_METHODS.0;
+
+        pg_sys::add_path(output_rel, cpath as *mut pg_sys::Path);
+    }
+}
+
+/// PlanCustomPath callback for CocoonCount.
+///
+/// Creates a CustomScan with scanrelid=0 that outputs a single INT8 column
+/// containing the pre-computed COUNT(*) result.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn plan_count_star_path(
+    _root: *mut pg_sys::PlannerInfo,
+    _rel: *mut pg_sys::RelOptInfo,
+    best_path: *mut pg_sys::CustomPath,
+    _tlist: *mut pg_sys::List,
+    _clauses: *mut pg_sys::List,
+    _custom_plans: *mut pg_sys::List,
+) -> *mut pg_sys::Plan {
+    unsafe {
+        let cscan =
+            pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScan>()) as *mut pg_sys::CustomScan;
+
+        (*cscan).scan.plan.type_ = pg_sys::NodeTag::T_CustomScan;
+        // scanrelid = 0: no real table scan, slot built from custom_scan_tlist
+        (*cscan).scan.scanrelid = 0;
+
+        // Build custom_scan_tlist: single TargetEntry with Const(0::int8)
+        // This defines the scan output schema (one INT8 column)
+        let const_node = pg_sys::makeConst(
+            pg_sys::INT8OID,
+            -1,                     // consttypmod
+            pg_sys::InvalidOid,     // constcollid
+            8,                      // constlen (sizeof int64)
+            pg_sys::Datum::from(0usize),
+            false,                  // constisnull
+            true,                   // constbyval
+        );
+        let scan_tle = pg_sys::makeTargetEntry(
+            const_node as *mut pg_sys::Expr,
+            1,                      // resno
+            std::ptr::null_mut(),   // resname
+            false,                  // resjunk
+        );
+        (*cscan).custom_scan_tlist = pg_sys::lappend(std::ptr::null_mut(), scan_tle as *mut _);
+
+        // Build plan.targetlist: same Const(0::int8) expression.
+        // PG's setrefs (fix_upper_expr) will find this matching expression
+        // in custom_scan_tlist and replace it with Var(INDEX_VAR, 1, INT8OID).
+        let const_node2 = pg_sys::makeConst(
+            pg_sys::INT8OID,
+            -1,
+            pg_sys::InvalidOid,
+            8,
+            pg_sys::Datum::from(0usize),
+            false,
+            true,
+        );
+        let plan_tle = pg_sys::makeTargetEntry(
+            const_node2 as *mut pg_sys::Expr,
+            1,                      // resno
+            std::ptr::null_mut(),   // resname
+            false,                  // resjunk
+        );
+        (*cscan).scan.plan.targetlist = pg_sys::lappend(std::ptr::null_mut(), plan_tle as *mut _);
+
+        // Build custom_private: [oid1, oid2, ..., -1 (sentinel)]
+        let oid_list = (*best_path).custom_private;
+        let num_oids = (*oid_list).length;
+        let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
+        for i in 0..num_oids {
+            let oid = pg_sys::list_nth_oid(oid_list, i);
+            private_list = pg_sys::lappend_int(private_list, u32::from(oid) as i32);
+        }
+        private_list = pg_sys::lappend_int(private_list, -1);
+
+        (*cscan).custom_private = private_list;
+        (*cscan).custom_plans = std::ptr::null_mut();
+        (*cscan).custom_relids = std::ptr::null_mut();
+        (*cscan).methods = &COCOON_COUNT_SCAN_METHODS.0;
+        (*cscan).flags = 0;
+        (*cscan).scan.plan.qual = std::ptr::null_mut();
+
+        &mut (*cscan).scan.plan as *mut pg_sys::Plan
+    }
+}
+
+// ============================================================================
 // CocoonAppend: replaces Append with single CustomScan for all compressed partitions
 // ============================================================================
 

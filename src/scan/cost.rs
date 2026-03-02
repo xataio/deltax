@@ -53,6 +53,23 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
     }
 }
 
+/// Get relpages from pg_class for a relation OID.
+pub(super) unsafe fn get_relpages(rel_oid: pg_sys::Oid) -> i32 {
+    unsafe {
+        let tuple = pg_sys::SearchSysCache1(
+            pg_sys::SysCacheIdentifier::RELOID as i32,
+            pg_sys::ObjectIdGetDatum(rel_oid),
+        );
+        if tuple.is_null() {
+            return 0;
+        }
+        let rel_form = pg_sys::GETSTRUCT(tuple) as pg_sys::Form_pg_class;
+        let pages = (*rel_form).relpages;
+        pg_sys::ReleaseSysCache(tuple);
+        pages
+    }
+}
+
 /// Get reltuples from pg_class for a relation OID.
 pub(super) unsafe fn get_reltuples(rel_oid: pg_sys::Oid) -> f64 {
     unsafe {
