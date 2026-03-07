@@ -16,15 +16,15 @@ struct ColumnMeta {
 // SQL-callable functions
 // ============================================================================
 
-/// Enable compression on a cocoon hypertable.
+/// Enable compression on a seaturtle hypertable.
 ///
 /// ```sql
-/// SELECT cocoon_enable_compression('metrics',
+/// SELECT seaturtle_enable_compression('metrics',
 ///     segment_by => ARRAY['device_id'],
 ///     order_by => ARRAY['ts']);
 /// ```
 #[pg_extern]
-fn cocoon_enable_compression(
+fn seaturtle_enable_compression(
     relation: &str,
     segment_by: default!(Vec<String>, "ARRAY[]::text[]"),
     order_by: default!(Vec<String>, "ARRAY[]::text[]"),
@@ -34,7 +34,7 @@ fn cocoon_enable_compression(
         let ht = catalog::get_hypertable(client, &schema, &table)
             .expect("failed to query hypertable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_cocoon: table {}.{} is not a cocoon table", schema, table)
+                pgrx::error!("pg_seaturtle: table {}.{} is not a seaturtle table", schema, table)
             });
 
         // Validate segment_by columns exist
@@ -48,7 +48,7 @@ fn cocoon_enable_compression(
                 )
                 .expect("failed to check column");
             if exists.is_empty() {
-                pgrx::error!("pg_cocoon: segment_by column '{}' not found in {}.{}", col, schema, table);
+                pgrx::error!("pg_seaturtle: segment_by column '{}' not found in {}.{}", col, schema, table);
             }
         }
 
@@ -71,7 +71,7 @@ fn cocoon_enable_compression(
 
 /// Set the automatic compression policy for a hypertable.
 #[pg_extern]
-fn cocoon_set_compression_policy(
+fn seaturtle_set_compression_policy(
     relation: &str,
     compress_after: pgrx::datum::Interval,
 ) -> String {
@@ -80,11 +80,11 @@ fn cocoon_set_compression_policy(
         let ht = catalog::get_hypertable(client, &schema, &table)
             .expect("failed to query hypertable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_cocoon: table {}.{} is not a cocoon table", schema, table)
+                pgrx::error!("pg_seaturtle: table {}.{} is not a seaturtle table", schema, table)
             });
 
         if ht.segment_by.is_empty() && ht.order_by.is_empty() {
-            pgrx::error!("pg_cocoon: enable compression first with cocoon_enable_compression()");
+            pgrx::error!("pg_seaturtle: enable compression first with seaturtle_enable_compression()");
         }
 
         catalog::set_compress_after(client, ht.id, &compress_after)
@@ -99,7 +99,7 @@ fn cocoon_set_compression_policy(
 
 /// Compress a single partition.
 #[pg_extern]
-fn cocoon_compress_partition(partition: &str) -> String {
+fn seaturtle_compress_partition(partition: &str) -> String {
     Spi::connect_mut(|client| {
         compress_partition_impl(client, partition)
     })
@@ -107,7 +107,7 @@ fn cocoon_compress_partition(partition: &str) -> String {
 
 /// Decompress a single partition.
 #[pg_extern]
-fn cocoon_decompress_partition(partition: &str) -> String {
+fn seaturtle_decompress_partition(partition: &str) -> String {
     Spi::connect_mut(|client| {
         decompress_partition_impl(client, partition)
     })
@@ -116,7 +116,7 @@ fn cocoon_decompress_partition(partition: &str) -> String {
 /// Show compression statistics for a hypertable.
 #[pg_extern]
 #[allow(clippy::type_complexity)]
-fn cocoon_compression_stats(
+fn seaturtle_compression_stats(
     relation: &str,
 ) -> TableIterator<
     'static,
@@ -134,13 +134,13 @@ fn cocoon_compression_stats(
         let ht = catalog::get_hypertable(client, &schema, &table)
             .expect("failed to query hypertable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_cocoon: table {}.{} is not a cocoon table", schema, table)
+                pgrx::error!("pg_seaturtle: table {}.{} is not a seaturtle table", schema, table)
             });
 
         let result = client
             .select(
                 "SELECT table_name, is_compressed, raw_size, compressed_size, row_count
-                 FROM cocoon_partition
+                 FROM seaturtle_partition
                  WHERE hypertable_id = $1
                  ORDER BY range_start",
                 None,
@@ -177,7 +177,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     let part_info = catalog::get_partition_by_name(client, &schema, &part_table)
         .expect("failed to query partition")
         .unwrap_or_else(|| {
-            pgrx::error!("pg_cocoon: partition {}.{} not found in catalog", schema, part_table)
+            pgrx::error!("pg_seaturtle: partition {}.{} not found in catalog", schema, part_table)
         });
 
     if part_info.is_compressed {
@@ -190,14 +190,14 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         .unwrap();
 
     if ht.order_by.is_empty() && ht.segment_by.is_empty() {
-        pgrx::error!("pg_cocoon: compression not enabled on {}.{}. Call cocoon_enable_compression() first.",
+        pgrx::error!("pg_seaturtle: compression not enabled on {}.{}. Call seaturtle_enable_compression() first.",
             ht.schema_name, ht.table_name);
     }
 
     // 3. Get column metadata
     let columns = get_column_metadata(client, &schema, &part_table, &ht.segment_by);
     if columns.is_empty() {
-        pgrx::error!("pg_cocoon: no columns found for {}.{}", schema, part_table);
+        pgrx::error!("pg_seaturtle: no columns found for {}.{}", schema, part_table);
     }
 
     // 4. Count rows
@@ -215,7 +215,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     }
 
     // 5. Build companion table DDL
-    let companion_schema = "_cocoon_compressed";
+    let companion_schema = "_seaturtle_compressed";
     let companion_fqn = format!("\"{}\".\"{}\"", companion_schema, part_table);
 
     let mut create_cols = Vec::new();
@@ -1134,7 +1134,7 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
     let part_info = catalog::get_partition_by_name(client, &schema, &part_table)
         .expect("failed to query partition")
         .unwrap_or_else(|| {
-            pgrx::error!("pg_cocoon: partition {}.{} not found in catalog", schema, part_table)
+            pgrx::error!("pg_seaturtle: partition {}.{} not found in catalog", schema, part_table)
         });
 
     if !part_info.is_compressed {
@@ -1148,7 +1148,7 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
     // 2. Get column metadata (from the parent table, since partition is truncated)
     let columns = get_column_metadata(client, &ht.schema_name, &ht.table_name, &ht.segment_by);
 
-    let companion_schema = "_cocoon_compressed";
+    let companion_schema = "_seaturtle_compressed";
     let companion_fqn = format!("\"{}\".\"{}\"", companion_schema, part_table);
     let part_fqn = crate::partition::fqn(&schema, &part_table);
 
@@ -1510,7 +1510,7 @@ pub fn auto_compress_partitions(client: &mut SpiClient<'_>, ht: &catalog::Hypert
     // range_end < now() - compress_after AND NOT is_compressed
     let eligible = client
         .select(
-            "SELECT table_name FROM cocoon_partition
+            "SELECT table_name FROM seaturtle_partition
              WHERE hypertable_id = $1 AND is_compressed = false
                AND range_end < now() - $2::interval",
             None,

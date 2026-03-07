@@ -11,7 +11,7 @@ fn interval_to_usec(interval: &pgrx::datum::Interval) -> i64 {
         .unwrap_or(0);
 
     if months != 0 {
-        pgrx::error!("pg_cocoon: monthly partition intervals are not supported; use days instead");
+        pgrx::error!("pg_seaturtle: monthly partition intervals are not supported; use days instead");
     }
 
     let days: i64 = interval
@@ -74,7 +74,7 @@ fn align_to_interval(ts_usec: i64, interval_usec: i64) -> i64 {
 }
 
 /// Get current time as microseconds since Unix epoch via SPI.
-/// Respects the `pg_cocoon.mock_now` GUC when set.
+/// Respects the `pg_seaturtle.mock_now` GUC when set.
 fn now_usec() -> i64 {
     if let Some(mock_cstr) = crate::MOCK_NOW.get() {
         let mock_val = mock_cstr.to_str().unwrap_or("");
@@ -83,7 +83,7 @@ fn now_usec() -> i64 {
                 "SELECT (EXTRACT(EPOCH FROM $1::timestamptz) * 1000000)::int8",
                 &[mock_val.into()],
             )
-            .expect("failed to parse pg_cocoon.mock_now")
+            .expect("failed to parse pg_seaturtle.mock_now")
             .unwrap();
         }
     }
@@ -197,7 +197,7 @@ pub fn ensure_future_partitions(
 
         // Check if partition already registered
         let exists = client.select(
-            "SELECT 1 FROM cocoon_partition WHERE schema_name = $1 AND table_name = $2",
+            "SELECT 1 FROM seaturtle_partition WHERE schema_name = $1 AND table_name = $2",
             None,
             &[ht.schema_name.as_str().into(), part_name.as_str().into()],
         )?;
@@ -223,7 +223,7 @@ pub fn ensure_future_partitions(
 // ============================================================================
 
 #[pg_extern]
-fn cocoon_create_table(
+fn seaturtle_create_table(
     relation: &str,
     time_column: &str,
     partition_interval: default!(pgrx::datum::Interval, "'1 day'"),
@@ -233,12 +233,12 @@ fn cocoon_create_table(
         // 1. Resolve schema and table name
         let (schema, table) = resolve_relation(client, relation);
 
-        // 2. Check if already registered as a cocoon table
+        // 2. Check if already registered as a seaturtle table
         if catalog::get_hypertable(client, &schema, &table)
             .unwrap_or(None)
             .is_some()
         {
-            return format!("Table {}.{} is already a cocoon table", schema, table);
+            return format!("Table {}.{} is already a seaturtle table", schema, table);
         }
 
         // 3. Validate the time column exists and is a timestamp type
@@ -266,7 +266,7 @@ fn cocoon_create_table(
 
             if has_rows {
                 pgrx::error!(
-                    "pg_cocoon: table {}.{} is not empty. Only empty tables are supported.",
+                    "pg_seaturtle: table {}.{} is not empty. Only empty tables are supported.",
                     schema,
                     table
                 );
@@ -298,7 +298,7 @@ fn cocoon_create_table(
         .expect("failed to create initial partitions");
 
         format!(
-            "Created cocoon table {}.{} with {} partitions",
+            "Created seaturtle table {}.{} with {} partitions",
             schema, table, count
         )
     })
@@ -315,13 +315,13 @@ pub fn resolve_relation(_client: &SpiClient, relation: &str) -> (String, String)
             )
             .expect("failed to look up table schema")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_cocoon: table '{}' not found", relation);
+                pgrx::error!("pg_seaturtle: table '{}' not found", relation);
             });
             (schema, parts[0].to_string())
         }
         2 => (parts[0].to_string(), parts[1].to_string()),
         _ => {
-            pgrx::error!("pg_cocoon: invalid relation name '{}'", relation);
+            pgrx::error!("pg_seaturtle: invalid relation name '{}'", relation);
         }
     }
 }
@@ -338,7 +338,7 @@ fn validate_time_column(_client: &SpiClient, schema: &str, table: &str, time_col
     match data_type {
         None => {
             pgrx::error!(
-                "pg_cocoon: column '{}' not found in table {}.{}",
+                "pg_seaturtle: column '{}' not found in table {}.{}",
                 time_column,
                 schema,
                 table
@@ -349,7 +349,7 @@ fn validate_time_column(_client: &SpiClient, schema: &str, table: &str, time_col
         }
         Some(ref dt) => {
             pgrx::error!(
-                "pg_cocoon: column '{}' has type '{}', expected a timestamp type",
+                "pg_seaturtle: column '{}' has type '{}', expected a timestamp type",
                 time_column,
                 dt
             );
@@ -378,7 +378,7 @@ fn convert_to_partitioned(
     time_column: &str,
 ) {
     let table_fqn = fqn(schema, table);
-    let tmp_name = format!("_cocoon_tmp_{}", table);
+    let tmp_name = format!("_seaturtle_tmp_{}", table);
     let tmp_fqn = fqn(schema, &tmp_name);
 
     // Rename original table
@@ -413,7 +413,7 @@ fn convert_to_partitioned(
 // ============================================================================
 
 #[pg_extern]
-fn cocoon_partition_info(
+fn seaturtle_partition_info(
     relation: &str,
 ) -> TableIterator<
     'static,
@@ -429,7 +429,7 @@ fn cocoon_partition_info(
         let ht = catalog::get_hypertable(client, &schema, &table)
             .expect("failed to query hypertable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_cocoon: table {}.{} is not a cocoon table", schema, table)
+                pgrx::error!("pg_seaturtle: table {}.{} is not a seaturtle table", schema, table)
             });
 
         let partitions = catalog::get_partitions(client, ht.id).expect("failed to query partitions");
@@ -443,7 +443,7 @@ fn cocoon_partition_info(
 }
 
 #[pg_extern]
-fn cocoon_hypertable_info(
+fn seaturtle_hypertable_info(
     relation: &str,
 ) -> TableIterator<
     'static,
@@ -460,7 +460,7 @@ fn cocoon_hypertable_info(
         let ht = catalog::get_hypertable(client, &schema, &table)
             .expect("failed to query hypertable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_cocoon: table {}.{} is not a cocoon table", schema, table)
+                pgrx::error!("pg_seaturtle: table {}.{} is not a seaturtle table", schema, table)
             });
 
         let partitions = catalog::get_partitions(client, ht.id).expect("failed to query partitions");
@@ -480,13 +480,13 @@ fn cocoon_hypertable_info(
 
 /// Set a retention policy on a hypertable.
 #[pg_extern]
-fn cocoon_set_retention(relation: &str, drop_after: pgrx::datum::Interval) -> String {
+fn seaturtle_set_retention(relation: &str, drop_after: pgrx::datum::Interval) -> String {
     Spi::connect_mut(|client| {
         let (schema, table) = resolve_relation(client, relation);
         let ht = catalog::get_hypertable(client, &schema, &table)
             .expect("failed to query hypertable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_cocoon: table {}.{} is not a cocoon table", schema, table)
+                pgrx::error!("pg_seaturtle: table {}.{} is not a seaturtle table", schema, table)
             });
 
         catalog::set_drop_after(client, ht.id, &drop_after)
@@ -501,13 +501,13 @@ fn cocoon_set_retention(relation: &str, drop_after: pgrx::datum::Interval) -> St
 
 /// Remove the retention policy from a hypertable.
 #[pg_extern]
-fn cocoon_remove_retention(relation: &str) -> String {
+fn seaturtle_remove_retention(relation: &str) -> String {
     Spi::connect_mut(|client| {
         let (schema, table) = resolve_relation(client, relation);
         let ht = catalog::get_hypertable(client, &schema, &table)
             .expect("failed to query hypertable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_cocoon: table {}.{} is not a cocoon table", schema, table)
+                pgrx::error!("pg_seaturtle: table {}.{} is not a seaturtle table", schema, table)
             });
 
         catalog::clear_drop_after(client, ht.id)
@@ -526,13 +526,13 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::HypertableInfo
     };
 
     // Compute cutoff using mock-aware now_usec() so the background worker
-    // respects pg_cocoon.mock_now (important for tests and deterministic behaviour).
+    // respects pg_seaturtle.mock_now (important for tests and deterministic behaviour).
     let now = usec_to_tstz(now_usec());
 
     // Find partitions eligible for dropping: range_end < now() - drop_after
     let eligible = client
         .select(
-            "SELECT schema_name, table_name, is_compressed FROM cocoon_partition
+            "SELECT schema_name, table_name, is_compressed FROM seaturtle_partition
              WHERE hypertable_id = $1 AND range_end < $2::timestamptz - $3::interval",
             None,
             &[ht.id.into(), now.into(), (*drop_after).into()],
@@ -552,7 +552,7 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::HypertableInfo
     for (schema, name, is_compressed) in &partitions {
         // If compressed, drop the companion table
         if *is_compressed {
-            let companion = format!("\"_cocoon_compressed\".\"{}\"", name);
+            let companion = format!("\"_seaturtle_compressed\".\"{}\"", name);
             client
                 .update(&format!("DROP TABLE IF EXISTS {}", companion), None, &[])
                 .expect("failed to drop compressed companion table");
@@ -577,7 +577,7 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::HypertableInfo
         // Remove from catalog
         client
             .update(
-                "DELETE FROM cocoon_partition WHERE schema_name = $1 AND table_name = $2",
+                "DELETE FROM seaturtle_partition WHERE schema_name = $1 AND table_name = $2",
                 None,
                 &[schema.as_str().into(), name.as_str().into()],
             )

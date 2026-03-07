@@ -7,6 +7,6 @@ tests/__pycache__/
 .DS_Store
 
 
-pg_cocoon_design_v03.md
+pg_seaturtle_design_v03.md
 tests/.data/
 tests/.bench_results/

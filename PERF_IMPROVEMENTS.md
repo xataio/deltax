@@ -1,11 +1,11 @@
 # Performance Improvements Roadmap
 
-Tracking the gap between pg_cocoon and TimescaleDB on ClickBench queries.
-Current geometric mean: **pg_cocoon 18.1ms vs TimescaleDB 17.7ms (0.98x, essentially on par)**.
+Tracking the gap between pg_seaturtle and TimescaleDB on ClickBench queries.
+Current geometric mean: **pg_seaturtle 18.1ms vs TimescaleDB 17.7ms (0.98x, essentially on par)**.
 
 ## Current Benchmark (2026-03-06, sorted scan + arena alloc + text eq/ne pushdown)
 
-| Query | Description | Cocoon (ms) | TSDB (ms) | Gap |
+| Query | Description | SeaTurtle (ms) | TSDB (ms) | Gap |
 |-------|-------------|-------------|-----------|-----|
 | Q1 | COUNT(*) | 0.7 | 3.3 | 0.2x |
 | Q2 | COUNT WHERE AdvEngineID | 5.1 | 4.5 | 1.1x |
@@ -25,7 +25,7 @@ Current geometric mean: **pg_cocoon 18.1ms vs TimescaleDB 17.7ms (0.98x, essenti
 
 ## Previous Benchmark (2026-03-05, LIKE filter pushdown + agg pushdown + batch quals)
 
-| Query | Description | Cocoon (ms) | TSDB (ms) | Gap |
+| Query | Description | SeaTurtle (ms) | TSDB (ms) | Gap |
 |-------|-------------|-------------|-----------|-----|
 | Q1 | COUNT(*) | 0.5 | 3.3 | 0.2x |
 | Q2 | COUNT WHERE AdvEngineID | 4.5 | 4.5 | 1.0x |
@@ -45,7 +45,7 @@ Current geometric mean: **pg_cocoon 18.1ms vs TimescaleDB 17.7ms (0.98x, essenti
 
 ## Previous Benchmark (2026-03-02, segment pruning implemented)
 
-| Query | Description | Cocoon (ms) | TSDB (ms) | Gap |
+| Query | Description | SeaTurtle (ms) | TSDB (ms) | Gap |
 |-------|-------------|-------------|-----------|-----|
 | Q1 | COUNT(*) | 42.5 | 3.3 | 13x |
 | Q2 | COUNT WHERE AdvEngineID | 76.2 | 4.5 | 17x |
@@ -65,7 +65,7 @@ Current geometric mean: **pg_cocoon 18.1ms vs TimescaleDB 17.7ms (0.98x, essenti
 
 ## Where the time goes (EXPLAIN ANALYZE breakdown)
 
-The cocoon scan has four phases: **metadata** (SPI catalog lookup), **heap_scan**
+The seaturtle scan has four phases: **metadata** (SPI catalog lookup), **heap_scan**
 (load compressed blobs from companion table), **decompress** (decode blobs to
 datums), and **emit** (fill slot + qual + projection, row at a time).
 
@@ -211,7 +211,7 @@ where X is outside `[_min_UserID, _max_UserID]`.
 **Impact: Q25 64ms -> 10.9ms (achieved)**
 **Complexity: High**
 
-Segments are now sorted by `min_time` during execution, and CocoonDecompress
+Segments are now sorted by `min_time` during execution, and SeaTurtleDecompress
 paths advertise pathkeys matching the time column when the query has
 `ORDER BY time_col ASC`. PG's planner sees the sorted children and creates a
 MergeAppend → Incremental Sort → Limit plan, short-circuiting after just a
@@ -220,7 +220,7 @@ few rows from the first segment instead of decompressing everything.
 Key details:
 - `find_parent_oid()` resolves the parent hypertable for child partitions
   during planning to look up the time column.
-- Pathkeys are set on individual CocoonDecompress paths (not CocoonAppend),
+- Pathkeys are set on individual SeaTurtleDecompress paths (not SeaTurtleAppend),
   so PG's `generate_orderedappend_paths` creates MergeAppend naturally.
 - Only ASC ordering is advertised for now; DESC can be added later.
 - PG18 compatibility: uses `pk_cmptype` instead of `pk_strategy`.
@@ -279,7 +279,7 @@ For text columns with moderate cardinality, store a per-segment bloom filter in
 the companion table. This enables pruning segments that definitely don't contain
 a given string, without decompressing.
 
-Referenced in the design doc (`pg_cocoon_design_v03.md`) as a future optimization.
+Referenced in the design doc (`pg_seaturtle_design_v03.md`) as a future optimization.
 
 **Files:** `src/compress.rs`, `src/scan/exec.rs`
 

@@ -12,30 +12,30 @@ pub unsafe extern "C-unwind" fn explain_custom_scan(
 ) {
     unsafe {
         let label = c"Storage";
-        let value = c"Compressed (CocoonDecompress)";
+        let value = c"Compressed (SeaTurtleDecompress)";
         pg_sys::ExplainPropertyText(label.as_ptr(), value.as_ptr(), es);
 
         explain_timing(node, es);
     }
 }
 
-/// ExplainCustomScan callback for CocoonAppend.
+/// ExplainCustomScan callback for SeaTurtleAppend.
 #[pg_guard]
-pub unsafe extern "C-unwind" fn explain_cocoon_append(
+pub unsafe extern "C-unwind" fn explain_seaturtle_append(
     node: *mut pg_sys::CustomScanState,
     _ancestors: *mut pg_sys::List,
     es: *mut pg_sys::ExplainState,
 ) {
     unsafe {
         let label = c"Storage";
-        let value = c"Compressed (CocoonAppend)";
+        let value = c"Compressed (SeaTurtleAppend)";
         pg_sys::ExplainPropertyText(label.as_ptr(), value.as_ptr(), es);
 
         explain_timing(node, es);
     }
 }
 
-/// ExplainCustomScan callback for CocoonCount (COUNT(*) pushdown).
+/// ExplainCustomScan callback for SeaTurtleCount (COUNT(*) pushdown).
 #[pg_guard]
 pub unsafe extern "C-unwind" fn explain_count_scan(
     node: *mut pg_sys::CustomScanState,
@@ -44,7 +44,7 @@ pub unsafe extern "C-unwind" fn explain_count_scan(
 ) {
     unsafe {
         let label = c"Storage";
-        let value = c"Compressed (CocoonCount - COUNT(*) pushdown)";
+        let value = c"Compressed (SeaTurtleCount - COUNT(*) pushdown)";
         pg_sys::ExplainPropertyText(label.as_ptr(), value.as_ptr(), es);
 
         if (*es).analyze {
@@ -62,7 +62,7 @@ pub unsafe extern "C-unwind" fn explain_count_scan(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"Cocoon Timing".as_ptr(),
+                    c"SeaTurtle Timing".as_ptr(),
                     timing_str.as_ptr(),
                     es,
                 );
@@ -74,7 +74,7 @@ pub unsafe extern "C-unwind" fn explain_count_scan(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"Cocoon Stats".as_ptr(),
+                    c"SeaTurtle Stats".as_ptr(),
                     stats_str.as_ptr(),
                     es,
                 );
@@ -83,7 +83,7 @@ pub unsafe extern "C-unwind" fn explain_count_scan(
     }
 }
 
-/// ExplainCustomScan callback for CocoonMinMax (MIN/MAX pushdown).
+/// ExplainCustomScan callback for SeaTurtleMinMax (MIN/MAX pushdown).
 #[pg_guard]
 pub unsafe extern "C-unwind" fn explain_minmax_scan(
     node: *mut pg_sys::CustomScanState,
@@ -92,7 +92,7 @@ pub unsafe extern "C-unwind" fn explain_minmax_scan(
 ) {
     unsafe {
         let label = c"Storage";
-        let value = c"Compressed (CocoonMinMax - MIN/MAX pushdown)";
+        let value = c"Compressed (SeaTurtleMinMax - MIN/MAX pushdown)";
         pg_sys::ExplainPropertyText(label.as_ptr(), value.as_ptr(), es);
 
         if (*es).analyze {
@@ -110,7 +110,7 @@ pub unsafe extern "C-unwind" fn explain_minmax_scan(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"Cocoon Timing".as_ptr(),
+                    c"SeaTurtle Timing".as_ptr(),
                     timing_str.as_ptr(),
                     es,
                 );
@@ -126,7 +126,7 @@ pub unsafe extern "C-unwind" fn explain_minmax_scan(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"Cocoon Stats".as_ptr(),
+                    c"SeaTurtle Stats".as_ptr(),
                     stats_str.as_ptr(),
                     es,
                 );
@@ -135,7 +135,7 @@ pub unsafe extern "C-unwind" fn explain_minmax_scan(
     }
 }
 
-/// ExplainCustomScan callback for CocoonAgg (aggregate pushdown).
+/// ExplainCustomScan callback for SeaTurtleAgg (aggregate pushdown).
 #[pg_guard]
 pub unsafe extern "C-unwind" fn explain_agg_scan(
     node: *mut pg_sys::CustomScanState,
@@ -144,7 +144,7 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
 ) {
     unsafe {
         let label = c"Storage";
-        let value = c"Compressed (CocoonAgg)";
+        let value = c"Compressed (SeaTurtleAgg)";
         pg_sys::ExplainPropertyText(label.as_ptr(), value.as_ptr(), es);
 
         if (*es).analyze {
@@ -165,7 +165,7 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"Cocoon Timing".as_ptr(),
+                    c"SeaTurtle Timing".as_ptr(),
                     timing_str.as_ptr(),
                     es,
                 );
@@ -178,7 +178,7 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"Cocoon Stats".as_ptr(),
+                    c"SeaTurtle Stats".as_ptr(),
                     stats_str.as_ptr(),
                     es,
                 );
@@ -211,7 +211,7 @@ unsafe fn explain_timing(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"Cocoon Timing".as_ptr(),
+                    c"SeaTurtle Timing".as_ptr(),
                     timing_str.as_ptr(),
                     es,
                 );
@@ -227,7 +227,7 @@ unsafe fn explain_timing(
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
-                    c"Cocoon Stats".as_ptr(),
+                    c"SeaTurtle Stats".as_ptr(),
                     stats_str.as_ptr(),
                     es,
                 );

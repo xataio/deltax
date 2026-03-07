@@ -1,7 +1,7 @@
 """Shared ClickBench data loading utilities.
 
 Constants, download helpers, parquet-to-PostgreSQL loading, and a generic
-query runner used by both the pg_cocoon and TimescaleDB benchmarks.
+query runner used by both the pg_seaturtle and TimescaleDB benchmarks.
 """
 
 import io
@@ -176,7 +176,7 @@ def download_parquet(idx: int) -> Path:
 
     url = PARQUET_URL.format(idx=idx)
     print(f"  Downloading {url} ...")
-    req = urllib.request.Request(url, headers={"User-Agent": "pg_cocoon-bench/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "pg_seaturtle-bench/1.0"})
     with urllib.request.urlopen(req) as resp, open(dest, "wb") as f:
         while True:
             chunk = resp.read(1 << 20)  # 1 MB chunks

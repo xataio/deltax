@@ -27,7 +27,7 @@ pub unsafe fn estimate_cost(companion_oid: pg_sys::Oid) -> (f64, f64, f64) {
     (startup, total, rows)
 }
 
-/// Get partition stats from cocoon_partition catalog.
+/// Get partition stats from seaturtle_partition catalog.
 fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
     let name = unsafe {
         let name_ptr = pg_sys::get_rel_name(companion_oid);
@@ -40,7 +40,7 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
     };
 
     let result = Spi::get_one_with_args::<i64>(
-        "SELECT row_count FROM cocoon_partition WHERE table_name = $1 AND is_compressed = true",
+        "SELECT row_count FROM seaturtle_partition WHERE table_name = $1 AND is_compressed = true",
         &[name.as_str().into()],
     );
 

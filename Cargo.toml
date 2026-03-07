@@ -1,5 +1,5 @@
 [package]
-name = "pg_cocoon"
+name = "pg_seaturtle"
 version = "0.1.0"
 edition = "2024"
 resolver = "3"
@@ -10,7 +10,7 @@ description = "PostgreSQL time-series extension with Gorilla compression"
 crate-type = ["cdylib", "lib"]
 
 [[bin]]
-name = "pgrx_embed_pg_cocoon"
+name = "pgrx_embed_pg_seaturtle"
 path = "src/bin/pgrx_embed.rs"
 
 [features]

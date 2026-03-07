@@ -17,7 +17,7 @@ fn time_bucket(
 ) -> TimestampWithTimeZone {
     let width_usec = interval_to_usec(&bucket_width);
     if width_usec <= 0 {
-        pgrx::error!("pg_cocoon: time_bucket width must be positive");
+        pgrx::error!("pg_seaturtle: time_bucket width must be positive");
     }
 
     // PostgreSQL stores timestamps as microseconds since 2000-01-01 00:00:00 UTC
@@ -43,7 +43,7 @@ fn time_bucket_offset(
 ) -> TimestampWithTimeZone {
     let width_usec = interval_to_usec(&bucket_width);
     if width_usec <= 0 {
-        pgrx::error!("pg_cocoon: time_bucket width must be positive");
+        pgrx::error!("pg_seaturtle: time_bucket width must be positive");
     }
 
     let offset_usec = interval_to_usec(&origin);
@@ -63,7 +63,7 @@ fn interval_to_usec(interval: &pgrx::datum::Interval) -> i64 {
         .and_then(|v| v.try_into().ok())
         .unwrap_or(0);
     if months != 0 {
-        pgrx::error!("pg_cocoon: time_bucket does not support monthly intervals");
+        pgrx::error!("pg_seaturtle: time_bucket does not support monthly intervals");
     }
 
     let days: i64 = interval

@@ -4,13 +4,13 @@ from datetime import datetime, timezone
 
 
 def _setup_metrics(db):
-    """Helper: create a cocoon table and insert test rows."""
+    """Helper: create a seaturtle table and insert test rows."""
     db.execute(
         "CREATE TABLE metrics (ts TIMESTAMPTZ NOT NULL, device TEXT, value FLOAT8)"
     )
     db.commit()
 
-    db.execute("SELECT cocoon_create_table('metrics', 'ts')")
+    db.execute("SELECT seaturtle_create_table('metrics', 'ts')")
     db.commit()
 
     now = datetime.now(timezone.utc)
@@ -60,7 +60,7 @@ def test_first_last(db):
     )
     db.commit()
 
-    db.execute("SELECT cocoon_create_table('fl', 'ts')")
+    db.execute("SELECT seaturtle_create_table('fl', 'ts')")
     db.commit()
 
     db.execute(
@@ -85,7 +85,7 @@ def test_first_last_with_groups(db):
     )
     db.commit()
 
-    db.execute("SELECT cocoon_create_table('grouped', 'ts')")
+    db.execute("SELECT seaturtle_create_table('grouped', 'ts')")
     db.commit()
 
     db.execute(

@@ -19,9 +19,9 @@ pub(crate) static MOCK_NOW: GucSetting<Option<CString>> =
 
 extension_sql!(
     r#"
-CREATE SCHEMA IF NOT EXISTS _cocoon_compressed;
+CREATE SCHEMA IF NOT EXISTS _seaturtle_compressed;
 
-CREATE TABLE IF NOT EXISTS cocoon_hypertable (
+CREATE TABLE IF NOT EXISTS seaturtle_hypertable (
     id              SERIAL PRIMARY KEY,
     schema_name     TEXT NOT NULL,
     table_name      TEXT NOT NULL,
@@ -35,9 +35,9 @@ CREATE TABLE IF NOT EXISTS cocoon_hypertable (
     UNIQUE(schema_name, table_name)
 );
 
-CREATE TABLE IF NOT EXISTS cocoon_partition (
+CREATE TABLE IF NOT EXISTS seaturtle_partition (
     id              SERIAL PRIMARY KEY,
-    hypertable_id   INT REFERENCES cocoon_hypertable(id) ON DELETE CASCADE,
+    hypertable_id   INT REFERENCES seaturtle_hypertable(id) ON DELETE CASCADE,
     schema_name     TEXT NOT NULL,
     table_name      TEXT NOT NULL,
     range_start     TIMESTAMPTZ NOT NULL,
@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS cocoon_partition (
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_string_guc(
-        c"pg_cocoon.mock_now",
+        c"pg_seaturtle.mock_now",
         c"Override current time for testing (timestamptz literal, empty = use real time)",
         c"Override current time for testing (timestamptz literal, empty = use real time)",
         &MOCK_NOW,
@@ -86,6 +86,6 @@ pub mod pg_test {
     pub fn setup(_options: Vec<&str>) {}
 
     pub fn postgresql_conf_options() -> Vec<&'static str> {
-        vec!["shared_preload_libraries = 'pg_cocoon'"]
+        vec!["shared_preload_libraries = 'pg_seaturtle'"]
     }
 }

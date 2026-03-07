@@ -6,7 +6,7 @@ import uuid
 import psycopg
 import pytest
 
-CONTAINER_NAME = "pg_cocoon_inttest"
+CONTAINER_NAME = "pg_seaturtle_inttest"
 HOST_PORT = 15432
 PG_PASSWORD = "postgres"
 PG_USER = "postgres"
@@ -15,9 +15,9 @@ PG_USER = "postgres"
 @pytest.fixture(scope="session")
 def pg_container():
     """Start the runtime container, wait for PG readiness, yield, then tear down."""
-    image = os.environ.get("PG_COCOON_IMAGE")
+    image = os.environ.get("PG_SEATURTLE_IMAGE")
     if not image:
-        pytest.skip("PG_COCOON_IMAGE not set")
+        pytest.skip("PG_SEATURTLE_IMAGE not set")
 
     # Clean up any leftover container from a previous run
     subprocess.run(
@@ -33,7 +33,7 @@ def pg_container():
             "-p", f"{HOST_PORT}:5432",
             "-e", f"POSTGRES_PASSWORD={PG_PASSWORD}",
             image,
-            "-c", "shared_preload_libraries=pg_cocoon",
+            "-c", "shared_preload_libraries=pg_seaturtle",
         ]
     )
 
@@ -98,7 +98,7 @@ def db(pg_container):
         password=PG_PASSWORD,
         dbname=db_name,
     )
-    conn.execute("CREATE EXTENSION pg_cocoon")
+    conn.execute("CREATE EXTENSION pg_seaturtle")
     conn.commit()
 
     yield conn
@@ -124,13 +124,13 @@ def postgres_db(pg_container):
         password=PG_PASSWORD,
         dbname="postgres",
     )
-    conn.execute("CREATE EXTENSION IF NOT EXISTS pg_cocoon")
+    conn.execute("CREATE EXTENSION IF NOT EXISTS pg_seaturtle")
     conn.commit()
 
     yield conn
 
     # The connection may be in an error state after a failed test; roll back first
     conn.rollback()
-    conn.execute("RESET pg_cocoon.mock_now")
+    conn.execute("RESET pg_seaturtle.mock_now")
     conn.commit()
     conn.close()

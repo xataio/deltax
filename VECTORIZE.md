@@ -46,7 +46,7 @@ skips most decompression work entirely.
 
 **No new dependencies. Extension of existing pattern.**
 
-Extend `cocoon_create_upper_paths` to detect SUM/AVG/COUNT patterns beyond the
+Extend `seaturtle_create_upper_paths` to detect SUM/AVG/COUNT patterns beyond the
 existing COUNT(*) and MIN/MAX pushdowns. Implement as new CustomScan node variants.
 
 For GROUP BY on segment_by columns, each segment maps to exactly one group key, so

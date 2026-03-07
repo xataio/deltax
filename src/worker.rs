@@ -11,9 +11,9 @@ const DEFAULT_WORKER_INTERVAL_SECS: u64 = 60;
 
 /// Register the background worker at extension load time.
 pub fn register_bgworker() {
-    BackgroundWorkerBuilder::new("pg_cocoon maintenance worker")
-        .set_function("cocoon_worker_main")
-        .set_library("pg_cocoon")
+    BackgroundWorkerBuilder::new("pg_seaturtle maintenance worker")
+        .set_function("seaturtle_worker_main")
+        .set_library("pg_seaturtle")
         .set_argument(0i32.into_datum())
         .enable_spi_access()
         .set_start_time(BgWorkerStartTime::RecoveryFinished)
@@ -22,12 +22,12 @@ pub fn register_bgworker() {
 
 #[pg_guard]
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
+pub extern "C-unwind" fn seaturtle_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
 
     log!(
-        "pg_cocoon: background worker started, interval = {}s",
+        "pg_seaturtle: background worker started, interval = {}s",
         DEFAULT_WORKER_INTERVAL_SECS
     );
 
@@ -47,7 +47,7 @@ pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
             Spi::connect_mut(|client| {
                 // Skip if the extension hasn't been installed yet (catalog tables missing)
                 let has_catalog = client.select(
-                    "SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'cocoon_hypertable'",
+                    "SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'seaturtle_hypertable'",
                     None,
                     &[],
                 ).map(|r| !r.is_empty()).unwrap_or(false);
@@ -58,7 +58,7 @@ pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
                 let hypertables = match catalog::get_all_hypertables(client) {
                     Ok(hts) => hts,
                     Err(e) => {
-                        log!("pg_cocoon: failed to get hypertables: {:?}", e);
+                        log!("pg_seaturtle: failed to get hypertables: {:?}", e);
                         return;
                     }
                 };
@@ -71,7 +71,7 @@ pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
                         Ok(moved) => {
                             if moved > 0 {
                                 log!(
-                                    "pg_cocoon: drained {} rows from {}_default",
+                                    "pg_seaturtle: drained {} rows from {}_default",
                                     moved,
                                     ht.table_name
                                 );
@@ -79,7 +79,7 @@ pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
                         }
                         Err(e) => {
                             log!(
-                                "pg_cocoon: failed to drain default partition for {}.{}: {:?}",
+                                "pg_seaturtle: failed to drain default partition for {}.{}: {:?}",
                                 ht.schema_name,
                                 ht.table_name,
                                 e
@@ -92,7 +92,7 @@ pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
                         Ok(created) => {
                             if created > 0 {
                                 log!(
-                                    "pg_cocoon: created {} new partitions for {}.{}",
+                                    "pg_seaturtle: created {} new partitions for {}.{}",
                                     created,
                                     ht.schema_name,
                                     ht.table_name
@@ -101,7 +101,7 @@ pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
                         }
                         Err(e) => {
                             log!(
-                                "pg_cocoon: failed to create partitions for {}.{}: {:?}",
+                                "pg_seaturtle: failed to create partitions for {}.{}: {:?}",
                                 ht.schema_name,
                                 ht.table_name,
                                 e
@@ -113,7 +113,7 @@ pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
                     let compressed = crate::compress::auto_compress_partitions(client, ht);
                     if compressed > 0 {
                         log!(
-                            "pg_cocoon: auto-compressed {} partitions for {}.{}",
+                            "pg_seaturtle: auto-compressed {} partitions for {}.{}",
                             compressed,
                             ht.schema_name,
                             ht.table_name
@@ -124,7 +124,7 @@ pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
                     let dropped = partition::auto_drop_partitions(client, ht);
                     if dropped > 0 {
                         log!(
-                            "pg_cocoon: dropped {} expired partitions for {}.{}",
+                            "pg_seaturtle: dropped {} expired partitions for {}.{}",
                             dropped,
                             ht.schema_name,
                             ht.table_name
@@ -135,7 +135,7 @@ pub extern "C-unwind" fn cocoon_worker_main(_arg: pg_sys::Datum) {
         });
     }
 
-    log!("pg_cocoon: background worker shutting down");
+    log!("pg_seaturtle: background worker shutting down");
 }
 
 /// Move rows from the default partition into proper partitions.

@@ -1,7 +1,7 @@
 /// Custom scan node for transparent querying of compressed partitions.
 ///
 /// Installs a `set_rel_pathlist_hook` that detects compressed partitions
-/// and injects a `CocoonDecompress` custom path/scan node.
+/// and injects a `SeaTurtleDecompress` custom path/scan node.
 mod cost;
 pub(crate) mod exec;
 mod explain;
@@ -21,19 +21,19 @@ static PREV_UPPER_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 static PREV_EXECUTOR_START_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Custom scan method name (NUL-terminated, static lifetime).
-const CUSTOM_NAME: &std::ffi::CStr = c"CocoonDecompress";
+const CUSTOM_NAME: &std::ffi::CStr = c"SeaTurtleDecompress";
 
-/// CocoonAppend custom scan method name.
-const COCOON_APPEND_NAME: &std::ffi::CStr = c"CocoonAppend";
+/// SeaTurtleAppend custom scan method name.
+const SEATURTLE_APPEND_NAME: &std::ffi::CStr = c"SeaTurtleAppend";
 
-/// CocoonCount custom scan method name (COUNT(*) pushdown).
-const COCOON_COUNT_NAME: &std::ffi::CStr = c"CocoonCount";
+/// SeaTurtleCount custom scan method name (COUNT(*) pushdown).
+const SEATURTLE_COUNT_NAME: &std::ffi::CStr = c"SeaTurtleCount";
 
-/// CocoonMinMax custom scan method name (MIN/MAX pushdown).
-const COCOON_MINMAX_NAME: &std::ffi::CStr = c"CocoonMinMax";
+/// SeaTurtleMinMax custom scan method name (MIN/MAX pushdown).
+const SEATURTLE_MINMAX_NAME: &std::ffi::CStr = c"SeaTurtleMinMax";
 
-/// CocoonAgg custom scan method name (aggregate pushdown).
-const COCOON_AGG_NAME: &std::ffi::CStr = c"CocoonAgg";
+/// SeaTurtleAgg custom scan method name (aggregate pushdown).
+const SEATURTLE_AGG_NAME: &std::ffi::CStr = c"SeaTurtleAgg";
 
 /// Wrapper to make pg_sys structs with raw pointers usable in statics.
 /// Safety: the static structs only contain function pointers and const string pointers
@@ -60,14 +60,14 @@ pub unsafe fn register_hook() {
         if let Some(prev_fn) = prev {
             PREV_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
         }
-        pg_sys::set_rel_pathlist_hook = Some(hook::cocoon_set_rel_pathlist);
+        pg_sys::set_rel_pathlist_hook = Some(hook::seaturtle_set_rel_pathlist);
 
         // Register create_upper_paths_hook for COUNT(*) pushdown
         let prev_upper = pg_sys::create_upper_paths_hook;
         if let Some(prev_fn) = prev_upper {
             PREV_UPPER_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
         }
-        pg_sys::create_upper_paths_hook = Some(hook::cocoon_create_upper_paths);
+        pg_sys::create_upper_paths_hook = Some(hook::seaturtle_create_upper_paths);
     }
 }
 
@@ -81,6 +81,6 @@ pub unsafe fn register_executor_start_hook() {
         if let Some(prev_fn) = prev {
             PREV_EXECUTOR_START_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
         }
-        pg_sys::ExecutorStart_hook = Some(hook::cocoon_executor_start);
+        pg_sys::ExecutorStart_hook = Some(hook::seaturtle_executor_start);
     }
 }

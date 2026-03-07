@@ -81,14 +81,14 @@ def print_compression_table(results):
     """Table 1: Compression comparison across systems."""
     rows = []
 
-    cocoon = results.get("pg_cocoon")
-    if cocoon:
+    seaturtle = results.get("pg_seaturtle")
+    if seaturtle:
         rows.append((
-            "pg_cocoon",
-            cocoon.get("raw_bytes"),
-            cocoon.get("compressed_bytes"),
-            cocoon.get("compression_ratio"),
-            cocoon.get("compression_time_s"),
+            "pg_seaturtle",
+            seaturtle.get("raw_bytes"),
+            seaturtle.get("compressed_bytes"),
+            seaturtle.get("compression_ratio"),
+            seaturtle.get("compression_time_s"),
         ))
 
     tsdb = results.get("timescaledb_tsl")
@@ -122,15 +122,15 @@ def print_compression_table(results):
 
 def print_query_table(results):
     """Table 2: Query performance comparison across systems."""
-    cocoon = results.get("pg_cocoon")
+    seaturtle = results.get("pg_seaturtle")
     tsdb = results.get("timescaledb_tsl")
 
     # Build column list dynamically based on available data
     columns = []  # (header, getter)
 
-    if cocoon:
-        columns.append(("Cocoon Uncompr", lambda qid: cocoon.get("uncompressed_queries", {}).get(qid)))
-        columns.append(("Cocoon Compr", lambda qid: cocoon.get("compressed_queries", {}).get(qid)))
+    if seaturtle:
+        columns.append(("SeaTurtle Uncompr", lambda qid: seaturtle.get("uncompressed_queries", {}).get(qid)))
+        columns.append(("SeaTurtle Compr", lambda qid: seaturtle.get("compressed_queries", {}).get(qid)))
     if tsdb:
         columns.append(("TSDB Uncompr", lambda qid: tsdb.get("uncompressed_queries", {}).get(qid)))
         columns.append(("TSDB Match", lambda qid: tsdb.get("compressed_matching_queries", {}).get(qid)))
@@ -170,36 +170,36 @@ def print_query_table(results):
 
 
 def print_speedup_table(results):
-    """Table 3: Compressed query speedup (pg_cocoon vs TimescaleDB matching)."""
-    cocoon = results.get("pg_cocoon")
+    """Table 3: Compressed query speedup (pg_seaturtle vs TimescaleDB matching)."""
+    seaturtle = results.get("pg_seaturtle")
     tsdb = results.get("timescaledb_tsl")
 
-    if not cocoon or not tsdb:
+    if not seaturtle or not tsdb:
         return
 
-    cocoon_compr = cocoon.get("compressed_queries", {})
+    seaturtle_compr = seaturtle.get("compressed_queries", {})
     tsdb_match = tsdb.get("compressed_matching_queries", {})
 
-    if not cocoon_compr or not tsdb_match:
+    if not seaturtle_compr or not tsdb_match:
         return
 
-    print("\n### Compressed Query Speedup (pg_cocoon vs TimescaleDB matching)")
+    print("\n### Compressed Query Speedup (pg_seaturtle vs TimescaleDB matching)")
     print()
-    print(f"| {'Query':<6} | {'Description':<25} | {'Cocoon (ms)':>12} | {'TSDB (ms)':>10} | {'Speedup':>8} |")
+    print(f"| {'Query':<6} | {'Description':<25} | {'SeaTurtle (ms)':>12} | {'TSDB (ms)':>10} | {'Speedup':>8} |")
     print(f"|{'-'*8}|{'-'*27}|{'-'*14}|{'-'*12}|{'-'*10}|")
 
-    cocoon_vals = []
+    seaturtle_vals = []
     tsdb_vals = []
     for qid, desc, _ in QUERIES:
-        c = cocoon_compr.get(qid)
+        c = seaturtle_compr.get(qid)
         t = tsdb_match.get(qid)
         speedup = fmt_speedup(c, t)
         print(f"| {qid:<6} | {desc:<25} | {fmt_ms(c):>12} | {fmt_ms(t):>10} | {speedup:>8} |")
-        cocoon_vals.append(c)
+        seaturtle_vals.append(c)
         tsdb_vals.append(t)
 
     # Summary
-    gm_c = geometric_mean(cocoon_vals)
+    gm_c = geometric_mean(seaturtle_vals)
     gm_t = geometric_mean(tsdb_vals)
     speedup = fmt_speedup(gm_c, gm_t)
     print(f"| {'':.<6} | {'Geometric Mean':<25} | {fmt_ms(gm_c):>12} | {fmt_ms(gm_t):>10} | {speedup:>8} |")

@@ -1,4 +1,4 @@
-# pg_cocoon
+# pg_seaturtle
 
 A PostgreSQL extension for time-series data, built on native declarative partitioning with automatic partition management.
 
@@ -39,7 +39,7 @@ A Python virtualenv (`.venv/`) is created automatically on first run.
 ## Build runtime image
 
 ```sh
-make image  # builds pg_cocoon:pg17
+make image  # builds pg_seaturtle:pg17
 ```
 
 ## Quick start
@@ -47,18 +47,18 @@ make image  # builds pg_cocoon:pg17
 ```sh
 make run
 # in another terminal:
-psql -h localhost -U postgres -c "CREATE EXTENSION pg_cocoon;"
+psql -h localhost -U postgres -c "CREATE EXTENSION pg_seaturtle;"
 ```
 
 ```sql
 CREATE TABLE metrics (ts TIMESTAMPTZ NOT NULL, device TEXT, value FLOAT8);
-SELECT cocoon_create_table('metrics', 'ts', '1 day');
+SELECT seaturtle_create_table('metrics', 'ts', '1 day');
 
 INSERT INTO metrics VALUES (now(), 'sensor-1', 42.0);
 
 SELECT time_bucket('1 hour', ts), avg(value) FROM metrics GROUP BY 1;
 SELECT first(value, ts), last(value, ts) FROM metrics;
-SELECT * FROM cocoon_partition_info('metrics');
+SELECT * FROM seaturtle_partition_info('metrics');
 ```
 
 ## License

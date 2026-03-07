@@ -8,7 +8,7 @@ use std::time::Instant;
 use crate::compression::{self, CompressionType, CompressedColumnRef};
 use super::SyncStatic;
 
-/// Static CustomExecMethods struct for CocoonDecompress.
+/// Static CustomExecMethods struct for SeaTurtleDecompress.
 pub(crate) static CUSTOM_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
         CustomName: super::CUSTOM_NAME.as_ptr(),
@@ -26,10 +26,10 @@ pub(crate) static CUSTOM_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
         ExplainCustomScan: Some(super::explain::explain_custom_scan),
     });
 
-/// Static CustomExecMethods struct for CocoonCount (COUNT(*) pushdown).
-pub(crate) static COCOON_COUNT_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
+/// Static CustomExecMethods struct for SeaTurtleCount (COUNT(*) pushdown).
+pub(crate) static SEATURTLE_COUNT_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
-        CustomName: super::COCOON_COUNT_NAME.as_ptr(),
+        CustomName: super::SEATURTLE_COUNT_NAME.as_ptr(),
         BeginCustomScan: Some(begin_count_scan),
         ExecCustomScan: Some(exec_count_scan),
         EndCustomScan: Some(end_count_scan),
@@ -44,10 +44,10 @@ pub(crate) static COCOON_COUNT_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethod
         ExplainCustomScan: Some(super::explain::explain_count_scan),
     });
 
-/// Static CustomExecMethods struct for CocoonMinMax (MIN/MAX pushdown).
-pub(crate) static COCOON_MINMAX_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
+/// Static CustomExecMethods struct for SeaTurtleMinMax (MIN/MAX pushdown).
+pub(crate) static SEATURTLE_MINMAX_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
-        CustomName: super::COCOON_MINMAX_NAME.as_ptr(),
+        CustomName: super::SEATURTLE_MINMAX_NAME.as_ptr(),
         BeginCustomScan: Some(begin_minmax_scan),
         ExecCustomScan: Some(exec_minmax_scan),
         EndCustomScan: Some(end_minmax_scan),
@@ -62,11 +62,11 @@ pub(crate) static COCOON_MINMAX_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMetho
         ExplainCustomScan: Some(super::explain::explain_minmax_scan),
     });
 
-/// Static CustomExecMethods struct for CocoonAppend.
-pub(crate) static COCOON_APPEND_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
+/// Static CustomExecMethods struct for SeaTurtleAppend.
+pub(crate) static SEATURTLE_APPEND_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
-        CustomName: super::COCOON_APPEND_NAME.as_ptr(),
-        BeginCustomScan: Some(begin_cocoon_append),
+        CustomName: super::SEATURTLE_APPEND_NAME.as_ptr(),
+        BeginCustomScan: Some(begin_seaturtle_append),
         ExecCustomScan: Some(exec_custom_scan),
         EndCustomScan: Some(end_custom_scan),
         ReScanCustomScan: Some(rescan_custom_scan),
@@ -77,7 +77,7 @@ pub(crate) static COCOON_APPEND_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMetho
         ReInitializeDSMCustomScan: None,
         InitializeWorkerCustomScan: None,
         ShutdownCustomScan: None,
-        ExplainCustomScan: Some(super::explain::explain_cocoon_append),
+        ExplainCustomScan: Some(super::explain::explain_seaturtle_append),
     });
 
 // Epoch offset: microseconds between Unix epoch (1970-01-01) and PG epoch (2000-01-01).
@@ -203,7 +203,7 @@ struct SegmentData {
     col_minmax: HashMap<String, ColMinMax>,
 }
 
-/// State for CocoonCount (COUNT(*) pushdown).
+/// State for SeaTurtleCount (COUNT(*) pushdown).
 pub(super) struct CountScanState {
     pub(super) total_count: i64,
     returned: bool,
@@ -221,7 +221,7 @@ pub(super) struct MinMaxResult {
     pub(super) type_oid: pg_sys::Oid,
 }
 
-/// State for CocoonMinMax (MIN/MAX pushdown on any column, multi-aggregate).
+/// State for SeaTurtleMinMax (MIN/MAX pushdown on any column, multi-aggregate).
 pub(super) struct MinMaxScanState {
     /// Results: one per aggregate.
     pub(super) results: Vec<MinMaxResult>,
@@ -232,7 +232,7 @@ pub(super) struct MinMaxScanState {
 }
 
 // ============================================================================
-// CocoonAgg: aggregate pushdown (SUM, AVG, COUNT, COUNT(DISTINCT), GROUP BY)
+// SeaTurtleAgg: aggregate pushdown (SUM, AVG, COUNT, COUNT(DISTINCT), GROUP BY)
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -290,7 +290,7 @@ pub(super) struct GroupByColSpec {
     pub(super) type_oid: pg_sys::Oid,
 }
 
-/// State for CocoonAgg (aggregate pushdown).
+/// State for SeaTurtleAgg (aggregate pushdown).
 pub(super) struct AggScanState {
     pub(super) _agg_specs: Vec<AggExecSpec>,
     pub(super) _group_specs: Vec<GroupByColSpec>,
@@ -305,10 +305,10 @@ pub(super) struct AggScanState {
     pub(super) total_rows_processed: u64,
 }
 
-/// Static CustomExecMethods struct for CocoonAgg.
-pub(crate) static COCOON_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
+/// Static CustomExecMethods struct for SeaTurtleAgg.
+pub(crate) static SEATURTLE_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
-        CustomName: super::COCOON_AGG_NAME.as_ptr(),
+        CustomName: super::SEATURTLE_AGG_NAME.as_ptr(),
         BeginCustomScan: Some(begin_agg_scan),
         ExecCustomScan: Some(exec_agg_scan),
         EndCustomScan: Some(end_agg_scan),
@@ -323,7 +323,7 @@ pub(crate) static COCOON_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods>
         ExplainCustomScan: Some(super::explain::explain_agg_scan),
     });
 
-/// CreateCustomScanState callback for CocoonCount.
+/// CreateCustomScanState callback for SeaTurtleCount.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn create_count_scan_state(
     cscan: *mut pg_sys::CustomScan,
@@ -333,7 +333,7 @@ pub unsafe extern "C-unwind" fn create_count_scan_state(
             as *mut pg_sys::CustomScanState;
 
         (*css).ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
-        (*css).methods = &COCOON_COUNT_EXEC_METHODS.0;
+        (*css).methods = &SEATURTLE_COUNT_EXEC_METHODS.0;
 
         // Copy custom_private for use in BeginCustomScan
         (*css).custom_ps = (*cscan).custom_private;
@@ -372,7 +372,7 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
         // Get custom_private (stored as IntList: [oid, -1, col0, col1, ...])
         let custom_private = (*node).custom_ps;
         if custom_private.is_null() {
-            pgrx::error!("pg_cocoon: missing companion table OID in custom scan state");
+            pgrx::error!("pg_seaturtle: missing companion table OID in custom scan state");
         }
 
         let companion_oid =
@@ -398,7 +398,7 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
             let name_ptr = pg_sys::get_rel_name(companion_oid);
             if name_ptr.is_null() {
                 pgrx::error!(
-                    "pg_cocoon: companion table not found for OID {}",
+                    "pg_seaturtle: companion table not found for OID {}",
                     u32::from(companion_oid)
                 );
             }
@@ -416,7 +416,7 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
         let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
         state.segment_mcxt = pg_sys::AllocSetContextCreateInternal(
             query_ctx,
-            c"CocoonSegment".as_ptr(),
+            c"SeaTurtleSegment".as_ptr(),
             pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
             pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
             pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
@@ -432,9 +432,9 @@ pub unsafe extern "C-unwind" fn begin_custom_scan(
     }
 }
 
-/// CreateCustomScanState callback for CocoonAppend.
+/// CreateCustomScanState callback for SeaTurtleAppend.
 #[pg_guard]
-pub unsafe extern "C-unwind" fn create_cocoon_append_state(
+pub unsafe extern "C-unwind" fn create_seaturtle_append_state(
     cscan: *mut pg_sys::CustomScan,
 ) -> *mut pg_sys::Node {
     unsafe {
@@ -442,7 +442,7 @@ pub unsafe extern "C-unwind" fn create_cocoon_append_state(
             as *mut pg_sys::CustomScanState;
 
         (*css).ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
-        (*css).methods = &COCOON_APPEND_EXEC_METHODS.0;
+        (*css).methods = &SEATURTLE_APPEND_EXEC_METHODS.0;
 
         // Copy custom_private for use in BeginCustomScan
         (*css).custom_ps = (*cscan).custom_private;
@@ -451,9 +451,9 @@ pub unsafe extern "C-unwind" fn create_cocoon_append_state(
     }
 }
 
-/// BeginCustomScan callback for CocoonAppend: load segments from all companion tables.
+/// BeginCustomScan callback for SeaTurtleAppend: load segments from all companion tables.
 #[pg_guard]
-pub unsafe extern "C-unwind" fn begin_cocoon_append(
+pub unsafe extern "C-unwind" fn begin_seaturtle_append(
     node: *mut pg_sys::CustomScanState,
     _estate: *mut pg_sys::EState,
     _eflags: i32,
@@ -461,7 +461,7 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
     unsafe {
         let custom_private = (*node).custom_ps;
         if custom_private.is_null() {
-            pgrx::error!("pg_cocoon: missing companion table OIDs in CocoonAppend state");
+            pgrx::error!("pg_seaturtle: missing companion table OIDs in SeaTurtleAppend state");
         }
 
         let list_len = (*custom_private).length;
@@ -484,7 +484,7 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
         }
 
         if companion_oids.is_empty() {
-            pgrx::error!("pg_cocoon: CocoonAppend has no companion tables");
+            pgrx::error!("pg_seaturtle: SeaTurtleAppend has no companion tables");
         }
 
         // Get first companion table name for metadata
@@ -492,7 +492,7 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
             let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
             if name_ptr.is_null() {
                 pgrx::error!(
-                    "pg_cocoon: companion table not found for OID {}",
+                    "pg_seaturtle: companion table not found for OID {}",
                     u32::from(companion_oids[0])
                 );
             }
@@ -596,7 +596,7 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
         let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
         state.segment_mcxt = pg_sys::AllocSetContextCreateInternal(
             query_ctx,
-            c"CocoonSegment".as_ptr(),
+            c"SeaTurtleSegment".as_ptr(),
             pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
             pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
             pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
@@ -611,7 +611,7 @@ pub unsafe extern "C-unwind" fn begin_cocoon_append(
     }
 }
 
-/// BeginCustomScan callback for CocoonCount: load segment metadata and sum row counts.
+/// BeginCustomScan callback for SeaTurtleCount: load segment metadata and sum row counts.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn begin_count_scan(
     node: *mut pg_sys::CustomScanState,
@@ -621,7 +621,7 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
     unsafe {
         let custom_private = (*node).custom_ps;
         if custom_private.is_null() {
-            pgrx::error!("pg_cocoon: missing companion table OIDs in CocoonCount state");
+            pgrx::error!("pg_seaturtle: missing companion table OIDs in SeaTurtleCount state");
         }
 
         let list_len = (*custom_private).length;
@@ -637,7 +637,7 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
         }
 
         if companion_oids.is_empty() {
-            pgrx::error!("pg_cocoon: CocoonCount has no companion tables");
+            pgrx::error!("pg_seaturtle: SeaTurtleCount has no companion tables");
         }
 
         // Get first companion table name for metadata
@@ -645,7 +645,7 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
             let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
             if name_ptr.is_null() {
                 pgrx::error!(
-                    "pg_cocoon: companion table not found for OID {}",
+                    "pg_seaturtle: companion table not found for OID {}",
                     u32::from(companion_oids[0])
                 );
             }
@@ -700,7 +700,7 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
     }
 }
 
-/// ExecCustomScan callback for CocoonCount: return one row with the count.
+/// ExecCustomScan callback for SeaTurtleCount: return one row with the count.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn exec_count_scan(
     node: *mut pg_sys::CustomScanState,
@@ -724,7 +724,7 @@ pub unsafe extern "C-unwind" fn exec_count_scan(
     }
 }
 
-/// EndCustomScan callback for CocoonCount: cleanup state.
+/// EndCustomScan callback for SeaTurtleCount: cleanup state.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn end_count_scan(
     node: *mut pg_sys::CustomScanState,
@@ -735,7 +735,7 @@ pub unsafe extern "C-unwind" fn end_count_scan(
             let state = Box::from_raw(state_ptr);
             let total_us = state.metadata_us + state.heap_scan_us;
             pgrx::log!(
-                "pg_cocoon CocoonCount timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  | \
+                "pg_seaturtle SeaTurtleCount timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  | \
                  total_count={} segments={}",
                 total_us as f64 / 1000.0,
                 state.metadata_us as f64 / 1000.0,
@@ -748,7 +748,7 @@ pub unsafe extern "C-unwind" fn end_count_scan(
     }
 }
 
-/// ReScanCustomScan callback for CocoonCount: reset returned flag.
+/// ReScanCustomScan callback for SeaTurtleCount: reset returned flag.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn rescan_count_scan(
     node: *mut pg_sys::CustomScanState,
@@ -759,7 +759,7 @@ pub unsafe extern "C-unwind" fn rescan_count_scan(
     }
 }
 
-/// CreateCustomScanState callback for CocoonMinMax.
+/// CreateCustomScanState callback for SeaTurtleMinMax.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn create_minmax_scan_state(
     cscan: *mut pg_sys::CustomScan,
@@ -769,7 +769,7 @@ pub unsafe extern "C-unwind" fn create_minmax_scan_state(
             as *mut pg_sys::CustomScanState;
 
         (*css).ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
-        (*css).methods = &COCOON_MINMAX_EXEC_METHODS.0;
+        (*css).methods = &SEATURTLE_MINMAX_EXEC_METHODS.0;
 
         // Copy custom_private for use in BeginCustomScan
         (*css).custom_ps = (*cscan).custom_private;
@@ -784,7 +784,7 @@ struct ExecAggSpec {
     varattno: i32,
 }
 
-/// BeginCustomScan callback for CocoonMinMax: load segment metadata and find global min/max.
+/// BeginCustomScan callback for SeaTurtleMinMax: load segment metadata and find global min/max.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn begin_minmax_scan(
     node: *mut pg_sys::CustomScanState,
@@ -794,7 +794,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
     unsafe {
         let custom_private = (*node).custom_ps;
         if custom_private.is_null() {
-            pgrx::error!("pg_cocoon: missing companion table OIDs in CocoonMinMax state");
+            pgrx::error!("pg_seaturtle: missing companion table OIDs in SeaTurtleMinMax state");
         }
 
         let list_len = (*custom_private).length;
@@ -835,7 +835,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
         let _ = num_aggs;
 
         if companion_oids.is_empty() {
-            pgrx::error!("pg_cocoon: CocoonMinMax has no companion tables");
+            pgrx::error!("pg_seaturtle: SeaTurtleMinMax has no companion tables");
         }
 
         // Get first companion table name for metadata
@@ -843,7 +843,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
             let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
             if name_ptr.is_null() {
                 pgrx::error!(
-                    "pg_cocoon: companion table not found for OID {}",
+                    "pg_seaturtle: companion table not found for OID {}",
                     u32::from(companion_oids[0])
                 );
             }
@@ -865,7 +865,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
                 if idx < meta.col_names.len() {
                     meta.col_names[idx].clone()
                 } else {
-                    pgrx::error!("pg_cocoon: CocoonMinMax varattno {} out of range", spec.varattno);
+                    pgrx::error!("pg_seaturtle: SeaTurtleMinMax varattno {} out of range", spec.varattno);
                 }
             })
             .collect();
@@ -951,7 +951,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
     }
 }
 
-/// ExecCustomScan callback for CocoonMinMax: return one row with N min/max values.
+/// ExecCustomScan callback for SeaTurtleMinMax: return one row with N min/max values.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn exec_minmax_scan(
     node: *mut pg_sys::CustomScanState,
@@ -977,7 +977,7 @@ pub unsafe extern "C-unwind" fn exec_minmax_scan(
     }
 }
 
-/// EndCustomScan callback for CocoonMinMax: cleanup state.
+/// EndCustomScan callback for SeaTurtleMinMax: cleanup state.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn end_minmax_scan(
     node: *mut pg_sys::CustomScanState,
@@ -992,7 +992,7 @@ pub unsafe extern "C-unwind" fn end_minmax_scan(
                 format!("{}({})=null={}", agg_name, r.col_name, r.is_null)
             }).collect();
             pgrx::log!(
-                "pg_cocoon CocoonMinMax timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  | \
+                "pg_seaturtle SeaTurtleMinMax timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  | \
                  {} segments={}",
                 total_us as f64 / 1000.0,
                 state.metadata_us as f64 / 1000.0,
@@ -1005,7 +1005,7 @@ pub unsafe extern "C-unwind" fn end_minmax_scan(
     }
 }
 
-/// ReScanCustomScan callback for CocoonMinMax: reset returned flag.
+/// ReScanCustomScan callback for SeaTurtleMinMax: reset returned flag.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn rescan_minmax_scan(
     node: *mut pg_sys::CustomScanState,
@@ -1017,10 +1017,10 @@ pub unsafe extern "C-unwind" fn rescan_minmax_scan(
 }
 
 // ============================================================================
-// CocoonAgg execution callbacks
+// SeaTurtleAgg execution callbacks
 // ============================================================================
 
-/// CreateCustomScanState callback for CocoonAgg.
+/// CreateCustomScanState callback for SeaTurtleAgg.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn create_agg_scan_state(
     cscan: *mut pg_sys::CustomScan,
@@ -1030,7 +1030,7 @@ pub unsafe extern "C-unwind" fn create_agg_scan_state(
             as *mut pg_sys::CustomScanState;
 
         (*css).ss.ps.type_ = pg_sys::NodeTag::T_CustomScanState;
-        (*css).methods = &COCOON_AGG_EXEC_METHODS.0;
+        (*css).methods = &SEATURTLE_AGG_EXEC_METHODS.0;
         (*css).custom_ps = (*cscan).custom_private;
 
         css as *mut pg_sys::Node
@@ -1044,7 +1044,7 @@ enum OutputEntry {
     Group(usize),  // index into group_specs
 }
 
-/// BeginCustomScan callback for CocoonAgg: decompress and aggregate.
+/// BeginCustomScan callback for SeaTurtleAgg: decompress and aggregate.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn begin_agg_scan(
     node: *mut pg_sys::CustomScanState,
@@ -1054,7 +1054,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
     unsafe {
         let custom_private = (*node).custom_ps;
         if custom_private.is_null() {
-            pgrx::error!("pg_cocoon: missing custom_private in CocoonAgg state");
+            pgrx::error!("pg_seaturtle: missing custom_private in SeaTurtleAgg state");
         }
 
         let list_len = (*custom_private).length;
@@ -1144,7 +1144,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
         let _ = idx;
 
         if companion_oids.is_empty() {
-            pgrx::error!("pg_cocoon: CocoonAgg has no companion tables");
+            pgrx::error!("pg_seaturtle: SeaTurtleAgg has no companion tables");
         }
 
         // Get first companion table name for metadata
@@ -1152,7 +1152,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
             if name_ptr.is_null() {
                 pgrx::error!(
-                    "pg_cocoon: companion table not found for OID {}",
+                    "pg_seaturtle: companion table not found for OID {}",
                     u32::from(companion_oids[0])
                 );
             }
@@ -1212,7 +1212,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
         let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
         let segment_mcxt = pg_sys::AllocSetContextCreateInternal(
             query_ctx,
-            c"CocoonAggSegment".as_ptr(),
+            c"SeaTurtleAggSegment".as_ptr(),
             pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
             pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
             pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
@@ -1618,7 +1618,7 @@ unsafe fn finalize_accumulator(acc: &AggAccumulator, spec: &AggExecSpec) -> (pg_
     }
 }
 
-/// ExecCustomScan callback for CocoonAgg: return result rows.
+/// ExecCustomScan callback for SeaTurtleAgg: return result rows.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn exec_agg_scan(
     node: *mut pg_sys::CustomScanState,
@@ -1645,7 +1645,7 @@ pub unsafe extern "C-unwind" fn exec_agg_scan(
     }
 }
 
-/// EndCustomScan callback for CocoonAgg.
+/// EndCustomScan callback for SeaTurtleAgg.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn end_agg_scan(
     node: *mut pg_sys::CustomScanState,
@@ -1656,7 +1656,7 @@ pub unsafe extern "C-unwind" fn end_agg_scan(
             let state = Box::from_raw(state_ptr);
             let total_us = state.metadata_us + state.heap_scan_us + state.decompress_us + state.agg_us;
             pgrx::log!(
-                "pg_cocoon CocoonAgg timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  \
+                "pg_seaturtle SeaTurtleAgg timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  \
                  decompress={:.1}ms  agg={:.1}ms  | \
                  segments={} rows_processed={} result_rows={}",
                 total_us as f64 / 1000.0,
@@ -1673,7 +1673,7 @@ pub unsafe extern "C-unwind" fn end_agg_scan(
     }
 }
 
-/// ReScanCustomScan callback for CocoonAgg.
+/// ReScanCustomScan callback for SeaTurtleAgg.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn rescan_agg_scan(
     node: *mut pg_sys::CustomScanState,
@@ -1702,8 +1702,8 @@ fn load_metadata(
     let mut ht_result = client
         .select(
             "SELECT h.segment_by, h.order_by, h.time_column, h.schema_name, h.table_name
-             FROM cocoon_partition p
-             JOIN cocoon_hypertable h ON h.id = p.hypertable_id
+             FROM seaturtle_partition p
+             JOIN seaturtle_hypertable h ON h.id = p.hypertable_id
              WHERE p.table_name = $1 AND p.is_compressed = true",
             None,
             &[companion_name.into()],
@@ -1712,7 +1712,7 @@ fn load_metadata(
 
     let ht_row = ht_result.next().unwrap_or_else(|| {
         pgrx::error!(
-            "pg_cocoon: no compressed partition info found for {}",
+            "pg_seaturtle: no compressed partition info found for {}",
             companion_name
         );
     });
@@ -3071,7 +3071,7 @@ pub unsafe extern "C-unwind" fn end_custom_scan(
             let t = &state.timing;
             let total_us = t.metadata_us + t.heap_scan_us + t.decompress_us + t.batch_eval_us + t.emit_us;
             pgrx::log!(
-                "pg_cocoon scan timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  \
+                "pg_seaturtle scan timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  \
                  decompress={:.1}ms  batch_eval={:.1}ms  emit={:.1}ms  | \
                  segments={} segments_skipped={} rows_out={} rows_filtered={} rows_batch_filtered={} compressed_bytes={}",
                 total_us as f64 / 1000.0,

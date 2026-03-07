@@ -1,7 +1,7 @@
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
 
-/// Metadata for a cocoon-managed hypertable.
+/// Metadata for a seaturtle-managed hypertable.
 #[derive(Debug, Clone)]
 pub struct HypertableInfo {
     pub id: i32,
@@ -37,7 +37,7 @@ pub fn register_hypertable(
     partition_interval: &pgrx::datum::Interval,
 ) -> spi::SpiResult<i32> {
     let result = client.update(
-        "INSERT INTO cocoon_hypertable (schema_name, table_name, time_column, partition_interval)
+        "INSERT INTO seaturtle_hypertable (schema_name, table_name, time_column, partition_interval)
          VALUES ($1, $2, $3, $4)
          RETURNING id",
         None,
@@ -61,7 +61,7 @@ pub fn register_partition(
     range_end: TimestampWithTimeZone,
 ) -> spi::SpiResult<()> {
     client.update(
-        "INSERT INTO cocoon_partition (hypertable_id, schema_name, table_name, range_start, range_end)
+        "INSERT INTO seaturtle_partition (hypertable_id, schema_name, table_name, range_start, range_end)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (schema_name, table_name) DO NOTHING",
         None,
@@ -84,7 +84,7 @@ pub fn get_hypertable(
 ) -> spi::SpiResult<Option<HypertableInfo>> {
     let result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval
-         FROM cocoon_hypertable
+         FROM seaturtle_hypertable
          WHERE schema_name = $1 AND table_name = $2",
         None,
         &[schema_name.into(), table_name.into()],
@@ -111,7 +111,7 @@ pub fn get_hypertable_by_id(
     let mut result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval,
                 segment_by, order_by, compress_after, drop_after
-         FROM cocoon_hypertable
+         FROM seaturtle_hypertable
          WHERE id = $1",
         None,
         &[id.into()],
@@ -158,7 +158,7 @@ pub fn get_all_hypertables(
     let result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval,
                 segment_by, order_by, compress_after, drop_after
-         FROM cocoon_hypertable",
+         FROM seaturtle_hypertable",
         None,
         &[],
     )?;
@@ -187,7 +187,7 @@ pub fn get_partitions(
 ) -> spi::SpiResult<Vec<PartitionInfo>> {
     let result = client.select(
         "SELECT id, hypertable_id, schema_name, table_name, range_start, range_end, is_compressed
-         FROM cocoon_partition
+         FROM seaturtle_partition
          WHERE hypertable_id = $1
          ORDER BY range_start",
         None,
@@ -219,7 +219,7 @@ pub fn update_hypertable_compression(
     let seg_vec = segment_by.to_vec();
     let ord_vec = order_by.to_vec();
     client.update(
-        "UPDATE cocoon_hypertable
+        "UPDATE seaturtle_hypertable
          SET segment_by = $1, order_by = $2
          WHERE id = $3",
         None,
@@ -235,7 +235,7 @@ pub fn set_compress_after(
     compress_after: &pgrx::datum::Interval,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE cocoon_hypertable SET compress_after = $1 WHERE id = $2",
+        "UPDATE seaturtle_hypertable SET compress_after = $1 WHERE id = $2",
         None,
         &[(*compress_after).into(), hypertable_id.into()],
     )?;
@@ -249,7 +249,7 @@ pub fn set_drop_after(
     drop_after: &pgrx::datum::Interval,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE cocoon_hypertable SET drop_after = $1 WHERE id = $2",
+        "UPDATE seaturtle_hypertable SET drop_after = $1 WHERE id = $2",
         None,
         &[(*drop_after).into(), hypertable_id.into()],
     )?;
@@ -262,7 +262,7 @@ pub fn clear_drop_after(
     hypertable_id: i32,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE cocoon_hypertable SET drop_after = NULL WHERE id = $1",
+        "UPDATE seaturtle_hypertable SET drop_after = NULL WHERE id = $1",
         None,
         &[hypertable_id.into()],
     )?;
@@ -278,7 +278,7 @@ pub fn mark_partition_compressed(
     row_count: i64,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE cocoon_partition
+        "UPDATE seaturtle_partition
          SET is_compressed = true, compressed_size = $1, raw_size = $2,
              row_count = $3, compressed_at = now()
          WHERE id = $4",
@@ -299,7 +299,7 @@ pub fn mark_partition_decompressed(
     partition_id: i32,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE cocoon_partition
+        "UPDATE seaturtle_partition
          SET is_compressed = false, compressed_size = NULL, raw_size = NULL,
              row_count = NULL, compressed_at = NULL
          WHERE id = $1",
@@ -317,7 +317,7 @@ pub fn get_partition_by_name(
 ) -> spi::SpiResult<Option<PartitionInfo>> {
     let mut result = client.select(
         "SELECT id, hypertable_id, schema_name, table_name, range_start, range_end, is_compressed
-         FROM cocoon_partition
+         FROM seaturtle_partition
          WHERE schema_name = $1 AND table_name = $2",
         None,
         &[schema_name.into(), table_name.into()],

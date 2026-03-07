@@ -17,7 +17,7 @@ BASE_TS = "2025-01-15 00:00:00+00"
 def setup_metrics_table(conn, table_name="metrics"):
     """Create a partitioned metrics table and insert test data."""
     # Pin "now" so partitions cover our test timestamps
-    conn.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+    conn.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
     conn.execute(f"""
         CREATE TABLE {table_name} (
             ts TIMESTAMPTZ NOT NULL,
@@ -28,7 +28,7 @@ def setup_metrics_table(conn, table_name="metrics"):
         )
     """)
     conn.execute(f"""
-        SELECT cocoon_create_table('{table_name}', 'ts', '1 day'::interval)
+        SELECT seaturtle_create_table('{table_name}', 'ts', '1 day'::interval)
     """)
     conn.commit()
 
@@ -68,7 +68,7 @@ class TestEnableCompression:
     def test_enable_compression_basic(self, db):
         setup_metrics_table(db)
         result = db.execute(
-            "SELECT cocoon_enable_compression('metrics', "
+            "SELECT seaturtle_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         ).fetchone()[0]
@@ -79,7 +79,7 @@ class TestEnableCompression:
     def test_enable_compression_no_segment(self, db):
         setup_metrics_table(db)
         result = db.execute(
-            "SELECT cocoon_enable_compression('metrics')"
+            "SELECT seaturtle_enable_compression('metrics')"
         ).fetchone()[0]
         db.commit()
         assert "Compression enabled" in result
@@ -88,7 +88,7 @@ class TestEnableCompression:
         setup_metrics_table(db)
         with pytest.raises(Exception, match="segment_by column"):
             db.execute(
-                "SELECT cocoon_enable_compression('metrics', "
+                "SELECT seaturtle_enable_compression('metrics', "
                 "segment_by => ARRAY['nonexistent'])"
             )
             db.commit()
@@ -100,7 +100,7 @@ class TestCompressDecompress:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=5, n_points=50)
         db.execute(
-            "SELECT cocoon_enable_compression('metrics', "
+            "SELECT seaturtle_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -108,7 +108,7 @@ class TestCompressDecompress:
 
         # Find a partition to compress
         partitions = db.execute(
-            "SELECT partition_name FROM cocoon_partition_info('metrics') "
+            "SELECT partition_name FROM seaturtle_partition_info('metrics') "
             "WHERE range_start <= '2025-01-15'::timestamptz "
             "AND range_end > '2025-01-15'::timestamptz"
         ).fetchall()
@@ -123,7 +123,7 @@ class TestCompressDecompress:
 
         # Compress
         result = db.execute(
-            f"SELECT cocoon_compress_partition('{part_name}')"
+            f"SELECT seaturtle_compress_partition('{part_name}')"
         ).fetchone()[0]
         db.commit()
         assert "Compressed" in result
@@ -137,13 +137,13 @@ class TestCompressDecompress:
         # Companion table should exist
         companion_exists = db.execute(
             f"SELECT EXISTS (SELECT 1 FROM pg_tables "
-            f"WHERE schemaname = '_cocoon_compressed' AND tablename = '{part_name}')"
+            f"WHERE schemaname = '_seaturtle_compressed' AND tablename = '{part_name}')"
         ).fetchone()[0]
         assert companion_exists
 
         # Catalog should show compressed
         info = db.execute(
-            "SELECT is_compressed FROM cocoon_partition_info('metrics') "
+            "SELECT is_compressed FROM seaturtle_partition_info('metrics') "
             f"WHERE partition_name = '{part_name}'"
         ).fetchone()
         assert info[0] is True
@@ -153,7 +153,7 @@ class TestCompressDecompress:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=3, n_points=20)
         db.execute(
-            "SELECT cocoon_enable_compression('metrics', "
+            "SELECT seaturtle_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -161,7 +161,7 @@ class TestCompressDecompress:
 
         # Get partition and original data
         partitions = db.execute(
-            "SELECT partition_name FROM cocoon_partition_info('metrics') "
+            "SELECT partition_name FROM seaturtle_partition_info('metrics') "
             "WHERE range_start <= '2025-01-15'::timestamptz "
             "AND range_end > '2025-01-15'::timestamptz"
         ).fetchall()
@@ -176,12 +176,12 @@ class TestCompressDecompress:
         assert original_count > 0
 
         # Compress
-        db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+        db.execute(f"SELECT seaturtle_compress_partition('{part_name}')")
         db.commit()
 
         # Decompress
         result = db.execute(
-            f"SELECT cocoon_decompress_partition('{part_name}')"
+            f"SELECT seaturtle_decompress_partition('{part_name}')"
         ).fetchone()[0]
         db.commit()
         assert "Decompressed" in result
@@ -204,17 +204,17 @@ class TestCompressDecompress:
         """Compressing an empty partition should be a no-op."""
         setup_metrics_table(db)
         db.execute(
-            "SELECT cocoon_enable_compression('metrics')"
+            "SELECT seaturtle_enable_compression('metrics')"
         )
         db.commit()
 
         partitions = db.execute(
-            "SELECT partition_name FROM cocoon_partition_info('metrics') LIMIT 1"
+            "SELECT partition_name FROM seaturtle_partition_info('metrics') LIMIT 1"
         ).fetchall()
         part_name = partitions[0][0]
 
         result = db.execute(
-            f"SELECT cocoon_compress_partition('{part_name}')"
+            f"SELECT seaturtle_compress_partition('{part_name}')"
         ).fetchone()[0]
         db.commit()
         assert "no rows" in result.lower()
@@ -224,23 +224,23 @@ class TestCompressDecompress:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=2, n_points=10)
         db.execute(
-            "SELECT cocoon_enable_compression('metrics', "
+            "SELECT seaturtle_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'])"
         )
         db.commit()
 
         partitions = db.execute(
-            "SELECT partition_name FROM cocoon_partition_info('metrics') "
+            "SELECT partition_name FROM seaturtle_partition_info('metrics') "
             "WHERE range_start <= '2025-01-15'::timestamptz "
             "AND range_end > '2025-01-15'::timestamptz"
         ).fetchall()
         part_name = partitions[0][0]
 
-        db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+        db.execute(f"SELECT seaturtle_compress_partition('{part_name}')")
         db.commit()
 
         result = db.execute(
-            f"SELECT cocoon_compress_partition('{part_name}')"
+            f"SELECT seaturtle_compress_partition('{part_name}')"
         ).fetchone()[0]
         db.commit()
         assert "already compressed" in result.lower()
@@ -251,23 +251,23 @@ class TestCompressionStats:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=5, n_points=50)
         db.execute(
-            "SELECT cocoon_enable_compression('metrics', "
+            "SELECT seaturtle_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'])"
         )
         db.commit()
 
         partitions = db.execute(
-            "SELECT partition_name FROM cocoon_partition_info('metrics') "
+            "SELECT partition_name FROM seaturtle_partition_info('metrics') "
             "WHERE range_start <= '2025-01-15'::timestamptz "
             "AND range_end > '2025-01-15'::timestamptz"
         ).fetchall()
         part_name = partitions[0][0]
 
-        db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+        db.execute(f"SELECT seaturtle_compress_partition('{part_name}')")
         db.commit()
 
         stats = db.execute(
-            "SELECT * FROM cocoon_compression_stats('metrics') "
+            "SELECT * FROM seaturtle_compression_stats('metrics') "
             f"WHERE partition_name = '{part_name}'"
         ).fetchone()
         assert stats is not None
@@ -287,12 +287,12 @@ class TestCompressionPolicy:
     def test_set_policy(self, db):
         setup_metrics_table(db)
         db.execute(
-            "SELECT cocoon_enable_compression('metrics', "
+            "SELECT seaturtle_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'])"
         )
         db.commit()
         result = db.execute(
-            "SELECT cocoon_set_compression_policy('metrics', '7 days'::interval)"
+            "SELECT seaturtle_set_compression_policy('metrics', '7 days'::interval)"
         ).fetchone()[0]
         db.commit()
         assert "Compression policy set" in result
@@ -301,7 +301,7 @@ class TestCompressionPolicy:
         setup_metrics_table(db)
         with pytest.raises(Exception, match="enable compression first"):
             db.execute(
-                "SELECT cocoon_set_compression_policy('metrics', '7 days'::interval)"
+                "SELECT seaturtle_set_compression_policy('metrics', '7 days'::interval)"
             )
             db.commit()
 
@@ -317,7 +317,7 @@ class TestTransparentQuery:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=5, n_points=50)
         db.execute(
-            "SELECT cocoon_enable_compression('metrics', "
+            "SELECT seaturtle_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -335,7 +335,7 @@ class TestTransparentQuery:
 
         # Find and compress all non-default partitions
         partitions = db.execute(
-            "SELECT partition_name FROM cocoon_partition_info('metrics') "
+            "SELECT partition_name FROM seaturtle_partition_info('metrics') "
             "WHERE partition_name NOT LIKE '%default%'"
         ).fetchall()
 
@@ -346,7 +346,7 @@ class TestTransparentQuery:
             ).fetchone()[0]
             if row_ct == 0:
                 continue
-            db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+            db.execute(f"SELECT seaturtle_compress_partition('{part_name}')")
             db.commit()
             compressed_count += 1
 
@@ -378,7 +378,7 @@ class TestTransparentQuery:
 
         Confirms Bug 2 fix: correct type mappings for all types.
         """
-        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
         db.execute("""
             CREATE TABLE diverse (
                 ts TIMESTAMPTZ NOT NULL,
@@ -393,7 +393,7 @@ class TestTransparentQuery:
                 val_real REAL
             )
         """)
-        db.execute("SELECT cocoon_create_table('diverse', 'ts', '1 day'::interval)")
+        db.execute("SELECT seaturtle_create_table('diverse', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert test data
@@ -441,14 +441,14 @@ class TestTransparentQuery:
 
         # Enable and compress
         db.execute(
-            "SELECT cocoon_enable_compression('diverse', "
+            "SELECT seaturtle_enable_compression('diverse', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
 
         partitions = db.execute(
-            "SELECT partition_name FROM cocoon_partition_info('diverse') "
+            "SELECT partition_name FROM seaturtle_partition_info('diverse') "
             "WHERE partition_name NOT LIKE '%default%'"
         ).fetchall()
 
@@ -458,7 +458,7 @@ class TestTransparentQuery:
             ).fetchone()[0]
             if row_ct == 0:
                 continue
-            db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+            db.execute(f"SELECT seaturtle_compress_partition('{part_name}')")
             db.commit()
 
         # Query AFTER compression
@@ -517,7 +517,7 @@ class TestTransparentQuery:
         Regression test for wrong OID in float8_numeric conversion (was
         calling numeric_float8 instead of float8_numeric, causing segfault).
         """
-        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
         db.execute("""
             CREATE TABLE avg_test (
                 ts TIMESTAMPTZ NOT NULL,
@@ -528,7 +528,7 @@ class TestTransparentQuery:
                 val_real REAL
             )
         """)
-        db.execute("SELECT cocoon_create_table('avg_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT seaturtle_create_table('avg_test', 'ts', '1 day'::interval)")
         db.commit()
 
         for i in range(50):
@@ -564,13 +564,13 @@ class TestTransparentQuery:
 
         # Enable and compress
         db.execute(
-            "SELECT cocoon_enable_compression('avg_test', "
+            "SELECT seaturtle_enable_compression('avg_test', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
         partitions = db.execute(
-            "SELECT partition_name FROM cocoon_partition_info('avg_test') "
+            "SELECT partition_name FROM seaturtle_partition_info('avg_test') "
             "WHERE partition_name NOT LIKE '%default%'"
         ).fetchall()
         for (part_name,) in partitions:
@@ -579,7 +579,7 @@ class TestTransparentQuery:
             ).fetchone()[0]
             if row_ct == 0:
                 continue
-            db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+            db.execute(f"SELECT seaturtle_compress_partition('{part_name}')")
             db.commit()
 
         # Query AFTER compression
@@ -625,11 +625,11 @@ class TestTransparentQuery:
     def test_transparent_query_agg_where_text(self, db):
         """Aggregate with WHERE on text column must not silently drop the filter.
 
-        Regression test: CocoonAgg had no PG-level qual fallback (plan.qual=null)
+        Regression test: SeaTurtleAgg had no PG-level qual fallback (plan.qual=null)
         and batch quals silently skipped unsupported types like TEXT, causing
         WHERE text_col <> '' to be ignored and returning wrong counts.
         """
-        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
         db.execute("""
             CREATE TABLE agg_where_text (
                 ts TIMESTAMPTZ NOT NULL,
@@ -638,7 +638,7 @@ class TestTransparentQuery:
                 val INTEGER
             )
         """)
-        db.execute("SELECT cocoon_create_table('agg_where_text', 'ts', '1 day'::interval)")
+        db.execute("SELECT seaturtle_create_table('agg_where_text', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert rows: half with empty label, half with non-empty
@@ -667,7 +667,7 @@ class TestTransparentQuery:
 
         # Compress
         db.execute(
-            "SELECT cocoon_enable_compression('agg_where_text', "
+            "SELECT seaturtle_enable_compression('agg_where_text', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -701,10 +701,10 @@ class TestTransparentQuery:
         """Aggregate with WHERE LIKE must not silently drop the filter.
 
         Regression test: LIKE operator was not in parse_compare_op, so
-        extract_batch_quals skipped it. With CocoonAgg's plan.qual=null,
+        extract_batch_quals skipped it. With SeaTurtleAgg's plan.qual=null,
         the LIKE filter was completely ignored.
         """
-        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
         db.execute("""
             CREATE TABLE agg_where_like (
                 ts TIMESTAMPTZ NOT NULL,
@@ -713,7 +713,7 @@ class TestTransparentQuery:
                 val INTEGER
             )
         """)
-        db.execute("SELECT cocoon_create_table('agg_where_like', 'ts', '1 day'::interval)")
+        db.execute("SELECT seaturtle_create_table('agg_where_like', 'ts', '1 day'::interval)")
         db.commit()
 
         for i in range(60):
@@ -732,7 +732,7 @@ class TestTransparentQuery:
         assert before_count == 10
 
         db.execute(
-            "SELECT cocoon_enable_compression('agg_where_like', "
+            "SELECT seaturtle_enable_compression('agg_where_like', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -750,10 +750,10 @@ class TestTransparentQuery:
     def test_transparent_query_agg_where_numeric(self, db):
         """Aggregate with WHERE on numeric column (supported by batch quals).
 
-        Tests that CocoonAgg correctly applies batch filtering for numeric
+        Tests that SeaTurtleAgg correctly applies batch filtering for numeric
         types including <> with SMALLINT (which PG may wrap in RelabelType).
         """
-        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
         db.execute("""
             CREATE TABLE agg_where_num (
                 ts TIMESTAMPTZ NOT NULL,
@@ -763,7 +763,7 @@ class TestTransparentQuery:
                 val DOUBLE PRECISION
             )
         """)
-        db.execute("SELECT cocoon_create_table('agg_where_num', 'ts', '1 day'::interval)")
+        db.execute("SELECT seaturtle_create_table('agg_where_num', 'ts', '1 day'::interval)")
         db.commit()
 
         for i in range(60):
@@ -794,7 +794,7 @@ class TestTransparentQuery:
         assert before["count_ne"] == 48  # 60 - 12 rows with engine_id=0
 
         db.execute(
-            "SELECT cocoon_enable_compression('agg_where_num', "
+            "SELECT seaturtle_enable_compression('agg_where_num', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -835,9 +835,9 @@ class TestTransparentQuery:
 
         Regression test: queries like Q37/Q38 with multiple WHERE conditions
         including text <> '' had the text filter silently dropped, returning
-        wrong results because CocoonAgg can't batch-filter text types.
+        wrong results because SeaTurtleAgg can't batch-filter text types.
         """
-        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
         db.execute("""
             CREATE TABLE agg_where_mixed (
                 ts TIMESTAMPTZ NOT NULL,
@@ -848,7 +848,7 @@ class TestTransparentQuery:
                 val INTEGER
             )
         """)
-        db.execute("SELECT cocoon_create_table('agg_where_mixed', 'ts', '1 day'::interval)")
+        db.execute("SELECT seaturtle_create_table('agg_where_mixed', 'ts', '1 day'::interval)")
         db.commit()
 
         for i in range(60):
@@ -876,7 +876,7 @@ class TestTransparentQuery:
         assert before_count > 0
 
         db.execute(
-            "SELECT cocoon_enable_compression('agg_where_mixed', "
+            "SELECT seaturtle_enable_compression('agg_where_mixed', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -901,7 +901,7 @@ class TestTransparentQuery:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=3, n_points=30)
         db.execute(
-            "SELECT cocoon_enable_compression('metrics', "
+            "SELECT seaturtle_enable_compression('metrics', "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -915,7 +915,7 @@ class TestTransparentQuery:
 
         # Compress all non-default partitions
         partitions = db.execute(
-            "SELECT partition_name FROM cocoon_partition_info('metrics') "
+            "SELECT partition_name FROM seaturtle_partition_info('metrics') "
             "WHERE partition_name NOT LIKE '%default%'"
         ).fetchall()
 
@@ -925,7 +925,7 @@ class TestTransparentQuery:
             ).fetchone()[0]
             if row_ct == 0:
                 continue
-            db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+            db.execute(f"SELECT seaturtle_compress_partition('{part_name}')")
             db.commit()
 
         # Query AFTER compression
@@ -946,7 +946,7 @@ class TestTransparentQuery:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=3, n_points=30)
         db.execute(
-            "SELECT cocoon_enable_compression('metrics', "
+            "SELECT seaturtle_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -967,7 +967,7 @@ class TestTransparentQuery:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=5, n_points=50)
         db.execute(
-            "SELECT cocoon_enable_compression('metrics', "
+            "SELECT seaturtle_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -1002,7 +1002,7 @@ class TestTransparentQuery:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=10, n_points=100)
         db.execute(
-            "SELECT cocoon_enable_compression('metrics', "
+            "SELECT seaturtle_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -1034,11 +1034,11 @@ class TestTransparentQuery:
             )
 
     def test_explain_analyze_shows_timing(self, db):
-        """EXPLAIN ANALYZE on compressed partition shows Cocoon timing."""
+        """EXPLAIN ANALYZE on compressed partition shows SeaTurtle timing."""
         setup_metrics_table(db)
         insert_metrics(db, n_devices=3, n_points=30)
         db.execute(
-            "SELECT cocoon_enable_compression('metrics', "
+            "SELECT seaturtle_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -1050,11 +1050,11 @@ class TestTransparentQuery:
         ).fetchall()
         explain_text = "\n".join(r[0] for r in rows)
 
-        assert "Cocoon Timing" in explain_text, (
-            f"Expected 'Cocoon Timing' in EXPLAIN ANALYZE output:\n{explain_text}"
+        assert "SeaTurtle Timing" in explain_text, (
+            f"Expected 'SeaTurtle Timing' in EXPLAIN ANALYZE output:\n{explain_text}"
         )
-        assert "Cocoon Stats" in explain_text, (
-            f"Expected 'Cocoon Stats' in EXPLAIN ANALYZE output:\n{explain_text}"
+        assert "SeaTurtle Stats" in explain_text, (
+            f"Expected 'SeaTurtle Stats' in EXPLAIN ANALYZE output:\n{explain_text}"
         )
         # Verify timing values are present (e.g., "metadata=")
         assert "metadata=" in explain_text
@@ -1069,7 +1069,7 @@ class TestTransparentQuery:
 def _compress_all_partitions(conn, table_name):
     """Enable compression and compress all non-empty, non-default partitions."""
     partitions = conn.execute(
-        f"SELECT partition_name FROM cocoon_partition_info('{table_name}') "
+        f"SELECT partition_name FROM seaturtle_partition_info('{table_name}') "
         "WHERE partition_name NOT LIKE '%default%'"
     ).fetchall()
 
@@ -1079,7 +1079,7 @@ def _compress_all_partitions(conn, table_name):
         ).fetchone()[0]
         if row_ct == 0:
             continue
-        conn.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+        conn.execute(f"SELECT seaturtle_compress_partition('{part_name}')")
         conn.commit()
 
 
@@ -1088,14 +1088,14 @@ class TestDatumConversions:
 
     def test_timestamp_epoch_conversion(self, db):
         """Timestamps at epoch boundaries must survive compression exactly."""
-        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
         db.execute("""
             CREATE TABLE ts_epoch (
                 ts TIMESTAMPTZ NOT NULL,
                 label TEXT NOT NULL
             )
         """)
-        db.execute("SELECT cocoon_create_table('ts_epoch', 'ts', '1 day'::interval)")
+        db.execute("SELECT seaturtle_create_table('ts_epoch', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert timestamps at known epoch boundaries — all within the
@@ -1122,7 +1122,7 @@ class TestDatumConversions:
 
         # Compress
         db.execute(
-            "SELECT cocoon_enable_compression('ts_epoch', "
+            "SELECT seaturtle_enable_compression('ts_epoch', "
             "segment_by => ARRAY['label'], order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -1142,14 +1142,14 @@ class TestDatumConversions:
 
     def test_date_epoch_conversion(self, db):
         """Dates must survive compression with correct PG-epoch offset."""
-        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
         db.execute("""
             CREATE TABLE date_test (
                 ts TIMESTAMPTZ NOT NULL,
                 val_date DATE
             )
         """)
-        db.execute("SELECT cocoon_create_table('date_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT seaturtle_create_table('date_test', 'ts', '1 day'::interval)")
         db.commit()
 
         test_dates = [
@@ -1172,7 +1172,7 @@ class TestDatumConversions:
             "FROM date_test ORDER BY ts"
         ).fetchall()
 
-        db.execute("SELECT cocoon_enable_compression('date_test', order_by => ARRAY['ts'])")
+        db.execute("SELECT seaturtle_enable_compression('date_test', order_by => ARRAY['ts'])")
         db.commit()
         _compress_all_partitions(db, "date_test")
 
@@ -1188,7 +1188,7 @@ class TestDatumConversions:
 
     def test_integer_types(self, db):
         """SMALLINT, INTEGER, BIGINT edge cases survive compression."""
-        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
         db.execute("""
             CREATE TABLE int_test (
                 ts TIMESTAMPTZ NOT NULL,
@@ -1197,7 +1197,7 @@ class TestDatumConversions:
                 val_big BIGINT
             )
         """)
-        db.execute("SELECT cocoon_create_table('int_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT seaturtle_create_table('int_test', 'ts', '1 day'::interval)")
         db.commit()
 
         small_vals = [0, 1, -1, 32767, -32768]
@@ -1220,7 +1220,7 @@ class TestDatumConversions:
             "SELECT val_small, val_int, val_big FROM int_test ORDER BY ts"
         ).fetchall()
 
-        db.execute("SELECT cocoon_enable_compression('int_test', order_by => ARRAY['ts'])")
+        db.execute("SELECT seaturtle_enable_compression('int_test', order_by => ARRAY['ts'])")
         db.commit()
         _compress_all_partitions(db, "int_test")
 
@@ -1236,7 +1236,7 @@ class TestDatumConversions:
 
     def test_float_types(self, db):
         """FLOAT8 and REAL edge cases survive compression."""
-        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
         db.execute("""
             CREATE TABLE float_test (
                 ts TIMESTAMPTZ NOT NULL,
@@ -1244,7 +1244,7 @@ class TestDatumConversions:
                 val_real REAL
             )
         """)
-        db.execute("SELECT cocoon_create_table('float_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT seaturtle_create_table('float_test', 'ts', '1 day'::interval)")
         db.commit()
 
         f8_vals = [0.0, 1.0, -1.0, 1e308, -1e308, 1e-307, math.pi]
@@ -1263,7 +1263,7 @@ class TestDatumConversions:
             "SELECT val_f8, val_real FROM float_test ORDER BY ts"
         ).fetchall()
 
-        db.execute("SELECT cocoon_enable_compression('float_test', order_by => ARRAY['ts'])")
+        db.execute("SELECT seaturtle_enable_compression('float_test', order_by => ARRAY['ts'])")
         db.commit()
         _compress_all_partitions(db, "float_test")
 
@@ -1281,14 +1281,14 @@ class TestDatumConversions:
 
     def test_boolean_values(self, db):
         """Boolean true/false patterns survive compression exactly."""
-        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
         db.execute("""
             CREATE TABLE bool_test (
                 ts TIMESTAMPTZ NOT NULL,
                 val_bool BOOLEAN
             )
         """)
-        db.execute("SELECT cocoon_create_table('bool_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT seaturtle_create_table('bool_test', 'ts', '1 day'::interval)")
         db.commit()
 
         bools = [True, False, True, True, False, False, True, False, True, False]
@@ -1304,7 +1304,7 @@ class TestDatumConversions:
             "SELECT val_bool FROM bool_test ORDER BY ts"
         ).fetchall()
 
-        db.execute("SELECT cocoon_enable_compression('bool_test', order_by => ARRAY['ts'])")
+        db.execute("SELECT seaturtle_enable_compression('bool_test', order_by => ARRAY['ts'])")
         db.commit()
         _compress_all_partitions(db, "bool_test")
 
@@ -1318,7 +1318,7 @@ class TestDatumConversions:
 
     def test_text_and_char_types(self, db):
         """TEXT, VARCHAR, and CHAR types survive compression including edge cases."""
-        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
         db.execute("""
             CREATE TABLE text_test (
                 ts TIMESTAMPTZ NOT NULL,
@@ -1327,7 +1327,7 @@ class TestDatumConversions:
                 val_char CHAR(5)
             )
         """)
-        db.execute("SELECT cocoon_create_table('text_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT seaturtle_create_table('text_test', 'ts', '1 day'::interval)")
         db.commit()
 
         texts = ["", "hello", "Hello World!", "multi\nline", "a" * 200]
@@ -1350,7 +1350,7 @@ class TestDatumConversions:
             "SELECT val_text, val_varchar, val_char FROM text_test ORDER BY ts"
         ).fetchall()
 
-        db.execute("SELECT cocoon_enable_compression('text_test', order_by => ARRAY['ts'])")
+        db.execute("SELECT seaturtle_enable_compression('text_test', order_by => ARRAY['ts'])")
         db.commit()
         _compress_all_partitions(db, "text_test")
 
@@ -1366,7 +1366,7 @@ class TestDatumConversions:
 
     def test_null_handling(self, db):
         """NULL positions must be preserved exactly through compression."""
-        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
         db.execute("""
             CREATE TABLE null_test (
                 ts TIMESTAMPTZ NOT NULL,
@@ -1376,7 +1376,7 @@ class TestDatumConversions:
                 val_bool BOOLEAN
             )
         """)
-        db.execute("SELECT cocoon_create_table('null_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT seaturtle_create_table('null_test', 'ts', '1 day'::interval)")
         db.commit()
 
         # Various null patterns: first null, last null, consecutive, sparse
@@ -1406,7 +1406,7 @@ class TestDatumConversions:
             "FROM null_test ORDER BY ts"
         ).fetchall()
 
-        db.execute("SELECT cocoon_enable_compression('null_test', order_by => ARRAY['ts'])")
+        db.execute("SELECT seaturtle_enable_compression('null_test', order_by => ARRAY['ts'])")
         db.commit()
         _compress_all_partitions(db, "null_test")
 
@@ -1429,7 +1429,7 @@ class TestDatumConversions:
 
 def _setup_minmax_table(conn):
     """Create a table with multiple orderable columns, insert data, compress."""
-    conn.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+    conn.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
     conn.execute("""
         CREATE TABLE minmax_test (
             ts TIMESTAMPTZ NOT NULL,
@@ -1440,9 +1440,9 @@ def _setup_minmax_table(conn):
             device_id TEXT NOT NULL
         )
     """)
-    conn.execute("SELECT cocoon_create_table('minmax_test', 'ts', '1 day'::interval)")
+    conn.execute("SELECT seaturtle_create_table('minmax_test', 'ts', '1 day'::interval)")
     conn.execute(
-        "SELECT cocoon_enable_compression('minmax_test', order_by => ARRAY['ts'])"
+        "SELECT seaturtle_enable_compression('minmax_test', order_by => ARRAY['ts'])"
     )
     conn.commit()
 
@@ -1471,14 +1471,14 @@ def _setup_minmax_table(conn):
 
 
 def _uses_minmax_pushdown(conn, query):
-    """Return True if EXPLAIN shows CocoonMinMax pushdown for query."""
+    """Return True if EXPLAIN shows SeaTurtleMinMax pushdown for query."""
     rows = conn.execute(f"EXPLAIN (COSTS OFF) {query}").fetchall()
     explain_text = "\n".join(r[0] for r in rows)
-    return "CocoonMinMax" in explain_text
+    return "SeaTurtleMinMax" in explain_text
 
 
 class TestMinMaxPushdown:
-    """Tests for MIN/MAX pushdown via CocoonMinMax custom scan."""
+    """Tests for MIN/MAX pushdown via SeaTurtleMinMax custom scan."""
 
     def test_min_on_non_time_column(self, db):
         """Single MIN on a DATE column uses pushdown and returns correct result."""
@@ -1575,11 +1575,11 @@ class TestMinMaxPushdown:
 
         query = "SELECT MIN(device_id) FROM minmax_test"
         assert not _uses_minmax_pushdown(db, query), \
-            "TEXT columns should not use CocoonMinMax pushdown"
+            "TEXT columns should not use SeaTurtleMinMax pushdown"
 
     def test_minmax_with_segment_by(self, db):
         """MIN/MAX pushdown works when table has segment_by columns."""
-        db.execute(f"SET pg_cocoon.mock_now = '{MOCK_NOW}'")
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
         db.execute("""
             CREATE TABLE minmax_seg (
                 ts TIMESTAMPTZ NOT NULL,
@@ -1587,9 +1587,9 @@ class TestMinMaxPushdown:
                 value INTEGER NOT NULL
             )
         """)
-        db.execute("SELECT cocoon_create_table('minmax_seg', 'ts', '1 day'::interval)")
+        db.execute("SELECT seaturtle_create_table('minmax_seg', 'ts', '1 day'::interval)")
         db.execute(
-            "SELECT cocoon_enable_compression('minmax_seg', "
+            "SELECT seaturtle_enable_compression('minmax_seg', "
             "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -1613,7 +1613,7 @@ class TestMinMaxPushdown:
         assert row[1] == 299, f"MAX(value): expected 299, got {row[1]}"
 
     def test_minmax_explain_analyze(self, db):
-        """EXPLAIN ANALYZE on MIN/MAX pushdown shows CocoonMinMax timing."""
+        """EXPLAIN ANALYZE on MIN/MAX pushdown shows SeaTurtleMinMax timing."""
         _setup_minmax_table(db)
 
         rows = db.execute(
@@ -1622,11 +1622,11 @@ class TestMinMaxPushdown:
         ).fetchall()
         explain_text = "\n".join(r[0] for r in rows)
 
-        assert "CocoonMinMax" in explain_text, (
-            f"Expected CocoonMinMax in EXPLAIN output:\n{explain_text}"
+        assert "SeaTurtleMinMax" in explain_text, (
+            f"Expected SeaTurtleMinMax in EXPLAIN output:\n{explain_text}"
         )
-        assert "Cocoon Timing" in explain_text
-        assert "Cocoon Stats" in explain_text
+        assert "SeaTurtle Timing" in explain_text
+        assert "SeaTurtle Stats" in explain_text
         assert "segments=" in explain_text
 
 
@@ -1642,21 +1642,21 @@ class TestDMLBlocking:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=3, n_points=20)
         db.execute(
-            "SELECT cocoon_enable_compression('metrics', "
+            "SELECT seaturtle_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
 
         partitions = db.execute(
-            "SELECT partition_name FROM cocoon_partition_info('metrics') "
+            "SELECT partition_name FROM seaturtle_partition_info('metrics') "
             "WHERE range_start <= '2025-01-15'::timestamptz "
             "AND range_end > '2025-01-15'::timestamptz"
         ).fetchall()
         assert len(partitions) > 0
         part_name = partitions[0][0]
 
-        db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+        db.execute(f"SELECT seaturtle_compress_partition('{part_name}')")
         db.commit()
         return part_name
 
@@ -1690,7 +1690,7 @@ class TestDMLBlocking:
         part_name = self._setup_and_compress(db)
 
         # Decompress
-        db.execute(f"SELECT cocoon_decompress_partition('{part_name}')")
+        db.execute(f"SELECT seaturtle_decompress_partition('{part_name}')")
         db.commit()
 
         # INSERT should work
@@ -1710,7 +1710,7 @@ class TestDMLBlocking:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=2, n_points=10)
         db.execute(
-            "SELECT cocoon_enable_compression('metrics', "
+            "SELECT seaturtle_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -1718,17 +1718,17 @@ class TestDMLBlocking:
 
         # Compress only one partition (the 2025-01-15 one)
         partitions = db.execute(
-            "SELECT partition_name FROM cocoon_partition_info('metrics') "
+            "SELECT partition_name FROM seaturtle_partition_info('metrics') "
             "WHERE range_start <= '2025-01-15'::timestamptz "
             "AND range_end > '2025-01-15'::timestamptz"
         ).fetchall()
         part_name = partitions[0][0]
-        db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+        db.execute(f"SELECT seaturtle_compress_partition('{part_name}')")
         db.commit()
 
         # Find an uncompressed partition to target
         uncompressed = db.execute(
-            "SELECT partition_name, range_start FROM cocoon_partition_info('metrics') "
+            "SELECT partition_name, range_start FROM seaturtle_partition_info('metrics') "
             "WHERE is_compressed = false AND partition_name NOT LIKE '%default%' "
             "LIMIT 1"
         ).fetchall()

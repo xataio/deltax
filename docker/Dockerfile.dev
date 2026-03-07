@@ -24,7 +24,7 @@ RUN rustup component add clippy \
 
 # Non-root user (initdb refuses root; pgrx test needs initdb)
 RUN useradd -m -s /bin/bash builder \
-    && mkdir -p /build/pg_cocoon \
+    && mkdir -p /build/pg_seaturtle \
     && chown -R builder:builder /build /usr/local/cargo \
         /usr/share/postgresql/${PG_MAJOR}/extension \
         /usr/lib/postgresql/${PG_MAJOR}/lib
@@ -37,7 +37,7 @@ RUN cargo pgrx init --pg${PG_MAJOR}=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_confi
 
 # Switch back to root for entrypoint (drops to builder after fixing permissions)
 USER root
-WORKDIR /build/pg_cocoon
+WORKDIR /build/pg_seaturtle
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

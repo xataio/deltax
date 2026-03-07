@@ -1,0 +1,6 @@
+comment = 'pg_seaturtle: time-series extension with Gorilla compression'
+default_version = '@CARGO_VERSION@'
+module_pathname = '$libdir/pg_seaturtle'
+relocatable = false
+superuser = true
+schema = 'public'

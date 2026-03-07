@@ -1,10 +1,10 @@
 """ClickBench benchmark for TimescaleDB (TSL and OSS variants).
 
-Compares TimescaleDB compression performance against pg_cocoon on the same
+Compares TimescaleDB compression performance against pg_seaturtle on the same
 ClickBench dataset and queries.
 
 TSL variant (full license): uncompressed hypertable + two compression configs
-  - "matching": segment_by=CounterID, order_by=EventTime (same as pg_cocoon)
+  - "matching": segment_by=CounterID, order_by=EventTime (same as pg_seaturtle)
   - "default": no segment_by, order_by=EventTime only
 OSS variant (Apache 2): uncompressed hypertable only (no compression support)
 
@@ -153,7 +153,7 @@ def setup_timescaledb(conn):
 # ---------------------------------------------------------------------------
 
 def compress_matching(conn):
-    """Compress with segment_by=CounterID, order_by=EventTime (matching pg_cocoon).
+    """Compress with segment_by=CounterID, order_by=EventTime (matching pg_seaturtle).
 
     Returns elapsed time in seconds.
     """
@@ -403,7 +403,7 @@ class TestClickBenchTimescaleDB:
         print(f"\n  Uncompressed hypertable size: {uncompr_size / 1e6:.1f} MB")
 
         # Phase 2: Compress with matching config
-        print("\n=== Phase 2: Compress (matching pg_cocoon config) ===")
+        print("\n=== Phase 2: Compress (matching pg_seaturtle config) ===")
         match_compress_time = compress_matching(conn)
         match_stats = get_compression_stats(conn)
 

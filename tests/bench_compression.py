@@ -1,7 +1,7 @@
 """Benchmark suite for Phase 2 compression.
 
 Run with: pytest tests/bench_compression.py -v -s
-(Requires PG_COCOON_IMAGE env var)
+(Requires PG_SEATURTLE_IMAGE env var)
 """
 
 import time
@@ -11,7 +11,7 @@ import pytest
 def setup_bench_table(conn, table_name="bench_metrics", n_devices=1000, n_points=10000):
     """Create table and insert n_devices * n_points rows of IoT data."""
     # Pin "now" so partitions cover our test timestamps
-    conn.execute("SET pg_cocoon.mock_now = '2025-01-15 12:00:00+00'")
+    conn.execute("SET pg_seaturtle.mock_now = '2025-01-15 12:00:00+00'")
     conn.execute(f"""
         CREATE TABLE {table_name} (
             ts TIMESTAMPTZ NOT NULL,
@@ -22,7 +22,7 @@ def setup_bench_table(conn, table_name="bench_metrics", n_devices=1000, n_points
         )
     """)
     conn.execute(f"""
-        SELECT cocoon_create_table('{table_name}', 'ts', '1 day'::interval)
+        SELECT seaturtle_create_table('{table_name}', 'ts', '1 day'::interval)
     """)
     conn.commit()
 
@@ -54,7 +54,7 @@ class TestBenchCompression:
         # Use smaller sizes for CI (10 devices × 1000 points = 10K rows)
         setup_bench_table(db, n_devices=10, n_points=1000)
         db.execute(
-            "SELECT cocoon_enable_compression('bench_metrics', "
+            "SELECT seaturtle_enable_compression('bench_metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -64,7 +64,7 @@ class TestBenchCompression:
     def _get_partition(self, conn, ts="2025-01-15"):
         """Get a partition name containing the given timestamp."""
         parts = conn.execute(
-            "SELECT partition_name FROM cocoon_partition_info('bench_metrics') "
+            "SELECT partition_name FROM seaturtle_partition_info('bench_metrics') "
             f"WHERE range_start <= '{ts}'::timestamptz "
             f"AND range_end > '{ts}'::timestamptz"
         ).fetchall()
@@ -84,13 +84,13 @@ class TestBenchCompression:
         ).fetchone()[0]
 
         result = bench_db.execute(
-            f"SELECT cocoon_compress_partition('{part_name}')"
+            f"SELECT seaturtle_compress_partition('{part_name}')"
         ).fetchone()[0]
         bench_db.commit()
 
         stats = bench_db.execute(
             "SELECT raw_size, compressed_size, compression_ratio "
-            f"FROM cocoon_compression_stats('bench_metrics') "
+            f"FROM seaturtle_compression_stats('bench_metrics') "
             f"WHERE partition_name = '{part_name}'"
         ).fetchone()
 
@@ -110,13 +110,13 @@ class TestBenchCompression:
 
         # Compress
         start = time.monotonic()
-        bench_db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+        bench_db.execute(f"SELECT seaturtle_compress_partition('{part_name}')")
         bench_db.commit()
         compress_time = time.monotonic() - start
 
         # Decompress
         start = time.monotonic()
-        bench_db.execute(f"SELECT cocoon_decompress_partition('{part_name}')")
+        bench_db.execute(f"SELECT seaturtle_decompress_partition('{part_name}')")
         bench_db.commit()
         decompress_time = time.monotonic() - start
 
@@ -139,7 +139,7 @@ class TestBenchCompression:
         uncompressed_time = time.monotonic() - start
 
         # Compress
-        bench_db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+        bench_db.execute(f"SELECT seaturtle_compress_partition('{part_name}')")
         bench_db.commit()
 
         # Compressed query (goes through custom scan)
@@ -167,7 +167,7 @@ class TestBenchCompression:
         ).fetchone()
         uncompressed_time = time.monotonic() - start
 
-        bench_db.execute(f"SELECT cocoon_compress_partition('{part_name}')")
+        bench_db.execute(f"SELECT seaturtle_compress_partition('{part_name}')")
         bench_db.commit()
 
         start = time.monotonic()

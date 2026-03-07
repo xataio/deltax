@@ -1,4 +1,4 @@
-"""Selected ClickBench queries for pg_cocoon benchmark.
+"""Selected ClickBench queries for pg_seaturtle benchmark.
 
 15 queries chosen from the 43 ClickBench queries to cover different access patterns:
 - Full scans (Q1, Q3, Q7)

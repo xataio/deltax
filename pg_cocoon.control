@@ -1,6 +1,0 @@
-comment = 'pg_cocoon: time-series extension with Gorilla compression'
-default_version = '@CARGO_VERSION@'
-module_pathname = '$libdir/pg_cocoon'
-relocatable = false
-superuser = true
-schema = 'public'

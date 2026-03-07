@@ -20,7 +20,7 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 
     /// When true, the ExecutorStart hook skips the DML-on-compressed check.
-    /// Used by internal operations like cocoon_decompress_partition.
+    /// Used by internal operations like seaturtle_decompress_partition.
     static DML_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -35,7 +35,7 @@ pub(crate) fn set_dml_bypass(bypass: bool) {
 }
 
 /// Get the time column's attribute number for a hypertable parent table.
-/// Returns None if the table is not a cocoon hypertable. Result is cached.
+/// Returns None if the table is not a seaturtle hypertable. Result is cached.
 unsafe fn get_time_column_attno(parent_oid: pg_sys::Oid) -> Option<i16> {
     let cached = TIME_COLUMN_CACHE.with(|cache| cache.borrow().get(&parent_oid).copied());
     if let Some(attno) = cached {
@@ -58,7 +58,7 @@ unsafe fn get_time_column_attno(parent_oid: pg_sys::Oid) -> Option<i16> {
 
         let time_col_name: Option<String> = pgrx::Spi::connect(|client| {
             let result = client.select(
-                "SELECT time_column FROM cocoon_hypertable WHERE schema_name = $1 AND table_name = $2",
+                "SELECT time_column FROM seaturtle_hypertable WHERE schema_name = $1 AND table_name = $2",
                 None,
                 &[schema_name.as_str().into(), table_name.as_str().into()],
             );
@@ -188,7 +188,7 @@ unsafe fn check_time_pathkey(
 
 /// The planner hook. Called for each relation during path generation.
 #[pg_guard]
-pub unsafe extern "C-unwind" fn cocoon_set_rel_pathlist(
+pub unsafe extern "C-unwind" fn seaturtle_set_rel_pathlist(
     root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     rti: pg_sys::Index,
@@ -209,12 +209,12 @@ pub unsafe extern "C-unwind" fn cocoon_set_rel_pathlist(
             return;
         }
 
-        // Check if this is the parent of a partitioned table (for CocoonAppend)
+        // Check if this is the parent of a partitioned table (for SeaTurtleAppend)
         if (*rel).reloptkind == pg_sys::RelOptKind::RELOPT_BASEREL
             && (*rte).inh
             && let Some(companion_oids) = collect_compressed_children(root, rti)
         {
-            path::add_cocoon_append_path(root, rel, &companion_oids, std::ptr::null_mut());
+            path::add_seaturtle_append_path(root, rel, &companion_oids, std::ptr::null_mut());
             return;
         }
 
@@ -258,13 +258,13 @@ pub unsafe extern "C-unwind" fn cocoon_set_rel_pathlist(
     }
 }
 
-/// The create_upper_paths hook. Detects aggregate patterns over cocoon
+/// The create_upper_paths hook. Detects aggregate patterns over seaturtle
 /// scans and injects optimized custom paths:
-/// - COUNT(*) alone → CocoonCount (sum of segment row_counts, metadata-only)
-/// - MIN/MAX(col) alone → CocoonMinMax (global min/max from segment metadata)
-/// - SUM/AVG/COUNT/COUNT(DISTINCT) with optional GROUP BY and WHERE → CocoonAgg
+/// - COUNT(*) alone → SeaTurtleCount (sum of segment row_counts, metadata-only)
+/// - MIN/MAX(col) alone → SeaTurtleMinMax (global min/max from segment metadata)
+/// - SUM/AVG/COUNT/COUNT(DISTINCT) with optional GROUP BY and WHERE → SeaTurtleAgg
 #[pg_guard]
-pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
+pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
     root: *mut pg_sys::PlannerInfo,
     stage: pg_sys::UpperRelationKind::Type,
     input_rel: *mut pg_sys::RelOptInfo,
@@ -356,7 +356,7 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
         };
 
         // =====================================================================
-        // Fast path: Single COUNT(*) with no GROUP BY, no WHERE → CocoonCount
+        // Fast path: Single COUNT(*) with no GROUP BY, no WHERE → SeaTurtleCount
         // =====================================================================
         if aggrefs.len() == 1 && (*aggrefs[0]).aggstar && !has_group_by && !has_where {
             path::add_count_star_path(root, output_rel, &companion_oids);
@@ -480,7 +480,7 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
                 }
                 "min" | "max" => {
                     if has_non_minmax {
-                        // Mix of min/max with other aggs — use CocoonAgg for all
+                        // Mix of min/max with other aggs — use SeaTurtleAgg for all
                         // Mix of min/max with other aggs — skip MinMax fast path
                         return; // Bail — mixing MIN/MAX with SUM/COUNT not supported yet
                     }
@@ -501,7 +501,7 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
         }
 
         // =====================================================================
-        // Fast path: All MIN/MAX, no GROUP BY, no WHERE → CocoonMinMax
+        // Fast path: All MIN/MAX, no GROUP BY, no WHERE → SeaTurtleMinMax
         // =====================================================================
         if all_minmax && !has_group_by && !has_where {
             let mut minmax_specs: Vec<path::MinMaxAggSpec> = Vec::new();
@@ -555,11 +555,11 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
         }
 
         // =====================================================================
-        // CocoonAgg path: SUM/AVG/COUNT/COUNT(DISTINCT) ± GROUP BY (no WHERE)
+        // SeaTurtleAgg path: SUM/AVG/COUNT/COUNT(DISTINCT) ± GROUP BY (no WHERE)
         // =====================================================================
 
-        // CocoonAgg doesn't support WHERE clauses yet — fall through to the
-        // standard CocoonAppend + PG Aggregate path which handles quals correctly
+        // SeaTurtleAgg doesn't support WHERE clauses yet — fall through to the
+        // standard SeaTurtleAppend + PG Aggregate path which handles quals correctly
         // via plan.qual. This ensures correctness for all WHERE patterns.
         if has_where {
             return;
@@ -635,11 +635,11 @@ pub unsafe extern "C-unwind" fn cocoon_create_upper_paths(
 /// Extract companion OIDs from a planner path for COUNT(*) pushdown.
 ///
 /// Handles:
-/// - CocoonDecompress/CocoonAppend CustomPath: extract OIDs from custom_private
-/// - AppendPath: walk subpaths, extract OIDs from CocoonDecompress CustomPaths
+/// - SeaTurtleDecompress/SeaTurtleAppend CustomPath: extract OIDs from custom_private
+/// - AppendPath: walk subpaths, extract OIDs from SeaTurtleDecompress CustomPaths
 ///
-/// Returns None if the path doesn't contain cocoon scan nodes, or if there
-/// are non-cocoon subpaths with actual data (uncompressed partitions).
+/// Returns None if the path doesn't contain seaturtle scan nodes, or if there
+/// are non-seaturtle subpaths with actual data (uncompressed partitions).
 unsafe fn extract_companion_oids(
     root: *mut pg_sys::PlannerInfo,
     path: *const pg_sys::Path,
@@ -668,7 +668,7 @@ unsafe fn extract_companion_oids(
                         return None;
                     }
                 } else if subpath_has_data(root, subpath) {
-                    // Non-cocoon subpath with actual data — can't push down
+                    // Non-seaturtle subpath with actual data — can't push down
                     return None;
                 }
                 // Empty partition (relpages=0) — safe to skip
@@ -715,7 +715,7 @@ unsafe fn subpath_has_data(
     }
 }
 
-/// Check if a single qual node is pushable to CocoonAgg's batch filter.
+/// Check if a single qual node is pushable to SeaTurtleAgg's batch filter.
 ///
 /// Requirements (must ALL be true):
 /// 1. Node is T_OpExpr with exactly 2 args
@@ -795,7 +795,7 @@ unsafe fn is_pushable_qual(node: *const pg_sys::Node) -> bool {
     }
 }
 
-/// Extract companion OIDs from a CocoonDecompress or CocoonAppend CustomPath.
+/// Extract companion OIDs from a SeaTurtleDecompress or SeaTurtleAppend CustomPath.
 unsafe fn extract_oids_from_custom_path(
     cpath: *const pg_sys::CustomPath,
 ) -> Option<Vec<pg_sys::Oid>> {
@@ -805,7 +805,7 @@ unsafe fn extract_oids_from_custom_path(
             return None;
         }
         let name = std::ffi::CStr::from_ptr((*methods).CustomName);
-        if name != super::COCOON_APPEND_NAME && name != super::CUSTOM_NAME {
+        if name != super::SEATURTLE_APPEND_NAME && name != super::CUSTOM_NAME {
             return None;
         }
         let private_list = (*cpath).custom_private;
@@ -826,7 +826,7 @@ unsafe fn extract_oids_from_custom_path(
 /// Iterates `root->append_rel_list` for children of `parent_rti`.
 /// - If a child has a compressed companion, adds its OID to the list.
 /// - If a child has no companion AND has uncompressed rows (reltuples > 0),
-///   returns None (cannot use CocoonAppend).
+///   returns None (cannot use SeaTurtleAppend).
 /// - Empty partitions (reltuples <= 0) are safely skipped.
 ///
 /// Returns `Some(companion_oids)` if we found at least one compressed child
@@ -875,7 +875,7 @@ unsafe fn collect_compressed_children(
                 // Not compressed — check if partition has data
                 let reltuples = cost::get_reltuples(child_oid);
                 if reltuples > 0.0 {
-                    // Uncompressed partition with data — cannot use CocoonAppend
+                    // Uncompressed partition with data — cannot use SeaTurtleAppend
                     return None;
                 }
                 // Empty partition, safe to skip
@@ -891,7 +891,7 @@ unsafe fn collect_compressed_children(
 }
 
 /// Check if a relation OID corresponds to a compressed partition
-/// by looking for a companion table in _cocoon_compressed schema.
+/// by looking for a companion table in _seaturtle_compressed schema.
 pub(crate) unsafe fn check_compressed_partition(rel_oid: pg_sys::Oid) -> pg_sys::Oid {
     unsafe {
         // Get the relation name
@@ -903,20 +903,20 @@ pub(crate) unsafe fn check_compressed_partition(rel_oid: pg_sys::Oid) -> pg_sys:
             .to_string_lossy()
             .into_owned();
 
-        // Look up _cocoon_compressed schema OID
-        let schema_cstr = c"_cocoon_compressed";
+        // Look up _seaturtle_compressed schema OID
+        let schema_cstr = c"_seaturtle_compressed";
         let compressed_ns_oid = pg_sys::get_namespace_oid(schema_cstr.as_ptr(), true);
         if compressed_ns_oid == pg_sys::InvalidOid {
             return pg_sys::InvalidOid;
         }
 
-        // Skip tables already in the _cocoon_compressed schema to avoid recursion
+        // Skip tables already in the _seaturtle_compressed schema to avoid recursion
         let rel_ns_oid = pg_sys::get_rel_namespace(rel_oid);
         if rel_ns_oid == compressed_ns_oid {
             return pg_sys::InvalidOid;
         }
 
-        // Check if _cocoon_compressed.<rel_name> exists
+        // Check if _seaturtle_compressed.<rel_name> exists
         let companion_cname = std::ffi::CString::new(rel_name).unwrap();
         pg_sys::get_relname_relid(companion_cname.as_ptr(), compressed_ns_oid)
     }
@@ -928,7 +928,7 @@ pub(crate) unsafe fn check_compressed_partition(rel_oid: pg_sys::Oid) -> pg_sys:
 /// incorrect results (writes go to the truncated heap, reads come from the
 /// companion table). This hook raises an error before execution begins.
 #[pg_guard]
-pub unsafe extern "C-unwind" fn cocoon_executor_start(
+pub unsafe extern "C-unwind" fn seaturtle_executor_start(
     query_desc: *mut pg_sys::QueryDesc,
     eflags: c_int,
 ) {

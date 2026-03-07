@@ -5,13 +5,13 @@ use super::cost;
 use super::SyncStatic;
 
 thread_local! {
-    /// Temporary storage for WHERE clause quals during CocoonAgg planning.
+    /// Temporary storage for WHERE clause quals during SeaTurtleAgg planning.
     /// Set in plan_agg_path, consumed in create_agg_scan_state.
     static AGG_PLAN_QUALS: std::cell::Cell<*mut pg_sys::List> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 
-/// Store WHERE clause quals for the next CocoonAgg plan.
+/// Store WHERE clause quals for the next SeaTurtleAgg plan.
 pub(super) fn set_agg_plan_quals(quals: *mut pg_sys::List) {
     AGG_PLAN_QUALS.with(|cell| cell.set(quals));
 }
@@ -22,22 +22,22 @@ pub(super) fn take_agg_plan_quals() -> *mut pg_sys::List {
 }
 
 // ============================================================================
-// CocoonAppend path/plan methods
+// SeaTurtleAppend path/plan methods
 // ============================================================================
 
-/// Static CustomPathMethods for CocoonAppend.
-static COCOON_APPEND_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
+/// Static CustomPathMethods for SeaTurtleAppend.
+static SEATURTLE_APPEND_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
     SyncStatic(pg_sys::CustomPathMethods {
-        CustomName: super::COCOON_APPEND_NAME.as_ptr(),
-        PlanCustomPath: Some(plan_cocoon_append_path),
+        CustomName: super::SEATURTLE_APPEND_NAME.as_ptr(),
+        PlanCustomPath: Some(plan_seaturtle_append_path),
         ReparameterizeCustomPathByChild: None,
     });
 
-/// Static CustomScanMethods for CocoonAppend.
-static COCOON_APPEND_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
+/// Static CustomScanMethods for SeaTurtleAppend.
+static SEATURTLE_APPEND_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
     SyncStatic(pg_sys::CustomScanMethods {
-        CustomName: super::COCOON_APPEND_NAME.as_ptr(),
-        CreateCustomScanState: Some(super::exec::create_cocoon_append_state),
+        CustomName: super::SEATURTLE_APPEND_NAME.as_ptr(),
+        CreateCustomScanState: Some(super::exec::create_seaturtle_append_state),
     });
 
 /// Static CustomPathMethods struct.
@@ -55,7 +55,7 @@ static CUSTOM_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
         CreateCustomScanState: Some(super::exec::create_custom_scan_state),
     });
 
-/// Add a CocoonDecompress custom path to the relation's pathlist.
+/// Add a SeaTurtleDecompress custom path to the relation's pathlist.
 pub unsafe fn add_decompress_path(
     _root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
@@ -161,25 +161,25 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
 }
 
 // ============================================================================
-// CocoonCount: COUNT(*) aggregate pushdown
+// SeaTurtleCount: COUNT(*) aggregate pushdown
 // ============================================================================
 
-/// Static CustomPathMethods for CocoonCount.
-static COCOON_COUNT_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
+/// Static CustomPathMethods for SeaTurtleCount.
+static SEATURTLE_COUNT_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
     SyncStatic(pg_sys::CustomPathMethods {
-        CustomName: super::COCOON_COUNT_NAME.as_ptr(),
+        CustomName: super::SEATURTLE_COUNT_NAME.as_ptr(),
         PlanCustomPath: Some(plan_count_star_path),
         ReparameterizeCustomPathByChild: None,
     });
 
-/// Static CustomScanMethods for CocoonCount.
-static COCOON_COUNT_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
+/// Static CustomScanMethods for SeaTurtleCount.
+static SEATURTLE_COUNT_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
     SyncStatic(pg_sys::CustomScanMethods {
-        CustomName: super::COCOON_COUNT_NAME.as_ptr(),
+        CustomName: super::SEATURTLE_COUNT_NAME.as_ptr(),
         CreateCustomScanState: Some(super::exec::create_count_scan_state),
     });
 
-/// Add a CocoonCount custom path to the grouped relation's pathlist.
+/// Add a SeaTurtleCount custom path to the grouped relation's pathlist.
 ///
 /// This replaces the Aggregate → Scan pipeline with a single CustomScan
 /// that returns the pre-computed row count from segment metadata.
@@ -214,13 +214,13 @@ pub unsafe fn add_count_star_path(
 
         (*cpath).custom_paths = std::ptr::null_mut();
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
-        (*cpath).methods = &COCOON_COUNT_PATH_METHODS.0;
+        (*cpath).methods = &SEATURTLE_COUNT_PATH_METHODS.0;
 
         pg_sys::add_path(output_rel, cpath as *mut pg_sys::Path);
     }
 }
 
-/// PlanCustomPath callback for CocoonCount.
+/// PlanCustomPath callback for SeaTurtleCount.
 ///
 /// Creates a CustomScan with scanrelid=0 that outputs a single INT8 column
 /// containing the pre-computed COUNT(*) result.
@@ -293,7 +293,7 @@ pub unsafe extern "C-unwind" fn plan_count_star_path(
         (*cscan).custom_private = private_list;
         (*cscan).custom_plans = std::ptr::null_mut();
         (*cscan).custom_relids = std::ptr::null_mut();
-        (*cscan).methods = &COCOON_COUNT_SCAN_METHODS.0;
+        (*cscan).methods = &SEATURTLE_COUNT_SCAN_METHODS.0;
         (*cscan).flags = 0;
         (*cscan).scan.plan.qual = std::ptr::null_mut();
 
@@ -302,21 +302,21 @@ pub unsafe extern "C-unwind" fn plan_count_star_path(
 }
 
 // ============================================================================
-// CocoonMinMax: MIN/MAX aggregate pushdown on time column
+// SeaTurtleMinMax: MIN/MAX aggregate pushdown on time column
 // ============================================================================
 
-/// Static CustomPathMethods for CocoonMinMax.
-static COCOON_MINMAX_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
+/// Static CustomPathMethods for SeaTurtleMinMax.
+static SEATURTLE_MINMAX_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
     SyncStatic(pg_sys::CustomPathMethods {
-        CustomName: super::COCOON_MINMAX_NAME.as_ptr(),
+        CustomName: super::SEATURTLE_MINMAX_NAME.as_ptr(),
         PlanCustomPath: Some(plan_minmax_path),
         ReparameterizeCustomPathByChild: None,
     });
 
-/// Static CustomScanMethods for CocoonMinMax.
-static COCOON_MINMAX_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
+/// Static CustomScanMethods for SeaTurtleMinMax.
+static SEATURTLE_MINMAX_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
     SyncStatic(pg_sys::CustomScanMethods {
-        CustomName: super::COCOON_MINMAX_NAME.as_ptr(),
+        CustomName: super::SEATURTLE_MINMAX_NAME.as_ptr(),
         CreateCustomScanState: Some(super::exec::create_minmax_scan_state),
     });
 
@@ -329,7 +329,7 @@ pub struct MinMaxAggSpec {
     pub typbyval: bool,
 }
 
-/// Add a CocoonMinMax custom path to the grouped relation's pathlist.
+/// Add a SeaTurtleMinMax custom path to the grouped relation's pathlist.
 ///
 /// This replaces the Aggregate → Scan pipeline with a single CustomScan
 /// that returns the pre-computed MIN/MAX values from segment metadata.
@@ -378,7 +378,7 @@ pub unsafe fn add_minmax_path(
 
         (*cpath).custom_paths = std::ptr::null_mut();
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
-        (*cpath).methods = &COCOON_MINMAX_PATH_METHODS.0;
+        (*cpath).methods = &SEATURTLE_MINMAX_PATH_METHODS.0;
 
         pg_sys::add_path(output_rel, cpath as *mut pg_sys::Path);
     }
@@ -393,7 +393,7 @@ struct PlanAggSpec {
     typbyval: bool,
 }
 
-/// PlanCustomPath callback for CocoonMinMax.
+/// PlanCustomPath callback for SeaTurtleMinMax.
 ///
 /// Creates a CustomScan with scanrelid=0 that outputs N columns,
 /// one per MIN/MAX aggregate, containing the pre-computed results.
@@ -518,7 +518,7 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
         (*cscan).custom_private = plan_private;
         (*cscan).custom_plans = std::ptr::null_mut();
         (*cscan).custom_relids = std::ptr::null_mut();
-        (*cscan).methods = &COCOON_MINMAX_SCAN_METHODS.0;
+        (*cscan).methods = &SEATURTLE_MINMAX_SCAN_METHODS.0;
         (*cscan).flags = 0;
         (*cscan).scan.plan.qual = std::ptr::null_mut();
 
@@ -527,25 +527,25 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
 }
 
 // ============================================================================
-// CocoonAgg: aggregate pushdown (SUM, AVG, COUNT, COUNT(DISTINCT), GROUP BY)
+// SeaTurtleAgg: aggregate pushdown (SUM, AVG, COUNT, COUNT(DISTINCT), GROUP BY)
 // ============================================================================
 
-/// Static CustomPathMethods for CocoonAgg.
-static COCOON_AGG_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
+/// Static CustomPathMethods for SeaTurtleAgg.
+static SEATURTLE_AGG_PATH_METHODS: SyncStatic<pg_sys::CustomPathMethods> =
     SyncStatic(pg_sys::CustomPathMethods {
-        CustomName: super::COCOON_AGG_NAME.as_ptr(),
+        CustomName: super::SEATURTLE_AGG_NAME.as_ptr(),
         PlanCustomPath: Some(plan_agg_path),
         ReparameterizeCustomPathByChild: None,
     });
 
-/// Static CustomScanMethods for CocoonAgg.
-static COCOON_AGG_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
+/// Static CustomScanMethods for SeaTurtleAgg.
+static SEATURTLE_AGG_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
     SyncStatic(pg_sys::CustomScanMethods {
-        CustomName: super::COCOON_AGG_NAME.as_ptr(),
+        CustomName: super::SEATURTLE_AGG_NAME.as_ptr(),
         CreateCustomScanState: Some(super::exec::create_agg_scan_state),
     });
 
-/// Specification for one aggregate in a CocoonAgg pushdown.
+/// Specification for one aggregate in a SeaTurtleAgg pushdown.
 pub struct AggSpec {
     pub agg_type: super::exec::AggType,
     pub col_idx: i32,               // 0-based column index, -1 for COUNT(*)
@@ -553,7 +553,7 @@ pub struct AggSpec {
     pub col_type_oid: pg_sys::Oid,  // source column type OID
 }
 
-/// Add a CocoonAgg custom path to the grouped relation's pathlist.
+/// Add a SeaTurtleAgg custom path to the grouped relation's pathlist.
 pub unsafe fn add_agg_path(
     _root: *mut pg_sys::PlannerInfo,
     output_rel: *mut pg_sys::RelOptInfo,
@@ -605,13 +605,13 @@ pub unsafe fn add_agg_path(
 
         (*cpath).custom_paths = std::ptr::null_mut();
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
-        (*cpath).methods = &COCOON_AGG_PATH_METHODS.0;
+        (*cpath).methods = &SEATURTLE_AGG_PATH_METHODS.0;
 
         pg_sys::add_path(output_rel, cpath as *mut pg_sys::Path);
     }
 }
 
-/// PlanCustomPath callback for CocoonAgg.
+/// PlanCustomPath callback for SeaTurtleAgg.
 ///
 /// Uses PG's provided _tlist for both plan.targetlist and custom_scan_tlist
 /// so that PG's setrefs and sort/pathkey matching work correctly.
@@ -796,7 +796,7 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
 
         (*cscan).custom_plans = std::ptr::null_mut();
         (*cscan).custom_relids = std::ptr::null_mut();
-        (*cscan).methods = &COCOON_AGG_SCAN_METHODS.0;
+        (*cscan).methods = &SEATURTLE_AGG_SCAN_METHODS.0;
         (*cscan).flags = 0;
 
         let _ = root;
@@ -806,14 +806,14 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
 }
 
 // ============================================================================
-// CocoonAppend: replaces Append with single CustomScan for all compressed partitions
+// SeaTurtleAppend: replaces Append with single CustomScan for all compressed partitions
 // ============================================================================
 
-/// Add a CocoonAppend custom path to the parent relation's pathlist.
+/// Add a SeaTurtleAppend custom path to the parent relation's pathlist.
 ///
 /// This replaces the Append node with a single CustomScan that internally
 /// iterates all compressed companion tables.
-pub unsafe fn add_cocoon_append_path(
+pub unsafe fn add_seaturtle_append_path(
     _root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     companion_oids: &[pg_sys::Oid],
@@ -855,7 +855,7 @@ pub unsafe fn add_cocoon_append_path(
 
         (*cpath).custom_paths = std::ptr::null_mut();
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
-        (*cpath).methods = &COCOON_APPEND_PATH_METHODS.0;
+        (*cpath).methods = &SEATURTLE_APPEND_PATH_METHODS.0;
 
         // Clear existing paths (removes Append paths)
         (*rel).pathlist = std::ptr::null_mut();
@@ -865,9 +865,9 @@ pub unsafe fn add_cocoon_append_path(
     }
 }
 
-/// PlanCustomPath callback for CocoonAppend.
+/// PlanCustomPath callback for SeaTurtleAppend.
 #[pg_guard]
-pub unsafe extern "C-unwind" fn plan_cocoon_append_path(
+pub unsafe extern "C-unwind" fn plan_seaturtle_append_path(
     _root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     best_path: *mut pg_sys::CustomPath,
@@ -928,7 +928,7 @@ pub unsafe extern "C-unwind" fn plan_cocoon_append_path(
         (*cscan).custom_scan_tlist = std::ptr::null_mut();
         (*cscan).custom_plans = std::ptr::null_mut();
         (*cscan).custom_relids = std::ptr::null_mut();
-        (*cscan).methods = &COCOON_APPEND_SCAN_METHODS.0;
+        (*cscan).methods = &SEATURTLE_APPEND_SCAN_METHODS.0;
         (*cscan).flags = 0;
 
         &mut (*cscan).scan.plan as *mut pg_sys::Plan
