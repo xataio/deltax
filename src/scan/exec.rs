@@ -208,6 +208,8 @@ pub(super) struct ScanTiming {
     pub(super) compressed_bytes: u64,
     /// Total segments skipped by pruning.
     pub(super) segments_skipped: u64,
+    /// Total segments skipped specifically by min/max predicate filters.
+    pub(super) segments_minmax_skipped: u64,
     /// Total segments where Phase 2 was skipped (no selected rows).
     pub(super) phase2_skipped: u64,
     /// Top-N effective limit (0 = disabled).
@@ -216,6 +218,77 @@ pub(super) struct ScanTiming {
     pub(super) topn_candidates: u64,
     /// Top-N segments processed in Phase 2.
     pub(super) topn_phase2_segments: u64,
+}
+
+/// Filter for pruning segments based on min/max metadata in the companion table.
+/// Built from batch quals with orderable types (int, float, timestamp, date).
+struct MinMaxFilter {
+    min_attno: usize,          // attno of _min_{col} in companion tuple
+    max_attno: usize,          // attno of _max_{col} in companion tuple
+    op: BatchCompareOp,        // Eq, Lt, Le, Gt, Ge
+    const_datum: pg_sys::Datum,
+    type_oid: pg_sys::Oid,
+}
+
+/// Check whether a segment might contain rows matching the filter.
+/// Returns `true` if the segment should be kept (may match), `false` if it can be skipped.
+fn segment_passes_minmax_filter(
+    f: &MinMaxFilter,
+    values: &[pg_sys::Datum],
+    nulls: &[bool],
+) -> bool {
+    // If either min or max is null, we can't prove anything — keep the segment
+    if nulls[f.min_attno] || nulls[f.max_attno] {
+        return true;
+    }
+
+    let seg_min_datum = values[f.min_attno];
+    let seg_max_datum = values[f.max_attno];
+
+    // Extract values based on type
+    match f.type_oid {
+        pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+        | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID | pg_sys::DATEOID => {
+            let seg_min = seg_min_datum.value() as i64;
+            let seg_max = seg_max_datum.value() as i64;
+            let c = f.const_datum.value() as i64;
+            match f.op {
+                BatchCompareOp::Eq => seg_min <= c && seg_max >= c,
+                BatchCompareOp::Lt => seg_min < c,
+                BatchCompareOp::Le => seg_min <= c,
+                BatchCompareOp::Gt => seg_max > c,
+                BatchCompareOp::Ge => seg_max >= c,
+                _ => true, // Ne, Like, NotLike — can't prune
+            }
+        }
+        pg_sys::FLOAT4OID => {
+            let seg_min = f32::from_bits(seg_min_datum.value() as u32) as f64;
+            let seg_max = f32::from_bits(seg_max_datum.value() as u32) as f64;
+            let c = f32::from_bits(f.const_datum.value() as u32) as f64;
+            match f.op {
+                BatchCompareOp::Eq => seg_min <= c && seg_max >= c,
+                BatchCompareOp::Lt => seg_min < c,
+                BatchCompareOp::Le => seg_min <= c,
+                BatchCompareOp::Gt => seg_max > c,
+                BatchCompareOp::Ge => seg_max >= c,
+                _ => true,
+            }
+        }
+        pg_sys::FLOAT8OID => {
+            let seg_min = f64::from_bits(seg_min_datum.value() as u64);
+            let seg_max = f64::from_bits(seg_max_datum.value() as u64);
+            let c = f64::from_bits(f.const_datum.value() as u64);
+            match f.op {
+                BatchCompareOp::Eq => seg_min <= c && seg_max >= c,
+                BatchCompareOp::Lt => seg_min < c,
+                BatchCompareOp::Le => seg_min <= c,
+                BatchCompareOp::Gt => seg_max > c,
+                BatchCompareOp::Ge => seg_max >= c,
+                _ => true,
+            }
+        }
+        _ => true, // Unknown type — can't prune
+    }
 }
 
 /// Per-column min/max metadata from the companion table.
@@ -632,14 +705,16 @@ pub unsafe extern "C-unwind" fn begin_seaturtle_append(
         let t1 = Instant::now();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         let mut total_skipped: u64 = 0;
+        let mut total_minmax_skipped: u64 = 0;
         for &oid in &companion_oids {
-            let (segs, skipped) = load_segments_heap(
+            let (segs, skipped, mm_skipped) = load_segments_heap(
                 oid, &meta.col_names, &meta.segment_by, &needed_cols,
                 &meta.time_column, false, &seg_filters, t_min, t_max,
-                lazy_cols.as_deref(),
+                lazy_cols.as_deref(), &batch_quals,
             );
             all_segments.extend(segs);
             total_skipped += skipped;
+            total_minmax_skipped += mm_skipped;
         }
         let heap_scan_us = t1.elapsed().as_micros() as u64;
 
@@ -686,6 +761,7 @@ pub unsafe extern "C-unwind" fn begin_seaturtle_append(
                 segments_decompressed: 0,
                 compressed_bytes,
                 segments_skipped: total_skipped,
+                segments_minmax_skipped: total_minmax_skipped,
                 phase2_skipped: 0,
                 topn_limit: if topn_limit > 0 { topn_limit as u64 } else { 0 },
                 topn_candidates: 0,
@@ -782,7 +858,7 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
         let mut total_count: i64 = 0;
         let mut total_segments: u64 = 0;
         for &oid in &companion_oids {
-            let (segs, _) = load_segments_heap(
+            let (segs, _, _) = load_segments_heap(
                 oid,
                 &meta.col_names,
                 &meta.segment_by,
@@ -793,6 +869,7 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
                 None,
                 None,
                 None,
+                &[],
             );
             for seg in &segs {
                 total_count += seg.row_count as i64;
@@ -1005,7 +1082,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
 
         let mut total_segments: u64 = 0;
         for &oid in &companion_oids {
-            let (segs, _) = load_segments_heap(
+            let (segs, _, _) = load_segments_heap(
                 oid,
                 &meta.col_names,
                 &meta.segment_by,
@@ -1016,6 +1093,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
                 None,
                 None,
                 None,
+                &[],
             );
             for seg in &segs {
                 for (agg_idx, result) in results.iter_mut().enumerate() {
@@ -1316,9 +1394,10 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
         let t1 = Instant::now();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         for &oid in &companion_oids {
-            let (segs, _) = load_segments_heap(
+            let (segs, _, _) = load_segments_heap(
                 oid, &meta.col_names, &meta.segment_by, &needed_cols,
                 &meta.time_column, false, &seg_filters, time_min, time_max, None,
+                &batch_quals,
             );
             all_segments.extend(segs);
         }
@@ -1943,7 +2022,8 @@ unsafe fn load_segments_heap(
     time_min: Option<i64>,
     time_max: Option<i64>,
     lazy_cols: Option<&[bool]>,
-) -> (Vec<SegmentData>, u64) {
+    batch_quals: &[BatchQual],
+) -> (Vec<SegmentData>, u64, u64) {
     unsafe {
         // Open companion table with AccessShareLock
         let rel = pg_sys::table_open(companion_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
@@ -2020,6 +2100,37 @@ unsafe fn load_segments_heap(
             }
         }
 
+        // Build min/max predicate filters from batch quals
+        let mut minmax_filters: Vec<MinMaxFilter> = Vec::new();
+        for bq in batch_quals {
+            // Only orderable types (not BOOL, not text, not LIKE/NotLike/Ne)
+            match bq.op {
+                BatchCompareOp::Ne | BatchCompareOp::Like | BatchCompareOp::NotLike => continue,
+                _ => {}
+            }
+            match bq.type_oid {
+                pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+                | pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
+                | pg_sys::DATEOID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {}
+                _ => continue,
+            }
+            let col_name = &col_names[bq.col_idx];
+            let min_name = format!("_min_{}", col_name);
+            let max_name = format!("_max_{}", col_name);
+            if let (Some(&min_att), Some(&max_att)) = (
+                attno_map.get(min_name.as_str()),
+                attno_map.get(max_name.as_str()),
+            ) {
+                minmax_filters.push(MinMaxFilter {
+                    min_attno: min_att,
+                    max_attno: max_att,
+                    op: bq.op,
+                    const_datum: bq.const_datum,
+                    type_oid: bq.type_oid,
+                });
+            }
+        }
+
         // Begin table scan via TableAmRoutine vtable
         // (table_beginscan is static inline in C, so we call via the vtable)
         let snapshot = pg_sys::GetActiveSnapshot();
@@ -2039,6 +2150,7 @@ unsafe fn load_segments_heap(
         // Iterate all tuples
         let mut segments = Vec::new();
         let mut segments_skipped: u64 = 0;
+        let mut segments_minmax_skipped: u64 = 0;
         let mut values = vec![pg_sys::Datum::from(0); natts];
         let mut nulls = vec![true; natts];
 
@@ -2117,6 +2229,22 @@ unsafe fn load_segments_heap(
             {
                 segments_skipped += 1;
                 continue;
+            }
+
+            // Check min/max predicate filters
+            if !minmax_filters.is_empty() {
+                let mut minmax_skip = false;
+                for f in &minmax_filters {
+                    if !segment_passes_minmax_filter(f, &values, &nulls) {
+                        minmax_skip = true;
+                        break;
+                    }
+                }
+                if minmax_skip {
+                    segments_skipped += 1;
+                    segments_minmax_skipped += 1;
+                    continue;
+                }
             }
 
             // --- Segment passed pruning: detoast blobs ---
@@ -2199,7 +2327,7 @@ unsafe fn load_segments_heap(
         (*(*rel).rd_tableam).scan_end.unwrap()(scan);
         pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
 
-        (segments, segments_skipped)
+        (segments, segments_skipped, segments_minmax_skipped)
     }
 }
 
@@ -2296,11 +2424,11 @@ fn load_decompress_state(
 
     // Phase 2: Direct heap scan for segment data (bypasses SPI overhead)
     let t1 = Instant::now();
-    let (segments_data, segments_skipped) = unsafe {
+    let (segments_data, segments_skipped, minmax_skipped) = unsafe {
         load_segments_heap(
             companion_oid, &meta.col_names, &meta.segment_by, &needed_cols,
             &meta.time_column, false, &seg_filters, t_min, t_max,
-            lazy_cols.as_deref(),
+            lazy_cols.as_deref(), &batch_quals,
         )
     };
     let heap_scan_us = t1.elapsed().as_micros() as u64;
@@ -2341,6 +2469,7 @@ fn load_decompress_state(
             segments_decompressed: 0,
             compressed_bytes,
             segments_skipped,
+            segments_minmax_skipped: minmax_skipped,
             phase2_skipped: 0,
             topn_limit: 0,
             topn_candidates: 0,
@@ -4024,7 +4153,7 @@ pub unsafe extern "C-unwind" fn end_custom_scan(
             );
             pgrx::log!(
                 "pg_seaturtle decomp: p1={:.1}ms p2={:.1}ms(text={:.1}/{} nontext={:.1}/{}) \
-                 segs={}/{} p2skip={} rows={}/{}/{} topn={}/{}",
+                 segs={}/{} mmskip={} p2skip={} rows={}/{}/{} topn={}/{}",
                 t.phase1_us as f64 / 1000.0,
                 t.phase2_us as f64 / 1000.0,
                 t.phase2_text_us as f64 / 1000.0,
@@ -4033,6 +4162,7 @@ pub unsafe extern "C-unwind" fn end_custom_scan(
                 t.phase2_nontext_cols,
                 t.segments_decompressed,
                 t.segments_decompressed + t.segments_skipped,
+                t.segments_minmax_skipped,
                 t.phase2_skipped,
                 t.rows_emitted,
                 t.rows_filtered,

@@ -222,9 +222,10 @@ unsafe fn explain_timing(
                     String::new()
                 };
                 let stats_str = std::ffi::CString::new(format!(
-                    "segments={} segments_skipped={} phase2_skipped={} rows_out={} rows_filtered={} rows_batch_filtered={} compressed_bytes={}{}",
+                    "segments={} segments_skipped={} segments_minmax_skipped={} phase2_skipped={} rows_out={} rows_filtered={} rows_batch_filtered={} compressed_bytes={}{}",
                     t.segments_decompressed,
                     t.segments_skipped,
+                    t.segments_minmax_skipped,
                     t.phase2_skipped,
                     t.rows_emitted,
                     t.rows_filtered,
