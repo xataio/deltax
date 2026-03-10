@@ -127,7 +127,7 @@ def run_explain_analyze(conn, queries):
                 continue
 
             # Sum timing values across partitions
-            totals = {"metadata": 0.0, "heap_scan": 0.0, "decompress": 0.0, "batch_eval": 0.0, "emit": 0.0}
+            totals = {"metadata": 0.0, "heap_scan": 0.0, "decompress": 0.0, "batch_eval": 0.0, "emit": 0.0, "agg": 0.0}
             for t in timings:
                 for token in t.replace("(", "").replace(")", "").split():
                     if "=" in token:
@@ -148,7 +148,8 @@ def run_explain_analyze(conn, queries):
             )
 
             # Sum stats across partitions
-            stat_totals = {"segments": 0, "segments_skipped": 0, "phase2_skipped": 0, "rows_out": 0, "rows_filtered": 0, "rows_batch_filtered": 0, "compressed_bytes": 0}
+            stat_totals = {"segments": 0, "segments_skipped": 0, "phase2_skipped": 0, "rows_out": 0, "rows_filtered": 0, "rows_batch_filtered": 0, "compressed_bytes": 0, "rows_processed": 0, "result_rows": 0, "batch_quals": 0}
+            str_stats = {}
             for s in stats_lines:
                 for token in s.split():
                     if "=" in token:
@@ -158,7 +159,11 @@ def run_explain_analyze(conn, queries):
                                 stat_totals[k] += int(v)
                             except ValueError:
                                 pass
+                        elif k == "where_quals_null":
+                            str_stats[k] = v
             stats_str = " ".join(f"{k}={v}" for k, v in stat_totals.items())
+            if str_stats:
+                stats_str += " " + " ".join(f"{k}={v}" for k, v in str_stats.items())
 
             results[qid] = {
                 "timing": timing_str,

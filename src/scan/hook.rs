@@ -536,16 +536,34 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
 
         let parse = (*root).parse;
 
-        // No HAVING (too complex)
-        if !(*parse).havingQual.is_null() {
-            return;
-        }
-
-        // Check for WHERE clause
+        // Check for WHERE clause.
+        // Primary: parse->jointree->quals. Fallback: baserestrictinfo,
+        // which PG always populates even if jointree quals get cleared.
         let has_where = {
             let jointree = (*parse).jointree;
-            !jointree.is_null() && !(*jointree).quals.is_null()
+            let jointree_has_quals = !jointree.is_null() && !(*jointree).quals.is_null();
+            if jointree_has_quals {
+                true
+            } else {
+                // Fallback: check baserestrictinfo on base relations
+                let mut found = false;
+                let array_size = (*root).simple_rel_array_size;
+                for rti in 1..array_size {
+                    let rel = *(*root).simple_rel_array.add(rti as usize);
+                    if !rel.is_null() {
+                        let bri = (*rel).baserestrictinfo;
+                        if !bri.is_null() && (*bri).length > 0 {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                found
+            }
         };
+
+        // Check for HAVING clause
+        let has_having = !(*parse).havingQual.is_null();
 
         // Check for GROUP BY
         let has_group_by = !(*parse).groupClause.is_null();
@@ -606,10 +624,11 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
             return;
         }
 
+
         // =====================================================================
         // Classify all aggregates
         // =====================================================================
-        use super::exec::AggType;
+        use super::exec::{AggType, AggExpr};
 
         let mut classified_aggs: Vec<path::AggSpec> = Vec::new();
         let mut all_minmax = true;
@@ -628,6 +647,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                     col_idx: -1,
                     result_type_oid: (*aggref).aggtype,
                     col_type_oid: pg_sys::InvalidOid,
+                    expr_kind: AggExpr::Column,
                 });
                 all_minmax = false;
                 has_non_minmax = true;
@@ -649,16 +669,44 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                 return;
             }
 
-            // Extract the Var from the argument
+            // Extract the Var from the argument (plain Var or length(Var))
             let arg_te = pg_sys::list_nth(args, 0) as *const pg_sys::TargetEntry;
             if arg_te.is_null() {
                 return;
             }
             let arg_expr = (*arg_te).expr as *const pg_sys::Node;
-            if arg_expr.is_null() || (*arg_expr).type_ != pg_sys::NodeTag::T_Var {
-                return; // Only plain column references
+            if arg_expr.is_null() {
+                return;
             }
-            let var_node = arg_expr as *const pg_sys::Var;
+
+            let (var_node, expr_kind): (*const pg_sys::Var, AggExpr) = if (*arg_expr).type_ == pg_sys::NodeTag::T_Var {
+                (arg_expr as *const pg_sys::Var, AggExpr::Column)
+            } else if (*arg_expr).type_ == pg_sys::NodeTag::T_FuncExpr {
+                // Check for length(Var)
+                let funcexpr = arg_expr as *const pg_sys::FuncExpr;
+                let fn_name_ptr = pg_sys::get_func_name((*funcexpr).funcid);
+                if fn_name_ptr.is_null() {
+                    return;
+                }
+                let fn_name = std::ffi::CStr::from_ptr(fn_name_ptr)
+                    .to_str()
+                    .unwrap_or("");
+                if fn_name != "length" {
+                    return; // Only length() is supported
+                }
+                let fn_args = (*funcexpr).args;
+                if fn_args.is_null() || (*fn_args).length != 1 {
+                    return;
+                }
+                let inner = (*(*fn_args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                if inner.is_null() || (*inner).type_ != pg_sys::NodeTag::T_Var {
+                    return;
+                }
+                (inner as *const pg_sys::Var, AggExpr::LengthOf)
+            } else {
+                return; // Only plain column references or length(col)
+            };
+
             let varattno = (*var_node).varattno;
             let col_idx = varattno as i32 - 1;
 
@@ -677,6 +725,13 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
             let mut col_collation: pg_sys::Oid = pg_sys::InvalidOid;
             pg_sys::get_atttypetypmodcoll(relid, varattno, &mut col_type_oid, &mut col_typmod, &mut col_collation);
 
+            // For length() expressions, the effective type for aggregation is INT4
+            let effective_col_type_oid = if expr_kind == AggExpr::LengthOf {
+                pg_sys::INT4OID
+            } else {
+                col_type_oid
+            };
+
             // Check for COUNT(DISTINCT ...)
             let is_distinct = !(*aggref).aggdistinct.is_null()
                 && (*(*aggref).aggdistinct).length > 0;
@@ -687,7 +742,8 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                         agg_type: AggType::Sum,
                         col_idx,
                         result_type_oid: (*aggref).aggtype,
-                        col_type_oid,
+                        col_type_oid: effective_col_type_oid,
+                        expr_kind,
                     });
                     all_minmax = false;
                     has_non_minmax = true;
@@ -697,7 +753,8 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                         agg_type: AggType::Avg,
                         col_idx,
                         result_type_oid: (*aggref).aggtype,
-                        col_type_oid,
+                        col_type_oid: effective_col_type_oid,
+                        expr_kind,
                     });
                     all_minmax = false;
                     has_non_minmax = true;
@@ -708,14 +765,16 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                             agg_type: AggType::CountDistinct,
                             col_idx,
                             result_type_oid: (*aggref).aggtype,
-                            col_type_oid,
+                            col_type_oid: effective_col_type_oid,
+                            expr_kind,
                         });
                     } else {
                         classified_aggs.push(path::AggSpec {
                             agg_type: AggType::Count,
                             col_idx,
                             result_type_oid: (*aggref).aggtype,
-                            col_type_oid,
+                            col_type_oid: effective_col_type_oid,
+                            expr_kind,
                         });
                     }
                     all_minmax = false;
@@ -723,15 +782,14 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                 }
                 "min" | "max" => {
                     if has_non_minmax {
-                        // Mix of min/max with other aggs — use SeaTurtleAgg for all
-                        // Mix of min/max with other aggs — skip MinMax fast path
                         return; // Bail — mixing MIN/MAX with SUM/COUNT not supported yet
                     }
                     classified_aggs.push(path::AggSpec {
                         agg_type: AggType::Sum, // placeholder, won't be used
                         col_idx,
                         result_type_oid: (*aggref).aggtype,
-                        col_type_oid,
+                        col_type_oid: effective_col_type_oid,
+                        expr_kind,
                     });
                     // Keep all_minmax = true
                 }
@@ -798,14 +856,180 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
         }
 
         // =====================================================================
-        // SeaTurtleAgg path: SUM/AVG/COUNT/COUNT(DISTINCT) ± GROUP BY (no WHERE)
+        // SeaTurtleAgg path: SUM/AVG/COUNT/COUNT(DISTINCT) ± GROUP BY ± WHERE ± HAVING
         // =====================================================================
 
-        // SeaTurtleAgg doesn't support WHERE clauses yet — fall through to the
-        // standard SeaTurtleAppend + PG Aggregate path which handles quals correctly
-        // via plan.qual. This ensures correctness for all WHERE patterns.
+        // Verify all WHERE quals are batch-pushable.  Each qual must be
+        // extractable by extract_batch_quals at execution time, otherwise the
+        // filter is silently dropped and AggScan produces wrong results.
         if has_where {
-            return;
+            // Get qual nodes from jointree->quals if available, otherwise from baserestrictinfo
+            let qual_nodes: Vec<*const pg_sys::Node> = {
+                let jointree = (*parse).jointree;
+                if !jointree.is_null() && !(*jointree).quals.is_null() {
+                    let quals_node = (*jointree).quals as *const pg_sys::Node;
+                    if (*quals_node).type_ == pg_sys::NodeTag::T_List {
+                        let list = quals_node as *const pg_sys::List;
+                        (0..(*list).length)
+                            .map(|i| pg_sys::list_nth(list as *mut _, i) as *const pg_sys::Node)
+                            .collect()
+                    } else {
+                        let list = pg_sys::make_ands_implicit(quals_node as *mut pg_sys::Expr);
+                        (0..(*list).length)
+                            .map(|i| pg_sys::list_nth(list, i) as *const pg_sys::Node)
+                            .collect()
+                    }
+                } else {
+                    // Fallback: extract from baserestrictinfo
+                    let mut nodes = Vec::new();
+                    let array_size = (*root).simple_rel_array_size;
+                    for rti in 1..array_size {
+                        let rel = *(*root).simple_rel_array.add(rti as usize);
+                        if rel.is_null() { continue; }
+                        let bri = (*rel).baserestrictinfo;
+                        if bri.is_null() { continue; }
+                        for i in 0..(*bri).length {
+                            let ri = pg_sys::list_nth(bri, i) as *const pg_sys::RestrictInfo;
+                            if !ri.is_null() && !(*ri).clause.is_null() {
+                                nodes.push((*ri).clause as *const pg_sys::Node);
+                            }
+                        }
+                        if !nodes.is_empty() { break; }
+                    }
+                    nodes
+                }
+            };
+
+            let unwrap_relabel = |n: *const pg_sys::Node| -> *const pg_sys::Node {
+                if (*n).type_ == pg_sys::NodeTag::T_RelabelType {
+                    let rlt = n as *const pg_sys::RelabelType;
+                    (*rlt).arg as *const pg_sys::Node
+                } else {
+                    n
+                }
+            };
+
+            for &qn in &qual_nodes {
+                if qn.is_null() {
+                    return;
+                }
+                let qt = (*qn).type_;
+                match qt {
+                    pg_sys::NodeTag::T_OpExpr => {
+                        // Validate exactly as extract_batch_quals would.
+                        let opexpr = qn as *const pg_sys::OpExpr;
+                        let args = (*opexpr).args;
+                        if args.is_null() || (*args).length != 2 {
+                            return;
+                        }
+
+                        let opname_ptr = pg_sys::get_opname((*opexpr).opno);
+                        if opname_ptr.is_null() {
+                            return;
+                        }
+                        let opname = std::ffi::CStr::from_ptr(opname_ptr)
+                            .to_str()
+                            .unwrap_or("");
+
+                        let is_like = opname == "~~";
+                        let is_not_like = opname == "!~~";
+                        let is_recognized_cmp = matches!(opname, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=");
+
+                        if !is_like && !is_not_like && !is_recognized_cmp {
+                            return; // unrecognized operator
+                        }
+
+                        let raw_arg0 = (*(*args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                        let raw_arg1 = (*(*args).elements.add(1)).ptr_value as *const pg_sys::Node;
+                        if raw_arg0.is_null() || raw_arg1.is_null() {
+                            return;
+                        }
+
+                        let a0 = unwrap_relabel(raw_arg0);
+                        let a1 = unwrap_relabel(raw_arg1);
+
+                        let (var_node, const_node, var_on_left) =
+                            if (*a0).type_ == pg_sys::NodeTag::T_Var
+                                && (*a1).type_ == pg_sys::NodeTag::T_Const
+                            {
+                                (a0 as *const pg_sys::Var, a1 as *const pg_sys::Const, true)
+                            } else if (*a0).type_ == pg_sys::NodeTag::T_Const
+                                && (*a1).type_ == pg_sys::NodeTag::T_Var
+                            {
+                                (a1 as *const pg_sys::Var, a0 as *const pg_sys::Const, false)
+                            } else {
+                                return; // neither (Var,Const) nor (Const,Var)
+                            };
+
+                        if (*const_node).constisnull {
+                            return;
+                        }
+
+                        let type_oid = (*var_node).vartype;
+
+                        if is_like || is_not_like {
+                            if !var_on_left {
+                                return;
+                            }
+                            if !matches!(type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID) {
+                                return;
+                            }
+                        } else if matches!(type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID)
+                            && matches!(opname, "=" | "<>" | "!=")
+                        {
+                            if !var_on_left {
+                                return;
+                            }
+                        } else {
+                            // Numeric/date/bool comparison — check type is supported
+                            if !matches!(
+                                type_oid,
+                                pg_sys::INT2OID
+                                    | pg_sys::INT4OID
+                                    | pg_sys::INT8OID
+                                    | pg_sys::FLOAT4OID
+                                    | pg_sys::FLOAT8OID
+                                    | pg_sys::BOOLOID
+                                    | pg_sys::DATEOID
+                                    | pg_sys::TIMESTAMPOID
+                                    | pg_sys::TIMESTAMPTZOID
+                            ) {
+                                return;
+                            }
+                        }
+                    }
+                    pg_sys::NodeTag::T_Var => {
+                        let var_node = qn as *const pg_sys::Var;
+                        if (*var_node).vartype != pg_sys::BOOLOID {
+                            return;
+                        }
+                    }
+                    pg_sys::NodeTag::T_BoolExpr => {
+                        let boolexpr = qn as *const pg_sys::BoolExpr;
+                        if (*boolexpr).boolop == pg_sys::BoolExprType::NOT_EXPR {
+                            let bargs = (*boolexpr).args;
+                            if bargs.is_null() || (*bargs).length != 1 {
+                                return;
+                            }
+                            let inner = (*(*bargs).elements.add(0)).ptr_value as *const pg_sys::Node;
+                            if inner.is_null() || (*inner).type_ != pg_sys::NodeTag::T_Var {
+                                return;
+                            }
+                            let inner_var = inner as *const pg_sys::Var;
+                            if (*inner_var).vartype != pg_sys::BOOLOID {
+                                return;
+                            }
+                        } else if (*boolexpr).boolop == pg_sys::BoolExprType::AND_EXPR {
+                            // AND — quals should already be flattened, but allow it
+                        } else {
+                            return; // OR in WHERE — not pushable
+                        }
+                    }
+                    _ => {
+                        return; // Unknown qual type — bail
+                    }
+                }
+            }
         }
 
         // Parse GROUP BY columns
@@ -865,12 +1089,152 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
             }
         }
 
+        // Parse HAVING clause into simple filters
+        let mut having_filters: Vec<super::exec::HavingFilter> = Vec::new();
+        if has_having {
+            use super::exec::{HavingOp, HavingFilter};
+            let having_node = (*parse).havingQual as *const pg_sys::Node;
+            // Collect qual nodes (single OpExpr or AND-list)
+            let qual_nodes: Vec<*const pg_sys::Node> = if (*having_node).type_ == pg_sys::NodeTag::T_BoolExpr {
+                let boolexpr = having_node as *const pg_sys::BoolExpr;
+                if (*boolexpr).boolop == pg_sys::BoolExprType::AND_EXPR {
+                    let args = (*boolexpr).args;
+                    let n = (*args).length;
+                    (0..n).map(|i| pg_sys::list_nth(args, i) as *const pg_sys::Node).collect()
+                } else {
+                    return; // OR/NOT in HAVING not supported
+                }
+            } else {
+                vec![having_node]
+            };
+
+            for &qnode in &qual_nodes {
+                if (*qnode).type_ != pg_sys::NodeTag::T_OpExpr {
+                    return; // Non-OpExpr HAVING not supported
+                }
+                let opexpr = qnode as *const pg_sys::OpExpr;
+                let hargs = (*opexpr).args;
+                if hargs.is_null() || (*hargs).length != 2 {
+                    return;
+                }
+
+                let opname_ptr = pg_sys::get_opname((*opexpr).opno);
+                if opname_ptr.is_null() {
+                    return;
+                }
+                let opname = std::ffi::CStr::from_ptr(opname_ptr)
+                    .to_str()
+                    .unwrap_or("");
+                let having_op = match opname {
+                    ">" => HavingOp::Gt,
+                    "<" => HavingOp::Lt,
+                    ">=" => HavingOp::Ge,
+                    "<=" => HavingOp::Le,
+                    "=" => HavingOp::Eq,
+                    "<>" | "!=" => HavingOp::Ne,
+                    _ => return,
+                };
+
+                let a0 = (*(*hargs).elements.add(0)).ptr_value as *const pg_sys::Node;
+                let a1 = (*(*hargs).elements.add(1)).ptr_value as *const pg_sys::Node;
+
+                // Must be Aggref op Const or Const op Aggref
+                let (aggref_node, const_node, agg_on_left) =
+                    if (*a0).type_ == pg_sys::NodeTag::T_Aggref
+                        && (*a1).type_ == pg_sys::NodeTag::T_Const
+                    {
+                        (a0 as *const pg_sys::Aggref, a1 as *const pg_sys::Const, true)
+                    } else if (*a0).type_ == pg_sys::NodeTag::T_Const
+                        && (*a1).type_ == pg_sys::NodeTag::T_Aggref
+                    {
+                        (a1 as *const pg_sys::Aggref, a0 as *const pg_sys::Const, false)
+                    } else {
+                        return;
+                    };
+
+                // For the Const op Aggref case, flip the comparison direction
+                let final_op = if !agg_on_left {
+                    match having_op {
+                        HavingOp::Gt => HavingOp::Lt,
+                        HavingOp::Lt => HavingOp::Gt,
+                        HavingOp::Ge => HavingOp::Le,
+                        HavingOp::Le => HavingOp::Ge,
+                        other => other,
+                    }
+                } else {
+                    having_op
+                };
+
+                if (*const_node).constisnull {
+                    return;
+                }
+                let const_val = (*const_node).constvalue.value() as i64;
+
+                // Match the Aggref to a classified agg by position.
+                // Walk aggrefs in order and find which one matches this HAVING aggref.
+                let mut agg_idx = None;
+                for (i, &ar) in aggrefs.iter().enumerate() {
+                    if std::ptr::eq(ar, aggref_node) {
+                        agg_idx = Some(i);
+                        break;
+                    }
+                }
+                // If not found by pointer, match by aggfnoid + aggstar
+                if agg_idx.is_none() {
+                    for (i, &ar) in aggrefs.iter().enumerate() {
+                        if (*ar).aggfnoid == (*aggref_node).aggfnoid
+                            && (*ar).aggstar == (*aggref_node).aggstar
+                        {
+                            // For non-star, also match args
+                            if (*ar).aggstar {
+                                agg_idx = Some(i);
+                                break;
+                            }
+                            // Match by column: compare first arg's Var
+                            let ar_args = (*ar).args;
+                            let h_args = (*aggref_node).args;
+                            if !ar_args.is_null() && !h_args.is_null()
+                                && (*ar_args).length == 1 && (*h_args).length == 1
+                            {
+                                let ar_te = pg_sys::list_nth(ar_args, 0) as *const pg_sys::TargetEntry;
+                                let h_te = pg_sys::list_nth(h_args, 0) as *const pg_sys::TargetEntry;
+                                let ar_expr = (*ar_te).expr as *const pg_sys::Node;
+                                let h_expr = (*h_te).expr as *const pg_sys::Node;
+                                if (*ar_expr).type_ == pg_sys::NodeTag::T_Var
+                                    && (*h_expr).type_ == pg_sys::NodeTag::T_Var
+                                {
+                                    let ar_var = ar_expr as *const pg_sys::Var;
+                                    let h_var = h_expr as *const pg_sys::Var;
+                                    if (*ar_var).varattno == (*h_var).varattno {
+                                        agg_idx = Some(i);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                match agg_idx {
+                    Some(idx) => {
+                        having_filters.push(HavingFilter {
+                            agg_idx: idx,
+                            op: final_op,
+                            const_val,
+                        });
+                    }
+                    None => return, // Can't match HAVING aggref — bail
+                }
+            }
+        }
+
         path::add_agg_path(
             root,
             output_rel,
             &companion_oids,
             &classified_aggs,
             &group_specs,
+            &having_filters,
         );
     }
 }

@@ -896,6 +896,107 @@ class TestTransparentQuery:
             f"mixed WHERE group: {before_rows} vs {after_rows}"
         )
 
+    def test_agg_where_prepared_statement_caching(self, db):
+        """AggScan+WHERE must return correct results under prepared statement plan caching.
+
+        Regression test: thread-local qual passing broke when PG reused cached plans
+        for prepared statements. psycopg3's prepare_threshold causes auto-preparation
+        after N executions; PG then caches the generic plan and skips PlanCustomPath,
+        so quals stored in thread-locals were lost. Fixed by serializing quals into
+        custom_private via nodeToString/stringToNode.
+        """
+        import psycopg
+        from conftest import HOST_PORT, PG_USER, PG_PASSWORD
+
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE agg_prep_test (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                region_id INTEGER NOT NULL,
+                val INTEGER
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('agg_prep_test', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Insert rows: region_id 1 gets 20 rows, region_id 2 gets 40 rows
+        for i in range(60):
+            region = 1 if i < 20 else 2
+            db.execute(
+                f"INSERT INTO agg_prep_test VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"'dev-{i % 3}', {region}, {i * 10})"
+            )
+        db.commit()
+
+        expected_count = db.execute(
+            "SELECT count(*) FROM agg_prep_test WHERE region_id = 1"
+        ).fetchone()[0]
+        expected_sum = db.execute(
+            "SELECT sum(val) FROM agg_prep_test WHERE region_id = 1"
+        ).fetchone()[0]
+        assert expected_count == 20
+
+        # Compress
+        db.execute(
+            "SELECT seaturtle_enable_compression('agg_prep_test', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "agg_prep_test")
+
+        # Open a new connection with prepare_threshold=1 so plan caching kicks in
+        # immediately after the first execution of each query.
+        dbname = db.info.dbname
+        conn2 = psycopg.connect(
+            host="localhost",
+            port=HOST_PORT,
+            user=PG_USER,
+            password=PG_PASSWORD,
+            dbname=dbname,
+            prepare_threshold=1,
+        )
+
+        try:
+            # Run COUNT+WHERE 10 times — after the 2nd execution PG uses cached plan
+            for attempt in range(10):
+                result = conn2.execute(
+                    "SELECT count(*) FROM agg_prep_test WHERE region_id = 1"
+                ).fetchone()[0]
+                assert result == expected_count, (
+                    f"COUNT+WHERE mismatch on attempt {attempt + 1}: "
+                    f"expected {expected_count}, got {result}"
+                )
+
+            # Run SUM+WHERE 10 times
+            for attempt in range(10):
+                result = conn2.execute(
+                    "SELECT sum(val) FROM agg_prep_test WHERE region_id = 1"
+                ).fetchone()[0]
+                assert result == expected_sum, (
+                    f"SUM+WHERE mismatch on attempt {attempt + 1}: "
+                    f"expected {expected_sum}, got {result}"
+                )
+
+            # Run GROUP BY + WHERE 10 times
+            before_groups = sorted(db.execute(
+                "SELECT region_id, count(*) FROM agg_prep_test "
+                "WHERE region_id IN (1, 2) GROUP BY region_id"
+            ).fetchall())
+            for attempt in range(10):
+                result = sorted(conn2.execute(
+                    "SELECT region_id, count(*) FROM agg_prep_test "
+                    "WHERE region_id IN (1, 2) GROUP BY region_id"
+                ).fetchall())
+                assert result == before_groups, (
+                    f"GROUP BY+WHERE mismatch on attempt {attempt + 1}: "
+                    f"expected {before_groups}, got {result}"
+                )
+        finally:
+            conn2.close()
+
     def test_transparent_query_no_segment_by(self, db):
         """Same validation without segment_by columns."""
         setup_metrics_table(db)

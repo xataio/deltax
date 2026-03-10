@@ -5,20 +5,20 @@ use super::cost;
 use super::SyncStatic;
 
 thread_local! {
-    /// Temporary storage for WHERE clause quals during SeaTurtleAgg planning.
-    /// Set in plan_agg_path, consumed in create_agg_scan_state.
-    static AGG_PLAN_QUALS: std::cell::Cell<*mut pg_sys::List> =
-        const { std::cell::Cell::new(std::ptr::null_mut()) };
+    /// Temporary storage for HAVING filters during SeaTurtleAgg planning.
+    /// Set in add_agg_path (hook), consumed in plan_agg_path.
+    static AGG_HAVING_FILTERS: std::cell::RefCell<Vec<super::exec::HavingFilter>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Store WHERE clause quals for the next SeaTurtleAgg plan.
-pub(super) fn set_agg_plan_quals(quals: *mut pg_sys::List) {
-    AGG_PLAN_QUALS.with(|cell| cell.set(quals));
+/// Store HAVING filters for the next SeaTurtleAgg plan.
+pub(super) fn set_agg_having_filters(filters: Vec<super::exec::HavingFilter>) {
+    AGG_HAVING_FILTERS.with(|cell| *cell.borrow_mut() = filters);
 }
 
-/// Take (consume) the stored WHERE clause quals.
-pub(super) fn take_agg_plan_quals() -> *mut pg_sys::List {
-    AGG_PLAN_QUALS.with(|cell| cell.replace(std::ptr::null_mut()))
+/// Take (consume) the stored HAVING filters.
+pub(super) fn take_agg_having_filters() -> Vec<super::exec::HavingFilter> {
+    AGG_HAVING_FILTERS.with(|cell| std::mem::take(&mut *cell.borrow_mut()))
 }
 
 // ============================================================================
@@ -575,6 +575,7 @@ pub struct AggSpec {
     pub col_idx: i32,               // 0-based column index, -1 for COUNT(*)
     pub result_type_oid: pg_sys::Oid,
     pub col_type_oid: pg_sys::Oid,  // source column type OID
+    pub expr_kind: super::exec::AggExpr,  // Column or LengthOf
 }
 
 /// Add a SeaTurtleAgg custom path to the grouped relation's pathlist.
@@ -584,6 +585,7 @@ pub unsafe fn add_agg_path(
     companion_oids: &[pg_sys::Oid],
     agg_specs: &[AggSpec],
     group_specs: &[super::exec::GroupByColSpec],
+    having_filters: &[super::exec::HavingFilter],
 ) {
     unsafe {
         let cpath =
@@ -605,7 +607,7 @@ pub unsafe fn add_agg_path(
 
         // Store in custom_private:
         // [oid1, oid2, ..., -1, num_aggs,
-        //  agg_type_0, col_idx_0, result_oid_0, col_type_oid_0,
+        //  agg_type_0, col_idx_0, result_oid_0, col_type_oid_0, expr_kind_0,
         //  ...,
         //  num_groups, group_col_idx_0, group_type_oid_0, ...]
         let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
@@ -619,11 +621,16 @@ pub unsafe fn add_agg_path(
             private_list = pg_sys::lappend_int(private_list, spec.col_idx);
             private_list = pg_sys::lappend_int(private_list, u32::from(spec.result_type_oid) as i32);
             private_list = pg_sys::lappend_int(private_list, u32::from(spec.col_type_oid) as i32);
+            private_list = pg_sys::lappend_int(private_list, spec.expr_kind as i32);
         }
         private_list = pg_sys::lappend_int(private_list, group_specs.len() as i32);
         for gs in group_specs {
             private_list = pg_sys::lappend_int(private_list, gs.col_idx);
             private_list = pg_sys::lappend_int(private_list, u32::from(gs.type_oid) as i32);
+        }
+        // Store HAVING filters for thread-local passing to plan_agg_path
+        if !having_filters.is_empty() {
+            set_agg_having_filters(having_filters.to_vec());
         }
         (*cpath).custom_private = private_list;
 
@@ -674,6 +681,7 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             col_idx: i32,
             result_oid: u32,
             col_type_oid: u32,
+            expr_kind: i32,  // 0=Column, 1=LengthOf
         }
         struct ParsedGroup {
             col_idx: i32,
@@ -707,12 +715,13 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                     continue;
                 }
                 agg_fields.push(val);
-                if agg_fields.len() == 4 {
+                if agg_fields.len() == 5 {
                     parsed_aggs.push(ParsedAgg {
                         agg_type: agg_fields[0],
                         col_idx: agg_fields[1],
                         result_oid: agg_fields[2] as u32,
                         col_type_oid: agg_fields[3] as u32,
+                        expr_kind: agg_fields[4],
                     });
                     agg_fields.clear();
                     if parsed_aggs.len() == num_aggs as usize {
@@ -783,6 +792,7 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             private_list = pg_sys::lappend_int(private_list, a.col_idx);
             private_list = pg_sys::lappend_int(private_list, a.result_oid as i32);
             private_list = pg_sys::lappend_int(private_list, a.col_type_oid as i32);
+            private_list = pg_sys::lappend_int(private_list, a.expr_kind);
         }
         private_list = pg_sys::lappend_int(private_list, parsed_groups.len() as i32);
         for g in &parsed_groups {
@@ -796,26 +806,56 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             private_list = pg_sys::lappend_int(private_list, *oref);
         }
 
-        (*cscan).custom_private = private_list;
+        // HAVING filters: [num_having, agg_idx_0, op_0, const_val_0, ...]
+        let having_filters = take_agg_having_filters();
+        private_list = pg_sys::lappend_int(private_list, having_filters.len() as i32);
+        for hf in &having_filters {
+            private_list = pg_sys::lappend_int(private_list, hf.agg_idx as i32);
+            private_list = pg_sys::lappend_int(private_list, hf.op as i32);
+            private_list = pg_sys::lappend_int(private_list, hf.const_val as i32);
+        }
 
-        // Store WHERE clause from parse tree for execution.
-        // We can't put it on plan.qual (setrefs would fail for scanrelid=0),
-        // so we pass it via thread-local to create_agg_scan_state.
+        // Store WHERE clause in custom_private as a serialized string.
+        // We can't use plan.qual (setrefs would fail for scanrelid=0) or
+        // thread-local (breaks when PG reuses a cached prepared plan).
+        // custom_private is deep-copied by PG during plan caching, so the
+        // serialized quals survive prepared statement reuse.
+        //
+        // Format: [str_len, char0, char1, ...] where str_len=0 means no quals.
+        // Uses nodeToString/stringToNode for round-trip serialization.
         let parse = (*root).parse;
         let jointree = (*parse).jointree;
-        if !jointree.is_null() && !(*jointree).quals.is_null() {
+        let mut qual_list: *mut pg_sys::List = std::ptr::null_mut();
+
+        let jointree_has_quals = !jointree.is_null() && !(*jointree).quals.is_null();
+        if jointree_has_quals {
             let quals_node = (*jointree).quals as *const pg_sys::Node;
-            let qual_list = if (*quals_node).type_ == pg_sys::NodeTag::T_List {
-                // quals is already a List — copy it directly
+            qual_list = if (*quals_node).type_ == pg_sys::NodeTag::T_List {
                 pg_sys::copyObjectImpl(quals_node as *const _) as *mut pg_sys::List
             } else {
-                // Single expression — copy and wrap in list
                 let qual_copy = pg_sys::copyObjectImpl(quals_node as *const _) as *mut pg_sys::Node;
                 pg_sys::make_ands_implicit(qual_copy as *mut pg_sys::Expr)
             };
-            set_agg_plan_quals(qual_list);
         }
 
+        if qual_list.is_null() {
+            qual_list = extract_quals_from_baserestrictinfo(root);
+        }
+
+        if !qual_list.is_null() {
+            let s = pg_sys::nodeToString(qual_list as *const _);
+            let s_bytes = std::ffi::CStr::from_ptr(s).to_bytes();
+            let len = s_bytes.len() as i32;
+            private_list = pg_sys::lappend_int(private_list, len);
+            for &b in s_bytes {
+                private_list = pg_sys::lappend_int(private_list, b as i32);
+            }
+            pg_sys::pfree(s as *mut _);
+        } else {
+            private_list = pg_sys::lappend_int(private_list, 0);
+        }
+
+        (*cscan).custom_private = private_list;
         (*cscan).scan.plan.qual = std::ptr::null_mut();
 
         (*cscan).custom_plans = std::ptr::null_mut();
@@ -826,6 +866,52 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
         let _ = root;
 
         &mut (*cscan).scan.plan as *mut pg_sys::Plan
+    }
+}
+
+/// Extract WHERE clause expressions from the base relation's baserestrictinfo.
+///
+/// After PG's `deconstruct_jointree`, WHERE quals are distributed to base
+/// relations as `RestrictInfo` nodes. This is a more reliable source than
+/// `parse->jointree->quals`, which may be NULL by the time PlanCustomPath
+/// callbacks fire.
+///
+/// Returns a copied List of clause expressions, or NULL if none found.
+unsafe fn extract_quals_from_baserestrictinfo(
+    root: *mut pg_sys::PlannerInfo,
+) -> *mut pg_sys::List {
+    unsafe {
+        // Find the first base relation (typically RTI=1 for single-table queries)
+        let array_size = (*root).simple_rel_array_size;
+        for rti in 1..array_size {
+            let rel = *(*root).simple_rel_array.add(rti as usize);
+            if rel.is_null() {
+                continue;
+            }
+            let bri = (*rel).baserestrictinfo;
+            if bri.is_null() || (*bri).length == 0 {
+                continue;
+            }
+            // Build a List of clause expressions from RestrictInfo nodes
+            let mut result: *mut pg_sys::List = std::ptr::null_mut();
+            for i in 0..(*bri).length {
+                let ri = pg_sys::list_nth(bri, i) as *const pg_sys::RestrictInfo;
+                if ri.is_null() {
+                    continue;
+                }
+                let clause = (*ri).clause;
+                if clause.is_null() {
+                    continue;
+                }
+                // Copy the clause expression to avoid ownership issues
+                let clause_copy = pg_sys::copyObjectImpl(clause as *const _) as *mut pg_sys::Expr;
+                result = pg_sys::lappend(result, clause_copy as *mut _);
+            }
+            if !result.is_null() {
+                return result;
+            }
+        }
+        std::ptr::null_mut()
     }
 }
 

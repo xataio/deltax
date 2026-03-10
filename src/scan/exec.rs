@@ -350,6 +350,15 @@ pub(super) struct MinMaxScanState {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum AggType { Sum, Count, CountStar, Avg, CountDistinct }
 
+/// Expression kind for aggregate arguments.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum AggExpr {
+    /// Plain column reference: AGG(col)
+    Column,
+    /// length(col): AGG(length(col)) — compute string lengths without varlena allocation
+    LengthOf,
+}
+
 enum AggAccumulator {
     SumInt { sum: i128, count: i64 },
     SumFloat { sum: f64, count: i64 },
@@ -394,12 +403,24 @@ pub(super) struct AggExecSpec {
     pub(super) agg_type: AggType,
     pub(super) col_idx: i32,               // -1 for COUNT(*)
     pub(super) col_type_oid: pg_sys::Oid,  // source column type
+    pub(super) expr_kind: AggExpr,         // Column or LengthOf
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct GroupByColSpec {
     pub(super) col_idx: i32,  // 0-based column index
     pub(super) type_oid: pg_sys::Oid,
+}
+
+/// A HAVING filter: compare an aggregate result against a constant.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum HavingOp { Gt, Lt, Ge, Le, Eq, Ne }
+
+#[derive(Debug, Clone)]
+pub(super) struct HavingFilter {
+    pub(super) agg_idx: usize,    // index into agg_specs
+    pub(super) op: HavingOp,
+    pub(super) const_val: i64,    // constant value (int8)
 }
 
 /// State for SeaTurtleAgg (aggregate pushdown).
@@ -415,6 +436,8 @@ pub(super) struct AggScanState {
     pub(super) agg_us: u64,
     pub(super) total_segments: u64,
     pub(super) total_rows_processed: u64,
+    pub(super) batch_quals_count: usize,
+    pub(super) where_quals_null: bool,
 }
 
 /// Static CustomExecMethods struct for SeaTurtleAgg.
@@ -1279,7 +1302,8 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                 let col_idx = pg_sys::list_nth_int(custom_private, idx + 1);
                 let result_oid = pg_sys::list_nth_int(custom_private, idx + 2) as u32;
                 let col_type_oid = pg_sys::list_nth_int(custom_private, idx + 3) as u32;
-                idx += 4;
+                let expr_kind_val = pg_sys::list_nth_int(custom_private, idx + 4);
+                idx += 5;
                 let agg_type = match agg_type_val {
                     0 => AggType::Sum,
                     1 => AggType::Count,
@@ -1288,11 +1312,16 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     4 => AggType::CountDistinct,
                     _ => AggType::Count,
                 };
+                let expr_kind = match expr_kind_val {
+                    1 => AggExpr::LengthOf,
+                    _ => AggExpr::Column,
+                };
                 let _ = result_oid; // parsed for offset, not stored
                 agg_specs.push(AggExecSpec {
                     agg_type,
                     col_idx,
                     col_type_oid: pg_sys::Oid::from(col_type_oid),
+                    expr_kind,
                 });
             }
         }
@@ -1335,6 +1364,47 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             }
         }
 
+        // Parse HAVING filters
+        let mut having_filters: Vec<HavingFilter> = Vec::new();
+        if idx < list_len {
+            let num_having = pg_sys::list_nth_int(custom_private, idx) as usize;
+            idx += 1;
+            for _ in 0..num_having {
+                let agg_idx = pg_sys::list_nth_int(custom_private, idx) as usize;
+                let op_val = pg_sys::list_nth_int(custom_private, idx + 1);
+                let const_val = pg_sys::list_nth_int(custom_private, idx + 2) as i64;
+                idx += 3;
+                let op = match op_val {
+                    0 => HavingOp::Gt,
+                    1 => HavingOp::Lt,
+                    2 => HavingOp::Ge,
+                    3 => HavingOp::Le,
+                    4 => HavingOp::Eq,
+                    5 => HavingOp::Ne,
+                    _ => HavingOp::Gt,
+                };
+                having_filters.push(HavingFilter { agg_idx, op, const_val });
+            }
+        }
+        // Read WHERE quals from custom_private (serialized as string by plan_agg_path).
+        // Format: [str_len, char0, char1, ...] where str_len=0 means no quals.
+        let where_quals: *mut pg_sys::List = if idx < list_len {
+            let str_len = pg_sys::list_nth_int(custom_private, idx) as usize;
+            idx += 1;
+            if str_len > 0 {
+                let mut chars: Vec<u8> = Vec::with_capacity(str_len + 1);
+                for _ in 0..str_len {
+                    chars.push(pg_sys::list_nth_int(custom_private, idx) as u8);
+                    idx += 1;
+                }
+                chars.push(0); // null terminator
+                pg_sys::stringToNode(chars.as_ptr() as *const std::ffi::c_char) as *mut pg_sys::List
+            } else {
+                std::ptr::null_mut()
+            }
+        } else {
+            std::ptr::null_mut()
+        };
         let _ = idx;
 
         if companion_oids.is_empty() {
@@ -1374,11 +1444,21 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             }
         }
 
-        // Take WHERE quals from thread-local (set during planning)
-        let where_quals = super::path::take_agg_plan_quals();
+        // Build length_cols: columns where ALL referencing agg specs use LengthOf.
+        // These columns will be decompressed as int4 lengths instead of text datums.
+        let length_cols: Vec<bool> = (0..num_cols)
+            .map(|col_idx| {
+                let refs: Vec<&AggExecSpec> = agg_specs
+                    .iter()
+                    .filter(|s| s.col_idx >= 0 && s.col_idx as usize == col_idx)
+                    .collect();
+                !refs.is_empty() && refs.iter().all(|s| s.expr_kind == AggExpr::LengthOf)
+            })
+            .collect();
 
-        // Extract batch quals and segment filters from WHERE clause
+        // Extract batch quals and segment filters from WHERE clause (quals from custom_private)
         let batch_quals = extract_batch_quals(where_quals, &meta.col_names, &meta.col_types);
+
         for bq in &batch_quals {
             if bq.col_idx < num_cols {
                 needed_cols[bq.col_idx] = true;
@@ -1496,30 +1576,71 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     let blob = &seg.compressed_blobs[blob_idx];
                     let typmod = meta.col_typmods[col_idx];
 
-                    // Check if this text column has a LIKE batch qual
-                    let like_qual = batch_quals.iter().find(|bq| {
-                        bq.col_idx == col_idx
-                            && matches!(bq.op, BatchCompareOp::Like | BatchCompareOp::NotLike)
-                    });
-
-                    if let Some(bq) = like_qual {
-                        let strat = bq.like_strategy.as_ref().unwrap();
-                        let neg = bq.op == BatchCompareOp::NotLike;
-                        let (datums, like_sel) =
-                            decompress_text_blob_with_like_filter(blob, type_oid, typmod, strat, neg);
+                    if length_cols[col_idx] {
+                        // Length-only column: decompress as int4 lengths.
+                        // Check for text_eq filter (e.g. URL <> '') to handle
+                        // during length decompression since we won't have text datums.
+                        let has_ne_empty = batch_quals.iter().any(|bq| {
+                            bq.col_idx == col_idx
+                                && bq.text_const.as_deref() == Some("")
+                                && bq.op == BatchCompareOp::Ne
+                        });
+                        let (datums, len_sel) = decompress_text_blob_to_lengths(blob, has_ne_empty);
                         decompressed.push(datums);
-                        // AND the like_sel into pre_selection
-                        if pre_selection.is_empty() {
-                            pre_selection = like_sel;
-                        } else {
-                            for (ps, ls) in pre_selection.iter_mut().zip(like_sel.iter()) {
-                                *ps = *ps && *ls;
+                        if !len_sel.is_empty() {
+                            if pre_selection.is_empty() {
+                                pre_selection = len_sel;
+                            } else {
+                                for (ps, ls) in pre_selection.iter_mut().zip(len_sel.iter()) {
+                                    *ps = *ps && *ls;
+                                }
                             }
                         }
                     } else {
-                        let type_name = pg_type_name(type_oid);
-                        let datums = decompress_blob_to_datums(blob, &type_name, type_oid, typmod);
-                        decompressed.push(datums);
+                        // Normal text/non-text column
+                        let like_qual = batch_quals.iter().find(|bq| {
+                            bq.col_idx == col_idx
+                                && matches!(bq.op, BatchCompareOp::Like | BatchCompareOp::NotLike)
+                        });
+
+                        let text_eq_qual = batch_quals.iter().find(|bq| {
+                            bq.col_idx == col_idx
+                                && bq.text_const.is_some()
+                                && matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne)
+                        });
+
+                        if let Some(bq) = like_qual {
+                            let strat = bq.like_strategy.as_ref().unwrap();
+                            let neg = bq.op == BatchCompareOp::NotLike;
+                            let (datums, like_sel) =
+                                decompress_text_blob_with_like_filter(blob, type_oid, typmod, strat, neg);
+                            decompressed.push(datums);
+                            if pre_selection.is_empty() {
+                                pre_selection = like_sel;
+                            } else {
+                                for (ps, ls) in pre_selection.iter_mut().zip(like_sel.iter()) {
+                                    *ps = *ps && *ls;
+                                }
+                            }
+                        } else if let Some(bq) = text_eq_qual {
+                            let const_str = bq.text_const.as_ref().unwrap();
+                            let is_ne = bq.op == BatchCompareOp::Ne;
+                            let (datums, eq_sel) = decompress_text_blob_with_eq_filter(
+                                blob, type_oid, typmod, const_str, is_ne,
+                            );
+                            decompressed.push(datums);
+                            if pre_selection.is_empty() {
+                                pre_selection = eq_sel;
+                            } else {
+                                for (ps, es) in pre_selection.iter_mut().zip(eq_sel.iter()) {
+                                    *ps = *ps && *es;
+                                }
+                            }
+                        } else {
+                            let type_name = pg_type_name(type_oid);
+                            let datums = decompress_blob_to_datums(blob, &type_name, type_oid, typmod);
+                            decompressed.push(datums);
+                        }
                     }
                     blob_idx += 1;
                 }
@@ -1632,14 +1753,34 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
 
         let agg_us = t2.elapsed().as_micros() as u64 - decompress_us;
 
-        // Finalize results using output mapping
+        // Finalize results using output mapping, applying HAVING filters
         let result_rows = if has_group_by {
             let mut rows = Vec::new();
             // Pre-finalize all agg results keyed by group
-            for (key, accumulators) in &group_map {
+            'group_loop: for (key, accumulators) in &group_map {
                 let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
                 for (spec_idx, spec) in agg_specs.iter().enumerate() {
                     agg_results.push(finalize_accumulator(&accumulators[spec_idx], spec));
+                }
+
+                // Apply HAVING filters on finalized aggregate values
+                for hf in &having_filters {
+                    let (datum, is_null) = agg_results[hf.agg_idx];
+                    if is_null {
+                        continue 'group_loop; // NULL doesn't satisfy HAVING
+                    }
+                    let val = datum.value() as i64;
+                    let pass = match hf.op {
+                        HavingOp::Gt => val > hf.const_val,
+                        HavingOp::Lt => val < hf.const_val,
+                        HavingOp::Ge => val >= hf.const_val,
+                        HavingOp::Le => val <= hf.const_val,
+                        HavingOp::Eq => val == hf.const_val,
+                        HavingOp::Ne => val != hf.const_val,
+                    };
+                    if !pass {
+                        continue 'group_loop;
+                    }
                 }
 
                 let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
@@ -1705,6 +1846,8 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             agg_us,
             total_segments,
             total_rows_processed,
+            batch_quals_count: batch_quals.len(),
+            where_quals_null: where_quals.is_null(),
         };
 
         let state_box = Box::new(state);
@@ -3033,6 +3176,56 @@ unsafe fn extract_batch_quals(
             }
 
             let tag = (*node).type_;
+
+            // Handle bare Var (boolean): PG simplifies `val_bool = true` to just `val_bool`
+            if tag == pg_sys::NodeTag::T_Var {
+                let var_node = node as *const pg_sys::Var;
+                let varattno = (*var_node).varattno as i32;
+                if varattno >= 1 && (varattno as usize) <= col_names.len() {
+                    let col_idx = (varattno - 1) as usize;
+                    if col_types[col_idx] == pg_sys::BOOLOID {
+                        batch_quals.push(BatchQual {
+                            col_idx,
+                            op: BatchCompareOp::Eq,
+                            const_datum: pg_sys::Datum::from(1usize), // true
+                            type_oid: pg_sys::BOOLOID,
+                            like_strategy: None,
+                            text_const: None,
+                        });
+                    }
+                }
+                continue;
+            }
+
+            // Handle NOT Var (boolean): PG may emit BoolExpr(NOT, [Var])
+            if tag == pg_sys::NodeTag::T_BoolExpr {
+                let boolexpr = node as *const pg_sys::BoolExpr;
+                if (*boolexpr).boolop == pg_sys::BoolExprType::NOT_EXPR {
+                    let args = (*boolexpr).args;
+                    if !args.is_null() && (*args).length == 1 {
+                        let inner = (*(*args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                        if !inner.is_null() && (*inner).type_ == pg_sys::NodeTag::T_Var {
+                            let var_node = inner as *const pg_sys::Var;
+                            let varattno = (*var_node).varattno as i32;
+                            if varattno >= 1 && (varattno as usize) <= col_names.len() {
+                                let col_idx = (varattno - 1) as usize;
+                                if col_types[col_idx] == pg_sys::BOOLOID {
+                                    batch_quals.push(BatchQual {
+                                        col_idx,
+                                        op: BatchCompareOp::Eq,
+                                        const_datum: pg_sys::Datum::from(0usize), // false
+                                        type_oid: pg_sys::BOOLOID,
+                                        like_strategy: None,
+                                        text_const: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
             if tag != pg_sys::NodeTag::T_OpExpr {
                 continue;
             }
@@ -4903,6 +5096,111 @@ unsafe fn decompress_text_blob_with_eq_filter(
             } else {
                 datums.push((nn_datums[val_idx], false));
                 sel.push(nn_sel[val_idx]);
+                val_idx += 1;
+            }
+        }
+        (datums, sel)
+    }
+}
+
+/// Decompress a text column blob to int4 lengths without varlena allocation.
+///
+/// For Dictionary: compute length of each dict entry once, map indices to lengths.
+/// For LZ4/LZ4Blocked: range lengths are the string lengths.
+///
+/// When `filter_empty` is true, rows where the string is empty ("") are marked
+/// as filtered in the returned selection vector. This handles `URL <> ''` without
+/// needing full text decompression.
+///
+/// Returns `(lengths_as_int4_datums, selection)`. Selection is empty if
+/// `filter_empty` is false and there are no nulls to filter.
+fn decompress_text_blob_to_lengths(
+    blob: &[u8],
+    filter_empty: bool,
+) -> (Vec<(pg_sys::Datum, bool)>, Vec<bool>) {
+    if blob.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let cc = CompressedColumnRef::from_bytes(blob);
+    let total_count = cc.row_count as usize;
+    let non_null_count = count_non_null(cc.null_bitmap, total_count);
+
+    // Compute non-null lengths and selection
+    let (nn_lengths, nn_sel): (Vec<i32>, Vec<bool>) = match cc.type_tag {
+        CompressionType::Dictionary => {
+            let (dict_entries, indices) =
+                compression::dictionary::decode_dict_and_indices(cc.data, non_null_count);
+
+            // Pre-compute lengths and empty status for each dict entry
+            let dict_lengths: Vec<i32> = dict_entries.iter().map(|s| s.len() as i32).collect();
+            let dict_empty: Vec<bool> = if filter_empty {
+                dict_entries.iter().map(|s| s.is_empty()).collect()
+            } else {
+                Vec::new()
+            };
+
+            let lengths: Vec<i32> = indices.iter().map(|&idx| dict_lengths[idx as usize]).collect();
+            let sel: Vec<bool> = if filter_empty {
+                indices.iter().map(|&idx| !dict_empty[idx as usize]).collect()
+            } else {
+                Vec::new()
+            };
+
+            (lengths, sel)
+        }
+        CompressionType::Lz4 => {
+            let (_buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
+            let lengths: Vec<i32> = ranges.iter().map(|&(_off, len)| len as i32).collect();
+            let sel: Vec<bool> = if filter_empty {
+                ranges.iter().map(|&(_off, len)| len > 0).collect()
+            } else {
+                Vec::new()
+            };
+            (lengths, sel)
+        }
+        CompressionType::Lz4Blocked => {
+            let (_buf, ranges) = compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
+            let lengths: Vec<i32> = ranges.iter().map(|&(_off, len)| len as i32).collect();
+            let sel: Vec<bool> = if filter_empty {
+                ranges.iter().map(|&(_off, len)| len > 0).collect()
+            } else {
+                Vec::new()
+            };
+            (lengths, sel)
+        }
+        _ => {
+            // Unexpected compression type for text — return zeros
+            let lengths = vec![0i32; non_null_count];
+            let sel = if filter_empty { vec![false; non_null_count] } else { Vec::new() };
+            (lengths, sel)
+        }
+    };
+
+    // Reinsert nulls
+    let null_bitmap = cc.null_bitmap;
+    if null_bitmap.is_empty() {
+        let datums: Vec<(pg_sys::Datum, bool)> = nn_lengths
+            .iter()
+            .map(|&len| (pg_sys::Datum::from(len as usize), false))
+            .collect();
+        (datums, nn_sel)
+    } else {
+        let mut datums = Vec::with_capacity(total_count);
+        let mut sel = if filter_empty { Vec::with_capacity(total_count) } else { Vec::new() };
+        let mut val_idx = 0;
+        for i in 0..total_count {
+            let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            if is_null {
+                datums.push((pg_sys::Datum::from(0usize), true));
+                if filter_empty {
+                    sel.push(false); // NULLs don't pass filter
+                }
+            } else {
+                datums.push((pg_sys::Datum::from(nn_lengths[val_idx] as usize), false));
+                if filter_empty {
+                    sel.push(nn_sel[val_idx]);
+                }
                 val_idx += 1;
             }
         }

@@ -171,10 +171,12 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
                 );
 
                 let stats_str = std::ffi::CString::new(format!(
-                    "segments={} rows_processed={} result_rows={}",
+                    "segments={} rows_processed={} result_rows={} batch_quals={} where_quals_null={}",
                     state.total_segments,
                     state.total_rows_processed,
                     state.result_rows.len(),
+                    state.batch_quals_count,
+                    state.where_quals_null,
                 ))
                 .unwrap();
                 pg_sys::ExplainPropertyText(
