@@ -71,6 +71,13 @@ pub(super) unsafe fn get_relpages(rel_oid: pg_sys::Oid) -> i32 {
     }
 }
 
+/// Get the uncompressed row count for a companion OID from seaturtle_partition catalog.
+/// Returns Some(row_count) if positive, None otherwise.
+pub(super) fn get_row_count(companion_oid: pg_sys::Oid) -> Option<i64> {
+    let (row_count, _) = get_partition_stats(companion_oid);
+    if row_count > 0 { Some(row_count) } else { None }
+}
+
 /// Get per-column ndistinct from seaturtle_partition catalog for a companion OID.
 /// Returns a map from column name to ndistinct count, or empty if unavailable.
 pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collections::HashMap<String, i64> {

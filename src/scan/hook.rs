@@ -1498,15 +1498,11 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
             }
         }
 
-        // Skip AggScan when any GROUP BY column has high cardinality (near-unique).
-        // Use stored ndistinct from compression to detect this, since PG's own
-        // statistics are unavailable (original partitions are empty after compression).
-        // Only check when there's no WHERE clause — a selective filter can drastically
-        // reduce the actual number of groups even for high-ndistinct columns.
-        if !group_specs.is_empty()
-            && !has_where
-            && group_by_relid != pg_sys::InvalidOid
-        {
+        // Fetch ndistinct stats for GROUP BY queries to:
+        // 1. Bail out on high-cardinality columns (only when no WHERE)
+        // 2. Provide accurate row estimates (always)
+        let mut ndistinct_estimated_groups: Option<f64> = None;
+        if !group_specs.is_empty() && group_by_relid != pg_sys::InvalidOid {
             let total_uncompressed_rows: f64 = companion_oids.iter()
                 .map(|&oid| { let (_, _, rows) = cost::estimate_cost(oid); rows })
                 .sum();
@@ -1522,40 +1518,74 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                 }
 
                 if !merged_ndistinct.is_empty() {
-                    let threshold = total_uncompressed_rows * 0.5;
-                    let has_high_cardinality = group_specs.iter().any(|gs| {
-                        if !matches!(gs.expr, GroupByExpr::Column) {
-                            return false;
+                    // Bail out for high-cardinality GROUP BY (only without WHERE)
+                    if !has_where {
+                        let threshold = total_uncompressed_rows * 0.5;
+                        let has_high_cardinality = group_specs.iter().any(|gs| {
+                            if !matches!(gs.expr, GroupByExpr::Column) {
+                                return false;
+                            }
+                            let attno = (gs.col_idx + 1) as i16;
+                            let name_ptr = pg_sys::get_attname(group_by_relid, attno, false);
+                            if name_ptr.is_null() {
+                                return false;
+                            }
+                            let col_name = std::ffi::CStr::from_ptr(name_ptr)
+                                .to_str()
+                                .unwrap_or("");
+                            merged_ndistinct
+                                .get(col_name)
+                                .map(|&nd| nd as f64 > threshold)
+                                .unwrap_or(false)
+                        });
+                        if has_high_cardinality {
+                            return;
                         }
-                        let attno = (gs.col_idx + 1) as i16;
-                        let name_ptr = pg_sys::get_attname(group_by_relid, attno, false);
-                        if name_ptr.is_null() {
-                            return false;
+                    }
+
+                    // Compute ndistinct-based group estimate for all-Column GROUP BY
+                    let all_column = group_specs.iter().all(|gs| matches!(gs.expr, GroupByExpr::Column));
+                    if all_column {
+                        let mut product: f64 = 1.0;
+                        let mut all_found = true;
+                        for gs in &group_specs {
+                            let attno = (gs.col_idx + 1) as i16;
+                            let name_ptr = pg_sys::get_attname(group_by_relid, attno, false);
+                            if name_ptr.is_null() {
+                                all_found = false;
+                                break;
+                            }
+                            let col_name = std::ffi::CStr::from_ptr(name_ptr)
+                                .to_str()
+                                .unwrap_or("");
+                            if let Some(&nd) = merged_ndistinct.get(col_name) {
+                                product *= nd as f64;
+                            } else {
+                                all_found = false;
+                                break;
+                            }
                         }
-                        let col_name = std::ffi::CStr::from_ptr(name_ptr)
-                            .to_str()
-                            .unwrap_or("");
-                        merged_ndistinct
-                            .get(col_name)
-                            .map(|&nd| nd as f64 > threshold)
-                            .unwrap_or(false)
-                    });
-                    if has_high_cardinality {
-                        return;
+                        if all_found {
+                            ndistinct_estimated_groups = Some(product.min(total_uncompressed_rows));
+                        }
                     }
                 }
             }
         }
 
-        // Use PG's estimated groups from its already-added paths for our row estimate.
+        // Use ndistinct estimate, fall back to PG's pathlist estimate, then 100.
         let pg_estimated_groups = if !group_specs.is_empty() {
-            let pathlist = (*output_rel).pathlist;
-            if !pathlist.is_null() && (*pathlist).length > 0 {
-                let first_path =
-                    (*(*pathlist).elements.add(0)).ptr_value as *const pg_sys::Path;
-                (*first_path).rows
+            if let Some(est) = ndistinct_estimated_groups {
+                est
             } else {
-                100.0
+                let pathlist = (*output_rel).pathlist;
+                if !pathlist.is_null() && (*pathlist).length > 0 {
+                    let first_path =
+                        (*(*pathlist).elements.add(0)).ptr_value as *const pg_sys::Path;
+                    (*first_path).rows
+                } else {
+                    100.0
+                }
             }
         } else {
             0.0

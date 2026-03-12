@@ -1540,6 +1540,74 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
         let meta = Spi::connect(|client| load_metadata(client, &first_name));
         let metadata_us = t0.elapsed().as_micros() as u64;
 
+        // Short-circuit: answer scalar COUNT(*)/COUNT(DISTINCT) from catalog
+        // without scanning any segments.
+        if group_specs.is_empty()
+            && where_quals.is_null()
+            && having_filters.is_empty()
+        {
+            let catalog_answers: Option<Vec<(pg_sys::Datum, bool)>> = (|| {
+                let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
+                for spec in &agg_specs {
+                    match spec.agg_type {
+                        AggType::CountStar => {
+                            let mut total: i64 = 0;
+                            for &oid in &companion_oids {
+                                total += super::cost::get_row_count(oid)?;
+                            }
+                            agg_results.push((pg_sys::Datum::from(total as usize), false));
+                        }
+                        AggType::CountDistinct if spec.expr_kind == AggExpr::Column => {
+                            // Can't merge distinct counts across partitions
+                            if companion_oids.len() != 1 {
+                                return None;
+                            }
+                            let nd_map = super::cost::get_column_ndistinct(companion_oids[0]);
+                            if nd_map.is_empty() {
+                                return None;
+                            }
+                            let col_name = meta.col_names.get(spec.col_idx as usize)?;
+                            let nd = nd_map.get(col_name)?;
+                            agg_results.push((pg_sys::Datum::from(*nd as usize), false));
+                        }
+                        _ => return None, // Non-catalog-answerable agg
+                    }
+                }
+                Some(agg_results)
+            })();
+
+            if let Some(agg_results) = catalog_answers {
+                let num_result_cols = output_map.len();
+                let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
+                for entry in &output_map {
+                    match entry {
+                        OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
+                        OutputEntry::Group(_) => row.push((pg_sys::Datum::from(0usize), true)),
+                    }
+                }
+                let state = AggScanState {
+                    _agg_specs: agg_specs,
+                    _group_specs: group_specs,
+                    result_rows: vec![row],
+                    result_idx: 0,
+                    _num_result_cols: num_result_cols,
+                    metadata_us,
+                    heap_scan_us: 0,
+                    decompress_us: 0,
+                    agg_us: 0,
+                    total_segments: 0,
+                    total_rows_processed: 0,
+                    batch_quals_count: 0,
+                    where_quals_null: true,
+                    regex_cache_size: 0,
+                    regex_cache_calls: 0,
+                };
+                let state_ptr = Box::into_raw(Box::new(state));
+                (*node).custom_ps = state_ptr as *mut pg_sys::List;
+                return;
+            }
+        }
+
         // Build needed_cols: only columns referenced by aggregates and group-by
         let num_cols = meta.col_names.len();
         let mut needed_cols = vec![false; num_cols];
