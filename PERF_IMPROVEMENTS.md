@@ -43,7 +43,7 @@ Tracking SeaTurtle compressed vs uncompressed performance on ClickBench.
 | Q33    | WatchID+ClientIP all      |         625.7 |       452.8 |  1.38x |
 | Q34    | Top URLs                  |        1194.7 |       326.2 |  3.66x |
 | Q35    | Top URLs with const       |        1123.7 |       299.1 |  3.76x |
-| Q36    | ClientIP arithmetic       |          98.7 |       143.1 |  0.69x |
+| Q36    | ClientIP arithmetic       |         110.3 |        66.8 |  1.65x |
 | Q37    | CounterID=62 URLs         |        1785.5 |       145.0 | 12.32x |
 | Q38    | CounterID=62 Titles       |         494.4 |        68.6 |  7.21x |
 | Q39    | CounterID=62 links        |         143.8 |        28.8 |  4.99x |
@@ -93,7 +93,7 @@ Tracking SeaTurtle compressed vs uncompressed performance on ClickBench.
 | Q33    |     21.422 ms |      0.349 |      3.267 |      17.238 |      0.000 |      0.568 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=1000000 rows_filtered=0 rows |
 | Q34    |     32.899 ms |      0.349 |      2.993 |      28.088 |      0.000 |      1.469 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=1000000 rows_filtered=0 rows |
 | Q35    |     30.933 ms |      0.340 |      2.469 |      27.430 |      0.000 |      0.694 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=1000000 rows_filtered=0 rows |
-| Q36    |      4.855 ms |      0.305 |      1.432 |       2.456 |      0.000 |      0.662 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=1000000 rows_filtered=0 rows |
+| Q36    |     85.609 ms |      1.325 |      2.412 |       6.351 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
 | Q37    |     23.929 ms |      0.340 |      1.866 |      19.490 |      1.799 |      0.434 | segments=15 segments_skipped=19 phase2_skipped=0 rows_out=376899 rows_filtered=0 rows |
 | Q38    |     16.522 ms |      0.329 |      0.787 |      10.345 |      1.917 |      3.144 | segments=15 segments_skipped=19 phase2_skipped=0 rows_out=370550 rows_filtered=0 rows |
 | Q39    |     21.504 ms |      0.350 |      2.406 |      16.875 |      1.825 |      0.048 | segments=15 segments_skipped=19 phase2_skipped=0 rows_out=26918 rows_filtered=0 rows_ |
@@ -351,6 +351,20 @@ Three changes that eliminate redundant per-row overhead:
    SIMD-accelerated pass instead of per-string `str::contains`. Cross-boundary
    safety: validates the full needle fits within a single string's byte range.
 
+### 27. Expression GROUP BY pushdown (col +/- const) [DONE]
+
+**Impact: Q36 143ms -> 67ms (fixes 0.69x regression -> 1.65x)**
+
+`GroupByExpr::AddConst { offset, op_oid }` detects `col + const` / `col - const`
+in GROUP BY expressions during the planner hook. Both `+` and `-` operators are
+supported; for `-`, the constant is negated so the offset is always stored as
+addition. At execution time, the group key is computed as `col_value + offset`.
+
+For Q36's `GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3`, all four keys
+are pushed into SeaTurtleAgg as a 4-element key vector. The scan processes 1M
+rows and emits only 10 (via TopN pushdown), eliminating the PG hash agg that
+previously dominated at 143ms.
+
 ---
 
 ## Regression Queries (Compressed Slower Than Uncompressed)
@@ -374,6 +388,9 @@ runs via Rust `regex` crate on raw slices with cross-segment caching.
 **Q23 (was 0.94x):** Fixed by ExecQual removal (#26). Eliminating redundant
 per-row PG qual evaluation brought ratio to 1.10x.
 
+**Q36 (was 0.69x):** Fixed by expression GROUP BY pushdown (#27). `col +/- const`
+in GROUP BY pushed into AggScan, eliminating 1M-row emit to PG hash agg.
+
 ### Remaining regressions
 
 **Q24 (0.71x):** `SELECT * WHERE URL LIKE '%google%' ORDER BY EventTime LIMIT 10`.
@@ -382,11 +399,7 @@ heap_scan=24ms. See planned #26 and #29.
 
 **Q29 (0.80x):** `REGEXP_REPLACE(Referer, ...) GROUP BY`. Decompress=756ms on
 Referer (high-cardinality LZ4). The regex runs in Rust but decompression of
-the full Referer column dominates. See planned #24.
-
-**Q36 (0.69x):** `GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3`.
-Expression GROUP BY not pushed into AggScan; emits 1M rows to PG hash agg.
-Scan itself is only 4.9ms. See planned #27.
+the full Referer column dominates. (#24 evaluated and deemed not worth implementing.)
 
 **Q33 (1.38x):** `GROUP BY WatchID, ClientIP` — high-cardinality hash agg.
 SeaTurtle scan=21ms, but PG hash agg on 1M rows with ~1M groups dominates.
@@ -399,30 +412,17 @@ high-cardinality keys, emit overhead for 1M rows.
 
 ## Planned Improvements
 
-### 24. Late text materialization
+### ~~24. Late text materialization~~ — Won't implement
 
-**Target: 10-30% improvement on all text-heavy queries (Q17, Q19, Q34, Q35)**
-**Complexity: High**
+**Status: Won't implement — insufficient benefit**
 
-Currently, text decompression always allocates PG varlena datums (even with
-arena). For queries where text columns pass through to aggregation or sorting,
-the full varlena is created for every row even if only a subset is actually
-accessed.
-
-**Approach:** Keep text data in "raw" form (LZ4 buffer + offset/len pairs, or
-dictionary + index array) during decompression. Only materialize to PG varlena
-when the row is about to be emitted and the text datum is actually needed.
-
-This is the columnar equivalent of "late materialization" from column-store
-literature. The selection vector from batch quals determines which rows need
-materialization; combined with lazy column decompression (#11), only matching
-rows in non-filter columns would ever touch palloc.
-
-**Interaction with arena allocation:** Could replace the current arena approach.
-Instead of one big arena for all rows, allocate a small arena for only the
-rows that survive filtering.
-
-**Files:** `src/scan/exec.rs` (new `LazyTextColumn` type, decompression paths)
+Phase 2 already only materializes varlena for selected rows via
+`decompress_text_blob_with_selection`. The text-heavy benchmark queries
+(Q34, Q35, Q38) all have `all_quals_batch_handled == true`, meaning every
+selected row is emitted — late materialization would save zero work. For
+queries with remaining PG quals, the filtered columns are typically
+numeric/timestamp, not text. The per-row palloc tradeoff (losing arena
+allocation) would partially offset any gain in the narrow case where it helps.
 
 ### 25. Bloom filters for text column segment pruning
 
@@ -439,29 +439,6 @@ columns where the dictionary approach doesn't apply.
 
 **Files:** `src/compress.rs` (bloom filter in companion table schema),
 `src/scan/exec.rs` (bloom filter test in segment loading)
-
-### 27. Expression GROUP BY pushdown (col +/- const)
-
-**Target: Q36 143.1ms -> ~10ms (fixes 0.69x regression)**
-**Complexity: Low**
-
-`GROUP BY ClientIP, ClientIP-1, ClientIP-2, ClientIP-3` emits 1M rows because
-AggScan doesn't recognize `col - const` in GROUP BY expressions. Since all
-derived columns are trivially computable from `ClientIP`, the GROUP BY is
-effectively just `GROUP BY ClientIP`.
-
-**Approach:** Add `GroupByExpr::AddConst { col_idx, offset }` similar to
-existing `AggExpr::AddConst`. Detect `col + const` / `col - const` in GROUP BY
-during planner hook. At execution time, group by the base column only and
-reconstruct derived columns during emit.
-
-The planner should also recognize that `GROUP BY a, a-1, a-2, a-3` has the
-same grouping cardinality as `GROUP BY a` alone — all derived keys are
-functionally dependent. This means the hash table only needs one key.
-
-**Files:** `src/scan/hook.rs` (detect expression GROUP BY),
-`src/scan/path.rs` (serialize to custom_private),
-`src/scan/exec.rs` (reconstruct derived columns during emit)
 
 ### 28. Text GROUP BY in AggScan
 
@@ -482,8 +459,8 @@ raw `&str` slices during decompression, store references into the decompressed
 buffer. Combined with Top-N pushdown (#21), the hash table can be pruned
 during aggregation — only keeping entries that could make it into the top N.
 
-**Interaction with late materialization (#24):** If text columns are kept in
-raw form, the hash table can reference slices without varlena allocation.
+**Note:** Late materialization (#24) was evaluated and deemed not worth
+implementing, so this optimization should use standard varlena allocation.
 
 **Files:** `src/scan/hook.rs` (detect text GROUP BY),
 `src/scan/exec.rs` (extend `AggState` hash table for string keys)

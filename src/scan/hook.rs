@@ -578,6 +578,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
         let mut aggrefs: Vec<*const pg_sys::Aggref> = Vec::new();
         let mut non_agg_vars: Vec<*const pg_sys::Var> = Vec::new();
         let mut non_agg_func_exprs: Vec<(i32, *const pg_sys::FuncExpr)> = Vec::new(); // (tlist_index, FuncExpr)
+        let mut non_agg_op_exprs: Vec<(i32, *const pg_sys::OpExpr)> = Vec::new(); // (tlist_index, OpExpr)
 
         for i in 0..nentries {
             let te = pg_sys::list_nth(tlist, i) as *const pg_sys::TargetEntry;
@@ -600,6 +601,9 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
             } else if (*expr).type_ == pg_sys::NodeTag::T_FuncExpr && has_group_by {
                 // Non-aggregate FuncExpr in target list — must match a GROUP BY expression
                 non_agg_func_exprs.push((i, expr as *const pg_sys::FuncExpr));
+            } else if (*expr).type_ == pg_sys::NodeTag::T_OpExpr && has_group_by {
+                // Non-aggregate OpExpr in target list (e.g. col - 1) — must match a GROUP BY expression
+                non_agg_op_exprs.push((i, expr as *const pg_sys::OpExpr));
             } else {
                 return; // Non-aggregate, non-Var, non-FuncExpr expression — bail
             }
@@ -1392,6 +1396,83 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                     } else {
                         return; // Unsupported function in GROUP BY
                     }
+                } else if (*expr).type_ == pg_sys::NodeTag::T_OpExpr {
+                    // col +/- const expression in GROUP BY
+                    let opexpr = expr as *const pg_sys::OpExpr;
+                    let opname_ptr = pg_sys::get_opname((*opexpr).opno);
+                    if opname_ptr.is_null() {
+                        return;
+                    }
+                    let opname = std::ffi::CStr::from_ptr(opname_ptr)
+                        .to_str()
+                        .unwrap_or("");
+                    let is_plus = opname == "+";
+                    let is_minus = opname == "-";
+                    if !is_plus && !is_minus {
+                        return;
+                    }
+                    let op_args = (*opexpr).args;
+                    if op_args.is_null() || (*op_args).length != 2 {
+                        return;
+                    }
+                    let left = (*(*op_args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                    let right = (*(*op_args).elements.add(1)).ptr_value as *const pg_sys::Node;
+                    if left.is_null() || right.is_null() {
+                        return;
+                    }
+                    // Extract (Var, Const) — for minus, Var must be on the left
+                    let (var_ptr, const_ptr, negate) = if (*left).type_ == pg_sys::NodeTag::T_Var
+                        && (*right).type_ == pg_sys::NodeTag::T_Const
+                    {
+                        (left as *const pg_sys::Var, right as *const pg_sys::Const, is_minus)
+                    } else if is_plus
+                        && (*left).type_ == pg_sys::NodeTag::T_Const
+                        && (*right).type_ == pg_sys::NodeTag::T_Var
+                    {
+                        (right as *const pg_sys::Var, left as *const pg_sys::Const, false)
+                    } else {
+                        return;
+                    };
+                    if (*const_ptr).constisnull {
+                        return;
+                    }
+                    let const_type = (*const_ptr).consttype;
+                    let const_val: i64 = match const_type {
+                        pg_sys::INT2OID => (*const_ptr).constvalue.value() as i16 as i64,
+                        pg_sys::INT4OID => (*const_ptr).constvalue.value() as i32 as i64,
+                        pg_sys::INT8OID => (*const_ptr).constvalue.value() as i64,
+                        _ => return,
+                    };
+                    let offset = if negate { -const_val } else { const_val };
+                    if offset < i32::MIN as i64 || offset > i32::MAX as i64 {
+                        return;
+                    }
+
+                    let col_idx = (*var_ptr).varattno as i32 - 1;
+                    let varno = (*var_ptr).varno as usize;
+                    if varno == 0 || varno >= (*root).simple_rel_array_size as usize {
+                        return;
+                    }
+                    let rte = *(*root).simple_rte_array.add(varno);
+                    if rte.is_null() {
+                        return;
+                    }
+                    let relid = (*rte).relid;
+                    if group_by_relid == pg_sys::InvalidOid {
+                        group_by_relid = relid;
+                    }
+                    let mut type_oid = pg_sys::InvalidOid;
+                    let mut typmod: i32 = -1;
+                    let mut collation: pg_sys::Oid = pg_sys::InvalidOid;
+                    pg_sys::get_atttypetypmodcoll(relid, (*var_ptr).varattno, &mut type_oid, &mut typmod, &mut collation);
+
+                    let op_oid = u32::from((*opexpr).opno);
+
+                    group_specs.push(super::exec::GroupByColSpec {
+                        col_idx,
+                        type_oid,
+                        expr: GroupByExpr::AddConst { offset, op_oid },
+                    });
                 } else {
                     return; // Unsupported GROUP BY expression type
                 }
@@ -1436,6 +1517,38 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                 });
                 if !matched {
                     return; // FuncExpr in target doesn't match any GROUP BY spec
+                }
+            }
+
+            // Validate that each non_agg_op_exprs entry matches a GROUP BY AddConst spec.
+            for &(_tlist_idx, opexpr) in &non_agg_op_exprs {
+                let op_oid = u32::from((*opexpr).opno);
+                let op_args = (*opexpr).args;
+                if op_args.is_null() || (*op_args).length != 2 {
+                    return;
+                }
+                // Find the Var in the OpExpr args
+                let mut col_idx = -1_i32;
+                for ai in 0..(*op_args).length {
+                    let arg = (*(*op_args).elements.add(ai as usize)).ptr_value as *const pg_sys::Node;
+                    if !arg.is_null() && (*arg).type_ == pg_sys::NodeTag::T_Var {
+                        let var_node = arg as *const pg_sys::Var;
+                        col_idx = (*var_node).varattno as i32 - 1;
+                        break;
+                    }
+                }
+                if col_idx < 0 {
+                    return;
+                }
+                let matched = group_specs.iter().any(|gs| {
+                    if let GroupByExpr::AddConst { op_oid: spec_op_oid, .. } = &gs.expr {
+                        gs.col_idx == col_idx && *spec_op_oid == op_oid
+                    } else {
+                        false
+                    }
+                });
+                if !matched {
+                    return; // OpExpr in target doesn't match any GROUP BY spec
                 }
             }
         }
@@ -1698,7 +1811,7 @@ pub unsafe extern "C-unwind" fn seaturtle_create_upper_paths(
                                     all_found = false;
                                     break;
                                 }
-                                GroupByExpr::Column => {
+                                GroupByExpr::Column | GroupByExpr::AddConst { .. } => {
                                     let attno = (gs.col_idx + 1) as i16;
                                     let name_ptr = pg_sys::get_attname(group_by_relid, attno, false);
                                     if name_ptr.is_null() {

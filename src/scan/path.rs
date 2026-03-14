@@ -691,6 +691,11 @@ pub unsafe fn add_agg_path(
                         private_list = pg_sys::lappend_int(private_list, b as i32);
                     }
                 }
+                super::exec::GroupByExpr::AddConst { offset, op_oid } => {
+                    private_list = pg_sys::lappend_int(private_list, 4); // expr_tag=4
+                    private_list = pg_sys::lappend_int(private_list, *offset as i32);
+                    private_list = pg_sys::lappend_int(private_list, *op_oid as i32);
+                }
             }
         }
         // Store HAVING filters for thread-local passing to plan_agg_path
@@ -776,6 +781,7 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
             RegexpReplace { func_oid: u32, collation: u32, pattern: String, replacement: String },
             DateTrunc { func_oid: u32, unit: String },
             Extract { func_oid: u32, unit: String },
+            AddConst { offset: i32, op_oid: u32 },
         }
         #[derive(Clone)]
         struct ParsedGroup {
@@ -872,6 +878,11 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                     }
                     let unit = String::from_utf8_lossy(&unit_bytes).into_owned();
                     ParsedGroupExpr::Extract { func_oid, unit }
+                } else if expr_tag == 4 {
+                    let offset = pg_sys::list_nth_int(path_private, idx);
+                    let op_oid = pg_sys::list_nth_int(path_private, idx + 1) as u32;
+                    idx += 2;
+                    ParsedGroupExpr::AddConst { offset, op_oid }
                 } else {
                     ParsedGroupExpr::Column
                 };
@@ -940,6 +951,61 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                         }
                     }).unwrap_or(0) as i32;
                     output_map.push((1, group_idx));
+                } else if (*expr).type_ == pg_sys::NodeTag::T_OpExpr {
+                    // OpExpr in target list (e.g. col - 1) — find matching GROUP BY AddConst spec
+                    let opexpr = expr as *const pg_sys::OpExpr;
+                    let op_oid = u32::from((*opexpr).opno);
+                    let op_args = (*opexpr).args;
+                    let mut col_idx = -1_i32;
+                    let mut tlist_offset: i32 = 0;
+                    let mut is_minus = false;
+                    if !op_args.is_null() && (*op_args).length == 2 {
+                        let left = (*(*op_args).elements.add(0)).ptr_value as *const pg_sys::Node;
+                        let right = (*(*op_args).elements.add(1)).ptr_value as *const pg_sys::Node;
+                        if !left.is_null() && !right.is_null() {
+                            // Determine operator name for sign
+                            let opname_ptr = pg_sys::get_opname((*opexpr).opno);
+                            if !opname_ptr.is_null() {
+                                let opname = std::ffi::CStr::from_ptr(opname_ptr).to_str().unwrap_or("");
+                                is_minus = opname == "-";
+                            }
+                            if (*left).type_ == pg_sys::NodeTag::T_Var && (*right).type_ == pg_sys::NodeTag::T_Const {
+                                col_idx = (*(left as *const pg_sys::Var)).varattno as i32 - 1;
+                                let c = right as *const pg_sys::Const;
+                                if !(*c).constisnull {
+                                    let cv: i64 = match (*c).consttype {
+                                        pg_sys::INT2OID => (*c).constvalue.value() as i16 as i64,
+                                        pg_sys::INT4OID => (*c).constvalue.value() as i32 as i64,
+                                        pg_sys::INT8OID => (*c).constvalue.value() as i64,
+                                        _ => 0,
+                                    };
+                                    tlist_offset = if is_minus { -cv } else { cv } as i32;
+                                }
+                            } else if (*left).type_ == pg_sys::NodeTag::T_Const && (*right).type_ == pg_sys::NodeTag::T_Var {
+                                col_idx = (*(right as *const pg_sys::Var)).varattno as i32 - 1;
+                                let c = left as *const pg_sys::Const;
+                                if !(*c).constisnull {
+                                    let cv: i64 = match (*c).consttype {
+                                        pg_sys::INT2OID => (*c).constvalue.value() as i16 as i64,
+                                        pg_sys::INT4OID => (*c).constvalue.value() as i32 as i64,
+                                        pg_sys::INT8OID => (*c).constvalue.value() as i64,
+                                        _ => 0,
+                                    };
+                                    tlist_offset = cv as i32; // const + col, no negation
+                                }
+                            }
+                        }
+                    }
+                    let group_idx = parsed_groups.iter().position(|g| {
+                        if g.col_idx != col_idx { return false; }
+                        match &g.expr {
+                            ParsedGroupExpr::AddConst { offset, op_oid: spec_op_oid } => {
+                                *offset == tlist_offset && *spec_op_oid == op_oid
+                            }
+                            _ => false,
+                        }
+                    }).unwrap_or(0) as i32;
+                    output_map.push((1, group_idx));
                 }
             }
         }
@@ -999,6 +1065,11 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                     for &b in unit.as_bytes() {
                         private_list = pg_sys::lappend_int(private_list, b as i32);
                     }
+                }
+                ParsedGroupExpr::AddConst { offset, op_oid } => {
+                    private_list = pg_sys::lappend_int(private_list, 4);
+                    private_list = pg_sys::lappend_int(private_list, *offset);
+                    private_list = pg_sys::lappend_int(private_list, *op_oid as i32);
                 }
             }
         }

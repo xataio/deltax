@@ -546,6 +546,8 @@ pub(super) enum GroupByExpr {
     DateTrunc { unit: String, unit_usecs: i64, func_oid: u32 },
     /// extract(field FROM timestamp_col): GROUP BY extract(minute FROM ts)
     Extract { unit: String, func_oid: u32 },
+    /// col +/- const: GROUP BY col - 1  (offset is always stored as addition, so col-1 → offset=-1)
+    AddConst { offset: i64, op_oid: u32 },
 }
 
 /// Convert a date_trunc unit string to microseconds.
@@ -1607,6 +1609,12 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                     }
                     let unit = String::from_utf8_lossy(&unit_bytes).into_owned();
                     GroupByExpr::Extract { unit, func_oid }
+                } else if expr_tag == 4 {
+                    // AddConst: offset_i32, op_oid
+                    let offset = pg_sys::list_nth_int(custom_private, idx) as i64;
+                    let op_oid = pg_sys::list_nth_int(custom_private, idx + 1) as u32;
+                    idx += 2;
+                    GroupByExpr::AddConst { offset, op_oid }
                 } else {
                     GroupByExpr::Column
                 };
@@ -2410,6 +2418,11 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
                                     let pg_usec = col[row].0.value() as i64;
                                     let extracted = extract_field_from_usecs(pg_usec, unit);
                                     key.push(GroupKeyVal::Int(extracted));
+                                }
+                                GroupByExpr::AddConst { offset, .. } => {
+                                    let datum = col[row].0;
+                                    let v = datum.value() as i64;
+                                    key.push(GroupKeyVal::Int(v + offset));
                                 }
                                 GroupByExpr::Column => {
                                     // Dictionary-index-level text GROUP BY: lookup from pre-built map

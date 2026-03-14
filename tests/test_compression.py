@@ -1453,6 +1453,59 @@ class TestTransparentQuery:
             f"  after:  {after}"
         )
 
+    def test_transparent_query_add_const_group_by(self, db):
+        """GROUP BY col, col - 1, col + 2 with COUNT(*).
+
+        Exercises the AddConst GROUP BY pushdown into SeaTurtleAgg.
+        Verifies results match before/after compression.
+        """
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE ac_gb (
+                ts TIMESTAMPTZ NOT NULL,
+                val INT NOT NULL
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('ac_gb', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Insert rows with a few distinct val values
+        values = []
+        for i in range(300):
+            ts = f"'2025-01-14 10:00:00+00'::timestamptz + interval '{i} seconds'"
+            v = i % 5
+            values.append(f"({ts}, {v})")
+        for j in range(0, len(values), 100):
+            batch = values[j:j + 100]
+            db.execute(
+                f"INSERT INTO ac_gb (ts, val) VALUES {','.join(batch)}"
+            )
+        db.commit()
+
+        q = (
+            "SELECT val, val - 1, val + 2, COUNT(*) AS c "
+            "FROM ac_gb "
+            "GROUP BY val, val - 1, val + 2 "
+            "ORDER BY val"
+        )
+        before = db.execute(q).fetchall()
+        assert len(before) == 5  # 5 distinct val values
+
+        # Compress
+        db.execute(
+            "SELECT seaturtle_enable_compression('ac_gb', "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "ac_gb")
+
+        after = db.execute(q).fetchall()
+        assert after == before, (
+            f"AddConst GROUP BY mismatch:\n"
+            f"  before: {before}\n"
+            f"  after:  {after}"
+        )
+
     def test_transparent_query_no_segment_by(self, db):
         """Same validation without segment_by columns."""
         setup_metrics_table(db)
