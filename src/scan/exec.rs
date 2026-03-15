@@ -317,6 +317,15 @@ struct ColMinMax {
     type_oid: pg_sys::Oid,
 }
 
+/// Per-column sum metadata from the companion table.
+#[allow(dead_code)]
+struct ColSum {
+    sum_datum: pg_sys::Datum,
+    sum_null: bool,
+    nonnull_count: i64,
+    type_oid: pg_sys::Oid,  // NUMERICOID or FLOAT8OID
+}
+
 /// Check whether a segment can be skipped based on dictionary pruning for LIKE quals.
 ///
 /// For each LIKE/NOT LIKE batch qual, finds the corresponding compressed blob and
@@ -405,6 +414,8 @@ struct SegmentData {
     max_time: Option<i64>,
     /// Per-column min/max (column name → ColMinMax).
     col_minmax: HashMap<String, ColMinMax>,
+    /// Per-column sum metadata (column name → ColSum).
+    col_sums: HashMap<String, ColSum>,
     /// Deferred TOAST pointer copies for lazy detoasting (Top-N only).
     /// Parallel to compressed_blobs: non-empty means "not yet detoasted, call
     /// detoast_lazy_blobs() to materialize". Empty means already detoasted or
@@ -951,7 +962,7 @@ pub unsafe extern "C-unwind" fn begin_seaturtle_append(
             let (segs, skipped, mm_skipped) = load_segments_heap(
                 oid, &meta.col_names, &meta.segment_by, &needed_cols,
                 &meta.time_column, false, &seg_filters, t_min, t_max,
-                lazy_cols.as_deref(), &batch_quals,
+                lazy_cols.as_deref(), &batch_quals, false,
             );
             all_segments.extend(segs);
             total_skipped += skipped;
@@ -1112,6 +1123,7 @@ pub unsafe extern "C-unwind" fn begin_count_scan(
                 None,
                 None,
                 &[],
+                false,
             );
             for seg in &segs {
                 total_count += seg.row_count as i64;
@@ -1336,6 +1348,7 @@ pub unsafe extern "C-unwind" fn begin_minmax_scan(
                 None,
                 None,
                 &[],
+                false,
             );
             for seg in &segs {
                 for (agg_idx, result) in results.iter_mut().enumerate() {
@@ -1804,6 +1817,225 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             }
         }
 
+        // Check if we can use the sum/metadata fast path:
+        // All agg specs are metadata-resolvable AND no GROUP BY AND no WHERE clause.
+        // SUM(col + const) is resolvable: SUM(col + C) = SUM(col) + C * COUNT(*)
+        let metadata_fast_path = group_specs.is_empty()
+            && where_quals.is_null()
+            && having_filters.is_empty()
+            && agg_specs.iter().all(|spec| {
+                match spec.agg_type {
+                    AggType::CountStar => true,
+                    AggType::Sum => {
+                        (spec.expr_kind == AggExpr::Column || spec.expr_kind == AggExpr::AddConst)
+                            && spec.col_idx >= 0 && {
+                            let t = spec.col_type_oid;
+                            t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
+                                || t == pg_sys::FLOAT4OID || t == pg_sys::FLOAT8OID
+                        }
+                    }
+                    AggType::Avg | AggType::Count => {
+                        spec.expr_kind == AggExpr::Column && spec.col_idx >= 0 && {
+                            let t = spec.col_type_oid;
+                            t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
+                                || t == pg_sys::FLOAT4OID || t == pg_sys::FLOAT8OID
+                        }
+                    }
+                    AggType::Min | AggType::Max => {
+                        spec.expr_kind == AggExpr::Column && spec.col_idx >= 0
+                    }
+                    _ => false,
+                }
+            });
+
+        if metadata_fast_path {
+            // Load segments with metadata only (no column decompression)
+            let needed_cols = vec![false; meta.col_names.len()];
+            let needs_sums = agg_specs.iter().any(|s| matches!(s.agg_type, AggType::Sum | AggType::Avg));
+            let needs_counts = agg_specs.iter().any(|s| matches!(s.agg_type, AggType::Count));
+            let needs_minmax = agg_specs.iter().any(|s| matches!(s.agg_type, AggType::Min | AggType::Max));
+
+            let t1 = Instant::now();
+            let mut all_segments: Vec<SegmentData> = Vec::new();
+            for &oid in &companion_oids {
+                let (segs, _, _) = load_segments_heap(
+                    oid, &meta.col_names, &meta.segment_by, &needed_cols,
+                    &meta.time_column, needs_minmax, &[], None, None, None,
+                    &[], needs_sums || needs_counts,
+                );
+                all_segments.extend(segs);
+            }
+            let heap_scan_us = t1.elapsed().as_micros() as u64;
+
+            // Check that sum metadata actually exists for all needed columns
+            let sums_available = agg_specs.iter().all(|spec| {
+                match spec.agg_type {
+                    AggType::Sum | AggType::Avg | AggType::Count => {
+                        let col_name = &meta.col_names[spec.col_idx as usize];
+                        all_segments.is_empty()
+                            || all_segments.iter().all(|seg| {
+                                match spec.agg_type {
+                                    AggType::Sum | AggType::Avg => seg.col_sums.contains_key(col_name),
+                                    AggType::Count => seg.col_sums.contains_key(col_name),
+                                    _ => true,
+                                }
+                            })
+                    }
+                    _ => true,
+                }
+            });
+            let minmax_available = agg_specs.iter().all(|spec| {
+                match spec.agg_type {
+                    AggType::Min | AggType::Max => {
+                        let col_name = &meta.col_names[spec.col_idx as usize];
+                        all_segments.is_empty()
+                            || all_segments.iter().all(|seg| seg.col_minmax.contains_key(col_name))
+                    }
+                    _ => true,
+                }
+            });
+
+            if sums_available && minmax_available {
+                // Accumulate from metadata
+                let mut accumulators: Vec<AggAccumulator> = agg_specs
+                    .iter()
+                    .map(|spec| AggAccumulator::new_for(spec.agg_type, spec.col_type_oid))
+                    .collect();
+
+                for seg in &all_segments {
+                    if seg.row_count == 0 { continue; }
+                    for (i, spec) in agg_specs.iter().enumerate() {
+                        match spec.agg_type {
+                            AggType::CountStar => {
+                                if let AggAccumulator::Count { count } = &mut accumulators[i] {
+                                    *count += seg.row_count as i64;
+                                }
+                            }
+                            AggType::Count => {
+                                let col_name = &meta.col_names[spec.col_idx as usize];
+                                if let Some(cs) = seg.col_sums.get(col_name) {
+                                    if let AggAccumulator::Count { count } = &mut accumulators[i] {
+                                        *count += cs.nonnull_count;
+                                    }
+                                }
+                            }
+                            AggType::Sum | AggType::Avg => {
+                                let col_name = &meta.col_names[spec.col_idx as usize];
+                                if let Some(cs) = seg.col_sums.get(col_name) {
+                                    if cs.sum_null { continue; }
+                                    // For SUM(col + C): SUM(col) + C * nonnull_count
+                                    let add_const = if spec.expr_kind == AggExpr::AddConst {
+                                        spec.const_offset
+                                    } else {
+                                        0
+                                    };
+                                    match &mut accumulators[i] {
+                                        AggAccumulator::SumInt { sum, count } => {
+                                            // Sum datum is NUMERIC — extract via numeric_out, parse as i128
+                                            let cstr = pg_sys::OidOutputFunctionCall(
+                                                pg_sys::Oid::from(1702u32), // numeric_out
+                                                cs.sum_datum,
+                                            );
+                                            let s = std::ffi::CStr::from_ptr(cstr)
+                                                .to_string_lossy();
+                                            if let Ok(v) = s.parse::<i128>() {
+                                                *sum += v + add_const as i128 * cs.nonnull_count as i128;
+                                                *count += cs.nonnull_count;
+                                            }
+                                            pg_sys::pfree(cstr as *mut _);
+                                        }
+                                        AggAccumulator::SumFloat { sum, count } => {
+                                            // Sum datum is FLOAT8
+                                            let f = f64::from_bits(cs.sum_datum.value() as u64);
+                                            *sum += f + add_const as f64 * cs.nonnull_count as f64;
+                                            *count += cs.nonnull_count;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            AggType::Min => {
+                                let col_name = &meta.col_names[spec.col_idx as usize];
+                                if let Some(cm) = seg.col_minmax.get(col_name) {
+                                    if cm.min_null { continue; }
+                                    match &mut accumulators[i] {
+                                        AggAccumulator::MinInt { val } => {
+                                            let v = cm.min_datum.value() as i64;
+                                            *val = Some(val.map_or(v, |cur| cur.min(v)));
+                                        }
+                                        AggAccumulator::MinFloat { val } => {
+                                            let v = f64::from_bits(cm.min_datum.value() as u64);
+                                            *val = Some(val.map_or(v, |cur| if v < cur { v } else { cur }));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            AggType::Max => {
+                                let col_name = &meta.col_names[spec.col_idx as usize];
+                                if let Some(cm) = seg.col_minmax.get(col_name) {
+                                    if cm.max_null { continue; }
+                                    match &mut accumulators[i] {
+                                        AggAccumulator::MaxInt { val } => {
+                                            let v = cm.max_datum.value() as i64;
+                                            *val = Some(val.map_or(v, |cur| cur.max(v)));
+                                        }
+                                        AggAccumulator::MaxFloat { val } => {
+                                            let v = f64::from_bits(cm.max_datum.value() as u64);
+                                            *val = Some(val.map_or(v, |cur| if v > cur { v } else { cur }));
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                // Finalize accumulators
+                let num_result_cols = output_map.len();
+                let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
+                for (i, acc) in accumulators.iter().enumerate() {
+                    agg_results.push(finalize_accumulator(acc, &agg_specs[i]));
+                }
+                let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
+                for entry in &output_map {
+                    match entry {
+                        OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
+                        OutputEntry::Group(_) => row.push((pg_sys::Datum::from(0usize), true)),
+                    }
+                }
+
+                let total_segments = all_segments.len() as u64;
+                let state = AggScanState {
+                    _agg_specs: agg_specs,
+                    _group_specs: group_specs,
+                    result_rows: vec![row],
+                    result_idx: 0,
+                    _num_result_cols: num_result_cols,
+                    metadata_us,
+                    heap_scan_us,
+                    decompress_us: 0,
+                    agg_us: 0,
+                    total_segments,
+                    total_rows_processed: 0,
+                    batch_quals_count: 0,
+                    where_quals_null: true,
+                    regex_cache_size: 0,
+                    regex_cache_calls: 0,
+                    topn_limit: 0,
+                    topn_sort_col: 0,
+                    topn_ascending: true,
+                    pre_topn_groups: 0,
+                };
+                let state_ptr = Box::into_raw(Box::new(state));
+                (*node).custom_ps = state_ptr as *mut pg_sys::List;
+                return;
+            }
+            // If metadata not available, fall through to normal path
+        }
+
         // Build needed_cols: only columns referenced by aggregates and group-by
         let num_cols = meta.col_names.len();
         let mut needed_cols = vec![false; num_cols];
@@ -1851,7 +2083,7 @@ pub unsafe extern "C-unwind" fn begin_agg_scan(
             let (segs, _, _) = load_segments_heap(
                 oid, &meta.col_names, &meta.segment_by, &needed_cols,
                 &meta.time_column, false, &seg_filters, time_min, time_max, None,
-                &batch_quals,
+                &batch_quals, false,
             );
             all_segments.extend(segs);
         }
@@ -3361,6 +3593,7 @@ unsafe fn load_segments_heap(
     time_max: Option<i64>,
     lazy_cols: Option<&[bool]>,
     batch_quals: &[BatchQual],
+    load_sums: bool,
 ) -> (Vec<SegmentData>, u64, u64) {
     unsafe {
         // Open companion table with AccessShareLock
@@ -3434,6 +3667,26 @@ unsafe fn load_segments_heap(
                     let type_oid = att_type_oids.get(min_name.as_str()).copied()
                         .unwrap_or(pg_sys::InvalidOid);
                     minmax_col_attnos.push((col_name.clone(), min_att, max_att, type_oid));
+                }
+            }
+        }
+
+        // Discover per-column sum/nonnull_count columns: (col_name, sum_attno, nonnull_count_attno, type_oid)
+        let mut sum_col_attnos: Vec<(String, usize, usize, pg_sys::Oid)> = Vec::new();
+        if load_sums {
+            for col_name in col_names {
+                if segment_by.contains(col_name) {
+                    continue;
+                }
+                let sum_name = format!("_sum_{}", col_name);
+                let nonnull_name = format!("_nonnull_count_{}", col_name);
+                if let (Some(&sum_att), Some(&nn_att)) = (
+                    attno_map.get(sum_name.as_str()),
+                    attno_map.get(nonnull_name.as_str()),
+                ) {
+                    let type_oid = att_type_oids.get(sum_name.as_str()).copied()
+                        .unwrap_or(pg_sys::InvalidOid);
+                    sum_col_attnos.push((col_name.clone(), sum_att, nn_att, type_oid));
                 }
             }
         }
@@ -3651,6 +3904,20 @@ unsafe fn load_segments_heap(
                 });
             }
 
+            // Extract per-column sum/nonnull_count
+            let mut col_sums = HashMap::new();
+            for (col_name, sum_att, nn_att, type_oid) in &sum_col_attnos {
+                let sum_null = nulls[*sum_att];
+                let sum_datum = if sum_null { pg_sys::Datum::from(0usize) } else { values[*sum_att] };
+                let nonnull_count = if nulls[*nn_att] { 0i64 } else { values[*nn_att].value() as i64 };
+                col_sums.insert(col_name.clone(), ColSum {
+                    sum_datum,
+                    sum_null,
+                    nonnull_count,
+                    type_oid: *type_oid,
+                });
+            }
+
             segments.push(SegmentData {
                 segment_values,
                 compressed_blobs,
@@ -3658,6 +3925,7 @@ unsafe fn load_segments_heap(
                 min_time: seg_min_time,
                 max_time: seg_max_time,
                 col_minmax,
+                col_sums,
                 toast_pointers,
             });
         }
@@ -3769,7 +4037,7 @@ fn load_decompress_state(
         load_segments_heap(
             companion_oid, &meta.col_names, &meta.segment_by, &needed_cols,
             &meta.time_column, false, &seg_filters, t_min, t_max,
-            lazy_cols.as_deref(), &batch_quals,
+            lazy_cols.as_deref(), &batch_quals, false,
         )
     };
     let heap_scan_us = t1.elapsed().as_micros() as u64;

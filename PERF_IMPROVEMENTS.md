@@ -8,99 +8,51 @@ Tracking SeaTurtle compressed vs uncompressed performance on ClickBench.
 
 | Query  | Description               |  Uncompr (ms) |  Compr (ms) |  Ratio |
 |--------|---------------------------|---------------|-------------|--------|
-| Q1     | COUNT(*)                  |          52.0 |         0.9 | 57.22x |
-| Q2     | COUNT WHERE AdvEngineID   |          81.1 |         5.7 | 14.31x |
-| Q3     | SUM/AVG full scan         |          90.1 |        11.9 |  7.55x |
-| Q4     | AVG UserID                |          57.9 |         7.6 |  7.61x |
-| Q5     | COUNT DISTINCT UserID     |         204.5 |         0.7 | 313.75x |
-| Q6     | COUNT DISTINCT SearchPhrase |         367.8 |         0.6 | 566.55x |
-| Q7     | MIN/MAX EventDate         |          56.4 |         0.8 | 68.48x |
-| Q8     | GROUP BY AdvEngineID      |          82.4 |         5.1 | 16.25x |
-| Q9     | GROUP BY RegionID         |         302.5 |        30.6 |  9.87x |
-| Q10    | RegionID multi-agg        |         404.2 |        39.1 | 10.34x |
-| Q11    | MobilePhoneModel users    |         207.3 |         8.1 | 25.73x |
-| Q12    | MobilePhone+Model users   |         236.8 |        12.5 | 18.99x |
-| Q13    | Top SearchPhrase          |         106.0 |        20.8 |  5.08x |
-| Q14    | SearchPhrase users        |         306.6 |        25.3 | 12.13x |
-| Q15    | SearchEngine+Phrase       |         232.4 |        24.2 |  9.62x |
-| Q16    | Top UserID                |          87.5 |        22.8 |  3.84x |
-| Q17    | UserID+SearchPhrase top   |         331.6 |        65.6 |  5.05x |
-| Q18    | UserID+SearchPhrase       |         114.1 |        62.4 |  1.83x |
-| Q19    | UserID+minute+Phrase      |         556.2 |       274.3 |  2.03x |
-| Q20    | Point lookup UserID       |          56.6 |         1.6 | 35.55x |
-| Q21    | URL LIKE google           |          90.0 |        56.7 |  1.59x |
-| Q22    | SearchPhrase+URL google   |         113.0 |        60.4 |  1.87x |
-| Q23    | Title LIKE Google         |         129.6 |       126.4 |  1.03x |
-| Q24    | SELECT * google sorted    |          89.7 |       121.4 |  0.74x |
-| Q25    | SearchPhrase by time      |          86.2 |        37.3 |  2.31x |
-| Q26    | SearchPhrase sorted       |          84.8 |        11.8 |  7.17x |
-| Q27    | SearchPhrase time+phrase  |          82.5 |        10.6 |  7.80x |
-| Q28    | CounterID avg URL len     |         108.5 |        50.8 |  2.14x |
-| Q29    | Referer domain regex      |         950.9 |      1146.6 |  0.83x |
-| Q30    | Wide SUM 89 cols          |         203.4 |         4.7 | 43.57x |
-| Q31    | SearchEngine+ClientIP     |         231.9 |        25.8 |  8.98x |
-| Q32    | WatchID+ClientIP filter   |         246.7 |        51.1 |  4.83x |
-| Q33    | WatchID+ClientIP all      |         569.0 |       462.9 |  1.23x |
-| Q34    | Top URLs                  |        1079.2 |       258.2 |  4.18x |
-| Q35    | Top URLs with const       |        1132.2 |       302.6 |  3.74x |
-| Q36    | ClientIP arithmetic       |          99.8 |        34.9 |  2.85x |
-| Q37    | CounterID=62 URLs         |        1802.6 |       133.5 | 13.50x |
-| Q38    | CounterID=62 Titles       |         533.2 |        49.3 | 10.82x |
-| Q39    | CounterID=62 links        |         146.0 |        27.8 |  5.25x |
-| Q40    | CounterID=62 traffic src  |        2234.9 |       275.0 |  8.13x |
-| Q41    | CounterID=62 URLHash      |         150.7 |        24.1 |  6.26x |
-| Q42    | CounterID=62 window dim   |         146.9 |        17.7 |  8.29x |
-| Q43    | CounterID=62 by minute    |         136.0 |        22.0 |  6.19x |
+| Q1     | COUNT(*)                  |          58.4 |         0.9 | 63.94x |
+| Q2     | COUNT WHERE AdvEngineID   |         129.4 |         5.8 | 22.44x |
+| Q3     | SUM/AVG full scan         |         106.9 |         2.2 | 48.67x |
+| Q4     | AVG UserID                |          66.0 |         1.4 | 46.30x |
+| Q5     | COUNT DISTINCT UserID     |         213.3 |         1.1 | 201.97x |
+| Q6     | COUNT DISTINCT SearchPhrase |         400.1 |         0.9 | 461.98x |
+| Q7     | MIN/MAX EventDate         |          63.4 |         1.9 | 33.04x |
+| Q8     | GROUP BY AdvEngineID      |          90.9 |         6.7 | 13.67x |
+| Q9     | GROUP BY RegionID         |         336.5 |        39.8 |  8.46x |
+| Q10    | RegionID multi-agg        |         461.6 |        43.2 | 10.69x |
+| Q11    | MobilePhoneModel users    |         226.1 |         8.7 | 26.13x |
+| Q12    | MobilePhone+Model users   |         258.2 |        11.6 | 22.27x |
+| Q13    | Top SearchPhrase          |         114.8 |        21.9 |  5.25x |
+| Q14    | SearchPhrase users        |         329.4 |        27.1 | 12.18x |
+| Q15    | SearchEngine+Phrase       |         269.7 |        26.6 | 10.13x |
+| Q16    | Top UserID                |          96.6 |        25.3 |  3.82x |
+| Q17    | UserID+SearchPhrase top   |         359.6 |        71.1 |  5.06x |
+| Q18    | UserID+SearchPhrase       |         123.2 |        69.1 |  1.78x |
+| Q19    | UserID+minute+Phrase      |         574.0 |       283.4 |  2.03x |
+| Q20    | Point lookup UserID       |          63.2 |         1.7 | 36.88x |
+| Q21    | URL LIKE google           |          99.9 |        59.0 |  1.69x |
+| Q22    | SearchPhrase+URL google   |         117.6 |        68.7 |  1.71x |
+| Q23    | Title LIKE Google         |         135.9 |       131.9 |  1.03x |
+| Q24    | SELECT * google sorted    |         100.7 |       127.3 |  0.79x |
+| Q25    | SearchPhrase by time      |          89.2 |        36.6 |  2.44x |
+| Q26    | SearchPhrase sorted       |          90.4 |        12.7 |  7.10x |
+| Q27    | SearchPhrase time+phrase  |          90.8 |        12.1 |  7.50x |
+| Q28    | CounterID avg URL len     |         112.7 |        50.4 |  2.24x |
+| Q29    | Referer domain regex      |         961.1 |      1129.0 |  0.85x |
+| Q30    | Wide SUM 89 cols          |         207.3 |         1.5 | 139.78x |
+| Q31    | SearchEngine+ClientIP     |         247.7 |        26.8 |  9.23x |
+| Q32    | WatchID+ClientIP filter   |         246.7 |        52.5 |  5.02x |
+| Q33    | WatchID+ClientIP all      |         611.6 |       459.8 |  1.33x |
+| Q34    | Top URLs                  |        1364.3 |       247.5 |  5.51x |
+| Q35    | Top URLs with const       |        1268.1 |       302.7 |  4.19x |
+| Q36    | ClientIP arithmetic       |         104.6 |        35.4 |  2.95x |
+| Q37    | CounterID=62 URLs         |        1826.1 |       145.5 | 12.55x |
+| Q38    | CounterID=62 Titles       |         528.3 |        49.4 | 10.70x |
+| Q39    | CounterID=62 links        |         152.5 |        28.5 |  5.36x |
+| Q40    | CounterID=62 traffic src  |        2288.0 |       282.5 |  8.10x |
+| Q41    | CounterID=62 URLHash      |         151.6 |        24.6 |  6.16x |
+| Q42    | CounterID=62 window dim   |         173.7 |        18.4 |  9.45x |
+| Q43    | CounterID=62 by minute    |         149.7 |        21.5 |  6.97x |
 |--------|---------------------------|---------------|-------------|--------|
-| GMEAN  | Geometric Mean            |         193.3 |        25.4 |  7.60x |
-
-### SeaTurtle Scan Timing Breakdown (EXPLAIN ANALYZE)
-
-| Query  | SeaTurtle Total |   Metadata |  Heap Scan |  Decompress | Batch Eval |       Emit | Stats                                                                                 |
-|--------|---------------|------------|------------|-------------|------------|------------|---------------------------------------------------------------------------------------|
-| Q1     |      0.443 ms |      0.325 |      0.118 |       0.000 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q2     |      3.777 ms |      0.224 |      0.422 |       1.938 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q3     |     11.226 ms |      0.222 |      1.413 |       3.921 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q4     |      7.271 ms |      0.282 |      1.637 |       2.571 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q5     |      0.326 ms |      0.326 |      0.000 |       0.000 |      0.000 |      0.000 | segments=0 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch_ |
-| Q6     |      0.276 ms |      0.276 |      0.000 |       0.000 |      0.000 |      0.000 | segments=0 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch_ |
-| Q7     |      0.645 ms |      0.249 |      0.396 |       0.000 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q8     |      4.289 ms |      0.272 |      0.337 |       1.921 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q9     |     48.058 ms |      0.239 |      2.465 |       4.441 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q10    |     55.608 ms |      0.290 |      3.489 |       8.316 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q11    |      8.426 ms |      0.301 |      1.640 |       4.771 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q12    |     11.321 ms |      0.258 |      1.909 |       7.256 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q13    |     15.015 ms |      0.261 |      1.376 |       4.467 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q14    |     20.773 ms |      0.290 |      2.853 |       7.038 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q15    |     19.056 ms |      0.314 |      1.982 |       6.540 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q16    |     39.226 ms |      0.321 |      1.508 |       2.610 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q17    |     65.450 ms |      0.347 |      2.760 |       8.156 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q18    |     63.456 ms |      0.316 |      2.775 |       8.158 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q19    |    213.628 ms |      0.304 |     10.454 |      26.667 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q20    |      1.408 ms |      0.327 |      0.434 |       0.508 |      0.139 |      0.000 | segments=6 segments_skipped=28 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q21    |     56.793 ms |      0.271 |      3.702 |      22.269 |      0.000 |      0.000 | segments=17 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q22    |     61.844 ms |      0.326 |      3.793 |      25.353 |      0.000 |      0.000 | segments=17 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q23    |    125.438 ms |      0.367 |      8.012 |      67.681 |      0.000 |      0.000 | segments=24 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q24    |     91.968 ms |      0.366 |     24.093 |      67.378 |      0.131 |      0.000 | segments=17 segments_skipped=17 phase2_skipped=0 rows_out=10 rows_filtered=0 rows_bat |
-| Q25    |     26.974 ms |      0.341 |      8.727 |      17.906 |      0.000 |      0.000 | segments=28 segments_skipped=6 phase2_skipped=0 rows_out=10 rows_filtered=0 rows_batc |
-| Q26    |      6.330 ms |      0.323 |      1.443 |       4.505 |      0.000 |      0.059 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=69354 rows_filtered=0 rows_b |
-| Q27    |      9.694 ms |      0.321 |      8.642 |       0.730 |      0.000 |      0.001 | segments=1 segments_skipped=0 phase2_skipped=0 rows_out=11 rows_filtered=0 rows_batch |
-| Q28    |     64.807 ms |      0.289 |      2.282 |      36.287 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q29    |   1070.818 ms |      0.536 |      3.479 |     755.975 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q30    |      4.227 ms |      0.312 |      1.007 |       1.890 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q31    |     22.504 ms |      0.246 |      4.257 |      12.492 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q32    |     36.777 ms |      0.311 |      5.080 |      20.642 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q33    |     21.422 ms |      0.349 |      3.267 |      17.238 |      0.000 |      0.568 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=1000000 rows_filtered=0 rows |
-| Q34    |     32.899 ms |      0.349 |      2.993 |      28.088 |      0.000 |      1.469 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=1000000 rows_filtered=0 rows |
-| Q35    |     30.933 ms |      0.340 |      2.469 |      27.430 |      0.000 |      0.694 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=1000000 rows_filtered=0 rows |
-| Q36    |     85.609 ms |      1.325 |      2.412 |       6.351 |      0.000 |      0.000 | segments=34 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q37    |     23.929 ms |      0.340 |      1.866 |      19.490 |      1.799 |      0.434 | segments=15 segments_skipped=19 phase2_skipped=0 rows_out=376899 rows_filtered=0 rows |
-| Q38    |     16.522 ms |      0.329 |      0.787 |      10.345 |      1.917 |      3.144 | segments=15 segments_skipped=19 phase2_skipped=0 rows_out=370550 rows_filtered=0 rows |
-| Q39    |     21.504 ms |      0.350 |      2.406 |      16.875 |      1.825 |      0.048 | segments=15 segments_skipped=19 phase2_skipped=0 rows_out=26918 rows_filtered=0 rows_ |
-| Q40    |     44.354 ms |      0.330 |      4.603 |      36.611 |      1.422 |      1.388 | segments=15 segments_skipped=19 phase2_skipped=0 rows_out=406063 rows_filtered=0 rows |
-| Q41    |     25.646 ms |      0.317 |      6.004 |      11.291 |      0.000 |      0.000 | segments=15 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q42    |     18.759 ms |      0.341 |      3.843 |       9.031 |      0.000 |      0.000 | segments=15 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
-| Q43    |     31.035 ms |      0.704 |      5.311 |      10.335 |      0.000 |      0.000 | segments=15 segments_skipped=0 phase2_skipped=0 rows_out=0 rows_filtered=0 rows_batch |
+| GMEAN  | Geometric Mean            |         211.4 |        24.8 |  8.51x |
 
 ## Where the time goes
 
@@ -314,7 +266,23 @@ truncated to N rows inside the scan node. Pathkeys are set on the CustomPath
 so PG eliminates the redundant Sort node above SeaTurtleAgg. EXPLAIN ANALYZE
 shows `TopN: limit=N sort_col=X direction=ASC|DESC pre_topn_groups=M`.
 
-### 22. Dictionary compression for text columns [DONE]
+### 22. Per-segment SUM/COUNT metadata for aggregate pushdown [DONE]
+
+**Impact: Q3 11.9ms -> 2.2ms (5.4x), Q4 7.6ms -> 1.4ms (5.4x), Q30 4.7ms -> 1.5ms (3.1x)**
+
+Store per-segment `_sum_<col>` (NUMERIC for integers, DOUBLE PRECISION for floats)
+and `_nonnull_count_<col>` (INT) in the companion table for all numeric columns.
+During `begin_agg_scan()`, when all aggregates are metadata-resolvable (SUM, AVG,
+COUNT, COUNT(*), MIN, MAX on plain columns) and there's no GROUP BY or WHERE clause,
+the scan loads only segment metadata — zero decompression, zero row iteration.
+
+Algebraic optimization for `SUM(col + C)`: computes `SUM(col) + C * nonnull_count`
+from metadata. This brings Q30 (89 `SUM(col + N)` expressions) from 4.7ms to 1.5ms.
+
+**Files:** `src/compress.rs` (companion DDL, sum computation, INSERT),
+`src/scan/exec.rs` (ColSum struct, load_segments_heap load_sums param, metadata fast path)
+
+### 23. Dictionary compression for text columns [DONE]
 
 **Impact: Better compression ratio and faster decompression for low-cardinality text**
 
@@ -323,7 +291,7 @@ use dictionary encoding: fixed-width indices into a deduplicated string table.
 Falls back to LZ4 for high-cardinality columns. Dictionary entries also serve
 as a perfect filter for LIKE pruning (see #19).
 
-### 23. Ndistinct statistics tracking [DONE]
+### 24. Ndistinct statistics tracking [DONE]
 
 **Impact: Enables cardinality-aware compression strategy selection**
 
@@ -376,8 +344,8 @@ Several queries were slower with compression. Many have been addressed:
 **Q24 (was 0.13x):** Fixed by lazy column decompression (#11). Phase 2
 skips text varlena allocation for non-matching rows.
 
-**Q30 (was 0.48x):** Fixed by expression aggregate pushdown (#12). `SUM(col + N)`
-computed algebraically inside SeaTurtleAgg.
+**Q30 (was 0.48x):** Fixed by expression aggregate pushdown (#12) and per-segment
+SUM metadata (#22). `SUM(col + N)` now resolved from metadata: `SUM(col) + N * nonnull_count`.
 
 **Q28 (was 0.57x):** Fixed by length() pushdown (#13). `AVG(length(URL))`
 computed on raw `&str` slices without varlena allocation.

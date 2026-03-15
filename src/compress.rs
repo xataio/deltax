@@ -247,6 +247,18 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
             create_cols.push(format!("\"_max_{}\" {}", col.name, col.data_type));
         }
     }
+    // Sum and non-null count metadata for numeric columns
+    for col in &columns {
+        if !col.is_segment_by && supports_sum(&col.data_type) {
+            let sum_type = if is_float_type(&col.data_type) {
+                "DOUBLE PRECISION"
+            } else {
+                "NUMERIC"
+            };
+            create_cols.push(format!("\"_sum_{}\" {}", col.name, sum_type));
+            create_cols.push(format!("\"_nonnull_count_{}\" INT", col.name));
+        }
+    }
     create_cols.push("_row_count INT".to_string());
 
     let create_ddl = format!(
@@ -596,6 +608,9 @@ fn flush_segment_data(
         std::collections::HashMap::new();
     let mut total_size: i64 = 0;
 
+    let mut col_sums: std::collections::HashMap<String, (Option<String>, i64)> =
+        std::collections::HashMap::new();
+
     for (i, col) in columns.iter().enumerate() {
         if col.is_segment_by {
             continue;
@@ -604,6 +619,9 @@ fn flush_segment_data(
         if supports_minmax(&col.data_type) {
             let (min_val, max_val) = compute_typed_minmax(&typed_cols[i], &col.data_type);
             col_minmax.insert(col.name.clone(), (min_val, max_val));
+        }
+        if supports_sum(&col.data_type) {
+            col_sums.insert(col.name.clone(), compute_typed_sum(&typed_cols[i]));
         }
         total_size += compressed.len() as i64;
         compressed_data.push((col.name.clone(), compressed));
@@ -656,6 +674,27 @@ fn flush_segment_data(
                 _ => {
                     insert_vals.push("NULL".to_string());
                     insert_vals.push("NULL".to_string());
+                }
+            }
+        }
+    }
+    // Sum and non-null count metadata
+    for col in columns {
+        if !col.is_segment_by && supports_sum(&col.data_type) {
+            insert_cols.push(format!("\"_sum_{}\"", col.name));
+            insert_cols.push(format!("\"_nonnull_count_{}\"", col.name));
+        }
+    }
+    for col in columns {
+        if !col.is_segment_by && supports_sum(&col.data_type) {
+            match col_sums.get(&col.name) {
+                Some((Some(sum_val), nonnull_count)) => {
+                    insert_vals.push(sum_val.clone());
+                    insert_vals.push(nonnull_count.to_string());
+                }
+                _ => {
+                    insert_vals.push("NULL".to_string());
+                    insert_vals.push("0".to_string());
                 }
             }
         }
@@ -1686,6 +1725,75 @@ fn supports_minmax(data_type: &str) -> bool {
         || dt == "smallint" || dt == "int2"
         || dt == "double precision" || dt == "float8"
         || dt == "real" || dt == "float4"
+}
+
+/// Check if a column type supports sum metadata (numeric types only, not timestamps/dates).
+fn supports_sum(data_type: &str) -> bool {
+    let dt = data_type.to_lowercase();
+    dt == "integer" || dt == "int4"
+        || dt == "bigint" || dt == "int8"
+        || dt == "smallint" || dt == "int2"
+        || dt == "double precision" || dt == "float8"
+        || dt == "real" || dt == "float4"
+}
+
+/// Check if a data type is a floating-point type.
+fn is_float_type(data_type: &str) -> bool {
+    let dt = data_type.to_lowercase();
+    dt == "double precision" || dt == "float8" || dt == "real" || dt == "float4"
+}
+
+/// Compute sum and non-null count for a typed column.
+/// Returns (sum_as_string, nonnull_count). Uses i128 for integer sums to avoid overflow.
+fn compute_typed_sum(data: &TypedColumn) -> (Option<String>, i64) {
+    match data {
+        TypedColumn::Int16(v) => {
+            let mut sum: i128 = 0;
+            let mut count: i64 = 0;
+            for val in v.iter().flatten() {
+                sum += *val as i128;
+                count += 1;
+            }
+            if count > 0 { (Some(sum.to_string()), count) } else { (None, 0) }
+        }
+        TypedColumn::Int32(v) => {
+            let mut sum: i128 = 0;
+            let mut count: i64 = 0;
+            for val in v.iter().flatten() {
+                sum += *val as i128;
+                count += 1;
+            }
+            if count > 0 { (Some(sum.to_string()), count) } else { (None, 0) }
+        }
+        TypedColumn::Int64(v) => {
+            let mut sum: i128 = 0;
+            let mut count: i64 = 0;
+            for val in v.iter().flatten() {
+                sum += *val as i128;
+                count += 1;
+            }
+            if count > 0 { (Some(sum.to_string()), count) } else { (None, 0) }
+        }
+        TypedColumn::Float32(v) => {
+            let mut sum: f64 = 0.0;
+            let mut count: i64 = 0;
+            for val in v.iter().flatten() {
+                sum += *val as f64;
+                count += 1;
+            }
+            if count > 0 { (Some(format!("{:.17e}", sum)), count) } else { (None, 0) }
+        }
+        TypedColumn::Float64(v) => {
+            let mut sum: f64 = 0.0;
+            let mut count: i64 = 0;
+            for val in v.iter().flatten() {
+                sum += *val;
+                count += 1;
+            }
+            if count > 0 { (Some(format!("{:.17e}", sum)), count) } else { (None, 0) }
+        }
+        TypedColumn::Text(_) | TypedColumn::Bool(_) => (None, 0),
+    }
 }
 
 /// Compute the min and max of a column's string values using type-aware comparison.

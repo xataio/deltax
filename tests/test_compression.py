@@ -1753,21 +1753,22 @@ class TestTransparentQuery:
             f"Expected SeaTurtleAgg in plan:\n{explain_text}"
         )
 
-        # Verify fast path via EXPLAIN ANALYZE: agg time should be tiny
-        # relative to the total (< 50% of decompress+heap_scan)
+        # Verify fast path via EXPLAIN ANALYZE: either metadata-only
+        # (decompress=0, agg=0) or algebraic fast path (agg << decompress)
         rows = db.execute(f"EXPLAIN ANALYZE {select_sql}").fetchall()
         for r in rows:
             line = r[0]
             if "SeaTurtle Timing" in line:
-                # Parse: decompress=X.XXX agg=Y.YYY
                 import re
                 m_decomp = re.search(r"decompress=([\d.]+)", line)
                 m_agg = re.search(r"agg=([\d.]+)", line)
                 if m_decomp and m_agg:
                     decomp = float(m_decomp.group(1))
                     agg = float(m_agg.group(1))
-                    assert agg < decomp * 2, (
-                        f"Fast path expected agg << decompress, "
+                    # Metadata-only path: both are 0
+                    # Algebraic fast path: agg < decompress * 2
+                    assert (decomp == 0.0 and agg == 0.0) or agg < decomp * 2, (
+                        f"Fast path expected metadata-only or agg << decompress, "
                         f"but agg={agg:.3f}ms decompress={decomp:.3f}ms\n"
                         f"Full line: {line}"
                     )
@@ -2757,4 +2758,127 @@ class TestRegressions:
             f"Filtered ORDER BY ts ASC LIMIT 15 mismatch:\n"
             f"  before: {before_filtered[:5]}...\n"
             f"  after:  {after_filtered[:5]}..."
+        )
+
+    def test_sum_avg_metadata_pushdown(self, db):
+        """SUM/AVG/COUNT use per-segment metadata instead of decompression.
+
+        Verifies that _sum_ and _nonnull_count_ columns in the companion
+        table produce correct results for SUM, AVG, COUNT, and mixed queries,
+        including with NULLs.
+        """
+        db.execute(f"SET pg_seaturtle.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE sum_meta_test (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                val_int INTEGER,
+                val_bigint BIGINT,
+                val_float8 DOUBLE PRECISION,
+                val_real REAL,
+                val_small SMALLINT
+            )
+        """)
+        db.execute("SELECT seaturtle_create_table('sum_meta_test', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Insert data with some NULLs
+        for i in range(100):
+            val_int = f"{i * 10}" if i % 7 != 0 else "NULL"
+            val_bigint = f"{1000000 + i}" if i % 11 != 0 else "NULL"
+            val_float8 = f"{1.5 + i * 0.1}"
+            val_real = f"{2.5 + i * 0.01}"
+            val_small = f"{i % 100}" if i % 5 != 0 else "NULL"
+            db.execute(
+                f"INSERT INTO sum_meta_test VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"'dev-{i % 3}', "
+                f"{val_int}, {val_bigint}, {val_float8}, {val_real}, {val_small})"
+            )
+        db.commit()
+
+        # Query BEFORE compression
+        before = {}
+        before["sum_int"] = db.execute("SELECT sum(val_int) FROM sum_meta_test").fetchone()[0]
+        before["sum_bigint"] = db.execute("SELECT sum(val_bigint) FROM sum_meta_test").fetchone()[0]
+        before["sum_float8"] = db.execute("SELECT sum(val_float8) FROM sum_meta_test").fetchone()[0]
+        before["sum_real"] = db.execute("SELECT sum(val_real) FROM sum_meta_test").fetchone()[0]
+        before["sum_small"] = db.execute("SELECT sum(val_small) FROM sum_meta_test").fetchone()[0]
+        before["avg_int"] = db.execute("SELECT avg(val_int) FROM sum_meta_test").fetchone()[0]
+        before["avg_bigint"] = db.execute("SELECT avg(val_bigint) FROM sum_meta_test").fetchone()[0]
+        before["avg_float8"] = db.execute("SELECT avg(val_float8) FROM sum_meta_test").fetchone()[0]
+        before["count_int"] = db.execute("SELECT count(val_int) FROM sum_meta_test").fetchone()[0]
+        before["count_bigint"] = db.execute("SELECT count(val_bigint) FROM sum_meta_test").fetchone()[0]
+        before["mixed"] = db.execute(
+            "SELECT sum(val_int), avg(val_bigint), count(*), count(val_int) FROM sum_meta_test"
+        ).fetchall()[0]
+
+        # Enable compression and compress
+        db.execute(
+            "SELECT seaturtle_enable_compression('sum_meta_test', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "sum_meta_test")
+
+        # Query AFTER compression
+        after = {}
+        after["sum_int"] = db.execute("SELECT sum(val_int) FROM sum_meta_test").fetchone()[0]
+        after["sum_bigint"] = db.execute("SELECT sum(val_bigint) FROM sum_meta_test").fetchone()[0]
+        after["sum_float8"] = db.execute("SELECT sum(val_float8) FROM sum_meta_test").fetchone()[0]
+        after["sum_real"] = db.execute("SELECT sum(val_real) FROM sum_meta_test").fetchone()[0]
+        after["sum_small"] = db.execute("SELECT sum(val_small) FROM sum_meta_test").fetchone()[0]
+        after["avg_int"] = db.execute("SELECT avg(val_int) FROM sum_meta_test").fetchone()[0]
+        after["avg_bigint"] = db.execute("SELECT avg(val_bigint) FROM sum_meta_test").fetchone()[0]
+        after["avg_float8"] = db.execute("SELECT avg(val_float8) FROM sum_meta_test").fetchone()[0]
+        after["count_int"] = db.execute("SELECT count(val_int) FROM sum_meta_test").fetchone()[0]
+        after["count_bigint"] = db.execute("SELECT count(val_bigint) FROM sum_meta_test").fetchone()[0]
+        after["mixed"] = db.execute(
+            "SELECT sum(val_int), avg(val_bigint), count(*), count(val_int) FROM sum_meta_test"
+        ).fetchall()[0]
+
+        # Integer SUMs must be exact
+        assert after["sum_int"] == before["sum_int"], (
+            f"SUM(int) mismatch: {before['sum_int']} vs {after['sum_int']}"
+        )
+        assert after["sum_bigint"] == before["sum_bigint"], (
+            f"SUM(bigint) mismatch: {before['sum_bigint']} vs {after['sum_bigint']}"
+        )
+        assert after["sum_small"] == before["sum_small"], (
+            f"SUM(smallint) mismatch: {before['sum_small']} vs {after['sum_small']}"
+        )
+
+        # Float SUMs — allow small tolerance
+        assert abs(float(after["sum_float8"]) - float(before["sum_float8"])) < 0.01, (
+            f"SUM(float8) mismatch: {before['sum_float8']} vs {after['sum_float8']}"
+        )
+        assert abs(float(after["sum_real"]) - float(before["sum_real"])) < 0.1, (
+            f"SUM(real) mismatch: {before['sum_real']} vs {after['sum_real']}"
+        )
+
+        # AVGs
+        assert after["avg_int"] == before["avg_int"], (
+            f"AVG(int) mismatch: {before['avg_int']} vs {after['avg_int']}"
+        )
+        assert after["avg_bigint"] == before["avg_bigint"], (
+            f"AVG(bigint) mismatch: {before['avg_bigint']} vs {after['avg_bigint']}"
+        )
+        assert abs(float(after["avg_float8"]) - float(before["avg_float8"])) < 0.001, (
+            f"AVG(float8) mismatch: {before['avg_float8']} vs {after['avg_float8']}"
+        )
+
+        # COUNTs (non-null)
+        assert after["count_int"] == before["count_int"], (
+            f"COUNT(val_int) mismatch: {before['count_int']} vs {after['count_int']}"
+        )
+        assert after["count_bigint"] == before["count_bigint"], (
+            f"COUNT(val_bigint) mismatch: {before['count_bigint']} vs {after['count_bigint']}"
+        )
+
+        # Mixed query
+        assert after["mixed"] == before["mixed"], (
+            f"Mixed SUM/AVG/COUNT mismatch:\n"
+            f"  before: {before['mixed']}\n"
+            f"  after:  {after['mixed']}"
         )
