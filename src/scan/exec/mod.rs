@@ -22,10 +22,6 @@ pub(crate) use decompress::{create_custom_scan_state, create_deltax_append_state
 pub(crate) use count_minmax::{create_count_scan_state, create_minmax_scan_state};
 pub(crate) use agg::create_agg_scan_state;
 
-// Re-export for tests
-#[cfg(any(test, feature = "pg_test"))]
-use datum_utils::reinsert_nulls_datum;
-
 // Callback imports for static method tables
 use decompress::{begin_custom_scan, exec_custom_scan, end_custom_scan, rescan_custom_scan};
 use decompress::begin_deltax_append;
@@ -253,7 +249,7 @@ mod tests {
     #[test]
     fn test_reinsert_nulls_datum() {
         use pgrx::pg_sys;
-        use super::reinsert_nulls_datum;
+        use super::datum_utils::reinsert_nulls_datum;
 
         // No nulls: empty bitmap
         let datums = vec![
@@ -295,11 +291,11 @@ mod tests {
         let datums: Vec<pg_sys::Datum> = (0..7).map(|i| pg_sys::Datum::from(i as usize)).collect();
         let result = reinsert_nulls_datum(&datums, &bitmap, 8);
         assert_eq!(result.len(), 8);
-        for i in 0..8 {
+        for (i, (_datum, is_null)) in result.iter().enumerate().take(8) {
             if i == 5 {
-                assert!(result[i].1, "position 5 should be null");
+                assert!(is_null, "position 5 should be null");
             } else {
-                assert!(!result[i].1, "position {} should not be null", i);
+                assert!(!is_null, "position {} should not be null", i);
             }
         }
     }

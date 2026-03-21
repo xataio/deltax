@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn test_float_roundtrip_single() {
-        let values = vec![3.14];
+        let values = vec![1.5];
         let encoded = encode_floats(&values);
         let decoded = decode_floats(&encoded, 1);
         assert_eq!(decoded, values);

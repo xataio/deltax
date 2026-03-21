@@ -2377,7 +2377,6 @@ pub(super) unsafe extern "C-unwind" fn rescan_agg_scan(
 #[pgrx::pg_schema]
 mod tests {
     use super::*;
-    use pgrx::prelude::*;
     use pgrx::pg_sys;
 
     /// Helper: build a pg_sys::List of integers from a slice.
@@ -2767,8 +2766,8 @@ mod tests {
         where_null: bool,
     ) -> ParsedAggPlan {
         let output_map: Vec<OutputEntry> = (0..agg_specs.len())
-            .map(|i| OutputEntry::Agg(i))
-            .chain((0..group_specs.len()).map(|i| OutputEntry::Group(i)))
+            .map(OutputEntry::Agg)
+            .chain((0..group_specs.len()).map(OutputEntry::Group))
             .collect();
         ParsedAggPlan {
             companion_oids: vec![pg_sys::Oid::from(9999u32)],
@@ -2778,7 +2777,7 @@ mod tests {
             having_filters: having,
             where_quals: if where_null { std::ptr::null_mut() } else {
                 // Non-null placeholder (never dereferenced in rejection path)
-                1usize as *mut pg_sys::List
+                std::ptr::dangling_mut::<pg_sys::List>()
             },
             topn_limit: 0,
             topn_sort_col: 0,
@@ -3229,5 +3228,706 @@ mod tests {
         assert_eq!(state.total_segments, 2);
         assert_eq!(state.metadata_us, 123);
         assert_eq!(state.heap_scan_us, 456);
+    }
+
+    // -------------------------------------------------------------------
+    // date_trunc_unit_to_usecs tests
+    // -------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_date_trunc_microsecond() {
+        assert_eq!(date_trunc_unit_to_usecs("microsecond"), 1);
+        assert_eq!(date_trunc_unit_to_usecs("microseconds"), 1);
+        assert_eq!(date_trunc_unit_to_usecs("us"), 1);
+    }
+
+    #[pg_test]
+    fn test_date_trunc_millisecond() {
+        assert_eq!(date_trunc_unit_to_usecs("millisecond"), 1_000);
+        assert_eq!(date_trunc_unit_to_usecs("milliseconds"), 1_000);
+        assert_eq!(date_trunc_unit_to_usecs("ms"), 1_000);
+    }
+
+    #[pg_test]
+    fn test_date_trunc_second() {
+        assert_eq!(date_trunc_unit_to_usecs("second"), 1_000_000);
+        assert_eq!(date_trunc_unit_to_usecs("seconds"), 1_000_000);
+    }
+
+    #[pg_test]
+    fn test_date_trunc_minute() {
+        assert_eq!(date_trunc_unit_to_usecs("minute"), 60_000_000);
+        assert_eq!(date_trunc_unit_to_usecs("minutes"), 60_000_000);
+    }
+
+    #[pg_test]
+    fn test_date_trunc_hour() {
+        assert_eq!(date_trunc_unit_to_usecs("hour"), 3_600_000_000);
+        assert_eq!(date_trunc_unit_to_usecs("hours"), 3_600_000_000);
+    }
+
+    #[pg_test]
+    fn test_date_trunc_day() {
+        assert_eq!(date_trunc_unit_to_usecs("day"), 86_400_000_000);
+        assert_eq!(date_trunc_unit_to_usecs("days"), 86_400_000_000);
+    }
+
+    #[pg_test]
+    fn test_date_trunc_unknown_fallback() {
+        assert_eq!(date_trunc_unit_to_usecs("week"), 1);
+        assert_eq!(date_trunc_unit_to_usecs(""), 1);
+    }
+
+    // -------------------------------------------------------------------
+    // extract_field_from_usecs tests
+    // -------------------------------------------------------------------
+
+    // Helper: PG epoch usecs for 2000-01-01 12:34:56.789012
+    // 12h=43200s, 34m=2040s, 56s → total 45296s → 45296_789012 usec
+    const SAMPLE_USEC: i64 = 45_296_789_012;
+
+    #[pg_test]
+    fn test_extract_microsecond() {
+        // PG EXTRACT(microsecond FROM ...) returns seconds_within_minute * 1_000_000 + frac_usec
+        // 56 seconds + 789012 usec = 56_789_012
+        assert_eq!(extract_field_from_usecs(SAMPLE_USEC, "microsecond"), 56_789_012);
+        assert_eq!(extract_field_from_usecs(SAMPLE_USEC, "microseconds"), 56_789_012);
+    }
+
+    #[pg_test]
+    fn test_extract_millisecond() {
+        // PG EXTRACT(millisecond FROM ...) returns seconds_within_minute * 1_000 + frac_ms
+        // 56 seconds + 789 ms = 56_789
+        assert_eq!(extract_field_from_usecs(SAMPLE_USEC, "millisecond"), 56_789);
+        assert_eq!(extract_field_from_usecs(SAMPLE_USEC, "milliseconds"), 56_789);
+    }
+
+    #[pg_test]
+    fn test_extract_second() {
+        assert_eq!(extract_field_from_usecs(SAMPLE_USEC, "second"), 56);
+        assert_eq!(extract_field_from_usecs(SAMPLE_USEC, "seconds"), 56);
+    }
+
+    #[pg_test]
+    fn test_extract_minute() {
+        assert_eq!(extract_field_from_usecs(SAMPLE_USEC, "minute"), 34);
+        assert_eq!(extract_field_from_usecs(SAMPLE_USEC, "minutes"), 34);
+    }
+
+    #[pg_test]
+    fn test_extract_hour() {
+        assert_eq!(extract_field_from_usecs(SAMPLE_USEC, "hour"), 12);
+        assert_eq!(extract_field_from_usecs(SAMPLE_USEC, "hours"), 12);
+    }
+
+    #[pg_test]
+    fn test_extract_dow() {
+        // PG epoch 2000-01-01 is a Saturday (dow=6), day 0
+        assert_eq!(extract_field_from_usecs(0, "dow"), 6); // Saturday
+        // Day 1 = Sunday=0
+        assert_eq!(extract_field_from_usecs(86_400_000_000, "dow"), 0);
+        // Day 2 = Monday=1
+        assert_eq!(extract_field_from_usecs(2 * 86_400_000_000, "dow"), 1);
+    }
+
+    #[pg_test]
+    fn test_extract_epoch() {
+        // PG epoch offset to Unix = 946684800 seconds
+        assert_eq!(extract_field_from_usecs(0, "epoch"), 946_684_800);
+        // 1 second after PG epoch
+        assert_eq!(extract_field_from_usecs(1_000_000, "epoch"), 946_684_801);
+    }
+
+    #[pg_test]
+    fn test_extract_negative_usec() {
+        // Before PG epoch (negative usec): 1999-12-31 23:59:59.000000
+        // -1 second = -1_000_000 usec
+        let usec = -1_000_000i64;
+        assert_eq!(extract_field_from_usecs(usec, "second"), 59);
+        assert_eq!(extract_field_from_usecs(usec, "minute"), 59);
+        assert_eq!(extract_field_from_usecs(usec, "hour"), 23);
+        // Day before PG epoch (1999-12-31) is Friday=5
+        assert_eq!(extract_field_from_usecs(usec, "dow"), 5);
+    }
+
+    #[pg_test]
+    fn test_extract_unknown_fallback() {
+        assert_eq!(extract_field_from_usecs(SAMPLE_USEC, "year"), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // datum_to_i128 tests
+    // -------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_datum_to_i128_int2() {
+        let d = pg_sys::Datum::from(-5i16 as usize);
+        assert_eq!(datum_to_i128(d, pg_sys::INT2OID), -5);
+    }
+
+    #[pg_test]
+    fn test_datum_to_i128_int4() {
+        let d = pg_sys::Datum::from(-100_000i32 as usize);
+        assert_eq!(datum_to_i128(d, pg_sys::INT4OID), -100_000);
+    }
+
+    #[pg_test]
+    fn test_datum_to_i128_int8() {
+        let d = pg_sys::Datum::from(-9_000_000_000i64 as usize);
+        assert_eq!(datum_to_i128(d, pg_sys::INT8OID), -9_000_000_000);
+    }
+
+    #[pg_test]
+    fn test_datum_to_i128_unknown_oid() {
+        // Falls through to raw usize cast
+        let d = pg_sys::Datum::from(42usize);
+        assert_eq!(datum_to_i128(d, pg_sys::Oid::from(9999u32)), 42);
+    }
+
+    // -------------------------------------------------------------------
+    // datum_to_f64 tests
+    // -------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_datum_to_f64_float4() {
+        let f: f32 = 1.5;
+        let d = pg_sys::Datum::from(f.to_bits() as usize);
+        let result = datum_to_f64(d, pg_sys::FLOAT4OID);
+        assert!((result - 1.5f64).abs() < 0.001);
+    }
+
+    #[pg_test]
+    fn test_datum_to_f64_float8() {
+        let f: f64 = 1.23456789;
+        let d = pg_sys::Datum::from(f.to_bits() as usize);
+        let result = datum_to_f64(d, pg_sys::FLOAT8OID);
+        assert!((result - 1.23456789).abs() < 1e-9);
+    }
+
+    #[pg_test]
+    fn test_datum_to_f64_unknown_oid() {
+        let d = pg_sys::Datum::from(100usize);
+        assert_eq!(datum_to_f64(d, pg_sys::Oid::from(9999u32)), 100.0);
+    }
+
+    // -------------------------------------------------------------------
+    // AggAccumulator::new_for tests
+    // -------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_accumulator_new_sum_int() {
+        let acc = AggAccumulator::new_for(AggType::Sum, pg_sys::INT4OID);
+        assert!(matches!(acc, AggAccumulator::SumInt { sum: 0, count: 0 }));
+    }
+
+    #[pg_test]
+    fn test_accumulator_new_sum_float() {
+        let acc = AggAccumulator::new_for(AggType::Sum, pg_sys::FLOAT8OID);
+        assert!(matches!(acc, AggAccumulator::SumFloat { .. }));
+    }
+
+    #[pg_test]
+    fn test_accumulator_new_avg_float4() {
+        let acc = AggAccumulator::new_for(AggType::Avg, pg_sys::FLOAT4OID);
+        assert!(matches!(acc, AggAccumulator::SumFloat { .. }));
+    }
+
+    #[pg_test]
+    fn test_accumulator_new_avg_int() {
+        let acc = AggAccumulator::new_for(AggType::Avg, pg_sys::INT8OID);
+        assert!(matches!(acc, AggAccumulator::SumInt { .. }));
+    }
+
+    #[pg_test]
+    fn test_accumulator_new_count() {
+        let acc = AggAccumulator::new_for(AggType::Count, pg_sys::INT4OID);
+        assert!(matches!(acc, AggAccumulator::Count { count: 0 }));
+    }
+
+    #[pg_test]
+    fn test_accumulator_new_count_star() {
+        let acc = AggAccumulator::new_for(AggType::CountStar, pg_sys::Oid::from(0u32));
+        assert!(matches!(acc, AggAccumulator::Count { count: 0 }));
+    }
+
+    #[pg_test]
+    fn test_accumulator_new_count_distinct_text() {
+        let acc = AggAccumulator::new_for(AggType::CountDistinct, pg_sys::TEXTOID);
+        assert!(matches!(acc, AggAccumulator::CountDistinctStr { .. }));
+    }
+
+    #[pg_test]
+    fn test_accumulator_new_count_distinct_int() {
+        let acc = AggAccumulator::new_for(AggType::CountDistinct, pg_sys::INT4OID);
+        assert!(matches!(acc, AggAccumulator::CountDistinctInt { .. }));
+    }
+
+    #[pg_test]
+    fn test_accumulator_new_min_text() {
+        let acc = AggAccumulator::new_for(AggType::Min, pg_sys::TEXTOID);
+        assert!(matches!(acc, AggAccumulator::MinStr { val: None }));
+    }
+
+    #[pg_test]
+    fn test_accumulator_new_min_float() {
+        let acc = AggAccumulator::new_for(AggType::Min, pg_sys::FLOAT8OID);
+        assert!(matches!(acc, AggAccumulator::MinFloat { val: None }));
+    }
+
+    #[pg_test]
+    fn test_accumulator_new_min_int() {
+        let acc = AggAccumulator::new_for(AggType::Min, pg_sys::INT4OID);
+        assert!(matches!(acc, AggAccumulator::MinInt { val: None }));
+    }
+
+    #[pg_test]
+    fn test_accumulator_new_max_varchar() {
+        let acc = AggAccumulator::new_for(AggType::Max, pg_sys::VARCHAROID);
+        assert!(matches!(acc, AggAccumulator::MaxStr { val: None }));
+    }
+
+    #[pg_test]
+    fn test_accumulator_new_max_float4() {
+        let acc = AggAccumulator::new_for(AggType::Max, pg_sys::FLOAT4OID);
+        assert!(matches!(acc, AggAccumulator::MaxFloat { val: None }));
+    }
+
+    #[pg_test]
+    fn test_accumulator_new_max_int() {
+        let acc = AggAccumulator::new_for(AggType::Max, pg_sys::INT8OID);
+        assert!(matches!(acc, AggAccumulator::MaxInt { val: None }));
+    }
+
+    // -------------------------------------------------------------------
+    // AggAccumulator::clone_fresh tests
+    // -------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_clone_fresh_sum_int_resets() {
+        let acc = AggAccumulator::SumInt { sum: 999, count: 50 };
+        let fresh = acc.clone_fresh();
+        assert!(matches!(fresh, AggAccumulator::SumInt { sum: 0, count: 0 }));
+    }
+
+    #[pg_test]
+    fn test_clone_fresh_sum_float_resets() {
+        let acc = AggAccumulator::SumFloat { sum: 1.5, count: 10 };
+        let fresh = acc.clone_fresh();
+        assert!(matches!(fresh, AggAccumulator::SumFloat { sum, count } if sum == 0.0 && count == 0));
+    }
+
+    #[pg_test]
+    fn test_clone_fresh_count_resets() {
+        let acc = AggAccumulator::Count { count: 42 };
+        let fresh = acc.clone_fresh();
+        assert!(matches!(fresh, AggAccumulator::Count { count: 0 }));
+    }
+
+    #[pg_test]
+    fn test_clone_fresh_min_int_resets() {
+        let acc = AggAccumulator::MinInt { val: Some(7) };
+        let fresh = acc.clone_fresh();
+        assert!(matches!(fresh, AggAccumulator::MinInt { val: None }));
+    }
+
+    #[pg_test]
+    fn test_clone_fresh_count_distinct_int_resets() {
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(1i64);
+        seen.insert(2);
+        let acc = AggAccumulator::CountDistinctInt { seen };
+        let fresh = acc.clone_fresh();
+        if let AggAccumulator::CountDistinctInt { seen } = fresh {
+            assert!(seen.is_empty());
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // finalize_accumulator tests
+    // -------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_finalize_count() {
+        let acc = AggAccumulator::Count { count: 42 };
+        let spec = make_agg_spec(AggType::Count, 0, 20);
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        assert_eq!(datum.value(), 42);
+    }
+
+    #[pg_test]
+    fn test_finalize_count_distinct_int() {
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(10i64);
+        seen.insert(20);
+        seen.insert(30);
+        let acc = AggAccumulator::CountDistinctInt { seen };
+        let spec = make_agg_spec(AggType::CountDistinct, 0, 20);
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        assert_eq!(datum.value(), 3);
+    }
+
+    #[pg_test]
+    fn test_finalize_count_distinct_str() {
+        let mut seen = std::collections::HashSet::new();
+        seen.insert("foo".to_string());
+        seen.insert("bar".to_string());
+        let acc = AggAccumulator::CountDistinctStr { seen };
+        let spec = make_agg_spec(AggType::CountDistinct, 0, 25);
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        assert_eq!(datum.value(), 2);
+    }
+
+    #[pg_test]
+    fn test_finalize_sum_int_zero_count_is_null() {
+        let acc = AggAccumulator::SumInt { sum: 0, count: 0 };
+        let spec = make_agg_spec(AggType::Sum, 0, 20);
+        let (_, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(is_null);
+    }
+
+    #[pg_test]
+    fn test_finalize_sum_int4_returns_int8() {
+        // SUM(int4) → INT8 datum
+        let acc = AggAccumulator::SumInt { sum: 100_000, count: 10 };
+        let spec = make_agg_spec(AggType::Sum, 0, 23); // INT4OID
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        assert_eq!(datum.value() as i64, 100_000);
+    }
+
+    #[pg_test]
+    fn test_finalize_sum_int8_returns_numeric() {
+        // SUM(int8) → NUMERIC
+        let acc = AggAccumulator::SumInt { sum: 999_999_999, count: 5 };
+        let spec = make_agg_spec(AggType::Sum, 0, 20); // INT8OID
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        // Verify via numeric_out
+        let s = unsafe {
+            let cstr = pg_sys::OidOutputFunctionCall(pg_sys::Oid::from(1702u32), datum);
+            let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+            pg_sys::pfree(cstr as *mut _);
+            s
+        };
+        assert_eq!(s, "999999999");
+    }
+
+    #[pg_test]
+    fn test_finalize_sum_float_zero_count_is_null() {
+        let acc = AggAccumulator::SumFloat { sum: 0.0, count: 0 };
+        let spec = make_agg_spec(AggType::Sum, 0, 701);
+        let (_, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(is_null);
+    }
+
+    #[pg_test]
+    fn test_finalize_sum_float8() {
+        let acc = AggAccumulator::SumFloat { sum: 1.5, count: 1 };
+        let spec = make_agg_spec(AggType::Sum, 0, 701); // FLOAT8OID
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        let result = f64::from_bits(datum.value() as u64);
+        assert!((result - 1.5).abs() < 1e-10);
+    }
+
+    #[pg_test]
+    fn test_finalize_sum_float4() {
+        let acc = AggAccumulator::SumFloat { sum: 2.5, count: 1 };
+        let spec = make_agg_spec(AggType::Sum, 0, 700); // FLOAT4OID
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        let result = f32::from_bits(datum.value() as u32);
+        assert!((result - 2.5).abs() < 0.001);
+    }
+
+    #[pg_test]
+    fn test_finalize_avg_int() {
+        // AVG(int) → NUMERIC (sum/count via PG numeric_div)
+        let acc = AggAccumulator::SumInt { sum: 100, count: 4 };
+        let spec = make_agg_spec(AggType::Avg, 0, 23); // INT4OID
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        let s = unsafe {
+            let cstr = pg_sys::OidOutputFunctionCall(pg_sys::Oid::from(1702u32), datum);
+            let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+            pg_sys::pfree(cstr as *mut _);
+            s
+        };
+        assert_eq!(s, "25.0000000000000000");
+    }
+
+    #[pg_test]
+    fn test_finalize_avg_float() {
+        // AVG(float8) → FLOAT8 (sum/count)
+        let acc = AggAccumulator::SumFloat { sum: 10.0, count: 4 };
+        let spec = make_agg_spec(AggType::Avg, 0, 701);
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        let result = f64::from_bits(datum.value() as u64);
+        assert!((result - 2.5).abs() < 1e-10);
+    }
+
+    #[pg_test]
+    fn test_finalize_min_int_some() {
+        let acc = AggAccumulator::MinInt { val: Some(-42) };
+        let spec = make_agg_spec(AggType::Min, 0, 20);
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        assert_eq!(datum.value() as i64, -42);
+    }
+
+    #[pg_test]
+    fn test_finalize_min_int_none_is_null() {
+        let acc = AggAccumulator::MinInt { val: None };
+        let spec = make_agg_spec(AggType::Min, 0, 20);
+        let (_, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(is_null);
+    }
+
+    #[pg_test]
+    fn test_finalize_max_float_some() {
+        let acc = AggAccumulator::MaxFloat { val: Some(99.9) };
+        let spec = make_agg_spec(AggType::Max, 0, 701);
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        let result = f64::from_bits(datum.value() as u64);
+        assert!((result - 99.9).abs() < 1e-10);
+    }
+
+    #[pg_test]
+    fn test_finalize_max_float_none_is_null() {
+        let acc = AggAccumulator::MaxFloat { val: None };
+        let spec = make_agg_spec(AggType::Max, 0, 701);
+        let (_, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(is_null);
+    }
+
+    // -------------------------------------------------------------------
+    // StringArena tests
+    // -------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_arena_alloc_and_get() {
+        let mut arena = StringArena::new();
+        let (off, len) = arena.alloc("hello");
+        assert_eq!(arena.get(off, len), "hello");
+    }
+
+    #[pg_test]
+    fn test_arena_multiple_allocs() {
+        let mut arena = StringArena::new();
+        let (o1, l1) = arena.alloc("foo");
+        let (o2, l2) = arena.alloc("bar");
+        let (o3, l3) = arena.alloc("baz");
+        assert_eq!(arena.get(o1, l1), "foo");
+        assert_eq!(arena.get(o2, l2), "bar");
+        assert_eq!(arena.get(o3, l3), "baz");
+    }
+
+    #[pg_test]
+    fn test_arena_empty_string() {
+        let mut arena = StringArena::new();
+        let (off, len) = arena.alloc("");
+        assert_eq!(arena.get(off, len), "");
+    }
+
+    #[pg_test]
+    fn test_arena_unicode() {
+        let mut arena = StringArena::new();
+        let (off, len) = arena.alloc("hello\u{00e9}world");
+        assert_eq!(arena.get(off, len), "hello\u{00e9}world");
+    }
+
+    // -------------------------------------------------------------------
+    // GroupKeyRef / GroupKeyVal / GroupKey tests
+    // -------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_group_key_ref_resolve_null() {
+        let mut arena = StringArena::new();
+        let r = GroupKeyRef::Null;
+        assert_eq!(r.resolve(&mut arena), GroupKeyVal::Null);
+    }
+
+    #[pg_test]
+    fn test_group_key_ref_resolve_int() {
+        let mut arena = StringArena::new();
+        let r = GroupKeyRef::Int(42);
+        assert_eq!(r.resolve(&mut arena), GroupKeyVal::Int(42));
+    }
+
+    #[pg_test]
+    fn test_group_key_ref_resolve_str() {
+        let mut arena = StringArena::new();
+        let s = "hello";
+        let r = GroupKeyRef::from_str(s);
+        let val = r.resolve(&mut arena);
+        if let GroupKeyVal::Str(off, len) = val {
+            assert_eq!(arena.get(off, len), "hello");
+        } else {
+            panic!("expected Str variant");
+        }
+    }
+
+    #[pg_test]
+    fn test_group_key_ref_matches_owned_null() {
+        let arena = StringArena::new();
+        assert!(GroupKeyRef::Null.matches_owned(&GroupKeyVal::Null, &arena));
+        assert!(!GroupKeyRef::Null.matches_owned(&GroupKeyVal::Int(0), &arena));
+    }
+
+    #[pg_test]
+    fn test_group_key_ref_matches_owned_int() {
+        let arena = StringArena::new();
+        assert!(GroupKeyRef::Int(5).matches_owned(&GroupKeyVal::Int(5), &arena));
+        assert!(!GroupKeyRef::Int(5).matches_owned(&GroupKeyVal::Int(6), &arena));
+        assert!(!GroupKeyRef::Int(5).matches_owned(&GroupKeyVal::Null, &arena));
+    }
+
+    #[pg_test]
+    fn test_group_key_ref_matches_owned_str() {
+        let mut arena = StringArena::new();
+        let (off, len) = arena.alloc("test");
+        let s = "test";
+        let r = GroupKeyRef::from_str(s);
+        assert!(r.matches_owned(&GroupKeyVal::Str(off, len), &arena));
+        let s2 = "other";
+        let r2 = GroupKeyRef::from_str(s2);
+        assert!(!r2.matches_owned(&GroupKeyVal::Str(off, len), &arena));
+    }
+
+    #[pg_test]
+    fn test_group_key_single_as_slice() {
+        let key = GroupKey::Single(GroupKeyVal::Int(7));
+        assert_eq!(key.as_slice().len(), 1);
+        assert_eq!(key.as_slice()[0], GroupKeyVal::Int(7));
+    }
+
+    #[pg_test]
+    fn test_group_key_multi_as_slice() {
+        let key = GroupKey::Multi(vec![GroupKeyVal::Int(1), GroupKeyVal::Null].into_boxed_slice());
+        assert_eq!(key.as_slice().len(), 2);
+        assert_eq!(key.as_slice()[0], GroupKeyVal::Int(1));
+        assert_eq!(key.as_slice()[1], GroupKeyVal::Null);
+    }
+
+    // -------------------------------------------------------------------
+    // hash_group_key / hash_group_key_ref / keys_match tests
+    // -------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_hash_consistency_int() {
+        // hash_group_key and hash_group_key_ref must produce the same hash
+        // for equivalent keys
+        let mut arena = StringArena::new();
+        let owned = GroupKey::Single(GroupKeyVal::Int(42));
+        let borrowed = [GroupKeyRef::Int(42)];
+        let _ = &mut arena; // arena unused for int keys, but needed for API
+        assert_eq!(hash_group_key(&owned, &arena), hash_group_key_ref(&borrowed));
+    }
+
+    #[pg_test]
+    fn test_hash_consistency_null() {
+        let arena = StringArena::new();
+        let owned = GroupKey::Single(GroupKeyVal::Null);
+        let borrowed = [GroupKeyRef::Null];
+        assert_eq!(hash_group_key(&owned, &arena), hash_group_key_ref(&borrowed));
+    }
+
+    #[pg_test]
+    fn test_hash_consistency_str() {
+        let mut arena = StringArena::new();
+        let (off, len) = arena.alloc("hello");
+        let owned = GroupKey::Single(GroupKeyVal::Str(off, len));
+        let s = "hello";
+        let borrowed = [GroupKeyRef::from_str(s)];
+        assert_eq!(hash_group_key(&owned, &arena), hash_group_key_ref(&borrowed));
+    }
+
+    #[pg_test]
+    fn test_hash_consistency_multi() {
+        let mut arena = StringArena::new();
+        let (off, len) = arena.alloc("world");
+        let owned = GroupKey::Multi(
+            vec![GroupKeyVal::Int(1), GroupKeyVal::Str(off, len), GroupKeyVal::Null]
+                .into_boxed_slice(),
+        );
+        let s = "world";
+        let borrowed = [GroupKeyRef::Int(1), GroupKeyRef::from_str(s), GroupKeyRef::Null];
+        assert_eq!(hash_group_key(&owned, &arena), hash_group_key_ref(&borrowed));
+    }
+
+    #[pg_test]
+    fn test_hash_different_values_differ() {
+        let arena = StringArena::new();
+        let k1 = GroupKey::Single(GroupKeyVal::Int(1));
+        let k2 = GroupKey::Single(GroupKeyVal::Int(2));
+        assert_ne!(hash_group_key(&k1, &arena), hash_group_key(&k2, &arena));
+    }
+
+    #[pg_test]
+    fn test_hash_different_types_differ() {
+        // Int(0) vs Null should hash differently (different discriminant)
+        let arena = StringArena::new();
+        let k1 = GroupKey::Single(GroupKeyVal::Int(0));
+        let k2 = GroupKey::Single(GroupKeyVal::Null);
+        assert_ne!(hash_group_key(&k1, &arena), hash_group_key(&k2, &arena));
+    }
+
+    #[pg_test]
+    fn test_keys_match_single_int() {
+        let arena = StringArena::new();
+        let owned = GroupKey::Single(GroupKeyVal::Int(42));
+        let temp = [GroupKeyRef::Int(42)];
+        assert!(keys_match(&owned, &temp, &arena));
+    }
+
+    #[pg_test]
+    fn test_keys_match_single_mismatch() {
+        let arena = StringArena::new();
+        let owned = GroupKey::Single(GroupKeyVal::Int(42));
+        let temp = [GroupKeyRef::Int(99)];
+        assert!(!keys_match(&owned, &temp, &arena));
+    }
+
+    #[pg_test]
+    fn test_keys_match_length_mismatch() {
+        let arena = StringArena::new();
+        let owned = GroupKey::Single(GroupKeyVal::Int(42));
+        let temp = [GroupKeyRef::Int(42), GroupKeyRef::Null];
+        assert!(!keys_match(&owned, &temp, &arena));
+    }
+
+    #[pg_test]
+    fn test_keys_match_multi_str() {
+        let mut arena = StringArena::new();
+        let (o1, l1) = arena.alloc("abc");
+        let (o2, l2) = arena.alloc("xyz");
+        let owned = GroupKey::Multi(
+            vec![GroupKeyVal::Str(o1, l1), GroupKeyVal::Str(o2, l2)].into_boxed_slice(),
+        );
+        let s1 = "abc";
+        let s2 = "xyz";
+        let temp = [GroupKeyRef::from_str(s1), GroupKeyRef::from_str(s2)];
+        assert!(keys_match(&owned, &temp, &arena));
+    }
+
+    #[pg_test]
+    fn test_keys_match_multi_str_mismatch() {
+        let mut arena = StringArena::new();
+        let (o1, l1) = arena.alloc("abc");
+        let (o2, l2) = arena.alloc("xyz");
+        let owned = GroupKey::Multi(
+            vec![GroupKeyVal::Str(o1, l1), GroupKeyVal::Str(o2, l2)].into_boxed_slice(),
+        );
+        let s1 = "abc";
+        let s2 = "DIFFERENT";
+        let temp = [GroupKeyRef::from_str(s1), GroupKeyRef::from_str(s2)];
+        assert!(!keys_match(&owned, &temp, &arena));
     }
 }

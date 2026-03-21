@@ -362,18 +362,18 @@ mod tests {
 
         // Select only rows 150..160 (block 1)
         let mut selection = vec![false; 300];
-        for i in 150..160 {
-            selection[i] = true;
+        for sel in &mut selection[150..160] {
+            *sel = true;
         }
 
         let (buf, ranges) = decode_to_ranges_blocked(&encoded, 300, Some(&selection));
 
         // Skipped blocks should have (0,0)
-        for i in 0..100 {
-            assert_eq!(ranges[i], (0, 0), "block 0 row {} should be skipped", i);
+        for (i, range) in ranges.iter().enumerate().take(100) {
+            assert_eq!(*range, (0, 0), "block 0 row {} should be skipped", i);
         }
-        for i in 200..300 {
-            assert_eq!(ranges[i], (0, 0), "block 2 row {} should be skipped", i);
+        for (i, range) in ranges.iter().enumerate().skip(200).take(100) {
+            assert_eq!(*range, (0, 0), "block 2 row {} should be skipped", i);
         }
 
         // Block 1 (rows 100-199) should all be decoded (whole block is decoded)
