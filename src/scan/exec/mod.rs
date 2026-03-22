@@ -299,4 +299,464 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_count_non_null() {
+        use super::datum_utils::count_non_null;
+
+        // No nulls (empty bitmap)
+        assert_eq!(count_non_null(&[], 10), 10);
+
+        // All nulls (8 rows, all bits set)
+        assert_eq!(count_non_null(&[0xFF], 8), 0);
+
+        // Some nulls: bits 0 and 2 set (positions 0,2 are null)
+        assert_eq!(count_non_null(&[0b00000101], 4), 2);
+
+        // Partial last byte: 5 rows, bits 0,3 set
+        assert_eq!(count_non_null(&[0b00001001], 5), 3);
+
+        // 16 rows across 2 bytes, 3 nulls
+        assert_eq!(count_non_null(&[0b00000001, 0b00000110], 16), 13);
+    }
+
+    #[test]
+    fn test_compare_datums() {
+        use pgrx::pg_sys;
+        use super::datum_utils::compare_datums;
+        use std::cmp::Ordering;
+
+        // int4
+        let d1 = pg_sys::Datum::from(10i32 as usize);
+        let d2 = pg_sys::Datum::from(20i32 as usize);
+        assert_eq!(compare_datums(d1, d2, pg_sys::INT4OID), Ordering::Less);
+        assert_eq!(compare_datums(d2, d1, pg_sys::INT4OID), Ordering::Greater);
+        assert_eq!(compare_datums(d1, d1, pg_sys::INT4OID), Ordering::Equal);
+
+        // int2
+        let d1 = pg_sys::Datum::from(5i16 as usize);
+        let d2 = pg_sys::Datum::from(3i16 as usize);
+        assert_eq!(compare_datums(d1, d2, pg_sys::INT2OID), Ordering::Greater);
+
+        // float8
+        let d1 = pg_sys::Datum::from(1.5f64.to_bits() as usize);
+        let d2 = pg_sys::Datum::from(2.5f64.to_bits() as usize);
+        assert_eq!(compare_datums(d1, d2, pg_sys::FLOAT8OID), Ordering::Less);
+
+        // float4
+        let d1 = pg_sys::Datum::from(3.0f32.to_bits() as usize);
+        let d2 = pg_sys::Datum::from(1.0f32.to_bits() as usize);
+        assert_eq!(compare_datums(d1, d2, pg_sys::FLOAT4OID), Ordering::Greater);
+
+        // unsupported type returns Equal
+        assert_eq!(compare_datums(d1, d2, pg_sys::TEXTOID), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_pg_type_oid_and_name() {
+        use pgrx::pg_sys;
+        use super::datum_utils::{pg_type_oid, pg_type_name};
+
+        assert_eq!(pg_type_oid("int4"), pg_sys::INT4OID);
+        assert_eq!(pg_type_oid("int8"), pg_sys::INT8OID);
+        assert_eq!(pg_type_oid("float8"), pg_sys::FLOAT8OID);
+        assert_eq!(pg_type_oid("bool"), pg_sys::BOOLOID);
+        assert_eq!(pg_type_oid("text"), pg_sys::TEXTOID);
+        assert_eq!(pg_type_oid("unknown_type"), pg_sys::TEXTOID); // fallback
+
+        assert_eq!(pg_type_name(pg_sys::INT4OID), "integer");
+        assert_eq!(pg_type_name(pg_sys::INT8OID), "bigint");
+        assert_eq!(pg_type_name(pg_sys::FLOAT8OID), "double precision");
+        assert_eq!(pg_type_name(pg_sys::BOOLOID), "boolean");
+        assert_eq!(pg_type_name(pg_sys::TEXTOID), "text"); // fallback
+    }
+
+    /// Helper: build a compressed blob from a CompressionType tag and encoded data.
+    fn make_blob(tag: crate::compression::CompressionType, row_count: u32, data: Vec<u8>) -> Vec<u8> {
+        crate::compression::CompressedColumn {
+            type_tag: tag,
+            row_count,
+            null_bitmap: Vec::new(),
+            data,
+        }.to_bytes()
+    }
+
+    /// Helper: build a compressed blob with a null bitmap.
+    fn make_blob_with_nulls(
+        tag: crate::compression::CompressionType,
+        row_count: u32,
+        null_bitmap: Vec<u8>,
+        data: Vec<u8>,
+    ) -> Vec<u8> {
+        crate::compression::CompressedColumn {
+            type_tag: tag,
+            row_count,
+            null_bitmap,
+            data,
+        }.to_bytes()
+    }
+
+    #[pg_test]
+    fn test_decompress_constant_i32() {
+        use super::datum_utils::decompress_blob_to_datums;
+        use crate::compression::{CompressionType, bitpacked};
+
+        let data = bitpacked::encode_constant_i32(42);
+        let blob = make_blob(CompressionType::Constant, 5, data);
+        let result = unsafe { decompress_blob_to_datums(&blob, "integer", pg_sys::INT4OID, -1) };
+        assert_eq!(result.len(), 5);
+        for (d, is_null) in &result {
+            assert!(!is_null);
+            assert_eq!(d.value() as i32, 42);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_constant_i64() {
+        use super::datum_utils::decompress_blob_to_datums;
+        use crate::compression::{CompressionType, bitpacked};
+
+        let data = bitpacked::encode_constant_i64(999_999);
+        let blob = make_blob(CompressionType::Constant, 3, data);
+        let result = unsafe { decompress_blob_to_datums(&blob, "bigint", pg_sys::INT8OID, -1) };
+        assert_eq!(result.len(), 3);
+        for (d, is_null) in &result {
+            assert!(!is_null);
+            assert_eq!(d.value() as i64, 999_999);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_constant_smallint() {
+        use super::datum_utils::decompress_blob_to_datums;
+        use crate::compression::{CompressionType, bitpacked};
+
+        let data = bitpacked::encode_constant_i32(7);
+        let blob = make_blob(CompressionType::Constant, 4, data);
+        let result = unsafe { decompress_blob_to_datums(&blob, "smallint", pg_sys::INT2OID, -1) };
+        assert_eq!(result.len(), 4);
+        for (d, is_null) in &result {
+            assert!(!is_null);
+            assert_eq!(d.value() as i16, 7);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_for_bitpacked_i32() {
+        use super::datum_utils::decompress_blob_to_datums;
+        use crate::compression::{CompressionType, bitpacked};
+
+        let values: Vec<i32> = vec![10, 20, 30, 40, 50];
+        let data = bitpacked::encode_for_i32(&values);
+        let blob = make_blob(CompressionType::ForBitpacked, 5, data);
+        let result = unsafe { decompress_blob_to_datums(&blob, "integer", pg_sys::INT4OID, -1) };
+        assert_eq!(result.len(), 5);
+        for (i, (d, is_null)) in result.iter().enumerate() {
+            assert!(!is_null);
+            assert_eq!(d.value() as i32, values[i]);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_for_bitpacked_i64() {
+        use super::datum_utils::decompress_blob_to_datums;
+        use crate::compression::{CompressionType, bitpacked};
+
+        let values: Vec<i64> = vec![100, 200, 300];
+        let data = bitpacked::encode_for_i64(&values);
+        let blob = make_blob(CompressionType::ForBitpacked, 3, data);
+        let result = unsafe { decompress_blob_to_datums(&blob, "bigint", pg_sys::INT8OID, -1) };
+        assert_eq!(result.len(), 3);
+        for (i, (d, is_null)) in result.iter().enumerate() {
+            assert!(!is_null);
+            assert_eq!(d.value() as i64, values[i]);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_for_bitpacked_smallint() {
+        use super::datum_utils::decompress_blob_to_datums;
+        use crate::compression::{CompressionType, bitpacked};
+
+        let values: Vec<i32> = vec![1, 2, 3, 4];
+        let data = bitpacked::encode_for_i32(&values);
+        let blob = make_blob(CompressionType::ForBitpacked, 4, data);
+        let result = unsafe { decompress_blob_to_datums(&blob, "smallint", pg_sys::INT2OID, -1) };
+        assert_eq!(result.len(), 4);
+        for (i, (d, is_null)) in result.iter().enumerate() {
+            assert!(!is_null);
+            assert_eq!(d.value() as i16, values[i] as i16);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_boolean() {
+        use super::datum_utils::decompress_blob_to_datums;
+        use crate::compression::{CompressionType, boolean};
+
+        let values = vec![true, false, true, true, false];
+        let data = boolean::encode(&values);
+        let blob = make_blob(CompressionType::BooleanBitmap, 5, data);
+        let result = unsafe { decompress_blob_to_datums(&blob, "boolean", pg_sys::BOOLOID, -1) };
+        assert_eq!(result.len(), 5);
+        for (i, (d, is_null)) in result.iter().enumerate() {
+            assert!(!is_null);
+            assert_eq!(d.value() != 0, values[i]);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_gorilla_float4() {
+        use super::datum_utils::decompress_blob_to_datums;
+        use crate::compression::{CompressionType, gorilla};
+
+        let values: Vec<f32> = vec![1.5, 2.5, 3.5];
+        let data = gorilla::encode_floats_f32(&values);
+        let blob = make_blob(CompressionType::Gorilla, 3, data);
+        let result = unsafe { decompress_blob_to_datums(&blob, "real", pg_sys::FLOAT4OID, -1) };
+        assert_eq!(result.len(), 3);
+        for (i, (d, is_null)) in result.iter().enumerate() {
+            assert!(!is_null);
+            let decoded = f32::from_bits(d.value() as u32);
+            assert_eq!(decoded, values[i]);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_gorilla_date() {
+        use super::datum_utils::decompress_blob_to_datums;
+        use crate::compression::{CompressionType, gorilla};
+
+        // Dates stored as unix-epoch microseconds (midnight)
+        let day_usec = 86_400_000_000i64;
+        let values: Vec<i64> = vec![0, day_usec, day_usec * 2]; // 1970-01-01, 02, 03
+        let data = gorilla::encode_timestamps(&values);
+        let blob = make_blob(CompressionType::Gorilla, 3, data);
+        let result = unsafe { decompress_blob_to_datums(&blob, "date", pg_sys::DATEOID, -1) };
+        assert_eq!(result.len(), 3);
+        // Verify PG days are correct: unix_days - PG_EPOCH_OFFSET_DAYS
+        for (i, (d, is_null)) in result.iter().enumerate() {
+            assert!(!is_null);
+            let pg_days = d.value() as i32;
+            let expected = i as i32 - PG_EPOCH_OFFSET_DAYS;
+            assert_eq!(pg_days, expected, "date mismatch at index {}", i);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_delta_varint_smallint() {
+        use super::datum_utils::decompress_blob_to_datums;
+        use crate::compression::{CompressionType, integer};
+
+        let values: Vec<i32> = vec![100, 200, 300];
+        let data = integer::encode_i32(&values);
+        let blob = make_blob(CompressionType::DeltaVarint, 3, data);
+        let result = unsafe { decompress_blob_to_datums(&blob, "smallint", pg_sys::INT2OID, -1) };
+        assert_eq!(result.len(), 3);
+        for (i, (d, is_null)) in result.iter().enumerate() {
+            assert!(!is_null);
+            assert_eq!(d.value() as i16, values[i] as i16);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_with_nulls() {
+        use super::datum_utils::decompress_blob_to_datums;
+        use crate::compression::{CompressionType, integer};
+
+        // 4 rows, positions 0 and 2 are null (bitmap bit 0 and 2 set)
+        let non_null_values: Vec<i32> = vec![10, 30]; // values at positions 1 and 3
+        let data = integer::encode_i32(&non_null_values);
+        let null_bitmap = vec![0b00000101u8]; // bits 0,2 = null
+        let blob = make_blob_with_nulls(CompressionType::DeltaVarint, 4, null_bitmap, data);
+        let result = unsafe { decompress_blob_to_datums(&blob, "integer", pg_sys::INT4OID, -1) };
+        assert_eq!(result.len(), 4);
+        assert!(result[0].1, "position 0 should be null");
+        assert!(!result[1].1);
+        assert_eq!(result[1].0.value() as i32, 10);
+        assert!(result[2].1, "position 2 should be null");
+        assert!(!result[3].1);
+        assert_eq!(result[3].0.value() as i32, 30);
+    }
+
+    #[pg_test]
+    fn test_decompress_truncated_basic() {
+        use super::datum_utils::decompress_blob_to_datums_truncated;
+        use crate::compression::{CompressionType, integer};
+
+        // 10 values, truncate to first 3
+        let values: Vec<i32> = (0..10).collect();
+        let data = integer::encode_i32(&values);
+        let blob = make_blob(CompressionType::DeltaVarint, 10, data);
+        let result = unsafe {
+            decompress_blob_to_datums_truncated(&blob, "integer", pg_sys::INT4OID, -1, 2)
+        };
+        // max_row=2 means rows 0,1,2 → 3 elements
+        assert_eq!(result.len(), 3);
+        for (i, (d, is_null)) in result.iter().enumerate() {
+            assert!(!is_null);
+            assert_eq!(d.value() as i32, i as i32);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_truncated_falls_back_when_no_benefit() {
+        use super::datum_utils::decompress_blob_to_datums_truncated;
+        use crate::compression::{CompressionType, integer};
+
+        // 5 values, max_row=10 → truncated_count >= total_count, uses full path
+        let values: Vec<i32> = vec![1, 2, 3, 4, 5];
+        let data = integer::encode_i32(&values);
+        let blob = make_blob(CompressionType::DeltaVarint, 5, data);
+        let result = unsafe {
+            decompress_blob_to_datums_truncated(&blob, "integer", pg_sys::INT4OID, -1, 10)
+        };
+        assert_eq!(result.len(), 5);
+        for (i, (d, is_null)) in result.iter().enumerate() {
+            assert!(!is_null);
+            assert_eq!(d.value() as i32, values[i]);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_truncated_with_nulls() {
+        use super::datum_utils::decompress_blob_to_datums_truncated;
+        use crate::compression::{CompressionType, integer};
+
+        // 8 rows, null at positions 1 and 5. Truncate to first 4 (max_row=3).
+        // Positions 0-3: null at 1, non-null at 0,2,3
+        let non_null_values: Vec<i32> = vec![10, 20, 30, 40, 50, 60];
+        let data = integer::encode_i32(&non_null_values);
+        let null_bitmap = vec![0b00100010u8]; // bits 1,5 = null
+        let blob = make_blob_with_nulls(CompressionType::DeltaVarint, 8, null_bitmap, data);
+        let result = unsafe {
+            decompress_blob_to_datums_truncated(&blob, "integer", pg_sys::INT4OID, -1, 3)
+        };
+        assert_eq!(result.len(), 4); // rows 0,1,2,3
+        assert!(!result[0].1);
+        assert_eq!(result[0].0.value() as i32, 10);
+        assert!(result[1].1, "position 1 should be null");
+        assert!(!result[2].1);
+        assert_eq!(result[2].0.value() as i32, 20);
+        assert!(!result[3].1);
+        assert_eq!(result[3].0.value() as i32, 30);
+    }
+
+    #[pg_test]
+    fn test_decompress_truncated_constant() {
+        use super::datum_utils::decompress_blob_to_datums_truncated;
+        use crate::compression::{CompressionType, bitpacked};
+
+        let data = bitpacked::encode_constant_i32(77);
+        let blob = make_blob(CompressionType::Constant, 100, data);
+        let result = unsafe {
+            decompress_blob_to_datums_truncated(&blob, "integer", pg_sys::INT4OID, -1, 4)
+        };
+        assert_eq!(result.len(), 5); // max_row=4 → 5 elements
+        for (d, is_null) in &result {
+            assert!(!is_null);
+            assert_eq!(d.value() as i32, 77);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_truncated_for_bitpacked() {
+        use super::datum_utils::decompress_blob_to_datums_truncated;
+        use crate::compression::{CompressionType, bitpacked};
+
+        let values: Vec<i64> = (0..20).collect();
+        let data = bitpacked::encode_for_i64(&values);
+        let blob = make_blob(CompressionType::ForBitpacked, 20, data);
+        let result = unsafe {
+            decompress_blob_to_datums_truncated(&blob, "bigint", pg_sys::INT8OID, -1, 2)
+        };
+        assert_eq!(result.len(), 3);
+        for (i, (d, is_null)) in result.iter().enumerate() {
+            assert!(!is_null);
+            assert_eq!(d.value() as i64, i as i64);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_truncated_boolean() {
+        use super::datum_utils::decompress_blob_to_datums_truncated;
+        use crate::compression::{CompressionType, boolean};
+
+        let values: Vec<bool> = vec![true, false, true, false, true, false, true, false, true, false];
+        let data = boolean::encode(&values);
+        let blob = make_blob(CompressionType::BooleanBitmap, 10, data);
+        let result = unsafe {
+            decompress_blob_to_datums_truncated(&blob, "boolean", pg_sys::BOOLOID, -1, 2)
+        };
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0.value() != 0, true);
+        assert_eq!(result[1].0.value() != 0, false);
+        assert_eq!(result[2].0.value() != 0, true);
+    }
+
+    #[pg_test]
+    fn test_decompress_lz4_text() {
+        use super::datum_utils::decompress_blob_to_datums;
+        use crate::compression::{CompressionType, lz4};
+
+        let values: Vec<&str> = vec!["hello", "world", "test"];
+        let data = lz4::encode(&values);
+        let blob = make_blob(CompressionType::Lz4, 3, data);
+        let result = unsafe { decompress_blob_to_datums(&blob, "text", pg_sys::TEXTOID, -1) };
+        assert_eq!(result.len(), 3);
+        for (d, is_null) in &result {
+            assert!(!is_null);
+            assert!(d.value() != 0, "datum should not be null pointer");
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_lz4_blocked_text() {
+        use super::datum_utils::decompress_blob_to_datums;
+        use crate::compression::{CompressionType, lz4};
+
+        let values: Vec<&str> = vec!["alpha", "beta", "gamma", "delta"];
+        let data = lz4::encode_blocked(&values, 2); // block_size=2
+        let blob = make_blob(CompressionType::Lz4Blocked, 4, data);
+        let result = unsafe { decompress_blob_to_datums(&blob, "text", pg_sys::TEXTOID, -1) };
+        assert_eq!(result.len(), 4);
+        for (d, is_null) in &result {
+            assert!(!is_null);
+            assert!(d.value() != 0);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_dictionary_lz4_text() {
+        use super::datum_utils::decompress_blob_to_datums;
+        use crate::compression::{CompressionType, dictionary};
+
+        let values: Vec<&str> = vec!["cat", "dog", "cat", "dog", "cat"];
+        let data = dictionary::encode_lz4(&values);
+        let blob = make_blob(CompressionType::DictionaryLz4, 5, data);
+        let result = unsafe { decompress_blob_to_datums(&blob, "text", pg_sys::TEXTOID, -1) };
+        assert_eq!(result.len(), 5);
+        for (d, is_null) in &result {
+            assert!(!is_null);
+            assert!(d.value() != 0);
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_empty_blob() {
+        use super::datum_utils::decompress_blob_to_datums;
+
+        let result = unsafe { decompress_blob_to_datums(&[], "integer", pg_sys::INT4OID, -1) };
+        assert!(result.is_empty());
+    }
+
+    #[pg_test]
+    fn test_decompress_truncated_empty_blob() {
+        use super::datum_utils::decompress_blob_to_datums_truncated;
+
+        let result = unsafe {
+            decompress_blob_to_datums_truncated(&[], "integer", pg_sys::INT4OID, -1, 5)
+        };
+        assert!(result.is_empty());
+    }
 }

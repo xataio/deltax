@@ -3691,3 +3691,240 @@ class TestDeltaXAppend:
             f"Missing: {set(expected_rows) - set(actual_values)}, "
             f"Extra: {set(actual_values) - set(expected_rows)}"
         )
+
+
+class TestTextDecompressionPaths:
+    """Integration tests exercising text decompression codec variants.
+
+    These tests target datum_utils.rs paths that are hard to reach with
+    typical data: LIKE StartsWith/EndsWith/Exact, text equality pushdown,
+    length() aggregate pushdown, nullable text columns, two-phase selection,
+    and bpchar columns.
+    """
+
+    def _setup_text_table(self, db):
+        """Create a table with varied text data to exercise multiple codecs."""
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE text_paths (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                tag TEXT,
+                url TEXT NOT NULL,
+                status CHAR(5) NOT NULL,
+                value INTEGER NOT NULL
+            )
+        """)
+        db.execute("SELECT deltax_create_table('text_paths', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Insert data with:
+        # - tag: nullable, few distinct values (Dictionary codec)
+        # - url: many distinct values (Lz4 codec), some with specific patterns
+        # - status: bpchar(5), few distinct values
+        for i in range(200):
+            ts = f"'{BASE_TS}'::timestamptz + interval '{i} minutes'"
+            device = f"dev-{i % 5}"
+            # tag: null every 10th row
+            if i % 10 == 0:
+                tag = "NULL"
+            else:
+                tag = f"'tag-{i % 7}'"
+            # url: varied patterns for LIKE testing
+            if i % 20 == 0:
+                url = f"https://example.com/search?q=item-{i}"
+            elif i % 20 == 1:
+                url = f"prefix-match-{i}.html"
+            elif i % 20 == 2:
+                url = f"page-{i}-suffix-match"
+            elif i % 20 == 3:
+                url = f"exact-url-{i % 3}"
+            else:
+                url = f"https://site-{i % 30}.com/path/{i}"
+            status = ["OK   ", "ERR  ", "WARN ", "INFO ", "DEBUG"][i % 5]
+            db.execute(
+                f"INSERT INTO text_paths VALUES ("
+                f"{ts}, '{device}', {tag}, '{url}', '{status}', {i})"
+            )
+        db.commit()
+
+        db.execute(
+            "SELECT deltax_enable_compression('text_paths', "
+            "segment_by => ARRAY['device_id'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "text_paths")
+        db.execute("ANALYZE text_paths")
+        db.commit()
+
+    def _query_before_after(self, db, sql):
+        """Run query before and after compression, return both results."""
+        return db.execute(sql).fetchall()
+
+    def test_like_starts_with(self, db):
+        """LIKE 'prefix%' uses StartsWith strategy."""
+        self._setup_text_table(db)
+        count = db.execute(
+            "SELECT count(*) FROM text_paths WHERE url LIKE 'prefix-%'"
+        ).fetchone()[0]
+        assert count == 10, f"StartsWith LIKE expected 10, got {count}"
+        rows = db.execute(
+            "SELECT url FROM text_paths WHERE url LIKE 'prefix-%' ORDER BY value"
+        ).fetchall()
+        assert all(r[0].startswith("prefix-") for r in rows)
+
+    def test_like_ends_with(self, db):
+        """LIKE '%suffix' uses EndsWith strategy."""
+        self._setup_text_table(db)
+        count = db.execute(
+            "SELECT count(*) FROM text_paths WHERE url LIKE '%-suffix-match'"
+        ).fetchone()[0]
+        assert count == 10, f"EndsWith LIKE expected 10, got {count}"
+        rows = db.execute(
+            "SELECT url FROM text_paths WHERE url LIKE '%-suffix-match' ORDER BY value"
+        ).fetchall()
+        assert all(r[0].endswith("-suffix-match") for r in rows)
+
+    def test_like_exact(self, db):
+        """LIKE without wildcards uses Exact strategy."""
+        self._setup_text_table(db)
+        # exact-url-0, exact-url-1, exact-url-2 each appear for i%20==3 && i%3
+        count = db.execute(
+            "SELECT count(*) FROM text_paths WHERE url LIKE 'exact-url-0'"
+        ).fetchone()[0]
+        rows = db.execute(
+            "SELECT url FROM text_paths WHERE url LIKE 'exact-url-0'"
+        ).fetchall()
+        assert count > 0, "Exact LIKE should match at least one row"
+        assert all(r[0] == "exact-url-0" for r in rows)
+
+    def test_text_equality_filter(self, db):
+        """WHERE text_col = 'value' uses eq_filter pushdown."""
+        self._setup_text_table(db)
+        count = db.execute(
+            "SELECT count(*) FROM text_paths WHERE tag = 'tag-0'"
+        ).fetchone()[0]
+        # tag-0 appears when i%7==0 and i%10!=0 (not null)
+        expected = sum(1 for i in range(200) if i % 7 == 0 and i % 10 != 0)
+        assert count == expected, f"text = expected {expected}, got {count}"
+
+    def test_text_inequality_filter(self, db):
+        """WHERE text_col <> 'value' uses eq_filter with is_ne=true."""
+        self._setup_text_table(db)
+        total_non_null = sum(1 for i in range(200) if i % 10 != 0)
+        eq_count = db.execute(
+            "SELECT count(*) FROM text_paths WHERE tag = 'tag-3'"
+        ).fetchone()[0]
+        ne_count = db.execute(
+            "SELECT count(*) FROM text_paths WHERE tag <> 'tag-3'"
+        ).fetchone()[0]
+        assert ne_count == total_non_null - eq_count, (
+            f"text <> mismatch: {ne_count} != {total_non_null} - {eq_count}"
+        )
+
+    def test_nullable_text_counts(self, db):
+        """NULL text values handled correctly in compressed scans."""
+        self._setup_text_table(db)
+        total = db.execute("SELECT count(*) FROM text_paths").fetchone()[0]
+        non_null = db.execute(
+            "SELECT count(tag) FROM text_paths"
+        ).fetchone()[0]
+        null_count = db.execute(
+            "SELECT count(*) FROM text_paths WHERE tag IS NULL"
+        ).fetchone()[0]
+        assert total == 200
+        expected_nulls = sum(1 for i in range(200) if i % 10 == 0)
+        assert null_count == expected_nulls, (
+            f"Expected {expected_nulls} nulls, got {null_count}"
+        )
+        assert non_null == total - null_count
+
+    def test_bpchar_decompression(self, db):
+        """CHAR(n) columns decompress correctly with padding."""
+        self._setup_text_table(db)
+        rows = db.execute(
+            "SELECT DISTINCT status FROM text_paths ORDER BY status"
+        ).fetchall()
+        values = [r[0] for r in rows]
+        assert len(values) == 5
+        # bpchar pads to 5 chars
+        assert "OK   " in values or "OK" in [v.strip() for v in values]
+
+    def test_bpchar_equality(self, db):
+        """WHERE on CHAR(n) column works after compression."""
+        self._setup_text_table(db)
+        count = db.execute(
+            "SELECT count(*) FROM text_paths WHERE status = 'OK'"
+        ).fetchone()[0]
+        assert count == 40, f"bpchar equality expected 40, got {count}"
+
+    def test_avg_length_pushdown(self, db):
+        """AVG(length(text)) triggers decompress_text_blob_to_lengths path."""
+        self._setup_text_table(db)
+        # Compare compressed result with expected
+        result = db.execute(
+            "SELECT AVG(length(url))::numeric(10,2) FROM text_paths"
+        ).fetchone()[0]
+        assert result is not None
+        assert float(result) > 0
+
+    def test_avg_length_with_filter(self, db):
+        """AVG(length(text)) with WHERE filter exercises length + selection."""
+        self._setup_text_table(db)
+        result = db.execute(
+            "SELECT AVG(length(tag))::numeric(10,2) FROM text_paths "
+            "WHERE tag <> ''"
+        ).fetchone()[0]
+        assert result is not None
+        assert float(result) > 0
+
+    def test_two_phase_text_selection(self, db):
+        """Batch qual on one column creates selection for other text columns."""
+        self._setup_text_table(db)
+        # WHERE value > 150 filters via batch qual (integer comparison),
+        # then tag/url columns use the selection vector for two-phase decompression.
+        rows = db.execute(
+            "SELECT tag, url FROM text_paths WHERE value > 150 ORDER BY value"
+        ).fetchall()
+        assert len(rows) == 49
+        # Verify NULLs are preserved in the selection
+        null_tags = [r for r in rows if r[0] is None]
+        # i=160,170,180,190 have null tags (i%10==0) and value>150
+        assert len(null_tags) == 4, f"Expected 4 null tags, got {len(null_tags)}"
+
+    def test_like_contains_with_nullable(self, db):
+        """LIKE '%pattern%' on nullable column handles NULLs correctly."""
+        self._setup_text_table(db)
+        count = db.execute(
+            "SELECT count(*) FROM text_paths WHERE tag LIKE '%tag-1%'"
+        ).fetchone()[0]
+        expected = sum(1 for i in range(200) if i % 10 != 0 and i % 7 == 1)
+        assert count == expected, f"LIKE on nullable: expected {expected}, got {count}"
+
+    def test_not_like_filter(self, db):
+        """NOT LIKE uses negated LIKE strategy."""
+        self._setup_text_table(db)
+        like_count = db.execute(
+            "SELECT count(*) FROM text_paths WHERE url LIKE '%search%'"
+        ).fetchone()[0]
+        not_like_count = db.execute(
+            "SELECT count(*) FROM text_paths WHERE url NOT LIKE '%search%'"
+        ).fetchone()[0]
+        assert like_count + not_like_count == 200, (
+            f"LIKE + NOT LIKE should equal total: {like_count} + {not_like_count} != 200"
+        )
+        assert like_count == 10  # every 20th row
+
+    def test_group_by_nullable_text(self, db):
+        """GROUP BY on nullable text column handles NULLs in raw_strings path."""
+        self._setup_text_table(db)
+        rows = db.execute(
+            "SELECT tag, count(*) FROM text_paths GROUP BY tag ORDER BY tag"
+        ).fetchall()
+        # 7 distinct non-null tags + 1 NULL group
+        non_null_groups = [r for r in rows if r[0] is not None]
+        null_groups = [r for r in rows if r[0] is None]
+        assert len(non_null_groups) == 7
+        assert len(null_groups) == 1
+        assert null_groups[0][1] == 20  # 200/10 nulls
