@@ -7,7 +7,7 @@ import psycopg
 import pytest
 
 CONTAINER_NAME = "pg_deltax_inttest"
-HOST_PORT = 15432
+HOST_PORT = int(os.environ.get("PG_DELTAX_PORT", 15432))
 PG_PASSWORD = "postgres"
 PG_USER = "postgres"
 BENCH_VOLUME = "pg_deltax_bench_pgdata"
@@ -15,7 +15,20 @@ BENCH_VOLUME = "pg_deltax_bench_pgdata"
 
 @pytest.fixture(scope="session")
 def pg_container():
-    """Start the runtime container, wait for PG readiness, yield, then tear down."""
+    """Start the runtime container, wait for PG readiness, yield, then tear down.
+
+    If PG_DELTAX_COV_CONTAINER is set, reuse that already-running container
+    (for coverage-all mode where the Makefile manages the container lifecycle).
+    """
+    cov_container = os.environ.get("PG_DELTAX_COV_CONTAINER")
+    if cov_container:
+        # Coverage mode: container is already running, managed by Makefile
+        global CONTAINER_NAME
+        CONTAINER_NAME = cov_container
+        _wait_for_pg()
+        yield
+        return
+
     image = os.environ.get("PG_DELTAX_IMAGE")
     if not image:
         pytest.skip("PG_DELTAX_IMAGE not set")

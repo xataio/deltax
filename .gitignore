@@ -1,4 +1,5 @@
 /target
+/coverage
 /.venv
 tests/__pycache__/
 *.swp

@@ -1,0 +1,12 @@
+# Runtime image for coverage-instrumented extension.
+# The instrumented .so is pre-built by the dev container and passed via build context.
+ARG PG_MAJOR=17
+FROM postgres:${PG_MAJOR}-bookworm
+
+ARG PG_MAJOR=17
+
+# The instrumented extension files are copied from coverage/pkg/ (populated by Makefile)
+COPY coverage/pkg/ /
+
+# Default profile output path — mount /coverage as a volume to collect profraw
+ENV LLVM_PROFILE_FILE=/coverage/integration-%p-%m.profraw

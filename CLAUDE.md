@@ -15,7 +15,9 @@ make dev-image                        # Build development Docker image (required
 make build                            # Compile the extension
 make test                             # Run pgrx unit tests (PG 17)
 make test PG_MAJOR=18                 # Run pgrx unit tests against specific PG version
-make clippy                           # Run Rust linter
+make clippy                           # Run Rust linter (includes test code)
+make coverage                         # Unit test coverage report → coverage/html/
+make coverage-all                     # Unit + integration test coverage → coverage/html/
 make integration-test                 # Run Python integration tests (PG 17 & 18)
 make integration-test PG_VERSIONS=17  # Integration tests for specific PG version(s)
 make run                              # Start PostgreSQL with extension on port 5432

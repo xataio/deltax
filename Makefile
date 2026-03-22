@@ -1,6 +1,7 @@
 PG_MAJOR ?= 17
 DEV_IMAGE  = pg_deltax-dev:pg$(PG_MAJOR)
 IMAGE      = pg_deltax:pg$(PG_MAJOR)
+COV_IMAGE  = pg_deltax-cov:pg$(PG_MAJOR)
 TARGET_VOL      = pg_deltax_target_pg$(PG_MAJOR)
 CARGO_VOL       = pg_deltax_cargo
 QUERY_CONTAINER = pg_deltax_query
@@ -8,7 +9,8 @@ QUERY_CONTAINER = pg_deltax_query
 PG_VERSIONS ?= 17 18
 VENV         = .venv
 
-.PHONY: dev-image image image-fresh test build clippy run psql cargo clean integration-test \
+.PHONY: dev-image image image-fresh test build clippy coverage coverage-all run psql cargo clean \
+       integration-test \
        bench-clickbench bench-clickbench-keep bench-clickbench-full bench-clean \
        bench-timescaledb bench-compare bench-all \
        run-sql run-sql-file logs logs-all logs-follow
@@ -33,6 +35,74 @@ build: dev-image
 clippy: dev-image
 	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
 		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) cargo clippy --features pg$(PG_MAJOR) --no-default-features --tests
+
+coverage: dev-image
+	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
+		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) bash -c '\
+		eval "$$(cargo llvm-cov show-env --export-prefix)" && \
+		cargo llvm-cov clean --workspace && \
+		cargo pgrx test pg$(PG_MAJOR) && \
+		cargo llvm-cov report --html --output-dir /build/pg_deltax/coverage && \
+		cargo llvm-cov report && \
+		echo "" && \
+		echo "HTML report: coverage/html/index.html"'
+
+# Combined unit + integration test coverage report.
+# 1. Instrumented build + unit tests in dev container (profraw → target/)
+# 2. Package the same instrumented .so into a runtime image
+# 3. Run integration tests with profraw mounted to host
+# 4. Copy integration profraw back and generate merged report
+#
+# The key is that unit tests and the runtime image share the same instrumented
+# binary, so all profraw files are compatible.
+coverage-all: dev-image $(VENV)/.stamp
+	@rm -rf $(CURDIR)/coverage/profraw $(CURDIR)/coverage/pkg
+	@mkdir -p $(CURDIR)/coverage/profraw $(CURDIR)/coverage/pkg
+	# Step 1: instrumented build + unit tests + install extension
+	# Uses cargo pgrx install (dev profile) so the .so matches the test profraw.
+	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
+		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) bash -c '\
+		eval "$$(cargo llvm-cov show-env --export-prefix)" && \
+		cargo llvm-cov clean --workspace && \
+		cargo pgrx test pg$(PG_MAJOR) && \
+		cargo pgrx install --pg-config /usr/lib/postgresql/$(PG_MAJOR)/bin/pg_config \
+			--features pg$(PG_MAJOR) --no-default-features && \
+		mkdir -p /build/pg_deltax/coverage/pkg/usr/lib/postgresql/$(PG_MAJOR)/lib \
+			/build/pg_deltax/coverage/pkg/usr/share/postgresql/$(PG_MAJOR)/extension && \
+		cp /usr/lib/postgresql/$(PG_MAJOR)/lib/pg_deltax.so \
+			/build/pg_deltax/coverage/pkg/usr/lib/postgresql/$(PG_MAJOR)/lib/ && \
+		cp /usr/share/postgresql/$(PG_MAJOR)/extension/pg_deltax* \
+			/build/pg_deltax/coverage/pkg/usr/share/postgresql/$(PG_MAJOR)/extension/'
+	# Step 2: build runtime image with the same instrumented .so
+	docker build -f docker/Dockerfile.coverage --build-arg PG_MAJOR=$(PG_MAJOR) -t $(COV_IMAGE) .
+	# Step 3: run integration tests against instrumented image
+	-docker rm -f pg_deltax_cov 2>/dev/null
+	docker run -d --name pg_deltax_cov \
+		-p 15433:5432 \
+		-e POSTGRES_PASSWORD=postgres \
+		-v $(CURDIR)/coverage/profraw:/coverage \
+		$(COV_IMAGE) \
+		-c shared_preload_libraries=pg_deltax
+	@echo "Waiting for coverage PG..."
+	@for i in $$(seq 1 30); do \
+		docker exec pg_deltax_cov pg_isready -U postgres -q 2>/dev/null && break; \
+		sleep 1; \
+	done
+	PG_DELTAX_IMAGE=__skip__ PG_DELTAX_COV_CONTAINER=pg_deltax_cov PG_DELTAX_PORT=15433 \
+		$(VENV)/bin/pytest tests/ -v --ignore=tests/bench_clickbench.py --ignore=tests/bench_clickbench_timescaledb.py || true
+	# Graceful shutdown to flush profraw
+	docker stop -t 10 pg_deltax_cov
+	docker rm pg_deltax_cov
+	# Step 4: merge integration profraw and generate combined report
+	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
+		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) bash -c '\
+		eval "$$(cargo llvm-cov show-env --export-prefix)" && \
+		PROFDIR=$$(dirname "$$LLVM_PROFILE_FILE") && \
+		cp /build/pg_deltax/coverage/profraw/*.profraw "$$PROFDIR"/ 2>/dev/null; \
+		cargo llvm-cov report --html --output-dir /build/pg_deltax/coverage && \
+		cargo llvm-cov report && \
+		echo "" && \
+		echo "HTML report: coverage/html/index.html"'
 
 # Build the runtime image (production-like, no build tools)
 image: dev-image

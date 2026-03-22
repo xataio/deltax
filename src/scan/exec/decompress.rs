@@ -1239,7 +1239,53 @@ pub(super) unsafe extern "C-unwind" fn exec_custom_scan(
             !(*node).ss.ps.instrument.is_null()
         });
 
-        // === Top-N fast path: emit from pre-computed buffer ===
+        // Top-N paths: emit from pre-computed buffer, or trigger the two-pass sort
+        if let Some(slot) = exec_topn(node, state, scan_slot, econtext, proj_info, instrument) {
+            return slot;
+        }
+
+        // Normal row-at-a-time execution
+        loop {
+            if let Some(slot) = try_emit_next_row(state, scan_slot, econtext, qual, proj_info, instrument) {
+                return slot;
+            }
+            if !load_next_segment(state, instrument) {
+                pg_sys::ExecClearTuple(scan_slot);
+                return scan_slot;
+            }
+        }
+    }
+}
+
+/// Handle Top-N execution paths for queries with ORDER BY + LIMIT.
+///
+/// Active for queries like `SELECT * FROM t ORDER BY ts DESC LIMIT 10` where
+/// DeltaX can push the sort + limit into the scan. The planner sets
+/// `topn_limit > 0` and `topn_sort_col` when it detects this pattern.
+///
+/// On the first call, triggers `exec_topn_two_pass` which scans all segments
+/// to collect candidate rows, sorts them, and stores the top-N results in
+/// `state.topn_buffer`. Subsequent calls emit rows one at a time from this
+/// pre-computed buffer without touching any more segments.
+///
+/// The two-pass approach is faster than full decompression because Pass 1 only
+/// decompresses filter + sort columns, and Pass 2 only decompresses the
+/// remaining columns for the winning rows.
+///
+/// Returns `Some(slot)` if a Top-N row was emitted or the buffer is exhausted
+/// (empty slot = end of scan). Returns `None` to fall through to the normal
+/// row-at-a-time path when Top-N is not active or was disabled at runtime
+/// (e.g. because a non-batch-comparable qual was detected during execution).
+unsafe fn exec_topn(
+    node: *mut pg_sys::CustomScanState,
+    state: &mut DecompressState,
+    scan_slot: *mut pg_sys::TupleTableSlot,
+    econtext: *mut pg_sys::ExprContext,
+    proj_info: *mut pg_sys::ProjectionInfo,
+    instrument: bool,
+) -> Option<*mut pg_sys::TupleTableSlot> {
+    unsafe {
+        // Fast path: emit from pre-computed buffer
         if state.topn_limit > 0 && state.topn_done {
             if state.topn_cursor < state.topn_buffer.len() {
                 pg_sys::ExecClearTuple(scan_slot);
@@ -1254,97 +1300,162 @@ pub(super) unsafe extern "C-unwind" fn exec_custom_scan(
                 state.topn_cursor += 1;
                 state.timing.rows_emitted += 1;
 
-                // Apply projection if needed
                 (*econtext).ecxt_scantuple = scan_slot;
                 let result = if !proj_info.is_null() {
                     exec_project(proj_info)
                 } else {
                     scan_slot
                 };
-                return result;
+                return Some(result);
             } else {
                 pg_sys::ExecClearTuple(scan_slot);
-                return scan_slot;
+                return Some(scan_slot);
             }
         }
 
-        // === Top-N two-pass execution (first call only) ===
+        // Two-pass execution (first call only): sort all qualifying rows, then
+        // re-enter exec_custom_scan to start emitting from the buffer.
         if state.topn_limit > 0 && !state.topn_done && state.topn_sort_col.is_some() {
             let plan_qual_list = (*(*node).ss.ps.plan).qual;
             exec_topn_two_pass(node, state, instrument, plan_qual_list);
             state.topn_done = true;
 
-            // If Top-N was disabled (e.g. non-batch qual detected), fall through
             if state.topn_limit == 0 {
-                // Fall through to normal path below
-            } else {
-                // Now emit the first row (re-enter the fast path above)
-                return exec_custom_scan(node);
+                // Top-N was disabled at runtime (e.g. non-batch qual detected)
+                return None;
             }
+            // Re-enter to emit the first row via the fast path above
+            return Some(exec_custom_scan(node));
         }
 
+        None
+    }
+}
+
+/// Try to emit the next qualifying row from the already-loaded segment.
+///
+/// This is the inner loop of the normal (non-Top-N) scan path, active for all
+/// DeltaXDecompress queries: `SELECT ... FROM t WHERE ...`. It is called
+/// repeatedly until the current segment is exhausted, then the caller loads
+/// the next segment via `load_next_segment`.
+///
+/// The function walks the selection vector (a boolean mask produced by batch
+/// quals during segment loading) to skip rows that were already filtered out
+/// at the batch level. For each surviving row it fills the scan slot with
+/// pre-decompressed datums, applies any remaining PostgreSQL WHERE quals that
+/// couldn't be pushed down to batch filtering (e.g. cross-column predicates,
+/// complex expressions), and runs projection to produce the output tuple.
+///
+/// Returns `Some(slot)` with the projected result if a qualifying row was
+/// found, or `None` when all rows in the current segment are exhausted.
+unsafe fn try_emit_next_row(
+    state: &mut DecompressState,
+    scan_slot: *mut pg_sys::TupleTableSlot,
+    econtext: *mut pg_sys::ExprContext,
+    qual: *mut pg_sys::ExprState,
+    proj_info: *mut pg_sys::ProjectionInfo,
+    instrument: bool,
+) -> Option<*mut pg_sys::TupleTableSlot> {
+    unsafe {
+        if state.current_segment.is_empty() {
+            return None;
+        }
+
+        let seg_rows = state.current_row_count;
+
         loop {
-            // If current segment has more rows, try the next one
-            if !state.current_segment.is_empty() {
-                let seg_rows = state.current_row_count;
-
-                // Batch filter: advance row_cursor to the next passing row.
-                // Uses slice .position() which LLVM can auto-vectorize (SIMD)
-                // to scan 16-32 bytes at a time instead of per-byte branching.
-                if !state.selection_vector.is_empty() {
-                    let start = state.row_cursor;
-                    let end = seg_rows;
-                    if let Some(offset) = state.selection_vector[start..end]
-                        .iter()
-                        .position(|&v| v)
-                    {
-                        state.timing.rows_batch_filtered += offset as u64;
-                        state.row_cursor = start + offset;
-                    } else {
-                        // All remaining rows fail — skip to end of segment
-                        state.timing.rows_batch_filtered += (end - start) as u64;
-                        state.row_cursor = end;
-                    }
-                }
-
-                if state.row_cursor < seg_rows {
-                    let t_row = if instrument { Some(Instant::now()) } else { None };
-
-                    fill_slot(scan_slot, state);
-                    state.row_cursor += 1;
-
-                    // Set the scan tuple in the expression context for qual/projection
-                    (*econtext).ecxt_scantuple = scan_slot;
-
-                    // Apply qualification (WHERE clauses pushed down to scan)
-                    if !qual.is_null() && !exec_qual(qual, econtext) {
-                        // Reset per-tuple memory context on filtered rows
-                        pg_sys::MemoryContextReset((*econtext).ecxt_per_tuple_memory);
-                        state.timing.rows_filtered += 1;
-                        if let Some(t) = t_row {
-                            state.timing.emit_us += t.elapsed().as_micros() as u64;
-                        }
-                        continue; // skip this row, try next
-                    }
-
-                    // Apply projection if needed
-                    let result = if !proj_info.is_null() {
-                        exec_project(proj_info)
-                    } else {
-                        scan_slot
-                    };
-                    state.timing.rows_emitted += 1;
-                    if let Some(t) = t_row {
-                        state.timing.emit_us += t.elapsed().as_micros() as u64;
-                    }
-                    return result;
+            // Batch filter: advance row_cursor to the next passing row.
+            // Uses slice .position() which LLVM can auto-vectorize (SIMD)
+            // to scan 16-32 bytes at a time instead of per-byte branching.
+            if !state.selection_vector.is_empty() {
+                let start = state.row_cursor;
+                let end = seg_rows;
+                if let Some(offset) = state.selection_vector[start..end]
+                    .iter()
+                    .position(|&v| v)
+                {
+                    state.timing.rows_batch_filtered += offset as u64;
+                    state.row_cursor = start + offset;
+                } else {
+                    // All remaining rows fail — skip to end of segment
+                    state.timing.rows_batch_filtered += (end - start) as u64;
+                    state.row_cursor = end;
                 }
             }
 
-            // Move to next segment
+            if state.row_cursor >= seg_rows {
+                return None;
+            }
+
+            let t_row = if instrument { Some(Instant::now()) } else { None };
+
+            fill_slot(scan_slot, state);
+            state.row_cursor += 1;
+
+            // Set the scan tuple in the expression context for qual/projection
+            (*econtext).ecxt_scantuple = scan_slot;
+
+            // Apply qualification (WHERE clauses pushed down to scan)
+            if !qual.is_null() && !exec_qual(qual, econtext) {
+                // Reset per-tuple memory context on filtered rows
+                pg_sys::MemoryContextReset((*econtext).ecxt_per_tuple_memory);
+                state.timing.rows_filtered += 1;
+                if let Some(t) = t_row {
+                    state.timing.emit_us += t.elapsed().as_micros() as u64;
+                }
+                continue; // skip this row, try next
+            }
+
+            // Apply projection if needed
+            let result = if !proj_info.is_null() {
+                exec_project(proj_info)
+            } else {
+                scan_slot
+            };
+            state.timing.rows_emitted += 1;
+            if let Some(t) = t_row {
+                state.timing.emit_us += t.elapsed().as_micros() as u64;
+            }
+            return Some(result);
+        }
+    }
+}
+
+/// Load and decompress the next qualifying segment into state.
+///
+/// Active for all DeltaXDecompress and DeltaXAppend queries during the normal
+/// (non-Top-N) scan path. Called by the outer loop in `exec_custom_scan` each
+/// time `try_emit_next_row` exhausts the current segment.
+///
+/// Iterates through remaining segments in order, applying three levels of
+/// pruning before decompressing:
+///   1. Segment-by filters — skip segments whose partition key doesn't match
+///   2. Time-range overlap — skip segments outside the query's time window
+///   3. Dictionary LIKE — for LIKE/ILIKE predicates on text columns, check
+///      the segment's dictionary to see if any value could possibly match
+///
+/// For segments that pass pruning, decompression happens in two phases to
+/// minimize work:
+///   - Phase 1: decompress only the columns referenced in WHERE clauses
+///     (filter columns) and evaluate batch quals to produce a selection
+///     vector (boolean mask of qualifying rows)
+///   - Phase 2: decompress the remaining columns needed by SELECT/ORDER BY,
+///     but only allocate text/variable-length data for rows that passed
+///     Phase 1. This avoids expensive string allocation for filtered-out rows.
+///
+/// After loading, resets `row_cursor` to 0 so `try_emit_next_row` can start
+/// emitting from the beginning of the segment.
+///
+/// Returns `true` if a segment was loaded, `false` if no segments remain
+/// (signaling end of scan).
+unsafe fn load_next_segment(
+    state: &mut DecompressState,
+    instrument: bool,
+) -> bool {
+    unsafe {
+        loop {
             if state.segment_index >= state.segments_data.len() {
-                pg_sys::ExecClearTuple(scan_slot);
-                return scan_slot;
+                return false;
             }
 
             let seg = &state.segments_data[state.segment_index];
@@ -1578,6 +1689,8 @@ pub(super) unsafe extern "C-unwind" fn exec_custom_scan(
                     // no selected rows — skip decompression entirely
                 }
             }
+
+            return true;
         }
     }
 }

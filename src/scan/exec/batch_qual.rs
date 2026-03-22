@@ -1,26 +1,36 @@
 use pgrx::pg_sys;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) enum BatchCompareOp { Eq, Ne, Lt, Le, Gt, Ge, Like, NotLike, InList }
+pub(super) enum BatchCompareOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Like,
+    NotLike,
+    InList,
+}
 
 #[derive(Debug, Clone)]
 pub(super) enum LikeStrategy {
-    Contains(String),    // %foo%  → str::contains
-    StartsWith(String),  // foo%   → str::starts_with
-    EndsWith(String),    // %foo   → str::ends_with
-    Exact(String),       // foo    → ==
-    General(String),     // patterns with _, \, or multiple % segments
+    Contains(String),   // %foo%  → str::contains
+    StartsWith(String), // foo%   → str::starts_with
+    EndsWith(String),   // %foo   → str::ends_with
+    Exact(String),      // foo    → ==
+    General(String),    // patterns with _, \, or multiple % segments
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct BatchQual {
-    pub(super) col_idx: usize,              // 0-based column index
-    pub(super) op: BatchCompareOp,          // comparison operator
-    pub(super) const_datum: pg_sys::Datum,  // constant value
-    pub(super) type_oid: pg_sys::Oid,       // column type OID
+    pub(super) col_idx: usize,                      // 0-based column index
+    pub(super) op: BatchCompareOp,                  // comparison operator
+    pub(super) const_datum: pg_sys::Datum,          // constant value
+    pub(super) type_oid: pg_sys::Oid,               // column type OID
     pub(super) like_strategy: Option<LikeStrategy>, // pre-compiled LIKE pattern
-    pub(super) text_const: Option<String>,  // text constant for Eq/Ne pushdown
-    pub(super) in_list_i64: Option<Vec<i64>>, // constant values for IN list (stored as i64)
+    pub(super) text_const: Option<String>,          // text constant for Eq/Ne pushdown
+    pub(super) in_list_i64: Option<Vec<i64>>,       // constant values for IN list (stored as i64)
 }
 
 // ============================================================================
@@ -44,7 +54,10 @@ pub(super) fn is_batch_comparable_type(type_oid: pg_sys::Oid) -> bool {
 }
 
 pub(super) fn is_text_type(type_oid: pg_sys::Oid) -> bool {
-    matches!(type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID)
+    matches!(
+        type_oid,
+        pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID
+    )
 }
 
 /// Flip a comparison operator for `Const op Var` → `Var op Const` rewriting.
@@ -85,8 +98,13 @@ pub(super) fn apply_batch_filter_i64(
     constant: i64,
 ) {
     for (i, &(datum, is_null)) in col.iter().enumerate() {
-        if !sel[i] { continue; }
-        if is_null { sel[i] = false; continue; }
+        if !sel[i] {
+            continue;
+        }
+        if is_null {
+            sel[i] = false;
+            continue;
+        }
         let v = datum.value() as i64;
         sel[i] = match op {
             BatchCompareOp::Eq => v == constant,
@@ -95,7 +113,9 @@ pub(super) fn apply_batch_filter_i64(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => unreachable!(),
+            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => {
+                unreachable!()
+            }
         };
     }
 }
@@ -107,8 +127,13 @@ pub(super) fn apply_batch_filter_i32(
     constant: i32,
 ) {
     for (i, &(datum, is_null)) in col.iter().enumerate() {
-        if !sel[i] { continue; }
-        if is_null { sel[i] = false; continue; }
+        if !sel[i] {
+            continue;
+        }
+        if is_null {
+            sel[i] = false;
+            continue;
+        }
         let v = datum.value() as i32;
         sel[i] = match op {
             BatchCompareOp::Eq => v == constant,
@@ -117,7 +142,9 @@ pub(super) fn apply_batch_filter_i32(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => unreachable!(),
+            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => {
+                unreachable!()
+            }
         };
     }
 }
@@ -129,8 +156,13 @@ pub(super) fn apply_batch_filter_i16(
     constant: i16,
 ) {
     for (i, &(datum, is_null)) in col.iter().enumerate() {
-        if !sel[i] { continue; }
-        if is_null { sel[i] = false; continue; }
+        if !sel[i] {
+            continue;
+        }
+        if is_null {
+            sel[i] = false;
+            continue;
+        }
         let v = datum.value() as i16;
         sel[i] = match op {
             BatchCompareOp::Eq => v == constant,
@@ -139,7 +171,9 @@ pub(super) fn apply_batch_filter_i16(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => unreachable!(),
+            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => {
+                unreachable!()
+            }
         };
     }
 }
@@ -151,8 +185,13 @@ pub(super) fn apply_batch_filter_f64(
     constant: f64,
 ) {
     for (i, &(datum, is_null)) in col.iter().enumerate() {
-        if !sel[i] { continue; }
-        if is_null { sel[i] = false; continue; }
+        if !sel[i] {
+            continue;
+        }
+        if is_null {
+            sel[i] = false;
+            continue;
+        }
         let v = f64::from_bits(datum.value() as u64);
         sel[i] = match op {
             BatchCompareOp::Eq => v == constant,
@@ -161,7 +200,9 @@ pub(super) fn apply_batch_filter_f64(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => unreachable!(),
+            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => {
+                unreachable!()
+            }
         };
     }
 }
@@ -173,8 +214,13 @@ pub(super) fn apply_batch_filter_f32(
     constant: f32,
 ) {
     for (i, &(datum, is_null)) in col.iter().enumerate() {
-        if !sel[i] { continue; }
-        if is_null { sel[i] = false; continue; }
+        if !sel[i] {
+            continue;
+        }
+        if is_null {
+            sel[i] = false;
+            continue;
+        }
         let v = f32::from_bits(datum.value() as u32);
         sel[i] = match op {
             BatchCompareOp::Eq => v == constant,
@@ -183,7 +229,9 @@ pub(super) fn apply_batch_filter_f32(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => unreachable!(),
+            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => {
+                unreachable!()
+            }
         };
     }
 }
@@ -195,13 +243,20 @@ pub(super) fn apply_batch_filter_bool(
     constant: bool,
 ) {
     for (i, &(datum, is_null)) in col.iter().enumerate() {
-        if !sel[i] { continue; }
-        if is_null { sel[i] = false; continue; }
+        if !sel[i] {
+            continue;
+        }
+        if is_null {
+            sel[i] = false;
+            continue;
+        }
         let v = datum.value() != 0;
         sel[i] = match op {
             BatchCompareOp::Eq => v == constant,
             BatchCompareOp::Ne => v != constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => unreachable!(),
+            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => {
+                unreachable!()
+            }
             _ => v == constant, // bool only supports = / <>
         };
     }
@@ -219,23 +274,38 @@ pub(super) fn apply_batch_filter_in_list(
         pg_sys::INT2OID => {
             let vals: Vec<i16> = values.iter().map(|&v| v as i16).collect();
             for (i, &(datum, is_null)) in col.iter().enumerate() {
-                if !sel[i] { continue; }
-                if is_null { sel[i] = false; continue; }
+                if !sel[i] {
+                    continue;
+                }
+                if is_null {
+                    sel[i] = false;
+                    continue;
+                }
                 sel[i] = vals.contains(&(datum.value() as i16));
             }
         }
         pg_sys::INT4OID | pg_sys::DATEOID => {
             let vals: Vec<i32> = values.iter().map(|&v| v as i32).collect();
             for (i, &(datum, is_null)) in col.iter().enumerate() {
-                if !sel[i] { continue; }
-                if is_null { sel[i] = false; continue; }
+                if !sel[i] {
+                    continue;
+                }
+                if is_null {
+                    sel[i] = false;
+                    continue;
+                }
                 sel[i] = vals.contains(&(datum.value() as i32));
             }
         }
         pg_sys::INT8OID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {
             for (i, &(datum, is_null)) in col.iter().enumerate() {
-                if !sel[i] { continue; }
-                if is_null { sel[i] = false; continue; }
+                if !sel[i] {
+                    continue;
+                }
+                if is_null {
+                    sel[i] = false;
+                    continue;
+                }
                 sel[i] = values.contains(&(datum.value() as i64));
             }
         }
@@ -534,8 +604,12 @@ pub(super) unsafe fn extract_batch_quals(
                 // Only support numeric/date/timestamp types for IN list
                 if !matches!(
                     sa_type_oid,
-                    pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
-                    | pg_sys::DATEOID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID
+                    pg_sys::INT2OID
+                        | pg_sys::INT4OID
+                        | pg_sys::INT8OID
+                        | pg_sys::DATEOID
+                        | pg_sys::TIMESTAMPOID
+                        | pg_sys::TIMESTAMPTZOID
                 ) {
                     continue;
                 }
@@ -613,9 +687,7 @@ pub(super) unsafe fn extract_batch_quals(
             if opname_ptr.is_null() {
                 continue;
             }
-            let opname = std::ffi::CStr::from_ptr(opname_ptr)
-                .to_str()
-                .unwrap_or("");
+            let opname = std::ffi::CStr::from_ptr(opname_ptr).to_str().unwrap_or("");
 
             // Recognize LIKE/NOT LIKE operators before comparison ops
             let is_like = opname == "~~";
@@ -655,18 +727,23 @@ pub(super) unsafe fn extract_batch_quals(
             let arg0_tag = (*arg0).type_;
             let arg1_tag = (*arg1).type_;
 
-            let (var_node, const_node, var_on_left) =
-                if arg0_tag == pg_sys::NodeTag::T_Var
-                    && arg1_tag == pg_sys::NodeTag::T_Const
-                {
-                    (arg0 as *const pg_sys::Var, arg1 as *const pg_sys::Const, true)
-                } else if arg0_tag == pg_sys::NodeTag::T_Const
-                    && arg1_tag == pg_sys::NodeTag::T_Var
-                {
-                    (arg1 as *const pg_sys::Var, arg0 as *const pg_sys::Const, false)
-                } else {
-                    continue;
-                };
+            let (var_node, const_node, var_on_left) = if arg0_tag == pg_sys::NodeTag::T_Var
+                && arg1_tag == pg_sys::NodeTag::T_Const
+            {
+                (
+                    arg0 as *const pg_sys::Var,
+                    arg1 as *const pg_sys::Const,
+                    true,
+                )
+            } else if arg0_tag == pg_sys::NodeTag::T_Const && arg1_tag == pg_sys::NodeTag::T_Var {
+                (
+                    arg1 as *const pg_sys::Var,
+                    arg0 as *const pg_sys::Const,
+                    false,
+                )
+            } else {
+                continue;
+            };
 
             if (*const_node).constisnull {
                 continue;
@@ -685,7 +762,10 @@ pub(super) unsafe fn extract_batch_quals(
                     continue;
                 }
                 // Only text-like types
-                if !matches!(type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID) {
+                if !matches!(
+                    type_oid,
+                    pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID
+                ) {
                     continue;
                 }
                 // Extract pattern string from constant datum
@@ -738,7 +818,11 @@ pub(super) unsafe fn extract_batch_quals(
                     continue;
                 }
 
-                let op = if var_on_left { cmp_op } else { flip_compare_op(cmp_op) };
+                let op = if var_on_left {
+                    cmp_op
+                } else {
+                    flip_compare_op(cmp_op)
+                };
 
                 batch_quals.push(BatchQual {
                     col_idx,
