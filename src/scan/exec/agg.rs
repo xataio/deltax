@@ -22,15 +22,18 @@ use super::segments::{
 };
 
 /// Compute a 128-bit hash of a byte slice for COUNT(DISTINCT) on strings.
-/// Uses two DefaultHasher rounds with different prefixes to produce independent
-/// 64-bit halves, combined into u128. Collision probability is negligible
-/// for any practical cardinality (~1 in 2^64 for any pair).
-fn hash128(data: &[u8]) -> u128 {
-    let mut h1 = std::collections::hash_map::DefaultHasher::new();
+/// Uses two AHasher instances (AES-NI accelerated) with different fixed keys
+/// to produce independent 64-bit halves, combined into u128. Collision
+/// probability is negligible for any practical cardinality (~1 in 2^64 for
+/// any pair).
+fn hash128_str(data: &[u8]) -> u128 {
+    use std::hash::BuildHasher;
+    let s1 = ahash::RandomState::with_seeds(0xa1b2c3d4, 0xe5f6a7b8, 0x11223344, 0x55667788);
+    let mut h1 = s1.build_hasher();
     h1.write(data);
     let lo = h1.finish();
-    let mut h2 = std::collections::hash_map::DefaultHasher::new();
-    h2.write_u8(0xff); // domain separation
+    let s2 = ahash::RandomState::with_seeds(0x1234abcd, 0x5678ef01, 0xaabbccdd, 0xeeff0011);
+    let mut h2 = s2.build_hasher();
     h2.write(data);
     let hi = h2.finish();
     (hi as u128) << 64 | lo as u128
@@ -1734,7 +1737,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                     AggAccumulator::CountDistinctStr { seen } => {
                                         let cstr = pg_sys::text_to_cstring(datum.cast_mut_ptr());
                                         let bytes = std::ffi::CStr::from_ptr(cstr).to_bytes();
-                                        let hash = siphash128(bytes);
+                                        let hash = hash128_str(bytes);
                                         pg_sys::pfree(cstr as *mut _);
                                         seen.insert(hash);
                                     }
@@ -3549,8 +3552,8 @@ mod tests {
     #[pg_test]
     fn test_finalize_count_distinct_str() {
         let mut seen = std::collections::HashSet::new();
-        seen.insert("foo".to_string());
-        seen.insert("bar".to_string());
+        seen.insert(0xdeadbeef_u128);
+        seen.insert(0xcafebabe_u128);
         let acc = AggAccumulator::CountDistinctStr { seen };
         let spec = make_agg_spec(AggType::CountDistinct, 0, 25);
         let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
