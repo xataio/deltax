@@ -30,6 +30,7 @@ lz4_flex = "0.11"
 memchr = "2"
 hashbrown = "0.15"
 ahash = "0.8"
+cardinality-estimator = "1.0"
 
 [dev-dependencies]
 pgrx-tests = "0.17"

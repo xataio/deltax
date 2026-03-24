@@ -401,13 +401,6 @@ def clickbench_db(pg_container):
     conn.execute("CREATE EXTENSION pg_deltax")
     conn.commit()
 
-    # Allow forcing streaming compression path via env var
-    threshold = os.environ.get("ARRAY_AGG_THRESHOLD")
-    if threshold is not None:
-        conn.execute(f"SET pg_deltax.array_agg_threshold = {int(threshold)}")
-        conn.commit()
-        print(f"  pg_deltax.array_agg_threshold = {threshold}")
-
     # Setup: create table, partition, load data
     setup_clickbench(conn, NUM_FILES)
     enable_compression(conn)

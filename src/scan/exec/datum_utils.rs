@@ -70,7 +70,7 @@ pub(super) unsafe fn exec_qual(state: *mut pg_sys::ExprState, econtext: *mut pg_
     feature = "pg17"
 ))]
 #[inline]
-pub(super) unsafe fn tupdesc_get_attr(
+pub(in crate::scan) unsafe fn tupdesc_get_attr(
     tupdesc: pg_sys::TupleDesc,
     i: usize,
 ) -> *const pg_sys::FormData_pg_attribute {
@@ -79,7 +79,7 @@ pub(super) unsafe fn tupdesc_get_attr(
 
 #[cfg(feature = "pg18")]
 #[inline]
-pub(super) unsafe fn tupdesc_get_attr(
+pub(in crate::scan) unsafe fn tupdesc_get_attr(
     tupdesc: pg_sys::TupleDesc,
     i: usize,
 ) -> *const pg_sys::FormData_pg_attribute {

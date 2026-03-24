@@ -78,32 +78,76 @@ pub(super) fn get_row_count(companion_oid: pg_sys::Oid) -> Option<i64> {
     if row_count > 0 { Some(row_count) } else { None }
 }
 
-/// Get per-column ndistinct from deltax_partition catalog for a companion OID.
+/// Get per-column ndistinct from the companion table for a companion OID.
+/// Reads MAX(_ndistinct_col) for each _ndistinct_* column in the companion relation.
 /// Returns a map from column name to ndistinct count, or empty if unavailable.
 pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collections::HashMap<String, i64> {
-    let name = unsafe {
+    let (nd_columns, companion_name) = unsafe {
+        // Open companion table to inspect tuple descriptor for _ndistinct_* columns
+        let rel = pg_sys::table_open(companion_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let tupdesc = (*rel).rd_att;
+        let natts = (*tupdesc).natts as usize;
+
+        let mut cols: Vec<(String, String)> = Vec::new(); // (col_name, attr_name)
+        for i in 0..natts {
+            let att = &*super::exec::datum_utils::tupdesc_get_attr(tupdesc, i);
+            if att.attisdropped {
+                continue;
+            }
+            let attr_name = std::ffi::CStr::from_ptr(att.attname.data.as_ptr())
+                .to_string_lossy()
+                .into_owned();
+            if let Some(col_name) = attr_name.strip_prefix("_ndistinct_") {
+                cols.push((col_name.to_string(), attr_name));
+            }
+        }
+
+        pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+        if cols.is_empty() {
+            return std::collections::HashMap::new();
+        }
+
         let name_ptr = pg_sys::get_rel_name(companion_oid);
         if name_ptr.is_null() {
             return std::collections::HashMap::new();
         }
-        std::ffi::CStr::from_ptr(name_ptr)
+        let name = std::ffi::CStr::from_ptr(name_ptr)
             .to_string_lossy()
-            .into_owned()
+            .into_owned();
+
+        (cols, name)
     };
 
-    let result = Spi::get_one_with_args::<pgrx::JsonB>(
-        "SELECT column_ndistinct FROM deltax_partition WHERE table_name = $1 AND is_compressed = true",
-        &[name.as_str().into()],
+    // Build query: SELECT MAX("_ndistinct_col1"), ... FROM companion
+    let max_exprs: Vec<String> = nd_columns
+        .iter()
+        .map(|(_, attr)| format!("MAX(\"{}\")::int8", attr))
+        .collect();
+    let query = format!(
+        "SELECT {} FROM \"_deltax_compressed\".\"{}\"",
+        max_exprs.join(", "),
+        companion_name
     );
 
-    match result {
-        Ok(Some(jsonb)) => {
-            // Parse the JSON value into a HashMap
-            serde_json::from_value::<std::collections::HashMap<String, i64>>(jsonb.0)
-                .unwrap_or_default()
+    let mut result_map = std::collections::HashMap::new();
+    let _ = Spi::connect(|client| {
+        let result = client.select(&query, None, &[])?;
+        if let Some(row) = result.into_iter().next() {
+            for (i, (col_name, _)) in nd_columns.iter().enumerate() {
+                if let Some(nd) = row.get_datum_by_ordinal(i + 1)
+                    .unwrap()
+                    .value::<i64>()
+                    .unwrap()
+                {
+                    result_map.insert(col_name.clone(), nd);
+                }
+            }
         }
-        _ => std::collections::HashMap::new(),
-    }
+        Ok::<(), spi::Error>(())
+    });
+
+    result_map
 }
 
 /// Get reltuples from pg_class for a relation OID.

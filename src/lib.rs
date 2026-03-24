@@ -17,18 +17,6 @@ pg_module_magic!();
 pub(crate) static MOCK_NOW: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 
-/// Maximum distinct values tracked per column during streaming compression.
-/// Columns exceeding this limit fall back to SQL COUNT(DISTINCT).
-/// Set to 0 to always use SQL. Default: 1,000,000.
-pub(crate) static NDISTINCT_MAX_TRACK: GucSetting<i32> =
-    GucSetting::<i32>::new(1_000_000);
-
-/// Threshold for choosing array_agg vs streaming compression path.
-/// If row_count * num_columns < this value AND segment_by is empty, use array_agg.
-/// Set to 0 to always use streaming. Default: 200,000,000.
-pub(crate) static ARRAY_AGG_THRESHOLD: GucSetting<i32> =
-    GucSetting::<i32>::new(200_000_000);
-
 extension_sql!(
     r#"
 CREATE SCHEMA IF NOT EXISTS _deltax_compressed;
@@ -60,7 +48,6 @@ CREATE TABLE IF NOT EXISTS deltax_partition (
     raw_size        BIGINT,
     row_count       BIGINT,
     compressed_at   TIMESTAMPTZ,
-    column_ndistinct JSONB,
     UNIQUE(schema_name, table_name)
 );
 "#,
@@ -74,26 +61,6 @@ pub extern "C-unwind" fn _PG_init() {
         c"Override current time for testing (timestamptz literal, empty = use real time)",
         c"Override current time for testing (timestamptz literal, empty = use real time)",
         &MOCK_NOW,
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_int_guc(
-        c"pg_deltax.ndistinct_max_track",
-        c"Max distinct values tracked per column during streaming compression (0 = always use SQL)",
-        c"Max distinct values tracked per column during streaming compression (0 = always use SQL)",
-        &NDISTINCT_MAX_TRACK,
-        0,
-        100_000_000,
-        GucContext::Suset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_int_guc(
-        c"pg_deltax.array_agg_threshold",
-        c"row_count * num_columns threshold for array_agg path (0 = always streaming)",
-        c"row_count * num_columns threshold for array_agg path (0 = always streaming)",
-        &ARRAY_AGG_THRESHOLD,
-        0,
-        2_000_000_000,
         GucContext::Suset,
         GucFlags::default(),
     );

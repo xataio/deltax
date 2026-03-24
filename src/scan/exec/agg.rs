@@ -21,6 +21,21 @@ use super::segments::{
     segment_skippable_by_dict_like, extract_segment_filters,
 };
 
+/// Compute a 128-bit hash of a byte slice for COUNT(DISTINCT) on strings.
+/// Uses two DefaultHasher rounds with different prefixes to produce independent
+/// 64-bit halves, combined into u128. Collision probability is negligible
+/// for any practical cardinality (~1 in 2^64 for any pair).
+fn hash128(data: &[u8]) -> u128 {
+    let mut h1 = std::collections::hash_map::DefaultHasher::new();
+    h1.write(data);
+    let lo = h1.finish();
+    let mut h2 = std::collections::hash_map::DefaultHasher::new();
+    h2.write_u8(0xff); // domain separation
+    h2.write(data);
+    let hi = h2.finish();
+    (hi as u128) << 64 | lo as u128
+}
+
 // ============================================================================
 // DeltaXAgg: aggregate pushdown (SUM, AVG, COUNT, COUNT(DISTINCT), GROUP BY)
 // ============================================================================
@@ -44,7 +59,9 @@ enum AggAccumulator {
     SumFloat { sum: f64, count: i64 },
     Count { count: i64 },
     CountDistinctInt { seen: std::collections::HashSet<i64> },
-    CountDistinctStr { seen: std::collections::HashSet<String> },
+    /// Stores SipHash-128 digests of strings instead of owned Strings.
+    /// Bounded memory (16 bytes per distinct value) — same approach as ClickHouse's uniqExact.
+    CountDistinctStr { seen: std::collections::HashSet<u128> },
     MinInt { val: Option<i64> },
     MaxInt { val: Option<i64> },
     MinFloat { val: Option<f64> },
@@ -536,24 +553,20 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
 /// Try to answer a scalar aggregate query entirely from catalog metadata,
 /// without loading or scanning any segments.
 ///
-/// This is the fastest possible path: it uses pre-computed row counts and
-/// ndistinct values stored in deltax_partition by mark_partition_compressed().
-/// Only works for ungrouped, unfiltered queries where every aggregate is either
-/// COUNT(*) or COUNT(DISTINCT col) on a single partition.
+/// This is the fastest possible path: it uses pre-computed row counts
+/// stored in deltax_partition by mark_partition_compressed().
+/// Only works for ungrouped, unfiltered queries where every aggregate is COUNT(*).
 ///
 /// The caller provides pre-fetched catalog data so this function has no
 /// external dependencies and is easy to test:
 /// - `row_counts`: one `Option<i64>` per companion OID (from `get_row_count`)
-/// - `ndistinct_map`: column_name → ndistinct (from `get_column_ndistinct`,
-///   only populated for single-partition queries)
 ///
 /// Returns Some(state) if the shortcut succeeded, None to fall through to
 /// segment-based execution.
 fn try_catalog_shortcut(
     plan: &ParsedAggPlan,
-    meta: &super::segments::MetadataInfo,
+    _meta: &super::segments::MetadataInfo,
     row_counts: &[Option<i64>],
-    ndistinct_map: &HashMap<String, i64>,
     metadata_us: u64,
 ) -> Option<AggScanState> {
     if !plan.group_specs.is_empty()
@@ -572,18 +585,6 @@ fn try_catalog_shortcut(
                     total += (*rc)?;
                 }
                 agg_results.push((pg_sys::Datum::from(total as usize), false));
-            }
-            AggType::CountDistinct if spec.expr_kind == AggExpr::Column => {
-                // Can't merge distinct counts across partitions
-                if plan.companion_oids.len() != 1 {
-                    return None;
-                }
-                if ndistinct_map.is_empty() {
-                    return None;
-                }
-                let col_name = meta.col_names.get(spec.col_idx as usize)?;
-                let nd = ndistinct_map.get(col_name)?;
-                agg_results.push((pg_sys::Datum::from(*nd as usize), false));
             }
             _ => return None, // Non-catalog-answerable agg
         }
@@ -887,12 +888,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             let row_counts: Vec<Option<i64>> = plan.companion_oids.iter()
                 .map(|&oid| super::super::cost::get_row_count(oid))
                 .collect();
-            let ndistinct_map = if plan.companion_oids.len() == 1 {
-                super::super::cost::get_column_ndistinct(plan.companion_oids[0])
-            } else {
-                HashMap::new()
-            };
-            if let Some(state) = try_catalog_shortcut(&plan, &meta, &row_counts, &ndistinct_map, metadata_us) {
+            if let Some(state) = try_catalog_shortcut(&plan, &meta, &row_counts, metadata_us) {
                 let state_ptr = Box::into_raw(Box::new(state));
                 (*node).custom_ps = state_ptr as *mut pg_sys::List;
                 return;
@@ -1737,9 +1733,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                     }
                                     AggAccumulator::CountDistinctStr { seen } => {
                                         let cstr = pg_sys::text_to_cstring(datum.cast_mut_ptr());
-                                        let s = std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned();
+                                        let bytes = std::ffi::CStr::from_ptr(cstr).to_bytes();
+                                        let hash = siphash128(bytes);
                                         pg_sys::pfree(cstr as *mut _);
-                                        seen.insert(s);
+                                        seen.insert(hash);
                                     }
                                     _ => {}
                                 }
@@ -2820,14 +2817,14 @@ mod tests {
             vec![GroupByColSpec { col_idx: 0, type_oid: pg_sys::Oid::from(23u32), expr: GroupByExpr::Column }],
             Vec::new(), true,
         );
-        assert!(try_catalog_shortcut(&plan, &meta, &[], &HashMap::new(), 0).is_none());
+        assert!(try_catalog_shortcut(&plan, &meta, &[], 0).is_none());
     }
 
     #[pg_test]
     fn test_catalog_shortcut_rejects_where() {
         let meta = make_meta(&["ts", "value"]);
         let plan = make_plan(vec![make_agg_spec(AggType::CountStar, -1, 23)], Vec::new(), Vec::new(), false);
-        assert!(try_catalog_shortcut(&plan, &meta, &[], &HashMap::new(), 0).is_none());
+        assert!(try_catalog_shortcut(&plan, &meta, &[], 0).is_none());
     }
 
     #[pg_test]
@@ -2838,21 +2835,21 @@ mod tests {
             vec![HavingFilter { agg_idx: 0, op: HavingOp::Gt, const_val: 10 }],
             true,
         );
-        assert!(try_catalog_shortcut(&plan, &meta, &[], &HashMap::new(), 0).is_none());
+        assert!(try_catalog_shortcut(&plan, &meta, &[], 0).is_none());
     }
 
     #[pg_test]
     fn test_catalog_shortcut_rejects_sum() {
         let meta = make_meta(&["ts", "value"]);
         let plan = make_plan(vec![make_agg_spec(AggType::Sum, 1, 23)], Vec::new(), Vec::new(), true);
-        assert!(try_catalog_shortcut(&plan, &meta, &[Some(100)], &HashMap::new(), 0).is_none());
+        assert!(try_catalog_shortcut(&plan, &meta, &[Some(100)], 0).is_none());
     }
 
     #[pg_test]
     fn test_catalog_shortcut_rejects_avg() {
         let meta = make_meta(&["ts", "value"]);
         let plan = make_plan(vec![make_agg_spec(AggType::Avg, 1, 23)], Vec::new(), Vec::new(), true);
-        assert!(try_catalog_shortcut(&plan, &meta, &[Some(100)], &HashMap::new(), 0).is_none());
+        assert!(try_catalog_shortcut(&plan, &meta, &[Some(100)], 0).is_none());
     }
 
     #[pg_test]
@@ -2860,7 +2857,7 @@ mod tests {
         let meta = make_meta(&["ts", "value"]);
         for agg_type in [AggType::Min, AggType::Max] {
             let plan = make_plan(vec![make_agg_spec(agg_type, 1, 23)], Vec::new(), Vec::new(), true);
-            assert!(try_catalog_shortcut(&plan, &meta, &[Some(100)], &HashMap::new(), 0).is_none());
+            assert!(try_catalog_shortcut(&plan, &meta, &[Some(100)], 0).is_none());
         }
     }
 
@@ -2868,7 +2865,7 @@ mod tests {
     fn test_catalog_shortcut_count_star_single_partition() {
         let meta = make_meta(&["ts", "value"]);
         let plan = make_plan(vec![make_agg_spec(AggType::CountStar, -1, 23)], Vec::new(), Vec::new(), true);
-        let state = try_catalog_shortcut(&plan, &meta, &[Some(42_000)], &HashMap::new(), 0).unwrap();
+        let state = try_catalog_shortcut(&plan, &meta, &[Some(42_000)], 0).unwrap();
         assert_eq!(state.result_rows.len(), 1);
         assert_eq!(state.result_rows[0][0].0.value(), 42_000usize);
         assert!(!state.result_rows[0][0].1); // not null
@@ -2886,7 +2883,7 @@ mod tests {
         let state = try_catalog_shortcut(
             &plan, &meta,
             &[Some(100), Some(200), Some(300)],
-            &HashMap::new(), 0,
+            0,
         ).unwrap();
         assert_eq!(state.result_rows[0][0].0.value(), 600usize);
     }
@@ -2897,36 +2894,15 @@ mod tests {
         let meta = make_meta(&["ts", "value"]);
         let mut plan = make_plan(vec![make_agg_spec(AggType::CountStar, -1, 23)], Vec::new(), Vec::new(), true);
         plan.companion_oids = vec![pg_sys::Oid::from(1u32), pg_sys::Oid::from(2u32)];
-        assert!(try_catalog_shortcut(&plan, &meta, &[Some(100), None], &HashMap::new(), 0).is_none());
+        assert!(try_catalog_shortcut(&plan, &meta, &[Some(100), None], 0).is_none());
     }
 
     #[pg_test]
-    fn test_catalog_shortcut_count_distinct() {
+    fn test_catalog_shortcut_count_distinct_falls_through() {
+        // CountDistinct is no longer a catalog shortcut — always falls through
         let meta = make_meta(&["ts", "value"]);
         let plan = make_plan(vec![make_agg_spec(AggType::CountDistinct, 1, 23)], Vec::new(), Vec::new(), true);
-        let mut nd_map = HashMap::new();
-        nd_map.insert("value".to_string(), 275i64);
-        let state = try_catalog_shortcut(&plan, &meta, &[Some(1000)], &nd_map, 0).unwrap();
-        assert_eq!(state.result_rows[0][0].0.value(), 275usize);
-    }
-
-    #[pg_test]
-    fn test_catalog_shortcut_count_distinct_multi_partition() {
-        // Can't merge distinct counts across partitions — should fail
-        let meta = make_meta(&["ts", "value"]);
-        let mut plan = make_plan(vec![make_agg_spec(AggType::CountDistinct, 1, 23)], Vec::new(), Vec::new(), true);
-        plan.companion_oids = vec![pg_sys::Oid::from(1u32), pg_sys::Oid::from(2u32)];
-        let mut nd_map = HashMap::new();
-        nd_map.insert("value".to_string(), 100i64);
-        assert!(try_catalog_shortcut(&plan, &meta, &[Some(500), Some(500)], &nd_map, 0).is_none());
-    }
-
-    #[pg_test]
-    fn test_catalog_shortcut_count_distinct_missing_ndistinct() {
-        let meta = make_meta(&["ts", "value"]);
-        let plan = make_plan(vec![make_agg_spec(AggType::CountDistinct, 1, 23)], Vec::new(), Vec::new(), true);
-        // Empty ndistinct_map → None
-        assert!(try_catalog_shortcut(&plan, &meta, &[Some(1000)], &HashMap::new(), 0).is_none());
+        assert!(try_catalog_shortcut(&plan, &meta, &[Some(1000)], 0).is_none());
     }
 
     // -------------------------------------------------------------------

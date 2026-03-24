@@ -281,20 +281,17 @@ pub fn mark_partition_compressed(
     compressed_size: i64,
     raw_size: i64,
     row_count: i64,
-    column_ndistinct_json: &str,
 ) -> spi::SpiResult<()> {
     client.update(
         "UPDATE deltax_partition
          SET is_compressed = true, compressed_size = $1, raw_size = $2,
-             row_count = $3, compressed_at = now(),
-             column_ndistinct = $4::jsonb
-         WHERE id = $5",
+             row_count = $3, compressed_at = now()
+         WHERE id = $4",
         None,
         &[
             compressed_size.into(),
             raw_size.into(),
             row_count.into(),
-            column_ndistinct_json.into(),
             partition_id.into(),
         ],
     )?;

@@ -1,7 +1,8 @@
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
-use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+
+use cardinality_estimator::CardinalityEstimator;
 
 use crate::catalog;
 use crate::compression::{self, CompressionType, CompressedColumn};
@@ -211,7 +212,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     }
 
     // 4. Estimate row count from pg_class stats (instant, no scan).
-    // Used for choosing array_agg vs streaming path and for skipping empty partitions.
+    // Used for skipping empty partitions.
     // reltuples: 0 = empty (known), -1 = unknown (no ANALYZE yet), >0 = estimated count.
     let part_fqn = crate::partition::fqn(&schema, &part_table);
     let reltuples = client
@@ -271,6 +272,12 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
             create_cols.push(format!("\"_nonnull_count_{}\" INT", col.name));
         }
     }
+    // Per-segment ndistinct for non-segment-by columns
+    for col in &columns {
+        if !col.is_segment_by {
+            create_cols.push(format!("\"_ndistinct_{}\" INT", col.name));
+        }
+    }
     create_cols.push("_row_count INT".to_string());
 
     let create_ddl = format!(
@@ -283,59 +290,20 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     // (it checks for companion table existence, not is_compressed in the catalog).
 
     // 6. Read and compress data per segment
-    let mut total_compressed_size: i64 = 0;
     let raw_size = estimate_raw_size(client, &part_fqn);
 
     let segment_size = ht.segment_size as usize;
 
-    // Choose compression path based on partition size:
-    // - array_agg: fast (bulk C-level aggregation), but hits PG's 1GB array limit on large partitions
-    // - streaming: cursor-based, bounded memory, works for any size
-    // Threshold: row_count * num_columns < threshold keeps us under PG's memory limits.
-    // E.g. 1M rows × 108 cols = 108M (array_agg), 7M rows × 108 cols = 756M (streaming).
-    let threshold = crate::ARRAY_AGG_THRESHOLD.get() as u64;
-    let use_array_agg =
-        ht.segment_by.is_empty() && threshold > 0 && (reltuples.max(0) as u64) * (columns.len() as u64) < threshold;
-
-    let ndistinct_json;
-    let row_count;
-
-    if use_array_agg {
-        let (size, rows, nd_map) = compress_partition_array_agg(
-            client,
-            &part_fqn,
-            &companion_fqn,
-            &create_ddl,
-            &columns,
-            &ht.order_by,
-            segment_size,
-        );
-        total_compressed_size += size;
-        row_count = rows;
-        let entries: Vec<String> = nd_map
-            .iter()
-            .map(|(k, v)| format!("\"{}\":{}", k, v))
-            .collect();
-        ndistinct_json = format!("{{{}}}", entries.join(","));
-    } else {
-        let (size, rows, nd_map) = compress_partition_streaming(
-            client,
-            &part_fqn,
-            &companion_fqn,
-            &create_ddl,
-            &columns,
-            &ht.order_by,
-            &ht.segment_by,
-            segment_size,
-        );
-        total_compressed_size += size;
-        row_count = rows;
-        let entries: Vec<String> = nd_map
-            .iter()
-            .map(|(k, v)| format!("\"{}\":{}", k, v))
-            .collect();
-        ndistinct_json = format!("{{{}}}", entries.join(","));
-    }
+    let (total_compressed_size, row_count) = compress_partition_streaming(
+        client,
+        &part_fqn,
+        &companion_fqn,
+        &create_ddl,
+        &columns,
+        &ht.order_by,
+        &ht.segment_by,
+        segment_size,
+    );
 
     // Empty partition — clean up companion table and return
     if row_count == 0 {
@@ -357,7 +325,6 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         total_compressed_size,
         raw_size,
         row_count,
-        &ndistinct_json,
     )
     .expect("failed to update catalog");
 
@@ -456,57 +423,6 @@ fn init_typed_columns(columns: &[ColumnMeta], kinds: &[ColumnKind]) -> Vec<Typed
         .zip(kinds.iter())
         .map(|(_, kind)| new_typed_column(*kind))
         .collect()
-}
-
-/// Hash a datum value for ndistinct tracking. Returns None for NULLs (matching COUNT(DISTINCT) semantics).
-fn hash_datum_for_ndistinct(
-    datum: &pgrx::spi::SpiHeapTupleDataEntry,
-    kind: &ColumnKind,
-) -> Option<u64> {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    match kind {
-        ColumnKind::Int16 => {
-            let v = datum.value::<i16>().unwrap()?;
-            v.hash(&mut hasher);
-        }
-        ColumnKind::Int32 => {
-            let v = datum.value::<i32>().unwrap()?;
-            v.hash(&mut hasher);
-        }
-        ColumnKind::Int64 => {
-            let v = datum.value::<i64>().unwrap()?;
-            v.hash(&mut hasher);
-        }
-        ColumnKind::Timestamp => {
-            let v = datum.value::<pgrx::datum::Timestamp>().unwrap()?;
-            v.into_inner().hash(&mut hasher);
-        }
-        ColumnKind::TimestampTz => {
-            let v = datum.value::<pgrx::datum::TimestampWithTimeZone>().unwrap()?;
-            v.into_inner().hash(&mut hasher);
-        }
-        ColumnKind::Date => {
-            let v = datum.value::<pgrx::datum::Date>().unwrap()?;
-            v.into_inner().hash(&mut hasher);
-        }
-        ColumnKind::Float32 => {
-            let v = datum.value::<f32>().unwrap()?;
-            v.to_bits().hash(&mut hasher);
-        }
-        ColumnKind::Float64 => {
-            let v = datum.value::<f64>().unwrap()?;
-            v.to_bits().hash(&mut hasher);
-        }
-        ColumnKind::Bool => {
-            let v = datum.value::<bool>().unwrap()?;
-            v.hash(&mut hasher);
-        }
-        ColumnKind::Text => {
-            let v = datum.value::<String>().unwrap()?;
-            v.hash(&mut hasher);
-        }
-    }
-    Some(hasher.finish())
 }
 
 /// Extract one SPI row into typed column accumulators using native datum access.
@@ -695,6 +611,7 @@ fn flush_segment_data(
     columns: &[ColumnMeta],
     typed_cols: &[TypedColumn],
     segment_by_values: &[Option<String>],
+    ndistinct_values: &[i64],
     row_count: u32,
 ) -> i64 {
     use pgrx::datum::DatumWithOid;
@@ -796,6 +713,19 @@ fn flush_segment_data(
             }
         }
     }
+    // Per-segment ndistinct for non-segment-by columns
+    let mut nd_idx = 0;
+    for col in columns {
+        if !col.is_segment_by {
+            insert_cols.push(format!("\"_ndistinct_{}\"", col.name));
+            if nd_idx < ndistinct_values.len() {
+                insert_vals.push(ndistinct_values[nd_idx].to_string());
+            } else {
+                insert_vals.push("0".to_string());
+            }
+            nd_idx += 1;
+        }
+    }
     insert_cols.push("_row_count".to_string());
     insert_vals.push(row_count.to_string());
 
@@ -833,6 +763,39 @@ fn slice_typed_column(tc: &TypedColumn, start: usize, end: usize) -> TypedColumn
     }
 }
 
+/// Hash a value and return the hash for HLL insertion.
+fn hash_for_hll<T: Hash>(val: &T) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    val.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Compute per-segment ndistinct using HyperLogLog estimators.
+/// Returns one estimate per non-segment-by column.
+fn compute_segment_ndistinct(
+    typed_cols: &[TypedColumn],
+    columns: &[ColumnMeta],
+) -> Vec<i64> {
+    let mut result = Vec::new();
+    for (i, col) in columns.iter().enumerate() {
+        if col.is_segment_by {
+            continue;
+        }
+        let mut hll = CardinalityEstimator::<u64>::new();
+        match &typed_cols[i] {
+            TypedColumn::Int16(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
+            TypedColumn::Int32(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
+            TypedColumn::Int64(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
+            TypedColumn::Float32(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(&x.to_bits())); } }
+            TypedColumn::Float64(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(&x.to_bits())); } }
+            TypedColumn::Bool(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
+            TypedColumn::Text(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
+        }
+        result.push(hll.estimate() as i64);
+    }
+    result
+}
+
 /// Flush typed column data, splitting into segment_size chunks if needed.
 fn flush_with_splitting(
     client: &mut SpiClient,
@@ -849,239 +812,30 @@ fn flush_with_splitting(
         let chunk_end = (offset + segment_size).min(total_rows);
         let chunk_rows = (chunk_end - offset) as u32;
         if offset == 0 && chunk_end == total_rows {
+            let ndistinct = compute_segment_ndistinct(typed_cols, columns);
             total_size +=
-                flush_segment_data(client, companion_fqn, columns, typed_cols, seg_values, chunk_rows);
+                flush_segment_data(client, companion_fqn, columns, typed_cols, seg_values, &ndistinct, chunk_rows);
         } else {
             let chunk_cols: Vec<TypedColumn> = typed_cols
                 .iter()
                 .map(|tc| slice_typed_column(tc, offset, chunk_end))
                 .collect();
+            let ndistinct = compute_segment_ndistinct(&chunk_cols, columns);
             total_size +=
-                flush_segment_data(client, companion_fqn, columns, &chunk_cols, seg_values, chunk_rows);
+                flush_segment_data(client, companion_fqn, columns, &chunk_cols, seg_values, &ndistinct, chunk_rows);
         }
         offset = chunk_end;
     }
     total_size
 }
 
-/// Compute ndistinct (count of distinct non-NULL values) for each column from in-memory data.
-/// Matches SQL `COUNT(DISTINCT col)` semantics (NULLs excluded).
-fn compute_ndistinct_from_typed(
-    typed_cols: &[TypedColumn],
-    columns: &[ColumnMeta],
-) -> HashMap<String, i64> {
-    let mut result = HashMap::new();
-    for (i, col) in columns.iter().enumerate() {
-        let nd = match &typed_cols[i] {
-            TypedColumn::Int16(v) => {
-                let set: HashSet<i16> = v.iter().flatten().copied().collect();
-                set.len() as i64
-            }
-            TypedColumn::Int32(v) => {
-                let set: HashSet<i32> = v.iter().flatten().copied().collect();
-                set.len() as i64
-            }
-            TypedColumn::Int64(v) => {
-                let set: HashSet<i64> = v.iter().flatten().copied().collect();
-                set.len() as i64
-            }
-            TypedColumn::Float32(v) => {
-                let set: HashSet<u32> = v.iter().flatten().map(|f| f.to_bits()).collect();
-                set.len() as i64
-            }
-            TypedColumn::Float64(v) => {
-                let set: HashSet<u64> = v.iter().flatten().map(|f| f.to_bits()).collect();
-                set.len() as i64
-            }
-            TypedColumn::Bool(v) => {
-                let set: HashSet<bool> = v.iter().flatten().copied().collect();
-                set.len() as i64
-            }
-            TypedColumn::Text(v) => {
-                let set: HashSet<&str> = v.iter().flatten().map(|s| s.as_str()).collect();
-                set.len() as i64
-            }
-        };
-        result.insert(col.name.clone(), nd);
-    }
-    result
-}
-
-/// Compress a partition using array_agg — single SPI call, bulk extraction.
-/// Used for partitions WITHOUT segment_by (e.g., ClickBench).
-/// Pushes column aggregation into PG's C code, avoiding per-row Rust overhead.
-/// Also computes ndistinct from in-memory data (avoids expensive SQL COUNT(DISTINCT)).
-fn compress_partition_array_agg(
-    client: &mut SpiClient,
-    part_fqn: &str,
-    companion_fqn: &str,
-    create_ddl: &str,
-    columns: &[ColumnMeta],
-    order_by: &[String],
-    segment_size: usize,
-) -> (i64, i64, HashMap<String, i64>) {
-    let kinds: Vec<ColumnKind> = columns
-        .iter()
-        .map(|c| classify_column(&c.data_type, c.is_segment_by))
-        .collect();
-
-    // Build ORDER BY clause for array_agg
-    let agg_order = if order_by.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " ORDER BY {}",
-            order_by
-                .iter()
-                .map(|o| format!("\"{}\"", o))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-
-    // Build array_agg expressions — timestamps/dates converted to unix usec in SQL
-    let agg_exprs: Vec<String> = columns
-        .iter()
-        .zip(kinds.iter())
-        .map(|(col, kind)| {
-            let expr = match kind {
-                ColumnKind::Text => format!("\"{}\"::text", col.name),
-                ColumnKind::Timestamp | ColumnKind::TimestampTz => {
-                    format!(
-                        "(extract(epoch from \"{}\") * 1000000)::bigint",
-                        col.name
-                    )
-                }
-                ColumnKind::Date => {
-                    format!(
-                        "(extract(epoch from \"{}\"::timestamp) * 1000000)::bigint",
-                        col.name
-                    )
-                }
-                _ => format!("\"{}\"", col.name),
-            };
-            format!("array_agg({}{})", expr, agg_order)
-        })
-        .collect();
-
-    let sql = format!("SELECT {} FROM {}", agg_exprs.join(", "), part_fqn);
-    let result = client
-        .select(&sql, None, &[])
-        .expect("array_agg query failed");
-
-    let mut result_iter = result.into_iter();
-    let row = match result_iter.next() {
-        Some(row) => row,
-        None => return (0, 0, HashMap::new()),
-    };
-
-    // Data exists — create companion table now
-    client.update(create_ddl, None, &[]).expect("failed to create companion table");
-
-    let mut typed_cols = Vec::with_capacity(columns.len());
-    for (i, kind) in kinds.iter().enumerate() {
-        let ordinal = i + 1;
-        let tc = match kind {
-            ColumnKind::Int16 => TypedColumn::Int16(
-                row.get_datum_by_ordinal(ordinal)
-                    .unwrap()
-                    .value::<Vec<Option<i16>>>()
-                    .unwrap()
-                    .unwrap_or_default(),
-            ),
-            ColumnKind::Int32 => TypedColumn::Int32(
-                row.get_datum_by_ordinal(ordinal)
-                    .unwrap()
-                    .value::<Vec<Option<i32>>>()
-                    .unwrap()
-                    .unwrap_or_default(),
-            ),
-            ColumnKind::Int64
-            | ColumnKind::Timestamp
-            | ColumnKind::TimestampTz
-            | ColumnKind::Date => TypedColumn::Int64(
-                row.get_datum_by_ordinal(ordinal)
-                    .unwrap()
-                    .value::<Vec<Option<i64>>>()
-                    .unwrap()
-                    .unwrap_or_default(),
-            ),
-            ColumnKind::Float32 => TypedColumn::Float32(
-                row.get_datum_by_ordinal(ordinal)
-                    .unwrap()
-                    .value::<Vec<Option<f32>>>()
-                    .unwrap()
-                    .unwrap_or_default(),
-            ),
-            ColumnKind::Float64 => TypedColumn::Float64(
-                row.get_datum_by_ordinal(ordinal)
-                    .unwrap()
-                    .value::<Vec<Option<f64>>>()
-                    .unwrap()
-                    .unwrap_or_default(),
-            ),
-            ColumnKind::Bool => TypedColumn::Bool(
-                row.get_datum_by_ordinal(ordinal)
-                    .unwrap()
-                    .value::<Vec<Option<bool>>>()
-                    .unwrap()
-                    .unwrap_or_default(),
-            ),
-            ColumnKind::Text => TypedColumn::Text(
-                row.get_datum_by_ordinal(ordinal)
-                    .unwrap()
-                    .value::<Vec<Option<String>>>()
-                    .unwrap()
-                    .unwrap_or_default(),
-            ),
-        };
-        typed_cols.push(tc);
-    }
-
-    // Compute ndistinct from in-memory data (avoids expensive SQL COUNT(DISTINCT))
-    let ndistinct = compute_ndistinct_from_typed(&typed_cols, columns);
-
-    // Determine total rows from first non-empty column
-    let total_rows = typed_cols
-        .iter()
-        .filter_map(|tc| {
-            let len = match tc {
-                TypedColumn::Int16(v) => v.len(),
-                TypedColumn::Int32(v) => v.len(),
-                TypedColumn::Int64(v) => v.len(),
-                TypedColumn::Float32(v) => v.len(),
-                TypedColumn::Float64(v) => v.len(),
-                TypedColumn::Bool(v) => v.len(),
-                TypedColumn::Text(v) => v.len(),
-            };
-            if len > 0 {
-                Some(len)
-            } else {
-                None
-            }
-        })
-        .next()
-        .unwrap_or(0);
-
-    let compressed_size = flush_with_splitting(
-        client,
-        companion_fqn,
-        columns,
-        &typed_cols,
-        &[],
-        total_rows,
-        segment_size,
-    );
-
-    (compressed_size, total_rows as i64, ndistinct)
-}
 
 /// Compress a partition using cursor-based streaming.
 /// Reads native PG datums directly — no text round-trip for numeric/timestamp types.
 /// Handles both segment_by and non-segment_by partitions (boundary detection is
 /// guarded by `if !seg_col_indices.is_empty()` and naturally skipped when empty).
-/// Returns (compressed_size, row_count, ndistinct_map). ndistinct is tracked inline via HashSets;
-/// columns exceeding `ndistinct_max_track` fall back to SQL COUNT(DISTINCT).
+/// Returns (compressed_size, row_count). ndistinct is tracked per-segment via HLL
+/// and stored in the companion table.
 fn compress_partition_streaming(
     client: &mut SpiClient,
     part_fqn: &str,
@@ -1091,7 +845,7 @@ fn compress_partition_streaming(
     order_by: &[String],
     segment_by: &[String],
     segment_size: usize,
-) -> (i64, i64, HashMap<String, i64>) {
+) -> (i64, i64) {
     let batch_size = segment_size;
 
     // Classify columns for native datum extraction
@@ -1164,20 +918,6 @@ fn compress_partition_streaming(
     let mut total_rows: i64 = 0;
     let mut companion_created = false;
 
-    // Inline ndistinct tracking: one HashSet<u64> per column, using hashed values.
-    // Columns exceeding the cap are marked with `None` and fall back to SQL later.
-    let ndistinct_cap = crate::NDISTINCT_MAX_TRACK.get() as usize;
-    let mut nd_sets: Vec<Option<HashSet<u64>>> = columns
-        .iter()
-        .map(|_| {
-            if ndistinct_cap > 0 {
-                Some(HashSet::new())
-            } else {
-                None // tracking disabled
-            }
-        })
-        .collect();
-
     loop {
         let result = client
             .select(&fetch_sql, None, &[])
@@ -1233,20 +973,6 @@ fn compress_partition_streaming(
             rows_in_segment += 1;
             total_rows += 1;
 
-            // Track ndistinct: hash each non-NULL value and insert into per-column set
-            for (i, kind) in kinds.iter().enumerate() {
-                if let Some(ref mut set) = nd_sets[i] {
-                    let ordinal = i + 1;
-                    let datum = row.get_datum_by_ordinal(ordinal).unwrap();
-                    if let Some(h) = hash_datum_for_ndistinct(&datum, kind) {
-                        set.insert(h);
-                        if set.len() > ndistinct_cap {
-                            nd_sets[i] = None; // exceeded cap, fall back to SQL
-                        }
-                    }
-                }
-            }
-
             // Check segment_size limit
             if rows_in_segment >= segment_size {
                 if !companion_created {
@@ -1257,12 +983,14 @@ fn compress_partition_streaming(
                 if seg_col_indices.is_empty() {
                     sort_typed_columns(&mut typed_cols, &order_col_indices, rows_in_segment);
                 }
+                let ndistinct = compute_segment_ndistinct(&typed_cols, columns);
                 total_compressed_size += flush_segment_data(
                     client,
                     companion_fqn,
                     columns,
                     &typed_cols,
                     &current_seg_values,
+                    &ndistinct,
                     rows_in_segment as u32,
                 );
                 typed_cols = init_typed_columns(columns, &kinds);
@@ -1285,7 +1013,6 @@ fn compress_partition_streaming(
     if rows_in_segment > 0 {
         if !companion_created {
             client.update(create_ddl, None, &[]).expect("failed to create companion table");
-            companion_created = true;
         }
         if seg_col_indices.is_empty() {
             sort_typed_columns(&mut typed_cols, &order_col_indices, rows_in_segment);
@@ -1305,45 +1032,7 @@ fn compress_partition_streaming(
         .update("CLOSE comp_cursor", None, &[])
         .expect("failed to close cursor");
 
-    // Build ndistinct map: use inline counts where available, SQL fallback for capped columns
-    let mut nd_map: HashMap<String, i64> = HashMap::new();
-    let mut fallback_cols: Vec<&ColumnMeta> = Vec::new();
-    for (i, col) in columns.iter().enumerate() {
-        match &nd_sets[i] {
-            Some(set) => {
-                nd_map.insert(col.name.clone(), set.len() as i64);
-            }
-            None => {
-                fallback_cols.push(col);
-            }
-        }
-    }
-    // SQL fallback for columns that exceeded the tracking cap
-    for chunk in fallback_cols.chunks(10) {
-        let count_exprs: String = chunk
-            .iter()
-            .map(|c| format!("COUNT(DISTINCT \"{}\")::int8", c.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let nd_query = format!("SELECT {} FROM {}", count_exprs, part_fqn);
-        let nd_result = client
-            .select(&nd_query, None, &[])
-            .expect("failed to compute ndistinct fallback");
-        if let Some(row) = nd_result.into_iter().next() {
-            for (i, col) in chunk.iter().enumerate() {
-                if let Some(nd) = row
-                    .get_datum_by_ordinal(i + 1)
-                    .unwrap()
-                    .value::<i64>()
-                    .unwrap()
-                {
-                    nd_map.insert(col.name.clone(), nd);
-                }
-            }
-        }
-    }
-
-    (total_compressed_size, total_rows, nd_map)
+    (total_compressed_size, total_rows)
 }
 
 /// Compress a typed column directly, bypassing string parsing.
