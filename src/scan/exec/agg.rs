@@ -977,6 +977,26 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             })
             .collect();
 
+        // Build count_distinct_only_int: integer columns where ALL referencing agg specs
+        // are CountDistinct and the column is not used in GROUP BY.  These can be
+        // pre-accumulated directly from compressed data, skipping datum conversion.
+        let count_distinct_only_int: Vec<bool> = (0..num_cols)
+            .map(|col_idx| {
+                let is_int = meta.col_types[col_idx] == pg_sys::INT2OID
+                    || meta.col_types[col_idx] == pg_sys::INT4OID
+                    || meta.col_types[col_idx] == pg_sys::INT8OID;
+                if !is_int { return false; }
+                let refs: Vec<&AggExecSpec> = agg_specs
+                    .iter()
+                    .filter(|s| s.col_idx >= 0 && s.col_idx as usize == col_idx)
+                    .collect();
+                if refs.is_empty() { return false; }
+                let all_cd = refs.iter().all(|s| s.agg_type == AggType::CountDistinct);
+                let in_group_by = group_specs.iter().any(|gs| gs.col_idx as usize == col_idx);
+                all_cd && !in_group_by
+            })
+            .collect();
+
         // Extract batch quals and segment filters from WHERE clause (quals from custom_private)
         let (batch_quals, _handled_count) = extract_batch_quals(where_quals, &meta.col_names, &meta.col_types);
 
@@ -1238,6 +1258,60 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                             }
                                         }
                                         _ => {}
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                        // Push empty so the row loop skips this column
+                        decompressed.push(Vec::new());
+                        raw_strings.push(None);
+                        blob_idx += 1;
+                        continue;
+                    }
+
+                    // Fast path: COUNT(DISTINCT) on integer without GROUP BY or
+                    // row-level WHERE — decode directly and insert into HashSet,
+                    // skipping all datum conversion.
+                    if count_distinct_only_int[col_idx] && !has_group_by && batch_quals.is_empty() {
+                        let cc_ref = compression::CompressedColumnRef::from_bytes(blob);
+                        let accumulators = global_accumulators.as_mut().unwrap();
+                        for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                            if spec.col_idx as usize == col_idx {
+                                if let AggAccumulator::CountDistinctInt { seen } = &mut accumulators[spec_idx] {
+                                    let non_null_count = count_non_null(cc_ref.null_bitmap, cc_ref.row_count as usize);
+                                    if non_null_count > 0 {
+                                        let is_i64 = type_oid == pg_sys::INT8OID;
+                                        match cc_ref.type_tag {
+                                            compression::CompressionType::Constant => {
+                                                if is_i64 {
+                                                    let v = i64::from_le_bytes(cc_ref.data[..8].try_into().unwrap());
+                                                    seen.insert(v);
+                                                } else {
+                                                    let v = i32::from_le_bytes(cc_ref.data[..4].try_into().unwrap());
+                                                    seen.insert(v as i64);
+                                                }
+                                            }
+                                            compression::CompressionType::ForBitpacked => {
+                                                if is_i64 {
+                                                    let vals = compression::bitpacked::decode_for_i64(cc_ref.data, non_null_count);
+                                                    for v in vals { seen.insert(v); }
+                                                } else {
+                                                    let vals = compression::bitpacked::decode_for_i32(cc_ref.data, non_null_count);
+                                                    for v in vals { seen.insert(v as i64); }
+                                                }
+                                            }
+                                            compression::CompressionType::DeltaVarint => {
+                                                if is_i64 {
+                                                    let vals = compression::integer::decode_i64(cc_ref.data, non_null_count);
+                                                    for v in vals { seen.insert(v); }
+                                                } else {
+                                                    let vals = compression::integer::decode_i32(cc_ref.data, non_null_count);
+                                                    for v in vals { seen.insert(v as i64); }
+                                                }
+                                            }
+                                            _ => {}
+                                        }
                                     }
                                 }
                                 break;
