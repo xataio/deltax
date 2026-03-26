@@ -205,6 +205,13 @@ pub(super) struct SegmentData {
     pub(super) toast_pointers: Vec<Vec<u8>>,
 }
 
+// SAFETY: SegmentData is shared across threads only via immutable references
+// during parallel aggregation. The pg_sys::Datum fields in ColMinMax/ColSum
+// are not accessed on worker threads (only compressed_blobs, segment_values,
+// row_count, and time bounds are used). All accessed fields are safe Rust types.
+unsafe impl Send for SegmentData {}
+unsafe impl Sync for SegmentData {}
+
 /// Metadata returned by the SPI metadata query.
 pub(super) struct MetadataInfo {
     pub(super) col_names: Vec<String>,

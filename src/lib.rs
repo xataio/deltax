@@ -17,6 +17,19 @@ pg_module_magic!();
 pub(crate) static MOCK_NOW: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(None);
 
+pub(crate) static PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(0);
+
+/// Resolve the effective number of parallel workers.
+/// 0 = auto (num_cpus, capped at 16), 1 = single-threaded, 2..=64 = explicit.
+pub(crate) fn get_parallel_workers() -> usize {
+    let v = PARALLEL_WORKERS.get();
+    if v <= 0 {
+        num_cpus::get().min(16)
+    } else {
+        (v as usize).min(64)
+    }
+}
+
 extension_sql!(
     r#"
 CREATE SCHEMA IF NOT EXISTS _deltax_compressed;
@@ -62,6 +75,16 @@ pub extern "C-unwind" fn _PG_init() {
         c"Override current time for testing (timestamptz literal, empty = use real time)",
         &MOCK_NOW,
         GucContext::Suset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"pg_deltax.parallel_workers",
+        c"Number of worker threads for parallel aggregation (0=auto, 1=off)",
+        c"Number of worker threads for parallel aggregation (0=auto, 1=off)",
+        &PARALLEL_WORKERS,
+        0,
+        64,
+        GucContext::Userset,
         GucFlags::default(),
     );
     worker::register_bgworker();

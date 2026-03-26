@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use crate::compression;
 use super::super::SyncStatic;
-use super::batch_qual::{BatchCompareOp,
+use super::batch_qual::{BatchCompareOp, BatchQual,
     extract_batch_quals, evaluate_batch_quals};
 use super::datum_utils::{
     decompress_blob_to_datums, decompress_text_blob_to_raw_strings,
@@ -137,6 +137,10 @@ pub(crate) struct AggExecSpec {
     pub(crate) const_offset: i64,          // Only used when expr_kind == AddConst
 }
 
+// SAFETY: AggExecSpec contains only value types (i32, i64, Oid=u32, enums).
+unsafe impl Send for AggExecSpec {}
+unsafe impl Sync for AggExecSpec {}
+
 /// Expression kind for GROUP BY columns.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GroupByExpr {
@@ -213,6 +217,10 @@ pub(crate) struct GroupByColSpec {
     pub(crate) type_oid: pg_sys::Oid,
     pub(crate) expr: GroupByExpr,
 }
+
+// SAFETY: GroupByColSpec contains only value types (i32, Oid=u32, strings, enums).
+unsafe impl Send for GroupByColSpec {}
+unsafe impl Sync for GroupByColSpec {}
 
 /// A HAVING filter: compare an aggregate result against a constant.
 #[derive(Debug, Clone, Copy)]
@@ -1132,6 +1140,168 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         // providing O(1) &str access per row without interning.
         let mut seg_text_columns: Vec<Option<SegTextColumn>> = Vec::new();
 
+        // ============================================================
+        // PARALLEL COMPACT PATH: multi-threaded segment processing
+        // ============================================================
+        // Conditions: compact keys + compact accs + all needed cols numeric +
+        // all batch quals numeric + no regexp GROUP BY + enough segments.
+        let n_workers = crate::get_parallel_workers();
+        let can_parallel = use_compact_keys
+            && use_compact_accs
+            && n_workers > 1
+            && all_segments.len() > 1
+            && !has_regexp_group
+            && all_needed_cols_numeric(&needed_cols, &meta.col_types)
+            && batch_quals_all_numeric(&batch_quals);
+
+        if can_parallel {
+            let t2 = Instant::now();
+            let config = ParallelCompactConfig {
+                agg_specs: &agg_specs,
+                group_specs: &group_specs,
+                col_names: &meta.col_names,
+                col_types: &meta.col_types,
+                segment_by: &meta.segment_by,
+                needed_cols: &needed_cols,
+                batch_quals: &batch_quals,
+                seg_filters: &seg_filters,
+                time_min,
+                time_max,
+            };
+
+            let chunk_size = (all_segments.len() + n_workers - 1) / n_workers;
+            let partial_results: Vec<ParallelCompactResult> = std::thread::scope(|s| {
+                let handles: Vec<_> = all_segments.chunks(chunk_size).map(|chunk| {
+                    let cfg = &config;
+                    s.spawn(move || process_segments_compact(chunk, cfg))
+                }).collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+            // Merge partial results
+            let mut total_segments: u64 = 0;
+            let mut total_rows_processed: u64 = 0;
+            let mut decompress_us: u64 = 0;
+            let storage = compact_storage.as_mut().unwrap();
+
+            for result in &partial_results {
+                total_segments += result.segments_processed;
+                total_rows_processed += result.rows_processed;
+                decompress_us += result.decompress_us;
+                merge_compact_results(
+                    &mut compact_group_map,
+                    storage,
+                    &result.compact_map,
+                    &result.compact_storage,
+                    &agg_specs,
+                );
+            }
+
+            let agg_us = t2.elapsed().as_micros() as u64 - decompress_us;
+
+            // Skip to finalization (same as single-threaded compact path)
+            let mut result_rows = {
+                let storage = compact_storage.as_ref().unwrap();
+                let num_group_keys = group_specs.len();
+                let mut rows = Vec::new();
+                'par_compact_group_loop: for (&packed_key, &group_idx) in &compact_group_map {
+                    let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
+                    for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                        agg_results.push(compact_finalize(storage, group_idx, spec_idx, spec));
+                    }
+
+                    for hf in &having_filters {
+                        let (datum, is_null) = agg_results[hf.agg_idx];
+                        if is_null { continue 'par_compact_group_loop; }
+                        let val = datum.value() as i64;
+                        let pass = match hf.op {
+                            HavingOp::Gt => val > hf.const_val,
+                            HavingOp::Lt => val < hf.const_val,
+                            HavingOp::Ge => val >= hf.const_val,
+                            HavingOp::Le => val <= hf.const_val,
+                            HavingOp::Eq => val == hf.const_val,
+                            HavingOp::Ne => val != hf.const_val,
+                        };
+                        if !pass { continue 'par_compact_group_loop; }
+                    }
+
+                    let keys = unpack_int_keys(packed_key, num_group_keys);
+                    let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
+                    for entry in &output_map {
+                        match entry {
+                            OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
+                            OutputEntry::Group(gi) => {
+                                let v = keys[*gi];
+                                if matches!(group_specs[*gi].expr, GroupByExpr::Extract { .. }) {
+                                    row.push((i128_to_numeric_datum(v as i128), false));
+                                } else {
+                                    row.push((pg_sys::Datum::from(v as usize), false));
+                                }
+                            }
+                        }
+                    }
+                    rows.push(row);
+                }
+                rows
+            };
+
+            // Apply top-N
+            let pre_topn_groups = result_rows.len();
+            if topn_limit > 0 && has_group_by && result_rows.len() > topn_limit as usize {
+                let si = topn_sort_col;
+                if topn_ascending {
+                    result_rows.sort_by_key(|row| {
+                        let (datum, is_null) = row[si];
+                        if is_null { i64::MAX } else { datum.value() as i64 }
+                    });
+                } else {
+                    result_rows.sort_by(|a, b| {
+                        let (da, na) = a[si];
+                        let (db, nb) = b[si];
+                        let va = if na { i64::MIN } else { da.value() as i64 };
+                        let vb = if nb { i64::MIN } else { db.value() as i64 };
+                        vb.cmp(&va)
+                    });
+                }
+                result_rows.truncate(topn_limit as usize);
+            }
+
+            pgrx::log!(
+                "pg_deltax DeltaXAgg parallel: workers={} segments={} rows={}",
+                n_workers, total_segments, total_rows_processed,
+            );
+
+            let state = AggScanState {
+                _agg_specs: agg_specs,
+                _group_specs: group_specs,
+                result_rows,
+                result_idx: 0,
+                _num_result_cols: num_result_cols,
+                metadata_us,
+                heap_scan_us,
+                decompress_us,
+                agg_us,
+                total_segments,
+                total_rows_processed,
+                batch_quals_count: batch_quals.len(),
+                where_quals_null: where_quals.is_null(),
+                regex_cache_size: 0,
+                regex_cache_calls: 0,
+                topn_limit: if topn_limit > 0 { topn_limit as u64 } else { 0 },
+                topn_sort_col: topn_sort_col as i64,
+                topn_ascending,
+                pre_topn_groups: pre_topn_groups as u64,
+            };
+
+            let state_box = Box::new(state);
+            let state_ptr = Box::into_raw(state_box);
+            (*node).custom_ps = state_ptr as *mut pg_sys::List;
+            return;
+        }
+
+        // ============================================================
+        // SINGLE-THREADED PATH (original)
+        // ============================================================
         let t2 = Instant::now();
         let mut total_segments: u64 = 0;
         let mut total_rows_processed: u64 = 0;
@@ -2843,6 +3013,7 @@ impl CompactAccStorage {
         }
     }
 
+
     /// Allocate accumulators for a new group. Returns the group index.
     ///
     /// Growth strategy: below 1GB, let Vec double normally. Above 1GB,
@@ -3129,6 +3300,499 @@ fn unpack_int_keys(packed: u128, num_keys: usize) -> [i64; 2] {
 
 /// Type alias for compact group map with u128 keys.
 type CompactGroupMap = hashbrown::HashMap<u128, u32, BuildHasherDefault<ahash::AHasher>>;
+
+// ============================================================================
+// Parallel Compact Aggregation
+// ============================================================================
+
+use super::{PG_EPOCH_OFFSET_USEC, PG_EPOCH_OFFSET_DAYS};
+
+/// Decompress a numeric/timestamp/date column from a compressed blob to
+/// `Vec<(pg_sys::Datum, bool)>` using only pure-Rust decompression.
+///
+/// SAFETY: This function does NOT call any PG functions and is safe to call
+/// from worker threads. Only handles integer, float, timestamp, date, and bool
+/// types (pass-by-value types where Datum is just the raw value).
+fn decompress_numeric_blob(
+    blob: &[u8],
+    type_oid: pg_sys::Oid,
+) -> Vec<(pg_sys::Datum, bool)> {
+    if blob.is_empty() {
+        return Vec::new();
+    }
+
+    let cc = compression::CompressedColumnRef::from_bytes(blob);
+    let total_count = cc.row_count as usize;
+    let non_null_count = count_non_null(cc.null_bitmap, total_count);
+
+    let nn_datums: Vec<pg_sys::Datum> = match cc.type_tag {
+        compression::CompressionType::Gorilla => {
+            if type_oid == pg_sys::TIMESTAMPOID || type_oid == pg_sys::TIMESTAMPTZOID {
+                let timestamps = compression::gorilla::decode_timestamps(cc.data, non_null_count);
+                timestamps.iter()
+                    .map(|&usec| {
+                        let pg_usec = usec - PG_EPOCH_OFFSET_USEC;
+                        pg_sys::Datum::from(pg_usec as usize)
+                    })
+                    .collect()
+            } else if type_oid == pg_sys::DATEOID {
+                let timestamps = compression::gorilla::decode_timestamps(cc.data, non_null_count);
+                timestamps.iter()
+                    .map(|&usec| {
+                        let unix_days = (usec / 86_400_000_000) as i32;
+                        let pg_days = unix_days - PG_EPOCH_OFFSET_DAYS;
+                        pg_sys::Datum::from(pg_days as usize)
+                    })
+                    .collect()
+            } else if type_oid == pg_sys::FLOAT4OID {
+                let floats = compression::gorilla::decode_floats_f32(cc.data, non_null_count);
+                floats.iter()
+                    .map(|&v| pg_sys::Datum::from(v.to_bits() as usize))
+                    .collect()
+            } else {
+                // FLOAT8OID
+                let floats = compression::gorilla::decode_floats(cc.data, non_null_count);
+                floats.iter()
+                    .map(|&v| pg_sys::Datum::from(v.to_bits() as usize))
+                    .collect()
+            }
+        }
+        compression::CompressionType::DeltaVarint => {
+            if type_oid == pg_sys::INT2OID {
+                let ints = compression::integer::decode_i32(cc.data, non_null_count);
+                ints.iter().map(|&v| pg_sys::Datum::from(v as i16 as usize)).collect()
+            } else if type_oid == pg_sys::INT4OID || type_oid == pg_sys::DATEOID {
+                let ints = compression::integer::decode_i32(cc.data, non_null_count);
+                ints.iter().map(|&v| pg_sys::Datum::from(v as usize)).collect()
+            } else {
+                // INT8OID, TIMESTAMPOID, TIMESTAMPTZOID
+                let ints = compression::integer::decode_i64(cc.data, non_null_count);
+                ints.iter().map(|&v| pg_sys::Datum::from(v as usize)).collect()
+            }
+        }
+        compression::CompressionType::Constant => {
+            if type_oid == pg_sys::INT2OID {
+                let ints = compression::bitpacked::decode_constant_i32(cc.data, non_null_count);
+                ints.iter().map(|&v| pg_sys::Datum::from(v as i16 as usize)).collect()
+            } else if type_oid == pg_sys::INT4OID || type_oid == pg_sys::DATEOID {
+                let ints = compression::bitpacked::decode_constant_i32(cc.data, non_null_count);
+                ints.iter().map(|&v| pg_sys::Datum::from(v as usize)).collect()
+            } else if type_oid == pg_sys::FLOAT4OID {
+                let ints = compression::bitpacked::decode_constant_i64(cc.data, non_null_count);
+                ints.iter().map(|&v| pg_sys::Datum::from(f32::from_bits(v as u32).to_bits() as usize)).collect()
+            } else if type_oid == pg_sys::FLOAT8OID {
+                let ints = compression::bitpacked::decode_constant_i64(cc.data, non_null_count);
+                ints.iter().map(|&v| pg_sys::Datum::from(f64::from_bits(v as u64).to_bits() as usize)).collect()
+            } else {
+                let ints = compression::bitpacked::decode_constant_i64(cc.data, non_null_count);
+                ints.iter().map(|&v| pg_sys::Datum::from(v as usize)).collect()
+            }
+        }
+        compression::CompressionType::ForBitpacked => {
+            if type_oid == pg_sys::INT2OID {
+                let ints = compression::bitpacked::decode_for_i32(cc.data, non_null_count);
+                ints.iter().map(|&v| pg_sys::Datum::from(v as i16 as usize)).collect()
+            } else if type_oid == pg_sys::INT4OID || type_oid == pg_sys::DATEOID {
+                let ints = compression::bitpacked::decode_for_i32(cc.data, non_null_count);
+                ints.iter().map(|&v| pg_sys::Datum::from(v as usize)).collect()
+            } else {
+                let ints = compression::bitpacked::decode_for_i64(cc.data, non_null_count);
+                ints.iter().map(|&v| pg_sys::Datum::from(v as usize)).collect()
+            }
+        }
+        compression::CompressionType::BooleanBitmap => {
+            let bools = compression::boolean::decode(cc.data, non_null_count);
+            bools.iter().map(|&b| pg_sys::Datum::from(b as usize)).collect()
+        }
+        _ => {
+            // Text/dictionary/lz4 types — should not happen in compact path
+            Vec::new()
+        }
+    };
+
+    // Reinsert nulls
+    if cc.null_bitmap.is_empty() {
+        nn_datums.iter().map(|&d| (d, false)).collect()
+    } else {
+        let mut result = Vec::with_capacity(total_count);
+        let mut val_idx = 0;
+        for i in 0..total_count {
+            let is_null = (cc.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            if is_null {
+                result.push((pg_sys::Datum::from(0usize), true));
+            } else {
+                result.push((nn_datums[val_idx], false));
+                val_idx += 1;
+            }
+        }
+        result
+    }
+}
+
+/// Check if all batch quals reference only numeric/comparable types (no text).
+/// Text LIKE/Eq/Ne quals require PG functions during decompression, making them
+/// unsafe for worker threads.
+fn batch_quals_all_numeric(batch_quals: &[BatchQual]) -> bool {
+    batch_quals.iter().all(|bq| {
+        matches!(bq.type_oid,
+            pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+            | pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
+            | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID
+            | pg_sys::DATEOID | pg_sys::BOOLOID
+        )
+    })
+}
+
+/// Check if a column type is supported for thread-safe decompression.
+fn is_numeric_type(type_oid: pg_sys::Oid) -> bool {
+    matches!(type_oid,
+        pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+        | pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
+        | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID
+        | pg_sys::DATEOID | pg_sys::BOOLOID
+    )
+}
+
+/// Configuration for parallel compact aggregation (read-only, shared across threads).
+struct ParallelCompactConfig<'a> {
+    agg_specs: &'a [AggExecSpec],
+    group_specs: &'a [GroupByColSpec],
+    col_names: &'a [String],
+    col_types: &'a [pg_sys::Oid],
+    segment_by: &'a [String],
+    needed_cols: &'a [bool],
+    batch_quals: &'a [BatchQual],
+    seg_filters: &'a [(usize, String)],
+    time_min: Option<i64>,
+    time_max: Option<i64>,
+}
+
+/// Result of parallel compact aggregation from one worker thread.
+struct ParallelCompactResult {
+    compact_map: CompactGroupMap,
+    compact_storage: CompactAccStorage,
+    segments_processed: u64,
+    rows_processed: u64,
+    decompress_us: u64,
+}
+
+/// Process a chunk of segments on a worker thread using the compact path.
+///
+/// Does decompression + aggregation entirely in pure Rust (no PG function calls).
+/// Safe to call from any thread.
+fn process_segments_compact(
+    segments: &[SegmentData],
+    config: &ParallelCompactConfig,
+) -> ParallelCompactResult {
+    let mut compact_map = CompactGroupMap::with_hasher(BuildHasherDefault::default());
+    let mut compact_storage = CompactAccStorage::new(CompactAccLayout::new(config.agg_specs));
+    let mut segments_processed: u64 = 0;
+    let mut rows_processed: u64 = 0;
+    let mut decompress_us: u64 = 0;
+    let num_group_keys = config.group_specs.len();
+
+    for seg in segments {
+        if seg.row_count == 0 {
+            continue;
+        }
+
+        // Segment-by pruning
+        if !config.seg_filters.is_empty() {
+            let mut skip = false;
+            for &(seg_val_idx, ref filter_val) in config.seg_filters {
+                match &seg.segment_values[seg_val_idx] {
+                    Some(val) if val == filter_val => {}
+                    _ => { skip = true; break; }
+                }
+            }
+            if skip { continue; }
+        }
+
+        // Time-range pruning
+        if let (Some(seg_min), Some(seg_max)) = (seg.min_time, seg.max_time) {
+            if config.time_min.is_some_and(|query_min| seg_max < query_min) { continue; }
+            if config.time_max.is_some_and(|query_max| seg_min > query_max) { continue; }
+        }
+
+        // Dictionary-based LIKE pruning
+        if segment_skippable_by_dict_like(
+            config.batch_quals, config.col_names, config.segment_by, &seg.compressed_blobs,
+        ) {
+            continue;
+        }
+
+        segments_processed += 1;
+
+        // Decompress needed columns (pure Rust, no PG calls)
+        let t_dec = Instant::now();
+        let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
+        let mut blob_idx = 0;
+        let mut seg_val_idx = 0;
+
+        for (col_idx, col_name) in config.col_names.iter().enumerate() {
+            let type_oid = config.col_types[col_idx];
+
+            if !config.needed_cols[col_idx] {
+                if config.segment_by.contains(col_name) {
+                    seg_val_idx += 1;
+                } else {
+                    blob_idx += 1;
+                }
+                decompressed.push(Vec::new());
+                continue;
+            }
+
+            if config.segment_by.contains(col_name) {
+                // Parse segment_by string to integer datum directly (no PG calls)
+                let val = &seg.segment_values[seg_val_idx];
+                let (datum, is_null) = match val {
+                    Some(s) => {
+                        let d = parse_string_to_datum(s, type_oid);
+                        (d, false)
+                    }
+                    None => (pg_sys::Datum::from(0usize), true),
+                };
+                let repeated: Vec<(pg_sys::Datum, bool)> =
+                    (0..seg.row_count).map(|_| (datum, is_null)).collect();
+                decompressed.push(repeated);
+                seg_val_idx += 1;
+            } else {
+                let blob = &seg.compressed_blobs[blob_idx];
+                decompressed.push(decompress_numeric_blob(blob, type_oid));
+                blob_idx += 1;
+            }
+        }
+        decompress_us += t_dec.elapsed().as_micros() as u64;
+
+        let row_count = seg.row_count as usize;
+
+        // Evaluate batch quals (pure Rust for numeric types)
+        let selection = evaluate_batch_quals(&decompressed, row_count, config.batch_quals, Vec::new());
+
+        // Compact aggregation loop (identical to single-threaded path)
+        for row in 0..row_count {
+            if !selection.is_empty() && !selection[row] {
+                continue;
+            }
+            rows_processed += 1;
+
+            // Build packed u128 key
+            let mut int_keys: [i64; 2] = [0; 2];
+            let mut has_null = false;
+            for (ki, gs) in config.group_specs.iter().enumerate() {
+                let col = &decompressed[gs.col_idx as usize];
+                if col.is_empty() || col[row].1 {
+                    has_null = true;
+                    break;
+                }
+                int_keys[ki] = match &gs.expr {
+                    GroupByExpr::DateTrunc { unit_usecs, .. } => {
+                        let pg_usec = col[row].0.value() as i64;
+                        pg_usec.div_euclid(*unit_usecs) * *unit_usecs
+                    }
+                    GroupByExpr::Extract { unit, .. } => {
+                        let pg_usec = col[row].0.value() as i64;
+                        extract_field_from_usecs(pg_usec, unit)
+                    }
+                    GroupByExpr::AddConst { offset, .. } => {
+                        col[row].0.value() as i64 + offset
+                    }
+                    GroupByExpr::Column => {
+                        col[row].0.value() as i64
+                    }
+                    _ => unreachable!(),
+                };
+            }
+
+            if has_null { continue; }
+
+            let packed = if num_group_keys == 1 {
+                pack_int_key_1(int_keys[0])
+            } else {
+                pack_int_keys_2(int_keys[0], int_keys[1])
+            };
+
+            // Lookup or insert group
+            if compact_map.len() == compact_map.capacity() {
+                let cap = compact_map.capacity();
+                if cap >= 32_000_000 {
+                    compact_map.reserve(8_000_000);
+                }
+            }
+            let group_idx = match compact_map.entry(packed) {
+                hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
+                hashbrown::hash_map::Entry::Vacant(e) => {
+                    let idx = compact_storage.alloc_group();
+                    e.insert(idx);
+                    idx
+                }
+            };
+
+            // Update compact accumulators
+            for (spec_idx, spec) in config.agg_specs.iter().enumerate() {
+                let (_, kind) = compact_storage.layout.slots[spec_idx];
+                match kind {
+                    CompactAccKind::Count => {
+                        match spec.agg_type {
+                            AggType::CountStar => {
+                                unsafe { *compact_storage.count_mut(group_idx, spec_idx) += 1; }
+                            }
+                            AggType::Count => {
+                                let col = &decompressed[spec.col_idx as usize];
+                                if !col.is_empty() && !col[row].1 {
+                                    unsafe { *compact_storage.count_mut(group_idx, spec_idx) += 1; }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    CompactAccKind::SumInt => {
+                        let col = &decompressed[spec.col_idx as usize];
+                        if !col.is_empty() && !col[row].1 {
+                            let v = datum_to_i128(col[row].0, spec.col_type_oid);
+                            let (sum, count) = unsafe { compact_storage.sum_int_mut(group_idx, spec_idx) };
+                            if spec.expr_kind == AggExpr::AddConst {
+                                *sum += v + spec.const_offset as i128;
+                            } else {
+                                *sum += v;
+                            }
+                            *count += 1;
+                        }
+                    }
+                    CompactAccKind::SumIntNarrow => {
+                        let col = &decompressed[spec.col_idx as usize];
+                        if !col.is_empty() && !col[row].1 {
+                            let v = col[row].0.value() as i64;
+                            let (sum, count) = unsafe { compact_storage.sum_int_narrow_mut(group_idx, spec_idx) };
+                            if spec.expr_kind == AggExpr::AddConst {
+                                *sum += v + spec.const_offset;
+                            } else {
+                                *sum += v;
+                            }
+                            *count += 1;
+                        }
+                    }
+                    CompactAccKind::SumFloat => {
+                        let col = &decompressed[spec.col_idx as usize];
+                        if !col.is_empty() && !col[row].1 {
+                            let v = datum_to_f64(col[row].0, spec.col_type_oid);
+                            let (sum, count) = unsafe { compact_storage.sum_float_mut(group_idx, spec_idx) };
+                            if spec.expr_kind == AggExpr::AddConst {
+                                *sum += v + spec.const_offset as f64;
+                            } else {
+                                *sum += v;
+                            }
+                            *count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ParallelCompactResult {
+        compact_map,
+        compact_storage,
+        segments_processed,
+        rows_processed,
+        decompress_us,
+    }
+}
+
+/// Parse a string value to a Datum for numeric types (pure Rust, no PG calls).
+/// Used for segment_by values on worker threads.
+fn parse_string_to_datum(s: &str, type_oid: pg_sys::Oid) -> pg_sys::Datum {
+    match type_oid {
+        pg_sys::INT2OID => {
+            let v: i16 = s.parse().unwrap_or(0);
+            pg_sys::Datum::from(v as usize)
+        }
+        pg_sys::INT4OID => {
+            let v: i32 = s.parse().unwrap_or(0);
+            pg_sys::Datum::from(v as usize)
+        }
+        pg_sys::INT8OID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {
+            let v: i64 = s.parse().unwrap_or(0);
+            pg_sys::Datum::from(v as usize)
+        }
+        pg_sys::FLOAT4OID => {
+            let v: f32 = s.parse().unwrap_or(0.0);
+            pg_sys::Datum::from(v.to_bits() as usize)
+        }
+        pg_sys::FLOAT8OID => {
+            let v: f64 = s.parse().unwrap_or(0.0);
+            pg_sys::Datum::from(v.to_bits() as usize)
+        }
+        pg_sys::DATEOID => {
+            let v: i32 = s.parse().unwrap_or(0);
+            pg_sys::Datum::from(v as usize)
+        }
+        pg_sys::BOOLOID => {
+            let v = s == "t" || s == "true" || s == "1";
+            pg_sys::Datum::from(v as usize)
+        }
+        _ => pg_sys::Datum::from(0usize),
+    }
+}
+
+/// Merge a worker's compact map+storage into the global map+storage.
+fn merge_compact_results(
+    global_map: &mut CompactGroupMap,
+    global_storage: &mut CompactAccStorage,
+    worker_map: &CompactGroupMap,
+    worker_storage: &CompactAccStorage,
+    agg_specs: &[AggExecSpec],
+) {
+    for (&packed_key, &worker_group_idx) in worker_map {
+        let global_group_idx = match global_map.entry(packed_key) {
+            hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
+            hashbrown::hash_map::Entry::Vacant(e) => {
+                let idx = global_storage.alloc_group();
+                e.insert(idx);
+                idx
+            }
+        };
+
+        // Merge each accumulator slot
+        for (slot_idx, _spec) in agg_specs.iter().enumerate() {
+            let (_, kind) = global_storage.layout.slots[slot_idx];
+            match kind {
+                CompactAccKind::Count => unsafe {
+                    let worker_count = worker_storage.read_count(worker_group_idx, slot_idx);
+                    *global_storage.count_mut(global_group_idx, slot_idx) += worker_count;
+                },
+                CompactAccKind::SumInt => unsafe {
+                    let (worker_sum, worker_count) = worker_storage.read_sum_int(worker_group_idx, slot_idx);
+                    let (global_sum, global_count) = global_storage.sum_int_mut(global_group_idx, slot_idx);
+                    *global_sum += worker_sum;
+                    *global_count += worker_count;
+                },
+                CompactAccKind::SumIntNarrow => unsafe {
+                    let (worker_sum, worker_count) = worker_storage.read_sum_int_narrow(worker_group_idx, slot_idx);
+                    let (global_sum, global_count) = global_storage.sum_int_narrow_mut(global_group_idx, slot_idx);
+                    *global_sum += worker_sum;
+                    *global_count += worker_count;
+                },
+                CompactAccKind::SumFloat => unsafe {
+                    let (worker_sum, worker_count) = worker_storage.read_sum_float(worker_group_idx, slot_idx);
+                    let (global_sum, global_count) = global_storage.sum_float_mut(global_group_idx, slot_idx);
+                    *global_sum += worker_sum;
+                    *global_count += worker_count;
+                },
+            }
+        }
+    }
+}
+
+/// Check if all needed columns (for aggs, groups, and batch quals) are numeric.
+fn all_needed_cols_numeric(
+    needed_cols: &[bool],
+    col_types: &[pg_sys::Oid],
+) -> bool {
+    needed_cols.iter().zip(col_types.iter()).all(|(&needed, &type_oid)| {
+        !needed || is_numeric_type(type_oid)
+    })
+}
 
 // ============================================================================
 // Tests

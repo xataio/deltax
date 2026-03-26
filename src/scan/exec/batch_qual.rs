@@ -33,6 +33,13 @@ pub(super) struct BatchQual {
     pub(super) in_list_i64: Option<Vec<i64>>,       // constant values for IN list (stored as i64)
 }
 
+// SAFETY: BatchQual is shared across threads only via immutable references
+// during parallel aggregation, and only when all quals reference numeric types
+// (verified by batch_quals_all_numeric). For numeric types, const_datum
+// contains an integer/float value (not a PG pointer).
+unsafe impl Send for BatchQual {}
+unsafe impl Sync for BatchQual {}
+
 // ============================================================================
 // Batch / vectorized qual evaluation
 // ============================================================================
