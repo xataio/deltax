@@ -2008,11 +2008,19 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     }
                 }
                 if topn_sort_col < 0 {
-                    topn_limit = 0;
+                    // No ORDER BY on aggregate found
+                    let sort_clause = (*parse).sortClause;
+                    if sort_clause.is_null() || (*sort_clause).length == 0 {
+                        // Bare LIMIT N — pass as bare_limit (sort_col = -1)
+                        path::set_agg_topn_info(topn_limit, -1, true);
+                        // topn_active stays false — no pathkeys claimed
+                    } else {
+                        topn_limit = 0; // ORDER BY exists but doesn't match an aggregate — disable
+                    }
                 }
             }
 
-            if topn_limit > 0 {
+            if topn_limit > 0 && topn_sort_col >= 0 {
                 path::set_agg_topn_info(topn_limit, topn_sort_col, topn_ascending);
                 topn_active = true;
             }
