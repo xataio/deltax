@@ -579,6 +579,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         let mut non_agg_vars: Vec<*const pg_sys::Var> = Vec::new();
         let mut non_agg_func_exprs: Vec<(i32, *const pg_sys::FuncExpr)> = Vec::new(); // (tlist_index, FuncExpr)
         let mut non_agg_op_exprs: Vec<(i32, *const pg_sys::OpExpr)> = Vec::new(); // (tlist_index, OpExpr)
+        let mut const_exprs: Vec<(i32, *const pg_sys::Const)> = Vec::new(); // (tlist_index, Const)
 
         for i in 0..nentries {
             let te = pg_sys::list_nth(tlist, i) as *const pg_sys::TargetEntry;
@@ -604,6 +605,9 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
             } else if (*expr).type_ == pg_sys::NodeTag::T_OpExpr && has_group_by {
                 // Non-aggregate OpExpr in target list (e.g. col - 1) — must match a GROUP BY expression
                 non_agg_op_exprs.push((i, expr as *const pg_sys::OpExpr));
+            } else if (*expr).type_ == pg_sys::NodeTag::T_Const && has_group_by {
+                // Constant in target list (e.g. SELECT 1, ...) — pass through as-is
+                const_exprs.push((i, expr as *const pg_sys::Const));
             } else {
                 return; // Non-aggregate, non-Var, non-FuncExpr expression — bail
             }
@@ -1189,7 +1193,11 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     return;
                 }
 
-                if (*expr).type_ == pg_sys::NodeTag::T_Var {
+                if (*expr).type_ == pg_sys::NodeTag::T_Const {
+                    // Constant GROUP BY key (e.g. GROUP BY 1 where 1 is a literal).
+                    // This is a no-op for grouping — skip it.
+                    continue;
+                } else if (*expr).type_ == pg_sys::NodeTag::T_Var {
                     let var_node = expr as *const pg_sys::Var;
                     let col_idx = (*var_node).varattno as i32 - 1;
 

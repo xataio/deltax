@@ -898,8 +898,9 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
         // Walk tlist to build output mapping:
         // For each tlist entry, determine if it's an Aggref or a group Var/FuncExpr.
         // Track which agg_spec index or group_spec index it maps to.
-        // output_map[i] = (type, index) where type=0 → agg, type=1 → group
+        // output_map[i] = (type, index) where type=0 → agg, type=1 → group, type=2 → const
         let mut output_map: Vec<(i32, i32)> = Vec::new();
+        let mut const_outputs: Vec<(pg_sys::Oid, i64, bool)> = Vec::new();
         let mut agg_counter = 0;
 
         if !tlist.is_null() {
@@ -1011,6 +1012,28 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                         }
                     }).unwrap_or(0) as i32;
                     output_map.push((1, group_idx));
+                } else if (*expr).type_ == pg_sys::NodeTag::T_Const {
+                    // Constant in SELECT list (e.g. SELECT 1, ...) — serialize type + value
+                    let c = expr as *const pg_sys::Const;
+                    let type_oid = (*c).consttype;
+                    let (const_val, is_null) = if (*c).constisnull {
+                        (0i64, true)
+                    } else {
+                        let v: i64 = match type_oid {
+                            pg_sys::INT2OID => (*c).constvalue.value() as i16 as i64,
+                            pg_sys::INT4OID => (*c).constvalue.value() as i32 as i64,
+                            pg_sys::INT8OID => (*c).constvalue.value() as i64,
+                            pg_sys::BOOLOID => (*c).constvalue.value() as i64,
+                            _ => (*c).constvalue.value() as i64,
+                        };
+                        (v, false)
+                    };
+                    // type=2 signals a constant output: next 3 ints are type_oid, value, is_null
+                    output_map.push((2, const_val as i32));
+                    // Store type_oid and is_null as extra entries after the output_map
+                    // Actually, encode inline: (2, type_oid, value, is_null)
+                    // We'll extend the serialization format below
+                    const_outputs.push((type_oid, const_val, is_null));
                 }
             }
         }
@@ -1080,9 +1103,19 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
         }
         // Output mapping
         private_list = pg_sys::lappend_int(private_list, output_map.len() as i32);
+        let mut const_idx = 0usize;
         for (otype, oref) in &output_map {
             private_list = pg_sys::lappend_int(private_list, *otype);
             private_list = pg_sys::lappend_int(private_list, *oref);
+            if *otype == 2 {
+                // Const output: append type_oid, const_val_hi, const_val_lo, is_null
+                let (type_oid, const_val, is_null) = const_outputs[const_idx];
+                private_list = pg_sys::lappend_int(private_list, u32::from(type_oid) as i32);
+                private_list = pg_sys::lappend_int(private_list, (const_val >> 32) as i32);
+                private_list = pg_sys::lappend_int(private_list, const_val as i32);
+                private_list = pg_sys::lappend_int(private_list, if is_null { 1 } else { 0 });
+                const_idx += 1;
+            }
         }
 
         // HAVING filters: [num_having, agg_idx_0, op_0, const_val_0, ...]

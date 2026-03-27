@@ -308,6 +308,7 @@ pub(crate) unsafe extern "C-unwind" fn create_agg_scan_state(
 enum OutputEntry {
     Agg(usize),    // index into agg_specs
     Group(usize),  // index into group_specs
+    Const(pg_sys::Datum, bool),  // constant value + is_null
 }
 
 /// All fields deserialized from a DeltaXAgg node's custom_private list.
@@ -479,11 +480,30 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
             let otype = pg_sys::list_nth_int(custom_private, idx);
             let oref = pg_sys::list_nth_int(custom_private, idx + 1) as usize;
             idx += 2;
-            output_map.push(if otype == 0 {
-                OutputEntry::Agg(oref)
+            if otype == 0 {
+                output_map.push(OutputEntry::Agg(oref));
+            } else if otype == 2 {
+                // Const output: type_oid, const_val_hi, const_val_lo, is_null
+                let type_oid = pg_sys::list_nth_int(custom_private, idx) as u32;
+                let val_hi = pg_sys::list_nth_int(custom_private, idx + 1) as i64;
+                let val_lo = pg_sys::list_nth_int(custom_private, idx + 2) as u32 as i64;
+                let is_null = pg_sys::list_nth_int(custom_private, idx + 3) != 0;
+                idx += 4;
+                let const_val = (val_hi << 32) | val_lo;
+                let datum = if is_null {
+                    pg_sys::Datum::from(0usize)
+                } else {
+                    // Reconstruct datum based on type
+                    match pg_sys::Oid::from(type_oid) {
+                        pg_sys::INT2OID => pg_sys::Datum::from(const_val as i16 as usize),
+                        pg_sys::INT4OID => pg_sys::Datum::from(const_val as i32 as usize),
+                        _ => pg_sys::Datum::from(const_val as usize),
+                    }
+                };
+                output_map.push(OutputEntry::Const(datum, is_null));
             } else {
-                OutputEntry::Group(oref)
-            });
+                output_map.push(OutputEntry::Group(oref));
+            }
         }
     }
     // If no output mapping (backward compat), default to aggs then groups
@@ -621,6 +641,7 @@ fn try_catalog_shortcut(
         match entry {
             OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
             OutputEntry::Group(_) => row.push((pg_sys::Datum::from(0usize), true)),
+            OutputEntry::Const(d, n) => row.push((*d, *n)),
         }
     }
     Some(AggScanState {
@@ -848,6 +869,7 @@ fn try_metadata_fast_path(
         match entry {
             OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
             OutputEntry::Group(_) => row.push((pg_sys::Datum::from(0usize), true)),
+            OutputEntry::Const(d, n) => row.push((*d, *n)),
         }
     }
 
@@ -1397,6 +1419,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                         row.push((pg_sys::Datum::from(v as usize), false));
                                     }
                                 }
+                                OutputEntry::Const(d, n) => row.push((*d, *n)),
                             }
                         }
                         result_rows.push(row);
@@ -1550,6 +1573,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                     row.push((pg_sys::Datum::from(v as usize), false));
                                 }
                             }
+                            OutputEntry::Const(d, n) => row.push((*d, *n)),
                         }
                     }
                     result_rows.push(row);
@@ -1581,6 +1605,255 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     topn_select_us: 0,
                     n_workers: n_workers as u64,
                     bare_limit,
+                };
+
+                let state_box = Box::new(state);
+                let state_ptr = Box::into_raw(state_box);
+                (*node).custom_ps = state_ptr as *mut pg_sys::List;
+                return;
+            }
+
+            // ----------------------------------------------------------
+            // Partitioned parallel merge + top-N: partition key space
+            // across threads, each merges its slice and finds local
+            // top-N, then merge the local results.
+            // ----------------------------------------------------------
+            if topn_limit > 0 && having_filters.is_empty() {
+                let t_merge = Instant::now();
+                let limit = topn_limit as usize;
+                let sort_slot = match output_map[topn_sort_col] {
+                    OutputEntry::Agg(ai) => ai,
+                    _ => unreachable!(),
+                };
+                let n_partitions = n_workers;
+
+                let pre_topn_groups: usize = partial_results.iter()
+                    .map(|r| r.compact_map.len()).sum();
+
+                // Each partition thread: merge its slice, find local top-N,
+                // copy winners to mini storage, drop the rest.
+                let partition_results: Vec<(CompactAccStorage, Vec<(i64, u128, u32)>)> =
+                    std::thread::scope(|s| {
+                    let workers = &partial_results;
+                    let specs = &agg_specs;
+                    let np = n_partitions;
+                    let ascending = topn_ascending;
+
+                    let handles: Vec<_> = (0..np).map(|p| {
+                        s.spawn(move || {
+                            let layout = CompactAccLayout::new(specs);
+                            let n_slots = layout.slots.len();
+                            let mut map: CompactGroupMap =
+                                CompactGroupMap::with_hasher(Default::default());
+                            let mut storage = CompactAccStorage::new(layout);
+
+                            // Merge entries from all workers belonging to this partition
+                            for worker in workers {
+                                for (&key, &wgidx) in &worker.compact_map {
+                                    if ((key as u64) ^ ((key >> 64) as u64)) as usize % np != p {
+                                        continue;
+                                    }
+                                    let gidx = match map.entry(key) {
+                                        hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
+                                        hashbrown::hash_map::Entry::Vacant(e) => {
+                                            let idx = storage.alloc_group();
+                                            e.insert(idx);
+                                            idx
+                                        }
+                                    };
+                                    for slot_idx in 0..n_slots {
+                                        let (_, kind) = storage.layout.slots[slot_idx];
+                                        match kind {
+                                            CompactAccKind::Count => {
+                                                let wc = worker.compact_storage.read_count(wgidx, slot_idx);
+                                                *storage.count_mut(gidx, slot_idx) += wc;
+                                            }
+                                            CompactAccKind::SumInt => {
+                                                let (ws, wc) = worker.compact_storage.read_sum_int(wgidx, slot_idx);
+                                                let (gs, gc) = storage.sum_int_mut(gidx, slot_idx);
+                                                *gs += ws;
+                                                *gc += wc;
+                                            }
+                                            CompactAccKind::SumIntNarrow => {
+                                                let (ws, wc) = worker.compact_storage.read_sum_int_narrow(wgidx, slot_idx);
+                                                let (gs, gc) = storage.sum_int_narrow_mut(gidx, slot_idx);
+                                                *gs += ws;
+                                                *gc += wc;
+                                            }
+                                            CompactAccKind::SumFloat => {
+                                                let (ws, wc) = worker.compact_storage.read_sum_float(wgidx, slot_idx);
+                                                let (gs, gc) = storage.sum_float_mut(gidx, slot_idx);
+                                                *gs += ws;
+                                                *gc += wc;
+                                            }
+                                            CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                                                let (w_off, w_len) = worker.compact_storage.read_min_max_str(wgidx, slot_idx);
+                                                if w_off != u32::MAX {
+                                                    let w_bytes = worker.compact_storage.str_arena.get(w_off, w_len).as_bytes();
+                                                    let (g_off, g_len) = storage.read_min_max_str(gidx, slot_idx);
+                                                    let should_update = if g_off == u32::MAX {
+                                                        true
+                                                    } else {
+                                                        let g_bytes = storage.str_arena.get(g_off, g_len).as_bytes();
+                                                        match kind {
+                                                            CompactAccKind::MinStr => w_bytes < g_bytes,
+                                                            _ => w_bytes > g_bytes,
+                                                        }
+                                                    };
+                                                    if should_update {
+                                                        let w_str = worker.compact_storage.str_arena.get(w_off, w_len);
+                                                        let (new_off, new_len) = storage.str_arena.alloc(w_str);
+                                                        storage.write_min_max_str(gidx, slot_idx, new_off, new_len);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Local top-N selection using a heap
+                            let (_, sort_kind) = storage.layout.slots[sort_slot];
+                            let read_val = |gidx: u32| -> i64 {
+                                match sort_kind {
+                                    CompactAccKind::Count => storage.read_count(gidx, sort_slot),
+                                    CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(gidx, sort_slot).0,
+                                    _ => storage.read_count(gidx, sort_slot),
+                                }
+                            };
+
+                            let winners: Vec<(i64, u128, u32)> = if ascending {
+                                // Keep smallest N: max-heap evicts largest
+                                let mut heap: BinaryHeap<(i64, u128, u32)> =
+                                    BinaryHeap::with_capacity(limit + 1);
+                                for (&key, &gidx) in &map {
+                                    let val = read_val(gidx);
+                                    heap.push((val, key, gidx));
+                                    if heap.len() > limit { heap.pop(); }
+                                }
+                                heap.into_vec()
+                            } else {
+                                // Keep largest N: min-heap (Reverse) evicts smallest
+                                let mut heap: BinaryHeap<Reverse<(i64, u128, u32)>> =
+                                    BinaryHeap::with_capacity(limit + 1);
+                                for (&key, &gidx) in &map {
+                                    let val = read_val(gidx);
+                                    heap.push(Reverse((val, key, gidx)));
+                                    if heap.len() > limit { heap.pop(); }
+                                }
+                                heap.into_iter().map(|Reverse(x)| x).collect()
+                            };
+
+                            drop(map); // free partition map (~250MB)
+
+                            // Copy winning groups to tiny mini-storage
+                            let layout2 = CompactAccLayout::new(specs);
+                            let stride = storage.layout.group_stride;
+                            let mut mini = CompactAccStorage::new(layout2);
+                            let mut top_entries = Vec::with_capacity(winners.len());
+
+                            for (sort_val, key, old_gidx) in winners {
+                                let new_gidx = mini.alloc_group();
+                                let src = old_gidx as usize * stride;
+                                let dst = new_gidx as usize * stride;
+                                mini.buf[dst..dst + stride]
+                                    .copy_from_slice(&storage.buf[src..src + stride]);
+                                // Remap MinStr/MaxStr arena references
+                                for slot_idx in 0..n_slots {
+                                    let (_, kind) = storage.layout.slots[slot_idx];
+                                    if kind == CompactAccKind::MinStr || kind == CompactAccKind::MaxStr {
+                                        let (off, len) = storage.read_min_max_str(old_gidx, slot_idx);
+                                        if off != u32::MAX {
+                                            let val_str = storage.str_arena.get(off, len);
+                                            let (no, nl) = mini.str_arena.alloc(val_str);
+                                            mini.write_min_max_str(new_gidx, slot_idx, no, nl);
+                                        }
+                                    }
+                                }
+                                top_entries.push((sort_val, key, new_gidx));
+                            }
+
+                            drop(storage); // free full partition storage
+
+                            (mini, top_entries)
+                        })
+                    }).collect();
+
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
+
+                drop(partial_results); // free all worker data
+
+                let merge_us = t_merge.elapsed().as_micros() as u64;
+
+                // Merge all partition top entries, select global top-N
+                let t_finalize = Instant::now();
+                let mut all_candidates: Vec<(i64, u128, u32, usize)> = Vec::new();
+                for (pi, (_, entries)) in partition_results.iter().enumerate() {
+                    for &(sort_val, key, gidx) in entries {
+                        all_candidates.push((sort_val, key, gidx, pi));
+                    }
+                }
+                if topn_ascending {
+                    all_candidates.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                } else {
+                    all_candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                }
+                all_candidates.truncate(limit);
+
+                let num_group_keys = group_specs.len();
+                let mut result_rows = Vec::with_capacity(limit);
+                for &(_sort_val, key, mini_gidx, pi) in &all_candidates {
+                    let storage = &partition_results[pi].0;
+                    let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
+                    for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                        agg_results.push(compact_finalize(storage, mini_gidx, spec_idx, spec));
+                    }
+                    let keys = unpack_int_keys(key, num_group_keys);
+                    let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
+                    for entry in &output_map {
+                        match entry {
+                            OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
+                            OutputEntry::Group(gi) => {
+                                let v = keys[*gi];
+                                if matches!(group_specs[*gi].expr, GroupByExpr::Extract { .. }) {
+                                    row.push((i128_to_numeric_datum(v as i128), false));
+                                } else {
+                                    row.push((pg_sys::Datum::from(v as usize), false));
+                                }
+                            }
+                            OutputEntry::Const(d, n) => row.push((*d, *n)),
+                        }
+                    }
+                    result_rows.push(row);
+                }
+                let finalize_us = t_finalize.elapsed().as_micros() as u64;
+
+                let state = AggScanState {
+                    _agg_specs: agg_specs,
+                    _group_specs: group_specs,
+                    result_rows,
+                    result_idx: 0,
+                    _num_result_cols: num_result_cols,
+                    metadata_us,
+                    heap_scan_us,
+                    decompress_us,
+                    agg_us,
+                    total_segments,
+                    total_rows_processed,
+                    batch_quals_count: batch_quals.len(),
+                    where_quals_null: where_quals.is_null(),
+                    regex_cache_size: 0,
+                    regex_cache_calls: 0,
+                    topn_limit: topn_limit as u64,
+                    topn_sort_col: topn_sort_col as i64,
+                    topn_ascending,
+                    pre_topn_groups: pre_topn_groups as u64,
+                    merge_us,
+                    finalize_us,
+                    topn_select_us: 0,
+                    n_workers: n_workers as u64,
+                    bare_limit: 0,
                 };
 
                 let state_box = Box::new(state);
@@ -1625,49 +1898,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
             // Finalize
             let pre_topn_groups = compact_group_map.len();
-            let mut topn_select_us: u64 = 0;
+            let topn_select_us: u64 = 0;
             let t_finalize = Instant::now();
-            let result_rows = if topn_limit > 0 && having_filters.is_empty()
-                && compact_group_map.len() > topn_limit as usize
-            {
-                // Top-N pushdown: heap-select top-N by raw sort value, finalize only those
-                let sort_slot = match output_map[topn_sort_col] {
-                    OutputEntry::Agg(ai) => ai,
-                    _ => unreachable!(),
-                };
-                let storage = compact_storage.as_ref().unwrap();
-                let t_topn = Instant::now();
-                let top_entries = compact_topn_select(
-                    &compact_group_map, storage, sort_slot,
-                    topn_limit as usize, topn_ascending,
-                );
-                topn_select_us = t_topn.elapsed().as_micros() as u64;
-                let num_group_keys = group_specs.len();
-                let mut rows = Vec::with_capacity(top_entries.len());
-                for &(packed_key, group_idx) in &top_entries {
-                    let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
-                    for (spec_idx, spec) in agg_specs.iter().enumerate() {
-                        agg_results.push(compact_finalize(storage, group_idx, spec_idx, spec));
-                    }
-                    let keys = unpack_int_keys(packed_key, num_group_keys);
-                    let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
-                    for entry in &output_map {
-                        match entry {
-                            OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
-                            OutputEntry::Group(gi) => {
-                                let v = keys[*gi];
-                                if matches!(group_specs[*gi].expr, GroupByExpr::Extract { .. }) {
-                                    row.push((i128_to_numeric_datum(v as i128), false));
-                                } else {
-                                    row.push((pg_sys::Datum::from(v as usize), false));
-                                }
-                            }
-                        }
-                    }
-                    rows.push(row);
-                }
-                rows
-            } else {
+            let result_rows = {
                 // Full-scan path (no top-N, or HAVING present)
                 let storage = compact_storage.as_ref().unwrap();
                 let num_group_keys = group_specs.len();
@@ -1706,6 +1939,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                     row.push((pg_sys::Datum::from(v as usize), false));
                                 }
                             }
+                            OutputEntry::Const(d, n) => row.push((*d, *n)),
                         }
                     }
                     rows.push(row);
@@ -2037,6 +2271,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                         }
                                     }
                                 }
+                                OutputEntry::Const(d, n) => row.push((*d, *n)),
                             }
                         }
                         result_rows.push(row);
@@ -2223,6 +2458,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                     }
                                 }
                             }
+                            OutputEntry::Const(d, n) => row.push((*d, *n)),
                         }
                     }
                     result_rows.push(row);
@@ -2399,6 +2635,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 }
                             }
                         }
+                        OutputEntry::Const(d, n) => row.push((*d, *n)),
                     }
                 }
                 row
@@ -2471,6 +2708,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                     }
                                 }
                             }
+                            OutputEntry::Const(d, n) => row.push((*d, *n)),
                         }
                     }
                     rows.push(row);
@@ -3615,6 +3853,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 row.push((pg_sys::Datum::from(v as usize), false));
                             }
                         }
+                        OutputEntry::Const(d, n) => row.push((*d, *n)),
                     }
                 }
                 rows.push(row);
@@ -3667,6 +3906,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 row.push((pg_sys::Datum::from(v as usize), false));
                             }
                         }
+                        OutputEntry::Const(d, n) => row.push((*d, *n)),
                     }
                 }
                 rows.push(row);
@@ -3732,6 +3972,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 }
                             }
                         }
+                        OutputEntry::Const(d, n) => row.push((*d, *n)),
                     }
                 }
                 rows.push(row);
@@ -3754,6 +3995,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     OutputEntry::Group(_) => {
                         row.push((pg_sys::Datum::from(0usize), true));
                     }
+                    OutputEntry::Const(d, n) => row.push((*d, *n)),
                 }
             }
             vec![row]
