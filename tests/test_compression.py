@@ -134,12 +134,17 @@ class TestCompressDecompress:
         ).fetchone()[0]
         assert count_after == count_before
 
-        # Companion table should exist
-        companion_exists = db.execute(
+        # Meta + blobs tables should exist
+        meta_exists = db.execute(
             f"SELECT EXISTS (SELECT 1 FROM pg_tables "
-            f"WHERE schemaname = '_deltax_compressed' AND tablename = '{part_name}')"
+            f"WHERE schemaname = '_deltax_compressed' AND tablename = '{part_name}_meta')"
         ).fetchone()[0]
-        assert companion_exists
+        assert meta_exists
+        blobs_exists = db.execute(
+            f"SELECT EXISTS (SELECT 1 FROM pg_tables "
+            f"WHERE schemaname = '_deltax_compressed' AND tablename = '{part_name}_blobs')"
+        ).fetchone()[0]
+        assert blobs_exists
 
         # Catalog should show compressed
         info = db.execute(

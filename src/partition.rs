@@ -550,12 +550,16 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
     let parent_fqn = fqn(&ht.schema_name, &ht.table_name);
 
     for (schema, name, is_compressed) in &partitions {
-        // If compressed, drop the companion table
+        // If compressed, drop the meta + blobs tables
         if *is_compressed {
-            let companion = format!("\"_deltax_compressed\".\"{}\"", name);
+            let blobs_table = format!("\"_deltax_compressed\".\"{}_blobs\"", name);
+            let meta_table = format!("\"_deltax_compressed\".\"{}_meta\"", name);
             client
-                .update(&format!("DROP TABLE IF EXISTS {}", companion), None, &[])
-                .expect("failed to drop compressed companion table");
+                .update(&format!("DROP TABLE IF EXISTS {}", blobs_table), None, &[])
+                .expect("failed to drop compressed blobs table");
+            client
+                .update(&format!("DROP TABLE IF EXISTS {}", meta_table), None, &[])
+                .expect("failed to drop compressed meta table");
         }
 
         let part_fqn = fqn(schema, name);

@@ -2422,8 +2422,9 @@ pub(crate) unsafe fn check_compressed_partition(rel_oid: pg_sys::Oid) -> pg_sys:
             return pg_sys::InvalidOid;
         }
 
-        // Check if _deltax_compressed.<rel_name> exists
-        let companion_cname = std::ffi::CString::new(rel_name).unwrap();
+        // Check if _deltax_compressed.<rel_name>_meta exists
+        let meta_name = format!("{}_meta", rel_name);
+        let companion_cname = std::ffi::CString::new(meta_name).unwrap();
         pg_sys::get_relname_relid(companion_cname.as_ptr(), compressed_ns_oid)
     }
 }

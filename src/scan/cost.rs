@@ -38,10 +38,12 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
             .to_string_lossy()
             .into_owned()
     };
+    // Strip _meta suffix to get the partition name for catalog lookup
+    let partition_name = name.strip_suffix("_meta").unwrap_or(&name);
 
     let result = Spi::get_one_with_args::<i64>(
         "SELECT row_count FROM deltax_partition WHERE table_name = $1 AND is_compressed = true",
-        &[name.as_str().into()],
+        &[partition_name.into()],
     );
 
     match result {

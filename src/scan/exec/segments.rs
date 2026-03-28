@@ -246,10 +246,17 @@ pub(super) struct MetadataInfo {
 }
 
 /// Load metadata (column names, types, segment_by) from catalog via SPI.
+/// `companion_name` is the meta table name (e.g. "<partition>_meta"). The `_meta`
+/// suffix is stripped to find the partition in the catalog.
 pub(super) fn load_metadata(
     client: &pgrx::spi::SpiClient<'_>,
     companion_name: &str,
 ) -> MetadataInfo {
+    // Strip _meta suffix to get the partition name for catalog lookup
+    let partition_name = companion_name
+        .strip_suffix("_meta")
+        .unwrap_or(companion_name);
+
     // Get the partition's deltatable info
     let mut ht_result = client
         .select(
@@ -258,7 +265,7 @@ pub(super) fn load_metadata(
              JOIN deltax_deltatable h ON h.id = p.deltatable_id
              WHERE p.table_name = $1 AND p.is_compressed = true",
             None,
-            &[companion_name.into()],
+            &[partition_name.into()],
         )
         .expect("failed to query partition info");
 
@@ -340,18 +347,21 @@ pub(super) fn load_metadata(
     }
 }
 
-/// Load segment data from the companion table via direct heap scan.
+/// Load segment data via two-phase scan: meta table (no TOAST) then blob table
+/// (column-major, sequential TOAST I/O per column).
 ///
-/// Bypasses SPI entirely — opens the companion table, iterates all tuples
-/// with `heap_getnext`, and extracts segment_by values, compressed BYTEA blobs,
-/// and row counts directly from the heap tuples.
+/// Phase 1: Heap-scan the meta table to extract segment_by values, row counts,
+/// min/max, sums, and apply pruning. Zero TOAST I/O (no BYTEA columns).
+///
+/// Phase 2: Index-scan the blob table for each needed column, reading only
+/// surviving segments. TOAST chunks are contiguous per column for sequential I/O.
 ///
 /// When `lazy_cols` is provided, columns marked true are stored as TOAST pointer
 /// copies (~18 bytes each) instead of being fully detoasted. Call
 /// `detoast_lazy_blobs()` later to materialize them on demand.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn load_segments_heap(
-    companion_oid: pg_sys::Oid,
+    meta_oid: pg_sys::Oid,
     col_names: &[String],
     segment_by: &[String],
     needed_cols: &[bool],
@@ -365,12 +375,14 @@ pub(super) unsafe fn load_segments_heap(
     load_sums: bool,
 ) -> (Vec<SegmentData>, u64, u64, u64) {  // last u64 = detoast_us
     unsafe {
-        // Open companion table with AccessShareLock
-        let rel = pg_sys::table_open(companion_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        // ================================================================
+        // Phase 1: Scan meta table — no TOAST I/O
+        // ================================================================
+        let rel = pg_sys::table_open(meta_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let tupdesc = (*rel).rd_att;
         let natts = (*tupdesc).natts as usize;
 
-        // Build column-name-to-attno mapping from companion TupleDesc
+        // Build column-name-to-attno mapping from meta TupleDesc
         let mut attno_map: HashMap<String, usize> = HashMap::new();
         let mut att_type_oids: HashMap<String, pg_sys::Oid> = HashMap::new();
         for i in 0..natts {
@@ -385,8 +397,8 @@ pub(super) unsafe fn load_segments_heap(
             attno_map.insert(name, i);
         }
 
-        // Locate attribute indices for segment_by columns, compressed columns, and _row_count
-        let mut segment_by_attnos: Vec<(usize, pg_sys::Oid)> = Vec::new(); // (attno, type_oid)
+        // Locate attribute indices for segment_by columns and _row_count
+        let mut segment_by_attnos: Vec<(usize, pg_sys::Oid)> = Vec::new();
         for name in col_names {
             if segment_by.contains(name)
                 && let Some(&attno) = attno_map.get(name.as_str())
@@ -396,31 +408,15 @@ pub(super) unsafe fn load_segments_heap(
             }
         }
 
-        let mut compressed_attnos: Vec<Option<usize>> = Vec::new(); // Some(attno) for needed, None for unneeded
-        let mut blob_is_lazy: Vec<bool> = Vec::new(); // parallel to compressed_attnos: true = store TOAST pointer only
-        for (idx, name) in col_names.iter().enumerate() {
-            if !segment_by.contains(name) {
-                if needed_cols[idx] {
-                    let comp_name = format!("_{}_compressed", name);
-                    compressed_attnos.push(attno_map.get(comp_name.as_str()).copied());
-                    blob_is_lazy.push(lazy_cols.is_some_and(|lc| idx < lc.len() && lc[idx]));
-                } else {
-                    compressed_attnos.push(None);
-                    blob_is_lazy.push(false);
-                }
-            }
-        }
-
         let row_count_attno = attno_map.get("_row_count").copied();
+        let segment_id_attno = attno_map.get("_segment_id").copied();
 
         let min_time_name = format!("_min_{}", time_column);
         let max_time_name = format!("_max_{}", time_column);
         let min_time_attno = attno_map.get(min_time_name.as_str()).copied();
         let max_time_attno = attno_map.get(max_time_name.as_str()).copied();
 
-        // Discover per-column min/max columns: (col_name, min_attno, max_attno, type_oid)
-        // Only needed for MinMax pushdown scans — skip for regular decompress scans
-        // to avoid overhead from deforming 100+ extra attributes.
+        // Discover per-column min/max columns
         let mut minmax_col_attnos: Vec<(String, usize, usize, pg_sys::Oid)> = Vec::new();
         if load_minmax {
             for col_name in col_names {
@@ -440,7 +436,7 @@ pub(super) unsafe fn load_segments_heap(
             }
         }
 
-        // Discover per-column sum/nonnull_count columns: (col_name, sum_attno, nonnull_count_attno, type_oid)
+        // Discover per-column sum/nonnull_count columns
         let mut sum_col_attnos: Vec<(String, usize, usize, pg_sys::Oid)> = Vec::new();
         if load_sums {
             for col_name in col_names {
@@ -463,7 +459,6 @@ pub(super) unsafe fn load_segments_heap(
         // Build min/max predicate filters from batch quals
         let mut minmax_filters: Vec<MinMaxFilter> = Vec::new();
         for bq in batch_quals {
-            // Only orderable types (not BOOL, not text, not LIKE/NotLike)
             match bq.op {
                 BatchCompareOp::Like | BatchCompareOp::NotLike => continue,
                 _ => {}
@@ -492,8 +487,7 @@ pub(super) unsafe fn load_segments_heap(
             }
         }
 
-        // Begin table scan via TableAmRoutine vtable
-        // (table_beginscan is static inline in C, so we call via the vtable)
+        // Begin meta table scan
         let snapshot = pg_sys::GetActiveSnapshot();
         let flags: u32 = pg_sys::ScanOptions::SO_TYPE_SEQSCAN
             | pg_sys::ScanOptions::SO_ALLOW_STRAT
@@ -508,20 +502,32 @@ pub(super) unsafe fn load_segments_heap(
             flags,
         );
 
-        // Iterate all tuples
-        let mut segments = Vec::new();
+        // Surviving segment metadata: (index_in_segments_vec, segment_id)
+        let mut segments: Vec<SegmentData> = Vec::new();
+        let mut surviving_segment_ids: Vec<i32> = Vec::new();
         let mut segments_skipped: u64 = 0;
         let mut segments_minmax_skipped: u64 = 0;
-        let mut detoast_us: u64 = 0;
         let mut heap_getnext_us: u64 = 0;
         let mut deform_us: u64 = 0;
-        let mut detoast_calls: u64 = 0;
-        let mut detoast_toasted: u64 = 0;
-        let mut detoast_bytes: u64 = 0;
-        let mut compressed_some_count: u64 = 0;
-        let mut compressed_none_count: u64 = 0;
         let mut values = vec![pg_sys::Datum::from(0); natts];
         let mut nulls = vec![true; natts];
+
+        // Build col_idx mapping: for each col_names[i] that is not segment_by,
+        // compute its col_idx (0-based among non-segment-by columns)
+        let mut col_idx_map: Vec<Option<u16>> = Vec::new(); // parallel to col_names: Some(col_idx) for non-seg-by, None for seg-by
+        let mut num_blob_cols: usize = 0;
+        {
+            let mut ci: u16 = 0;
+            for name in col_names {
+                if segment_by.contains(name) {
+                    col_idx_map.push(None);
+                } else {
+                    col_idx_map.push(Some(ci));
+                    ci += 1;
+                    num_blob_cols += 1;
+                }
+            }
+        }
 
         loop {
             let getnext_start = std::time::Instant::now();
@@ -534,7 +540,6 @@ pub(super) unsafe fn load_segments_heap(
                 break;
             }
 
-            // Deform tuple into datums + nulls arrays
             let deform_start = std::time::Instant::now();
             pg_sys::heap_deform_tuple(
                 tuple,
@@ -543,6 +548,12 @@ pub(super) unsafe fn load_segments_heap(
                 nulls.as_mut_ptr(),
             );
             deform_us += deform_start.elapsed().as_micros() as u64;
+
+            // Extract _segment_id
+            let segment_id = match segment_id_attno {
+                Some(attno) if !nulls[attno] => values[attno].value() as i32,
+                _ => 0,
+            };
 
             // Extract segment_by values
             let mut segment_values: Vec<Option<String>> = Vec::new();
@@ -562,13 +573,11 @@ pub(super) unsafe fn load_segments_heap(
                 }
             }
 
-            // Extract _row_count (INT4) — cheap, needed before pruning
             let row_count = match row_count_attno {
                 Some(attno) if !nulls[attno] => values[attno].value() as i32,
                 _ => 0,
             };
 
-            // Extract min/max time (TIMESTAMPTZ stored as i64 PG epoch microseconds) — cheap
             let seg_min_time = match min_time_attno {
                 Some(attno) if !nulls[attno] => Some(values[attno].value() as i64),
                 _ => None,
@@ -578,9 +587,8 @@ pub(super) unsafe fn load_segments_heap(
                 _ => None,
             };
 
-            // --- Lazy pruning: skip blob detoasting for segments that fail filters ---
+            // --- Pruning (same logic as before, zero TOAST I/O) ---
 
-            // Check segment_by filters
             if !segment_by_filters.is_empty() {
                 let mut skip = false;
                 for &(seg_val_idx, ref filter_val) in segment_by_filters {
@@ -595,7 +603,6 @@ pub(super) unsafe fn load_segments_heap(
                 }
             }
 
-            // Check time range filters
             if let (Some(s_min), Some(s_max)) = (seg_min_time, seg_max_time)
                 && (time_min.is_some_and(|qmin| s_max < qmin)
                     || time_max.is_some_and(|qmax| s_min > qmax))
@@ -604,7 +611,6 @@ pub(super) unsafe fn load_segments_heap(
                 continue;
             }
 
-            // Check min/max predicate filters
             if !minmax_filters.is_empty() {
                 let mut minmax_skip = false;
                 for f in &minmax_filters {
@@ -620,70 +626,7 @@ pub(super) unsafe fn load_segments_heap(
                 }
             }
 
-            // --- Segment passed pruning: detoast blobs ---
-
-            // Extract compressed BYTEA blobs (timed separately — this is the TOAST I/O)
-            let detoast_start = std::time::Instant::now();
-            let mut compressed_blobs: Vec<Vec<u8>> = Vec::new();
-            let mut toast_pointers: Vec<Vec<u8>> = Vec::new();
-            for (bi, opt_attno) in compressed_attnos.iter().enumerate() {
-                match opt_attno {
-                    Some(attno) => {
-                        compressed_some_count += 1;
-                        let attno = *attno;
-                        if !nulls[attno] {
-                            if blob_is_lazy[bi] {
-                                // Lazy: copy just the TOAST pointer (~18 bytes)
-                                let varlena_ptr = values[attno].cast_mut_ptr::<pg_sys::varlena>();
-                                let ptr_size = pgrx::varsize_any(varlena_ptr);
-                                let mut ptr_copy = vec![0u8; ptr_size];
-                                std::ptr::copy_nonoverlapping(
-                                    varlena_ptr as *const u8,
-                                    ptr_copy.as_mut_ptr(),
-                                    ptr_size,
-                                );
-                                compressed_blobs.push(Vec::new());
-                                toast_pointers.push(ptr_copy);
-                            } else {
-                                // Eager: detoast immediately
-                                let varlena_ptr: *mut pg_sys::varlena =
-                                    values[attno].cast_mut_ptr();
-                                detoast_calls += 1;
-                                let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
-                                let len = pgrx::varsize_any_exhdr(detoasted);
-                                let data = pgrx::vardata_any(detoasted);
-                                detoast_bytes += len as u64;
-                                let was_toasted = detoasted != varlena_ptr;
-                                if was_toasted {
-                                    detoast_toasted += 1;
-                                }
-                                // Cast needed: vardata_any returns *const i8 on Linux, *const u8 on macOS
-                                #[allow(clippy::unnecessary_cast)]
-                                let bytes = std::slice::from_raw_parts(
-                                    data as *const u8,
-                                    len,
-                                )
-                                .to_vec();
-                                if was_toasted {
-                                    pg_sys::pfree(detoasted as *mut _);
-                                }
-                                compressed_blobs.push(bytes);
-                                toast_pointers.push(Vec::new());
-                            }
-                        } else {
-                            compressed_blobs.push(Vec::new());
-                            toast_pointers.push(Vec::new());
-                        }
-                    }
-                    None => {
-                        compressed_none_count += 1;
-                        // Unneeded column — empty placeholder to keep blob_idx mapping
-                        compressed_blobs.push(Vec::new());
-                        toast_pointers.push(Vec::new());
-                    }
-                }
-            }
-            detoast_us += detoast_start.elapsed().as_micros() as u64;
+            // --- Segment survived pruning ---
 
             // Extract per-column min/max
             let mut col_minmax = HashMap::new();
@@ -711,6 +654,11 @@ pub(super) unsafe fn load_segments_heap(
                 });
             }
 
+            // Pre-allocate empty blob slots — will be filled in Phase 2
+            let compressed_blobs: Vec<Vec<u8>> = vec![Vec::new(); num_blob_cols];
+            let toast_pointers: Vec<Vec<u8>> = vec![Vec::new(); num_blob_cols];
+
+            surviving_segment_ids.push(segment_id);
             segments.push(SegmentData {
                 segment_values,
                 compressed_blobs,
@@ -723,24 +671,258 @@ pub(super) unsafe fn load_segments_heap(
             });
         }
 
-        // End scan + close relation
+        // End meta scan
         (*(*rel).rd_tableam).scan_end.unwrap()(scan);
         pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
 
         pgrx::log!(
-            "load_segments_heap: segments={} skipped={} heap_getnext={:.1}ms deform={:.1}ms detoast={:.1}ms \
-             detoast_calls={} toasted={} inline={} bytes={} blob_some={} blob_none={}",
+            "load_segments_heap phase1: segments={} skipped={} heap_getnext={:.1}ms deform={:.1}ms",
             segments.len(),
             segments_skipped,
             heap_getnext_us as f64 / 1000.0,
             deform_us as f64 / 1000.0,
+        );
+
+        // ================================================================
+        // Phase 2: Scan blob table — sequential TOAST I/O per column
+        // ================================================================
+        let mut detoast_us: u64 = 0;
+
+        // Check if any blobs are needed
+        let any_blobs_needed = col_names.iter().enumerate().any(|(i, name)| {
+            !segment_by.contains(name) && needed_cols[i]
+        });
+
+        if !segments.is_empty() && any_blobs_needed {
+            // Derive blob table OID from meta table name
+            let meta_name_ptr = pg_sys::get_rel_name(meta_oid);
+            let meta_name = std::ffi::CStr::from_ptr(meta_name_ptr)
+                .to_string_lossy()
+                .into_owned();
+            let meta_ns_oid = pg_sys::get_rel_namespace(meta_oid);
+
+            // Strip "_meta" suffix to get partition name, then add "_blobs"
+            let partition_name = meta_name.strip_suffix("_meta").unwrap_or(&meta_name);
+            let blobs_name = format!("{}_blobs", partition_name);
+            let blobs_cname = std::ffi::CString::new(blobs_name).unwrap();
+            let blob_oid = pg_sys::get_relname_relid(blobs_cname.as_ptr(), meta_ns_oid);
+
+            if blob_oid != pg_sys::InvalidOid {
+                // Build surviving segment_id → segment index mapping
+                let mut seg_id_to_idx: HashMap<i32, usize> = HashMap::new();
+                for (idx, &sid) in surviving_segment_ids.iter().enumerate() {
+                    seg_id_to_idx.insert(sid, idx);
+                }
+
+                // Determine which col_idx values we need
+                let mut needed_col_indices: Vec<(u16, usize)> = Vec::new(); // (col_idx, blob_slot_idx)
+                for (i, name) in col_names.iter().enumerate() {
+                    if segment_by.contains(name) {
+                        continue;
+                    }
+                    let ci = col_idx_map[i].unwrap();
+                    if needed_cols[i] {
+                        needed_col_indices.push((ci, ci as usize));
+                    }
+                }
+
+                // Open blob table + its PK index
+                let blob_rel = pg_sys::table_open(blob_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                let blob_tupdesc = (*blob_rel).rd_att;
+
+                // Find PK index OID — first index that is primary
+                let pk_index_oid = {
+                    let mut pk_oid = pg_sys::InvalidOid;
+                    let index_list = pg_sys::RelationGetIndexList(blob_rel);
+                    if !index_list.is_null() {
+                        let n = (*index_list).length;
+                        for i in 0..n {
+                            let idx_oid =
+                                (*(*index_list).elements.add(i as usize)).oid_value;
+                            let idx_rel = pg_sys::index_open(idx_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                            let is_primary = if !(*idx_rel).rd_index.is_null() {
+                                (*(*idx_rel).rd_index).indisprimary
+                            } else { false };
+                            pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                            if is_primary {
+                                pk_oid = idx_oid;
+                                break;
+                            }
+                        }
+                        pg_sys::list_free(index_list);
+                    }
+                    pk_oid
+                };
+
+                let detoast_start = std::time::Instant::now();
+
+                if pk_index_oid != pg_sys::InvalidOid {
+                    let idx_rel = pg_sys::index_open(pk_index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+                    for &(col_idx, blob_slot) in &needed_col_indices {
+                        let is_lazy = lazy_cols.is_some_and(|lc| {
+                            // Find the original col_names index for this col_idx
+                            col_names.iter().enumerate().any(|(i, name)| {
+                                !segment_by.contains(name) && col_idx_map[i] == Some(col_idx) && i < lc.len() && lc[i]
+                            })
+                        });
+
+                        // Set up scan key: _col_idx = col_idx (SMALLINT equality)
+                        let mut skey = [pg_sys::ScanKeyData::default()];
+                        pg_sys::ScanKeyInit(
+                            &mut skey[0],
+                            1,  // attnum 1 = _col_idx
+                            pg_sys::BTEqualStrategyNumber as u16,
+                            pg_sys::F_INT2EQ.into(),
+                            pg_sys::Datum::from(col_idx as i16),
+                        );
+
+                        let scan = pg_sys::index_beginscan(blob_rel, idx_rel, snapshot, 1, 0);
+                        pg_sys::index_rescan(scan, skey.as_mut_ptr(), 1, std::ptr::null_mut(), 0);
+
+                        // Allocate slot for tuple extraction
+                        let slot = pg_sys::table_slot_create(blob_rel, std::ptr::null_mut());
+
+                        loop {
+                            if !pg_sys::index_getnext_slot(scan, pg_sys::ScanDirection::ForwardScanDirection, slot) {
+                                break;
+                            }
+
+                            // Extract _segment_id (attnum 2) and _data (attnum 3)
+                            let mut blob_values = [pg_sys::Datum::from(0); 3];
+                            let mut blob_nulls = [true; 3];
+                            pg_sys::slot_getallattrs(slot);
+                            let tts_values = (*slot).tts_values;
+                            let tts_isnull = (*slot).tts_isnull;
+                            for j in 0..3usize {
+                                blob_values[j] = *tts_values.add(j);
+                                blob_nulls[j] = *tts_isnull.add(j);
+                            }
+
+                            if blob_nulls[1] {
+                                continue; // no segment_id — skip
+                            }
+                            let seg_id = blob_values[1].value() as i32;
+
+                            // Check if this segment survived pruning
+                            let seg_idx = match seg_id_to_idx.get(&seg_id) {
+                                Some(&idx) => idx,
+                                None => continue, // pruned — skip without detoasting
+                            };
+
+                            if blob_nulls[2] {
+                                // null blob — leave empty
+                                continue;
+                            }
+
+                            if is_lazy {
+                                // Lazy: copy just the TOAST pointer
+                                let varlena_ptr = blob_values[2].cast_mut_ptr::<pg_sys::varlena>();
+                                let ptr_size = pgrx::varsize_any(varlena_ptr);
+                                let mut ptr_copy = vec![0u8; ptr_size];
+                                std::ptr::copy_nonoverlapping(
+                                    varlena_ptr as *const u8,
+                                    ptr_copy.as_mut_ptr(),
+                                    ptr_size,
+                                );
+                                segments[seg_idx].toast_pointers[blob_slot] = ptr_copy;
+                            } else {
+                                // Eager: detoast immediately
+                                let varlena_ptr: *mut pg_sys::varlena = blob_values[2].cast_mut_ptr();
+                                let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                                let len = pgrx::varsize_any_exhdr(detoasted);
+                                let data = pgrx::vardata_any(detoasted);
+                                #[allow(clippy::unnecessary_cast)]
+                                let bytes = std::slice::from_raw_parts(
+                                    data as *const u8,
+                                    len,
+                                )
+                                .to_vec();
+                                let was_toasted = detoasted != varlena_ptr;
+                                if was_toasted {
+                                    pg_sys::pfree(detoasted as *mut _);
+                                }
+                                segments[seg_idx].compressed_blobs[blob_slot] = bytes;
+                            }
+                        }
+
+                        pg_sys::ExecDropSingleTupleTableSlot(slot);
+                        pg_sys::index_endscan(scan);
+                    }
+
+                    pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                } else {
+                    // Fallback: sequential scan of blob table (no PK index found)
+                    let blob_flags: u32 = pg_sys::ScanOptions::SO_TYPE_SEQSCAN
+                        | pg_sys::ScanOptions::SO_ALLOW_STRAT
+                        | pg_sys::ScanOptions::SO_ALLOW_SYNC
+                        | pg_sys::ScanOptions::SO_ALLOW_PAGEMODE;
+                    let blob_scan = (*(*blob_rel).rd_tableam).scan_begin.unwrap()(
+                        blob_rel, snapshot, 0, std::ptr::null_mut(), std::ptr::null_mut(), blob_flags,
+                    );
+
+                    let blob_natts = (*blob_tupdesc).natts as usize;
+                    let mut bv = vec![pg_sys::Datum::from(0); blob_natts];
+                    let mut bn = vec![true; blob_natts];
+
+                    // Build set of needed col indices for fast lookup
+                    let needed_set: std::collections::HashSet<u16> = needed_col_indices.iter().map(|&(ci, _)| ci).collect();
+
+                    loop {
+                        let tuple = pg_sys::heap_getnext(blob_scan, pg_sys::ScanDirection::ForwardScanDirection);
+                        if tuple.is_null() { break; }
+                        pg_sys::heap_deform_tuple(tuple, blob_tupdesc, bv.as_mut_ptr(), bn.as_mut_ptr());
+
+                        if bn[0] || bn[1] { continue; }
+                        let ci = bv[0].value() as u16;
+                        let seg_id = bv[1].value() as i32;
+
+                        if !needed_set.contains(&ci) { continue; }
+                        let seg_idx = match seg_id_to_idx.get(&seg_id) {
+                            Some(&idx) => idx,
+                            None => continue,
+                        };
+                        if bn[2] { continue; }
+
+                        let blob_slot = ci as usize;
+                        let is_lazy = lazy_cols.is_some_and(|lc| {
+                            col_names.iter().enumerate().any(|(i, name)| {
+                                !segment_by.contains(name) && col_idx_map[i] == Some(ci) && i < lc.len() && lc[i]
+                            })
+                        });
+
+                        if is_lazy {
+                            let varlena_ptr = bv[2].cast_mut_ptr::<pg_sys::varlena>();
+                            let ptr_size = pgrx::varsize_any(varlena_ptr);
+                            let mut ptr_copy = vec![0u8; ptr_size];
+                            std::ptr::copy_nonoverlapping(varlena_ptr as *const u8, ptr_copy.as_mut_ptr(), ptr_size);
+                            segments[seg_idx].toast_pointers[blob_slot] = ptr_copy;
+                        } else {
+                            let varlena_ptr: *mut pg_sys::varlena = bv[2].cast_mut_ptr();
+                            let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                            let len = pgrx::varsize_any_exhdr(detoasted);
+                            let data = pgrx::vardata_any(detoasted);
+                            #[allow(clippy::unnecessary_cast)]
+                            let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
+                            if detoasted != varlena_ptr { pg_sys::pfree(detoasted as *mut _); }
+                            segments[seg_idx].compressed_blobs[blob_slot] = bytes;
+                        }
+                    }
+
+                    (*(*blob_rel).rd_tableam).scan_end.unwrap()(blob_scan);
+                }
+
+                detoast_us = detoast_start.elapsed().as_micros() as u64;
+
+                pg_sys::table_close(blob_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            }
+        }
+
+        pgrx::log!(
+            "load_segments_heap phase2: segments={} skipped={} detoast={:.1}ms",
+            segments.len(),
+            segments_skipped,
             detoast_us as f64 / 1000.0,
-            detoast_calls,
-            detoast_toasted,
-            detoast_calls - detoast_toasted,
-            detoast_bytes,
-            compressed_some_count,
-            compressed_none_count,
         );
 
         (segments, segments_skipped, segments_minmax_skipped, detoast_us)
