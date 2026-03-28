@@ -777,7 +777,10 @@ pub(super) unsafe fn load_segments_heap(
                             pg_sys::Datum::from(col_idx as i16),
                         );
 
+                        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
                         let scan = pg_sys::index_beginscan(blob_rel, idx_rel, snapshot, 1, 0);
+                        #[cfg(feature = "pg18")]
+                        let scan = pg_sys::index_beginscan(blob_rel, idx_rel, snapshot, std::ptr::null_mut(), 1, 0);
                         pg_sys::index_rescan(scan, skey.as_mut_ptr(), 1, std::ptr::null_mut(), 0);
 
                         // Allocate slot for tuple extraction

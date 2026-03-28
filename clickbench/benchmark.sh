@@ -44,11 +44,26 @@ sudo -u postgres psql "$DB" -c "CREATE EXTENSION pg_deltax"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '1GB'"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET min_parallel_table_scan_size TO '0'"
 
+# Parallelism for loading and compression
+LOAD_WORKERS=8
+COMPRESS_WORKERS=8
+
 # Download data
 wget --continue --progress=dot:giga 'https://datasets.clickhouse.com/hits_compatible/hits.tsv.gz'
 pigz -d -f hits.tsv.gz
 sudo mv hits.tsv /tmp/hits.tsv
 sudo chmod 644 /tmp/hits.tsv
+
+# Split TSV into chunks for parallel loading
+echo "Splitting data into $LOAD_WORKERS chunks..."
+SPLIT_DIR=/tmp/hits_chunks
+sudo rm -rf "$SPLIT_DIR"
+sudo mkdir -p "$SPLIT_DIR"
+TOTAL_LINES=$(wc -l < /tmp/hits.tsv)
+LINES_PER_CHUNK=$(( (TOTAL_LINES + LOAD_WORKERS - 1) / LOAD_WORKERS ))
+sudo split -l "$LINES_PER_CHUNK" -d -a 2 /tmp/hits.tsv "$SPLIT_DIR/chunk_"
+sudo chmod 644 "$SPLIT_DIR"/chunk_*
+echo "Split into $(ls "$SPLIT_DIR" | wc -l) chunks of ~$LINES_PER_CHUNK lines each"
 
 # Create table
 sudo -u postgres psql "$DB" < create.sql 2>&1 | tee load_out.txt
@@ -59,31 +74,33 @@ fi
 # Set up partitioning — mock_now must be set before deltax_create_table
 sudo -u postgres psql "$DB" -t -c "SET pg_deltax.mock_now = '2013-07-01 12:00:00'; SELECT deltax_create_table('hits', 'eventtime', '3 days'::interval, 15)"
 
-# Load data
+# Parallel data loading
+sudo apt-get install -y parallel
+echo "Loading data with $LOAD_WORKERS parallel workers..."
 echo -n "Load time: "
-command time -f '%e' sudo -u postgres psql "$DB" -t -c "\copy hits FROM '/tmp/hits.tsv'"
+command time -f '%e' ls "$SPLIT_DIR"/chunk_* \
+    | parallel -j "$LOAD_WORKERS" \
+        "sudo -u postgres psql $DB -c \"\\copy hits FROM '{}'\""
+echo "Loaded $TOTAL_LINES rows"
 
 # Enable compression
 sudo -u postgres psql "$DB" -t -c "SELECT deltax_enable_compression('hits', order_by => ARRAY['counterid', 'userid', 'eventtime'], segment_size => 30000)"
 
-# Compress all non-default partitions
+# Parallel compression
+echo "Compressing partitions with $COMPRESS_WORKERS parallel workers..."
 echo -n "Compress time: "
-command time -f '%e' sudo -u postgres psql "$DB" -q -t -c "
-DO \$\$
-DECLARE
-    p RECORD;
-BEGIN
-    FOR p IN SELECT partition_name FROM deltax_partition_info('hits') WHERE partition_name NOT LIKE '%default%'
-    LOOP
-        PERFORM deltax_compress_partition(p.partition_name);
-    END LOOP;
-END;
-\$\$;
-"
+command time -f '%e' sudo -u postgres psql "$DB" -t -A -c \
+    "SELECT partition_name FROM deltax_partition_info('hits') WHERE partition_name NOT LIKE '%default%'" \
+    | grep -v '^$' \
+    | parallel -j "$COMPRESS_WORKERS" \
+        "sudo -u postgres psql $DB -q -c \"SELECT deltax_compress_partition('{}')\" && echo '  Compressed {}'"
 
 # Vacuum
 echo -n "Vacuum time: "
 command time -f '%e' sudo -u postgres psql "$DB" -q -t -c "VACUUM FREEZE ANALYZE hits"
+
+# Clean up chunks
+sudo rm -rf "$SPLIT_DIR"
 
 # Report data size
 echo -n "Data size: "
