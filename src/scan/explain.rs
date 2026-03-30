@@ -176,13 +176,20 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
                 } else {
                     String::new()
                 };
+                let filtered_str = if state.segments_metadata_resolved > 0 || state.segments_decompressed > 0 {
+                    format!(" segments_metadata_resolved={} segments_decompressed={}",
+                        state.segments_metadata_resolved, state.segments_decompressed)
+                } else {
+                    String::new()
+                };
                 let stats_str = std::ffi::CString::new(format!(
-                    "segments={} rows_processed={} result_rows={} batch_quals={} where_quals_null={}{}",
+                    "segments={} rows_processed={} result_rows={} batch_quals={} where_quals_null={}{}{}",
                     state.total_segments,
                     state.total_rows_processed,
                     state.result_rows.len(),
                     state.batch_quals_count,
                     state.where_quals_null,
+                    filtered_str,
                     regex_str,
                 ))
                 .unwrap();

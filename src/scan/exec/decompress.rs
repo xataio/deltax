@@ -864,7 +864,11 @@ unsafe fn exec_topn_two_pass(
             let mut sort_col_already_decompressed = false;
             let mut sort_first_datums: Option<Vec<(pg_sys::Datum, bool)>> = None;
 
-            if let (true, Some(threshold)) = (state.rows_sorted_by_time, topn_threshold) {
+            // Only truncate for ASC: rows are sorted ascending, so the cutoff
+            // truncates from the end. For DESC, the rows we want are at the end
+            // of the ascending-sorted data, and our decompress infrastructure
+            // doesn't support "skip from beginning" truncation.
+            if let (true, true, Some(threshold)) = (state.rows_sorted_by_time, state.topn_ascending, topn_threshold) {
                 // Compute sort column's blob index
                 let mut sort_blob_idx: Option<usize> = None;
                 let mut bi: usize = 0;
@@ -887,7 +891,7 @@ unsafe fn exec_topn_two_pass(
                         let cutoff = datums.iter().position(|(datum, is_null)| {
                             if *is_null { return false; }
                             let key = datum.value() as i64;
-                            if state.topn_ascending { key > threshold } else { key < threshold }
+                            key > threshold
                         }).unwrap_or(datums.len());
 
                         if cutoff == 0 {
@@ -1087,9 +1091,18 @@ unsafe fn exec_topn_two_pass(
             }
 
             // Row-level early exit: when rows within this segment are sorted
-            // by the time column and we already have a threshold, skip rows
-            // that can't possibly beat it.
+            // by the time column (ascending) and we already have a threshold,
+            // skip rows that can't possibly beat it.
+            // For ASC: once sort_key > threshold, all subsequent rows are also
+            // beyond threshold → break.
+            // For DESC: rows we want are at the END of ascending data (highest
+            // values). We can't break early, but we can skip individual rows
+            // below threshold.
             let can_row_early_exit = state.rows_sorted_by_time
+                && state.topn_ascending
+                && topn_threshold.is_some();
+            let can_row_skip_desc = state.rows_sorted_by_time
+                && !state.topn_ascending
                 && topn_threshold.is_some();
             let row_threshold = topn_threshold.unwrap_or(0);
 
@@ -1104,16 +1117,15 @@ unsafe fn exec_topn_two_pass(
                 }
                 let sort_key = datum.value() as i64;
 
-                // Row-level early exit: rows are in time order within the segment,
-                // so once we see a row beyond the threshold, all subsequent rows
-                // in this segment are also beyond it.
-                if can_row_early_exit {
-                    if state.topn_ascending && sort_key > row_threshold {
-                        break;
-                    }
-                    if !state.topn_ascending && sort_key < row_threshold {
-                        break;
-                    }
+                // Row-level early exit (ASC only): rows are ascending, so once
+                // we see a row beyond the threshold, all subsequent rows are too.
+                if can_row_early_exit && sort_key > row_threshold {
+                    break;
+                }
+                // Row-level skip (DESC): skip rows below threshold (they can't
+                // be in the top-N), but don't break — later rows may be above.
+                if can_row_skip_desc && sort_key < row_threshold {
+                    continue;
                 }
 
                 // Store Phase 1 column datums for this candidate.

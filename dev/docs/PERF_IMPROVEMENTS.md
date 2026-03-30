@@ -59,7 +59,7 @@ Tracking DeltaX compressed vs uncompressed performance on ClickBench.
 | Query  | Description               | pg_deltax (s) | vs ClickHouse |
 |--------|---------------------------|---------------|---------------|
 | Q0     | COUNT(*)                  |         0.020 |         2.73x |
-| Q1     | COUNT WHERE AdvEngineID   |         0.583 |        37.06x |
+| Q1     | COUNT WHERE AdvEngineID   |         0.189 |        12.44x |
 | Q2     | SUM/AVG full scan         |         0.072 |         2.65x |
 | Q3     | AVG UserID                |         0.071 |         2.19x |
 | Q4     | COUNT DISTINCT UserID     |         5.632 |        15.54x |
@@ -424,6 +424,30 @@ the full Referer column dominates. (#24 evaluated and deemed not worth implement
 DeltaX scan=21ms, but PG hash agg on 1M rows with ~1M groups dominates.
 Would require pushing hash agg into scan — very high effort.
 
+### 32. Metadata-enhanced filtered COUNT/SUM with parallel decompression [DONE]
+
+**Impact: Q1 0.583s -> 0.189s (3.1x improvement, 12.4x vs ClickHouse down from 37x)**
+
+`try_metadata_fast_path` now accepts WHERE clauses on numeric columns. For each
+segment, min/max metadata classifies it as:
+
+- **AllPass:** min/max proves all rows satisfy the predicate → use `row_count`/sums
+  directly from metadata (zero decompression).
+- **Ambiguous:** min/max can't decide → decompress and filter.
+
+Ambiguous segments are decompressed in parallel using `std::thread::scope` with
+chunked work distribution (same pattern as the compact aggregation path). Each
+thread gets its own `AggAccumulator` vector; results are merged after join. The
+fast path only decompresses the qual column + agg column (1-2 columns) vs the
+full scan's broader pipeline.
+
+For Q1 (`COUNT(*) WHERE AdvEngineID <> 0`), all 2660 segments are ambiguous
+(AdvEngineID has mixed 0/non-0 values in every segment), but parallel
+decompression of just one column achieves ~150ms vs ~660ms for the full scan
+fallback.
+
+**Files:** `src/scan/exec/agg.rs` (`try_metadata_fast_path`, `merge_accumulator`)
+
 ---
 
 ## Planned Improvements
@@ -553,47 +577,13 @@ to skip rows by checking the 1-2 byte index array without decompressing any
 string data. Make sure `check_ne_empty()` is wired into the batch eval path
 inside AggScan, not just DecompressState.
 
-This also affects simple filtered aggregates without GROUP BY, e.g. Q2
-`COUNT(*) WHERE AdvEngineID <> 0`. Currently the filter and count run in
-separate iterations; fusing them eliminates re-traversal of the selection
-vector. On the ClickBench c6a.4xlarge hot run, Q2 is 37x slower than
-native columnar engines that process the single-column filter+count in
-one SIMD pass.
+Simple filtered aggregates without GROUP BY (e.g. Q1
+`COUNT(*) WHERE AdvEngineID <> 0`) are now handled by #32's metadata-enhanced
+fast path with parallel decompression. This optimization targets the remaining
+case: filtered aggregates *with* GROUP BY, where fusing the filter and
+accumulation loops improves cache locality.
 
 **Files:** `src/scan/exec/agg.rs` (fused filter+aggregate loop in AggState)
-
-### 32. Metadata-enhanced filtered COUNT/SUM
-
-**Target: Q2 0.583s -> ~0.020s (ClickBench Q1: `COUNT(*) WHERE AdvEngineID <> 0`)**
-**Complexity: Medium**
-
-`try_metadata_fast_path` currently bails out when `where_quals` is non-null,
-even when min/max metadata can resolve most or all segments without
-decompression. For `COUNT(*) WHERE col <op> const` on a numeric column:
-
-- **Segment provably passes:** min/max proves all rows satisfy the predicate
-  (e.g. `AdvEngineID <> 0` when `min > 0`). Use `row_count` directly.
-- **Segment provably fails:** min/max proves no rows satisfy (e.g. `<> 0`
-  when `min == max == 0`). Skip, contribute 0.
-- **Ambiguous:** min/max can't decide. Decompress and filter as today.
-
-For AdvEngineID where ~99% of values are 0, most segments have
-`min == max == 0` and get skipped. The few mixed segments are decompressed.
-Extends naturally to `SUM(col) WHERE other_col <op> const` when the filter
-column has min/max metadata.
-
-On the ClickBench hot run, Q2 takes 0.583s — 37x slower than e.g. ClickHouse. 
-This optimization should bring it close to the unfiltered metadata-only path
-(~20ms for metadata scan overhead).
-
-**Implementation:** Extend `try_metadata_fast_path` to accept WHERE clauses
-with a single batch qual on a numeric column. For each segment, classify as
-pass/fail/ambiguous using `segment_passes_minmax_filter` logic. Accumulate
-metadata for pass segments, decompress ambiguous segments. This is a strict
-superset of the current metadata fast path.
-
-**Files:** `src/scan/exec/agg.rs` (`try_metadata_fast_path`),
-`src/scan/exec/segments.rs` (min/max filter reuse)
 
 ### 33. Trigram bloom filters for LIKE substring pruning
 

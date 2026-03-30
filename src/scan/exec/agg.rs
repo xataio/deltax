@@ -12,7 +12,9 @@ use regex::Regex;
 use crate::compression;
 use super::super::SyncStatic;
 use super::batch_qual::{BatchCompareOp, BatchQual,
-    extract_batch_quals, evaluate_batch_quals};
+    extract_batch_quals, evaluate_batch_quals,
+    apply_batch_filter_i64, apply_batch_filter_i32, apply_batch_filter_i16,
+    apply_batch_filter_f64, apply_batch_filter_f32, apply_batch_filter_in_list};
 use super::datum_utils::{
     decompress_blob_to_datums, decompress_text_blob_to_raw_strings,
     decompress_text_blob_to_lengths, decompress_text_blob_with_like_filter,
@@ -22,6 +24,7 @@ use super::datum_utils::{
 use super::segments::{
     SegmentData, load_metadata, load_segments_heap,
     segment_skippable_by_dict, extract_segment_filters,
+    classify_segment_quals, SegmentQualResult,
 };
 
 /// Compute a 128-bit hash of a byte slice for COUNT(DISTINCT) on strings.
@@ -252,6 +255,8 @@ pub(crate) struct AggScanState {
     pub(crate) total_rows_processed: u64,
     pub(crate) batch_quals_count: usize,
     pub(crate) where_quals_null: bool,
+    pub(crate) segments_metadata_resolved: u64,
+    pub(crate) segments_decompressed: u64,
     pub(crate) regex_cache_size: u64,
     pub(crate) regex_cache_calls: u64,
     pub(crate) topn_limit: u64,
@@ -662,6 +667,8 @@ fn try_catalog_shortcut(
         total_rows_processed: 0,
         batch_quals_count: 0,
         where_quals_null: true,
+        segments_metadata_resolved: 0,
+        segments_decompressed: 0,
         regex_cache_size: 0,
         regex_cache_calls: 0,
         topn_limit: 0,
@@ -696,14 +703,27 @@ fn try_metadata_fast_path(
     plan: &ParsedAggPlan,
     meta: &super::segments::MetadataInfo,
     segments: &[SegmentData],
+    batch_quals: &[BatchQual],
     metadata_us: u64,
     heap_scan_us: u64,
 ) -> Option<AggScanState> {
-    if !plan.group_specs.is_empty()
-        || !plan.where_quals.is_null()
-        || !plan.having_filters.is_empty()
-    {
+    // Still bail on GROUP BY and HAVING
+    if !plan.group_specs.is_empty() || !plan.having_filters.is_empty() {
         return None;
+    }
+
+    let has_where = !plan.where_quals.is_null();
+
+    if has_where {
+        // Bail if no batch quals extracted (unhandled qual types)
+        if batch_quals.is_empty() { return None; }
+        // Bail if any qual is on a non-numeric type (text LIKE etc.)
+        let numeric_types = [pg_sys::INT2OID, pg_sys::INT4OID, pg_sys::INT8OID,
+            pg_sys::FLOAT4OID, pg_sys::FLOAT8OID,
+            pg_sys::TIMESTAMPOID, pg_sys::TIMESTAMPTZOID, pg_sys::DATEOID];
+        if batch_quals.iter().any(|bq| !numeric_types.contains(&bq.type_oid)) {
+            return None;
+        }
     }
 
     // Check that all agg specs are metadata-resolvable
@@ -725,10 +745,11 @@ fn try_metadata_fast_path(
                         || t == pg_sys::FLOAT4OID || t == pg_sys::FLOAT8OID
                 }
             }
+            // Min/Max can only be resolved from metadata when there's no WHERE
             AggType::Min | AggType::Max => {
-                spec.expr_kind == AggExpr::Column && spec.col_idx >= 0
+                !has_where && spec.expr_kind == AggExpr::Column && spec.col_idx >= 0
             }
-            _ => false,
+            _ => false, // CountDistinct always bails
         }
     });
     if !all_resolvable {
@@ -761,106 +782,94 @@ fn try_metadata_fast_path(
         return None;
     }
 
-    // Accumulate from metadata
+    // Accumulate from metadata (with optional filtered decompression for ambiguous segments)
     let mut accumulators: Vec<AggAccumulator> = plan.agg_specs
         .iter()
         .map(|spec| AggAccumulator::new_for(spec.agg_type, spec.col_type_oid))
         .collect();
 
-    for seg in segments {
-        if seg.row_count == 0 { continue; }
-        for (i, spec) in plan.agg_specs.iter().enumerate() {
-            match spec.agg_type {
-                AggType::CountStar => {
-                    if let AggAccumulator::Count { count } = &mut accumulators[i] {
-                        *count += seg.row_count as i64;
-                    }
-                }
-                AggType::Count => {
-                    let col_name = &meta.col_names[spec.col_idx as usize];
-                    if let Some(cs) = seg.col_sums.get(col_name)
-                        && let AggAccumulator::Count { count } = &mut accumulators[i]
-                    {
-                        *count += cs.nonnull_count;
-                    }
-                }
-                AggType::Sum | AggType::Avg => {
-                    let col_name = &meta.col_names[spec.col_idx as usize];
-                    if let Some(cs) = seg.col_sums.get(col_name) {
-                        if cs.sum_null { continue; }
-                        // For SUM(col + C): SUM(col) + C * nonnull_count
-                        let add_const = if spec.expr_kind == AggExpr::AddConst {
-                            spec.const_offset
-                        } else {
-                            0
-                        };
-                        match &mut accumulators[i] {
-                            AggAccumulator::SumInt { sum, count } => {
-                                // Sum datum is NUMERIC — extract via numeric_out, parse as i128
-                                let s = unsafe {
-                                    let cstr = pg_sys::OidOutputFunctionCall(
-                                        pg_sys::Oid::from(1702u32), // numeric_out
-                                        cs.sum_datum,
-                                    );
-                                    let s = std::ffi::CStr::from_ptr(cstr)
-                                        .to_string_lossy()
-                                        .into_owned();
-                                    pg_sys::pfree(cstr as *mut _);
-                                    s
-                                };
-                                if let Ok(v) = s.parse::<i128>() {
-                                    *sum += v + add_const as i128 * cs.nonnull_count as i128;
-                                    *count += cs.nonnull_count;
-                                }
-                            }
-                            AggAccumulator::SumFloat { sum, count } => {
-                                // Sum datum is FLOAT8
-                                let f = f64::from_bits(cs.sum_datum.value() as u64);
-                                *sum += f + add_const as f64 * cs.nonnull_count as f64;
-                                *count += cs.nonnull_count;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                AggType::Min => {
-                    let col_name = &meta.col_names[spec.col_idx as usize];
-                    if let Some(cm) = seg.col_minmax.get(col_name) {
-                        if cm.min_null { continue; }
-                        match &mut accumulators[i] {
-                            AggAccumulator::MinInt { val } => {
-                                let v = cm.min_datum.value() as i64;
-                                *val = Some(val.map_or(v, |cur| cur.min(v)));
-                            }
-                            AggAccumulator::MinFloat { val } => {
-                                let v = f64::from_bits(cm.min_datum.value() as u64);
-                                *val = Some(val.map_or(v, |cur| if v < cur { v } else { cur }));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                AggType::Max => {
-                    let col_name = &meta.col_names[spec.col_idx as usize];
-                    if let Some(cm) = seg.col_minmax.get(col_name) {
-                        if cm.max_null { continue; }
-                        match &mut accumulators[i] {
-                            AggAccumulator::MaxInt { val } => {
-                                let v = cm.max_datum.value() as i64;
-                                *val = Some(val.map_or(v, |cur| cur.max(v)));
-                            }
-                            AggAccumulator::MaxFloat { val } => {
-                                let v = f64::from_bits(cm.max_datum.value() as u64);
-                                *val = Some(val.map_or(v, |cur| if v > cur { v } else { cur }));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
+    // Pre-classify segments
+    let (allpass, ambiguous): (Vec<&SegmentData>, Vec<&SegmentData>) = if has_where {
+        let mut ap = Vec::new();
+        let mut amb = Vec::new();
+        for seg in segments {
+            if seg.row_count == 0 {
+                continue;
+            }
+            match classify_segment_quals(seg, batch_quals, &meta.col_names) {
+                SegmentQualResult::AllPass => ap.push(seg),
+                SegmentQualResult::Ambiguous => amb.push(seg),
             }
         }
+        (ap, amb)
+    } else {
+        (
+            segments.iter().filter(|s| s.row_count > 0).collect(),
+            vec![],
+        )
+    };
+
+    // AllPass: instant metadata accumulation
+    for seg in &allpass {
+        accumulate_segment_metadata(&mut accumulators, seg, &plan.agg_specs, meta);
     }
+    let segments_metadata_resolved = allpass.len() as u64;
+
+    // Ambiguous: parallel decompression
+    let n_workers = crate::get_parallel_workers();
+    let (segments_decompressed, agg_us) = if !ambiguous.is_empty() && n_workers > 1 {
+        let chunk_size = ambiguous.len().div_ceil(n_workers);
+        let results: Vec<_> = std::thread::scope(|s| {
+            ambiguous
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    let specs = &plan.agg_specs;
+                    let bqs = batch_quals;
+                    let m = meta;
+                    s.spawn(move || {
+                        let mut local_acc: Vec<AggAccumulator> = specs
+                            .iter()
+                            .map(|sp| AggAccumulator::new_for(sp.agg_type, sp.col_type_oid))
+                            .collect();
+                        let t = Instant::now();
+                        for seg in chunk {
+                            unsafe {
+                                accumulate_segment_decompressed(
+                                    &mut local_acc, seg, bqs, specs, m,
+                                );
+                            }
+                        }
+                        (local_acc, chunk.len() as u64, t.elapsed().as_micros() as u64)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+        let mut total_decomp = 0u64;
+        let mut max_us = 0u64;
+        for (local_acc, cnt, us) in results {
+            for (dst, src) in accumulators.iter_mut().zip(local_acc.iter()) {
+                merge_accumulator(dst, src);
+            }
+            total_decomp += cnt;
+            max_us = max_us.max(us);
+        }
+        (total_decomp, max_us)
+    } else if !ambiguous.is_empty() {
+        let t = Instant::now();
+        for seg in &ambiguous {
+            unsafe {
+                accumulate_segment_decompressed(
+                    &mut accumulators, seg, batch_quals, &plan.agg_specs, meta,
+                );
+            }
+        }
+        (ambiguous.len() as u64, t.elapsed().as_micros() as u64)
+    } else {
+        (0, 0)
+    };
 
     // Finalize accumulators
     let num_result_cols = plan.output_map.len();
@@ -888,11 +897,13 @@ fn try_metadata_fast_path(
         heap_scan_us,
         detoast_us: 0,
         decompress_us: 0,
-        agg_us: 0,
+        agg_us,
         total_segments,
         total_rows_processed: 0,
-        batch_quals_count: 0,
-        where_quals_null: true,
+        batch_quals_count: batch_quals.len(),
+        where_quals_null: !has_where,
+        segments_metadata_resolved,
+        segments_decompressed,
         regex_cache_size: 0,
         regex_cache_calls: 0,
         topn_limit: 0,
@@ -905,6 +916,264 @@ fn try_metadata_fast_path(
         n_workers: 0,
         bare_limit: 0,
     })
+}
+
+/// Merge a source accumulator into a destination (used for parallel reduction).
+/// Only Count/SumInt/SumFloat are used in filtered fast path (Min/Max/CountDistinct bail earlier).
+fn merge_accumulator(dst: &mut AggAccumulator, src: &AggAccumulator) {
+    match (dst, src) {
+        (AggAccumulator::Count { count: dc }, AggAccumulator::Count { count: sc }) => *dc += sc,
+        (
+            AggAccumulator::SumInt { sum: ds, count: dc },
+            AggAccumulator::SumInt { sum: ss, count: sc },
+        ) => {
+            *ds += ss;
+            *dc += sc;
+        }
+        (
+            AggAccumulator::SumFloat { sum: ds, count: dc },
+            AggAccumulator::SumFloat { sum: ss, count: sc },
+        ) => {
+            *ds += ss;
+            *dc += sc;
+        }
+        _ => {}
+    }
+}
+
+/// Accumulate aggregate results from segment metadata (no decompression).
+fn accumulate_segment_metadata(
+    accumulators: &mut [AggAccumulator],
+    seg: &SegmentData,
+    agg_specs: &[AggExecSpec],
+    meta: &super::segments::MetadataInfo,
+) {
+    for (i, spec) in agg_specs.iter().enumerate() {
+        match spec.agg_type {
+            AggType::CountStar => {
+                if let AggAccumulator::Count { count } = &mut accumulators[i] {
+                    *count += seg.row_count as i64;
+                }
+            }
+            AggType::Count => {
+                let col_name = &meta.col_names[spec.col_idx as usize];
+                if let Some(cs) = seg.col_sums.get(col_name)
+                    && let AggAccumulator::Count { count } = &mut accumulators[i]
+                {
+                    *count += cs.nonnull_count;
+                }
+            }
+            AggType::Sum | AggType::Avg => {
+                let col_name = &meta.col_names[spec.col_idx as usize];
+                if let Some(cs) = seg.col_sums.get(col_name) {
+                    if cs.sum_null { continue; }
+                    let add_const = if spec.expr_kind == AggExpr::AddConst {
+                        spec.const_offset
+                    } else {
+                        0
+                    };
+                    match &mut accumulators[i] {
+                        AggAccumulator::SumInt { sum, count } => {
+                            let s = unsafe {
+                                let cstr = pg_sys::OidOutputFunctionCall(
+                                    pg_sys::Oid::from(1702u32), // numeric_out
+                                    cs.sum_datum,
+                                );
+                                let s = std::ffi::CStr::from_ptr(cstr)
+                                    .to_string_lossy()
+                                    .into_owned();
+                                pg_sys::pfree(cstr as *mut _);
+                                s
+                            };
+                            if let Ok(v) = s.parse::<i128>() {
+                                *sum += v + add_const as i128 * cs.nonnull_count as i128;
+                                *count += cs.nonnull_count;
+                            }
+                        }
+                        AggAccumulator::SumFloat { sum, count } => {
+                            let f = f64::from_bits(cs.sum_datum.value() as u64);
+                            *sum += f + add_const as f64 * cs.nonnull_count as f64;
+                            *count += cs.nonnull_count;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            AggType::Min => {
+                let col_name = &meta.col_names[spec.col_idx as usize];
+                if let Some(cm) = seg.col_minmax.get(col_name) {
+                    if cm.min_null { continue; }
+                    match &mut accumulators[i] {
+                        AggAccumulator::MinInt { val } => {
+                            let v = cm.min_datum.value() as i64;
+                            *val = Some(val.map_or(v, |cur| cur.min(v)));
+                        }
+                        AggAccumulator::MinFloat { val } => {
+                            let v = f64::from_bits(cm.min_datum.value() as u64);
+                            *val = Some(val.map_or(v, |cur| if v < cur { v } else { cur }));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            AggType::Max => {
+                let col_name = &meta.col_names[spec.col_idx as usize];
+                if let Some(cm) = seg.col_minmax.get(col_name) {
+                    if cm.max_null { continue; }
+                    match &mut accumulators[i] {
+                        AggAccumulator::MaxInt { val } => {
+                            let v = cm.max_datum.value() as i64;
+                            *val = Some(val.map_or(v, |cur| cur.max(v)));
+                        }
+                        AggAccumulator::MaxFloat { val } => {
+                            let v = f64::from_bits(cm.max_datum.value() as u64);
+                            *val = Some(val.map_or(v, |cur| if v > cur { v } else { cur }));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Decompress an ambiguous segment, apply batch quals, and accumulate agg results.
+unsafe fn accumulate_segment_decompressed(
+    accumulators: &mut [AggAccumulator],
+    seg: &SegmentData,
+    batch_quals: &[BatchQual],
+    agg_specs: &[AggExecSpec],
+    meta: &super::segments::MetadataInfo,
+) {
+    let row_count = seg.row_count as usize;
+    if row_count == 0 { return; }
+
+    // Collect unique column indices needed (qual columns + agg columns)
+    let mut col_indices: Vec<usize> = Vec::new();
+    for bq in batch_quals {
+        if !col_indices.contains(&bq.col_idx) {
+            col_indices.push(bq.col_idx);
+        }
+    }
+    for spec in agg_specs {
+        if spec.col_idx >= 0 && !col_indices.contains(&(spec.col_idx as usize)) {
+            col_indices.push(spec.col_idx as usize);
+        }
+    }
+
+    // Decompress needed columns. Map col_idx → decompressed datums.
+    let mut decompressed: HashMap<usize, Vec<(pg_sys::Datum, bool)>> = HashMap::new();
+    for &col_idx in &col_indices {
+        let col_name = &meta.col_names[col_idx];
+        if meta.segment_by.contains(col_name) {
+            continue; // segment_by columns are not in compressed_blobs
+        }
+        // Compute blob index (skip segment_by columns)
+        let mut blob_idx = 0;
+        for (ci, cn) in meta.col_names.iter().enumerate() {
+            if ci == col_idx { break; }
+            if !meta.segment_by.contains(cn) { blob_idx += 1; }
+        }
+        if blob_idx < seg.compressed_blobs.len() {
+            let blob = &seg.compressed_blobs[blob_idx];
+            let data_type = pg_type_name(meta.col_types[col_idx]);
+            let typmod = meta.col_typmods[col_idx];
+            let datums = unsafe { decompress_blob_to_datums(blob, &data_type, meta.col_types[col_idx], typmod) };
+            decompressed.insert(col_idx, datums);
+        }
+    }
+
+    // Build selection vector from batch quals
+    let mut sel = vec![true; row_count];
+    for bq in batch_quals {
+        if let Some(col) = decompressed.get(&bq.col_idx) {
+            if col.is_empty() { continue; }
+            if bq.op == BatchCompareOp::InList {
+                if let Some(ref values) = bq.in_list_i64 {
+                    apply_batch_filter_in_list(col, &mut sel, values, bq.type_oid);
+                }
+                continue;
+            }
+            match bq.type_oid {
+                pg_sys::INT8OID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {
+                    apply_batch_filter_i64(col, &mut sel, bq.op, bq.const_datum.value() as i64);
+                }
+                pg_sys::INT4OID | pg_sys::DATEOID => {
+                    apply_batch_filter_i32(col, &mut sel, bq.op, bq.const_datum.value() as i32);
+                }
+                pg_sys::INT2OID => {
+                    apply_batch_filter_i16(col, &mut sel, bq.op, bq.const_datum.value() as i16);
+                }
+                pg_sys::FLOAT8OID => {
+                    let c = f64::from_bits(bq.const_datum.value() as u64);
+                    apply_batch_filter_f64(col, &mut sel, bq.op, c);
+                }
+                pg_sys::FLOAT4OID => {
+                    let c = f32::from_bits(bq.const_datum.value() as u32);
+                    apply_batch_filter_f32(col, &mut sel, bq.op, c);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Accumulate from filtered rows
+    for (i, spec) in agg_specs.iter().enumerate() {
+        match spec.agg_type {
+            AggType::CountStar => {
+                if let AggAccumulator::Count { count } = &mut accumulators[i] {
+                    *count += sel.iter().filter(|&&s| s).count() as i64;
+                }
+            }
+            AggType::Count => {
+                if let AggAccumulator::Count { count } = &mut accumulators[i]
+                    && let Some(col) = decompressed.get(&(spec.col_idx as usize))
+                {
+                    for (j, &selected) in sel.iter().enumerate() {
+                        if selected && j < col.len() && !col[j].1 {
+                            *count += 1;
+                        }
+                    }
+                }
+            }
+            AggType::Sum | AggType::Avg => {
+                let add_const = if spec.expr_kind == AggExpr::AddConst {
+                    spec.const_offset
+                } else {
+                    0
+                };
+                if let Some(col) = decompressed.get(&(spec.col_idx as usize)) {
+                    match &mut accumulators[i] {
+                        AggAccumulator::SumInt { sum, count } => {
+                            for (j, &selected) in sel.iter().enumerate() {
+                                if selected && j < col.len() && !col[j].1 {
+                                    let v = col[j].0.value() as i64;
+                                    *sum += v as i128 + add_const as i128;
+                                    *count += 1;
+                                }
+                            }
+                        }
+                        AggAccumulator::SumFloat { sum, count } => {
+                            for (j, &selected) in sel.iter().enumerate() {
+                                if selected && j < col.len() && !col[j].1 {
+                                    let v = if spec.col_type_oid == pg_sys::FLOAT4OID {
+                                        f32::from_bits(col[j].0.value() as u32) as f64
+                                    } else {
+                                        f64::from_bits(col[j].0.value() as u64)
+                                    };
+                                    *sum += v + add_const as f64;
+                                    *count += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {} // Min/Max/CountDistinct not supported with WHERE in this path
+        }
+    }
 }
 
 /// BeginCustomScan callback for DeltaXAgg: decompress and aggregate.
@@ -957,26 +1226,62 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             }
         }
 
-        // Fast path 2: answer from per-segment metadata (no decompression)
+        // Fast path 2: answer from per-segment metadata (with selective decompression for filtered queries)
         {
             let needs_sums = plan.agg_specs.iter().any(|s| matches!(s.agg_type, AggType::Sum | AggType::Avg));
             let needs_counts = plan.agg_specs.iter().any(|s| matches!(s.agg_type, AggType::Count));
             let needs_minmax = plan.agg_specs.iter().any(|s| matches!(s.agg_type, AggType::Min | AggType::Max));
-            let needed_cols = vec![false; meta.col_names.len()];
+            let num_cols = meta.col_names.len();
+
+            // Extract batch quals early for the filtered metadata fast path
+            let fast_batch_quals = if !plan.where_quals.is_null() {
+                let (bqs, handled) = extract_batch_quals(plan.where_quals, &meta.col_names, &meta.col_types);
+                if handled as i32 == (*plan.where_quals).length { bqs } else { vec![] }
+            } else {
+                vec![]
+            };
+
+            // When we have batch quals, we need blobs for ambiguous segments
+            let mut needed_cols = vec![false; num_cols];
+            let mut load_minmax = needs_minmax;
+            let mut load_sums = needs_sums || needs_counts;
+            if !fast_batch_quals.is_empty() {
+                load_minmax = true;
+                load_sums = true;
+                // Need blobs for qual columns (for ambiguous segment decompression)
+                for bq in &fast_batch_quals {
+                    if bq.col_idx < num_cols { needed_cols[bq.col_idx] = true; }
+                }
+                // Need blobs for agg columns (for ambiguous segment decompression)
+                for spec in &plan.agg_specs {
+                    if spec.col_idx >= 0 && (spec.col_idx as usize) < num_cols {
+                        needed_cols[spec.col_idx as usize] = true;
+                    }
+                }
+            }
+
+            // Extract segment-by/time filters for pruning
+            let (seg_filters, time_min, time_max) = if !plan.where_quals.is_null() {
+                extract_segment_filters(
+                    plan.where_quals, &meta.col_names, &meta.segment_by, &meta.time_column,
+                )
+            } else {
+                (vec![], None, None)
+            };
 
             let t1 = Instant::now();
             let mut all_segments: Vec<SegmentData> = Vec::new();
             for &oid in &plan.companion_oids {
                 let (segs, _, _, _, _) = load_segments_heap(
                     oid, &meta.col_names, &meta.segment_by, &needed_cols,
-                    &meta.time_column, needs_minmax, &[], None, None, None,
-                    &[], needs_sums || needs_counts,
+                    &meta.time_column, load_minmax, &seg_filters, time_min, time_max, None,
+                    &fast_batch_quals, load_sums,
                 );
                 all_segments.extend(segs);
             }
             let heap_scan_us = t1.elapsed().as_micros() as u64;
 
-            if let Some(state) = try_metadata_fast_path(&plan, &meta, &all_segments, metadata_us, heap_scan_us) {
+            if let Some(state) = try_metadata_fast_path(&plan, &meta, &all_segments, &fast_batch_quals, metadata_us, heap_scan_us) {
                 let state_ptr = Box::into_raw(Box::new(state));
                 (*node).custom_ps = state_ptr as *mut pg_sys::List;
                 return;
@@ -1475,6 +1780,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         total_rows_processed,
                         batch_quals_count: batch_quals.len(),
                         where_quals_null: where_quals.is_null(),
+                        segments_metadata_resolved: 0,
+                        segments_decompressed: 0,
                         regex_cache_size: 0,
                         regex_cache_calls: 0,
                         topn_limit: topn_limit as u64,
@@ -1641,6 +1948,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     total_rows_processed,
                     batch_quals_count: batch_quals.len(),
                     where_quals_null: where_quals.is_null(),
+                    segments_metadata_resolved: 0,
+                    segments_decompressed: 0,
                     regex_cache_size: 0,
                     regex_cache_calls: 0,
                     topn_limit: 0,
@@ -1896,6 +2205,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     total_rows_processed,
                     batch_quals_count: batch_quals.len(),
                     where_quals_null: where_quals.is_null(),
+                    segments_metadata_resolved: 0,
+                    segments_decompressed: 0,
                     regex_cache_size: 0,
                     regex_cache_calls: 0,
                     topn_limit: topn_limit as u64,
@@ -2041,6 +2352,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 total_rows_processed,
                 batch_quals_count: batch_quals.len(),
                 where_quals_null: where_quals.is_null(),
+                segments_metadata_resolved: 0,
+                segments_decompressed: 0,
                 regex_cache_size: 0,
                 regex_cache_calls: 0,
                 topn_limit: if topn_limit > 0 { topn_limit as u64 } else { 0 },
@@ -2401,6 +2714,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         total_rows_processed,
                         batch_quals_count: batch_quals.len(),
                         where_quals_null: where_quals.is_null(),
+                        segments_metadata_resolved: 0,
+                        segments_decompressed: 0,
                         regex_cache_size: 0,
                         regex_cache_calls: 0,
                         topn_limit: topn_limit as u64,
@@ -2607,6 +2922,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     total_rows_processed,
                     batch_quals_count: batch_quals.len(),
                     where_quals_null: where_quals.is_null(),
+                    segments_metadata_resolved: 0,
+                    segments_decompressed: 0,
                     regex_cache_size: 0,
                     regex_cache_calls: 0,
                     topn_limit: 0,
@@ -2889,6 +3206,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 total_rows_processed,
                 batch_quals_count: batch_quals.len(),
                 where_quals_null: where_quals.is_null(),
+                segments_metadata_resolved: 0,
+                segments_decompressed: 0,
                 regex_cache_size: 0,
                 regex_cache_calls: 0,
                 topn_limit: if topn_limit > 0 { topn_limit as u64 } else { 0 },
@@ -4208,6 +4527,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             total_rows_processed,
             batch_quals_count: batch_quals.len(),
             where_quals_null: where_quals.is_null(),
+            segments_metadata_resolved: 0,
+            segments_decompressed: 0,
             regex_cache_size: regex_cache.len() as u64,
             regex_cache_calls,
             topn_limit: if topn_limit > 0 { topn_limit as u64 } else { 0 },
@@ -6614,15 +6935,12 @@ fn process_segments_mixed(
                     match seg_col_ref {
                         Some(seg_col) => {
                             str_keys[str_idx] = seg_col.get_str(row);
-                            // NULL text key → skip (like compact path)
-                            if str_keys[str_idx].is_none() {
-                                has_null = true;
-                                break;
-                            }
+                            // NULL text key: leave str_keys[str_idx] as None.
+                            // hash_mixed_key and MixedKeyStorage handle None correctly,
+                            // producing a NULL group (matching PostgreSQL GROUP BY semantics).
                         }
                         None => {
-                            has_null = true;
-                            break;
+                            str_keys[str_idx] = None;
                         }
                     }
                     str_idx += 1;
@@ -7408,14 +7726,14 @@ mod tests {
         plan.group_specs = vec![GroupByColSpec {
             col_idx: 0, type_oid: pg_sys::Oid::from(23u32), expr: GroupByExpr::Column,
         }];
-        assert!(try_metadata_fast_path(&plan, &meta, &[], 0, 0).is_none());
+        assert!(try_metadata_fast_path(&plan, &meta, &[], &[], 0, 0).is_none());
     }
 
     #[pg_test]
     fn test_metadata_fast_path_rejects_where() {
         let meta = make_meta(&["ts", "value"]);
         let plan = make_plan(vec![make_agg_spec(AggType::Sum, 1, 23)], Vec::new(), Vec::new(), false);
-        assert!(try_metadata_fast_path(&plan, &meta, &[], 0, 0).is_none());
+        assert!(try_metadata_fast_path(&plan, &meta, &[], &[], 0, 0).is_none());
     }
 
     #[pg_test]
@@ -7426,21 +7744,21 @@ mod tests {
             vec![HavingFilter { agg_idx: 0, op: HavingOp::Gt, const_val: 5 }],
             true,
         );
-        assert!(try_metadata_fast_path(&plan, &meta, &[], 0, 0).is_none());
+        assert!(try_metadata_fast_path(&plan, &meta, &[], &[], 0, 0).is_none());
     }
 
     #[pg_test]
     fn test_metadata_fast_path_rejects_count_distinct() {
         let meta = make_meta(&["ts", "value"]);
         let plan = make_plan(vec![make_agg_spec(AggType::CountDistinct, 1, 23)], Vec::new(), Vec::new(), true);
-        assert!(try_metadata_fast_path(&plan, &meta, &[], 0, 0).is_none());
+        assert!(try_metadata_fast_path(&plan, &meta, &[], &[], 0, 0).is_none());
     }
 
     #[pg_test]
     fn test_metadata_fast_path_rejects_text_sum() {
         let meta = make_meta(&["ts", "name"]);
         let plan = make_plan(vec![make_agg_spec(AggType::Sum, 1, 25)], Vec::new(), Vec::new(), true); // TEXTOID=25
-        assert!(try_metadata_fast_path(&plan, &meta, &[], 0, 0).is_none());
+        assert!(try_metadata_fast_path(&plan, &meta, &[], &[], 0, 0).is_none());
     }
 
     #[pg_test]
@@ -7448,7 +7766,7 @@ mod tests {
         let meta = make_meta(&["ts", "name"]);
         let mut plan = make_plan(vec![make_agg_spec(AggType::Sum, 1, 23)], Vec::new(), Vec::new(), true);
         plan.agg_specs[0].expr_kind = AggExpr::LengthOf;
-        assert!(try_metadata_fast_path(&plan, &meta, &[], 0, 0).is_none());
+        assert!(try_metadata_fast_path(&plan, &meta, &[], &[], 0, 0).is_none());
     }
 
     #[pg_test]
@@ -7456,7 +7774,7 @@ mod tests {
         // COUNT(*) with no segments → 0
         let meta = make_meta(&["ts", "value"]);
         let plan = make_plan(vec![make_agg_spec(AggType::CountStar, -1, 23)], Vec::new(), Vec::new(), true);
-        let state = try_metadata_fast_path(&plan, &meta, &[], 0, 0).unwrap();
+        let state = try_metadata_fast_path(&plan, &meta, &[], &[], 0, 0).unwrap();
         assert_eq!(state.result_rows.len(), 1);
         assert_eq!(state.result_rows[0][0].0.value(), 0usize);
     }
@@ -7471,7 +7789,7 @@ mod tests {
             make_empty_segment(2000),
             make_empty_segment(500),
         ];
-        let state = try_metadata_fast_path(&plan, &meta, &segs, 0, 0).unwrap();
+        let state = try_metadata_fast_path(&plan, &meta, &segs, &[], 0, 0).unwrap();
         assert_eq!(state.result_rows[0][0].0.value(), 3500usize);
     }
 
@@ -7484,7 +7802,7 @@ mod tests {
             make_empty_segment(0),  // should be skipped
             make_empty_segment(50),
         ];
-        let state = try_metadata_fast_path(&plan, &meta, &segs, 0, 0).unwrap();
+        let state = try_metadata_fast_path(&plan, &meta, &segs, &[], 0, 0).unwrap();
         assert_eq!(state.result_rows[0][0].0.value(), 150usize);
     }
 
@@ -7508,7 +7826,7 @@ mod tests {
             max_null: false,
             type_oid: pg_sys::Oid::from(20u32),
         });
-        let state = try_metadata_fast_path(&plan, &meta, &[seg1, seg2], 0, 0).unwrap();
+        let state = try_metadata_fast_path(&plan, &meta, &[seg1, seg2], &[], 0, 0).unwrap();
         let result = state.result_rows[0][0].0.value() as i64;
         assert_eq!(result, 10);
     }
@@ -7533,7 +7851,7 @@ mod tests {
             max_null: false,
             type_oid: pg_sys::Oid::from(20u32),
         });
-        let state = try_metadata_fast_path(&plan, &meta, &[seg1, seg2], 0, 0).unwrap();
+        let state = try_metadata_fast_path(&plan, &meta, &[seg1, seg2], &[], 0, 0).unwrap();
         let result = state.result_rows[0][0].0.value() as i64;
         assert_eq!(result, 999);
     }
@@ -7558,7 +7876,7 @@ mod tests {
             max_null: false,
             type_oid: pg_sys::Oid::from(20u32),
         });
-        let state = try_metadata_fast_path(&plan, &meta, &[seg1, seg2], 0, 0).unwrap();
+        let state = try_metadata_fast_path(&plan, &meta, &[seg1, seg2], &[], 0, 0).unwrap();
         let result = state.result_rows[0][0].0.value() as i64;
         assert_eq!(result, 77);
     }
@@ -7569,7 +7887,7 @@ mod tests {
         let meta = make_meta(&["ts", "value"]);
         let plan = make_plan(vec![make_agg_spec(AggType::Min, 1, 20)], Vec::new(), Vec::new(), true);
         let seg = make_empty_segment(100); // no col_minmax
-        assert!(try_metadata_fast_path(&plan, &meta, &[seg], 0, 0).is_none());
+        assert!(try_metadata_fast_path(&plan, &meta, &[seg], &[], 0, 0).is_none());
     }
 
     #[pg_test]
@@ -7578,7 +7896,7 @@ mod tests {
         let meta = make_meta(&["ts", "value"]);
         let plan = make_plan(vec![make_agg_spec(AggType::Sum, 1, 20)], Vec::new(), Vec::new(), true);
         let seg = make_empty_segment(100); // no col_sums
-        assert!(try_metadata_fast_path(&plan, &meta, &[seg], 0, 0).is_none());
+        assert!(try_metadata_fast_path(&plan, &meta, &[seg], &[], 0, 0).is_none());
     }
 
     #[pg_test]
@@ -7600,7 +7918,7 @@ mod tests {
             nonnull_count: 450,
             type_oid: pg_sys::Oid::from(1700u32),
         });
-        let state = try_metadata_fast_path(&plan, &meta, &[seg1, seg2], 0, 0).unwrap();
+        let state = try_metadata_fast_path(&plan, &meta, &[seg1, seg2], &[], 0, 0).unwrap();
         assert_eq!(state.result_rows[0][0].0.value() as i64, 1350);
     }
 
@@ -7620,7 +7938,7 @@ mod tests {
             nonnull_count: 100,
             type_oid: pg_sys::Oid::from(701u32),
         });
-        let state = try_metadata_fast_path(&plan, &meta, &[seg], 0, 0).unwrap();
+        let state = try_metadata_fast_path(&plan, &meta, &[seg], &[], 0, 0).unwrap();
         let result_bits = state.result_rows[0][0].0.value() as u64;
         let result = f64::from_bits(result_bits);
         assert!((result - 123.5).abs() < 1e-10);
@@ -7653,7 +7971,7 @@ mod tests {
             nonnull_count: 100,
             type_oid: pg_sys::Oid::from(1700u32),
         });
-        let state = try_metadata_fast_path(&plan, &meta, &[seg], 0, 0).unwrap();
+        let state = try_metadata_fast_path(&plan, &meta, &[seg], &[], 0, 0).unwrap();
         // SumInt finalized: returns NUMERIC datum — verify via numeric_out
         let result_datum = state.result_rows[0][0].0;
         let s = unsafe {
@@ -7681,7 +7999,7 @@ mod tests {
             nonnull_count: 50,
             type_oid: pg_sys::Oid::from(701u32),
         });
-        let state = try_metadata_fast_path(&plan, &meta, &[seg], 0, 0).unwrap();
+        let state = try_metadata_fast_path(&plan, &meta, &[seg], &[], 0, 0).unwrap();
         let result = f64::from_bits(state.result_rows[0][0].0.value() as u64);
         // Expected: 100.0 + 10 * 50 = 600.0
         assert!((result - 600.0).abs() < 1e-10);
@@ -7692,7 +8010,7 @@ mod tests {
         let meta = make_meta(&["ts", "value"]);
         let plan = make_plan(vec![make_agg_spec(AggType::CountStar, -1, 23)], Vec::new(), Vec::new(), true);
         let segs = vec![make_empty_segment(10), make_empty_segment(20)];
-        let state = try_metadata_fast_path(&plan, &meta, &segs, 123, 456).unwrap();
+        let state = try_metadata_fast_path(&plan, &meta, &segs, &[], 123, 456).unwrap();
         assert_eq!(state.total_segments, 2);
         assert_eq!(state.metadata_us, 123);
         assert_eq!(state.heap_scan_us, 456);

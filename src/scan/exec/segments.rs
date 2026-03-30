@@ -98,6 +98,163 @@ pub(super) fn segment_passes_minmax_filter(
     }
 }
 
+/// Returns Some(true) if all rows provably satisfy the qual,
+/// Some(false) if no rows satisfy (already pruned by load_segments_heap),
+/// None if ambiguous (must decompress).
+pub(super) fn segment_all_rows_pass(
+    cm: &ColMinMax,
+    op: BatchCompareOp,
+    const_datum: pg_sys::Datum,
+) -> Option<bool> {
+    if cm.min_null || cm.max_null {
+        return None;
+    }
+
+    match cm.type_oid {
+        pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+        | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID | pg_sys::DATEOID => {
+            let seg_min = cm.min_datum.value() as i64;
+            let seg_max = cm.max_datum.value() as i64;
+            let c = const_datum.value() as i64;
+            match op {
+                BatchCompareOp::Eq => {
+                    if seg_min == c && seg_max == c { Some(true) }
+                    else if seg_max < c || seg_min > c { Some(false) }
+                    else { None }
+                }
+                BatchCompareOp::Ne => {
+                    if seg_min > c || seg_max < c { Some(true) }
+                    else if seg_min == c && seg_max == c { Some(false) }
+                    else { None }
+                }
+                BatchCompareOp::Gt => {
+                    if seg_min > c { Some(true) }
+                    else if seg_max <= c { Some(false) }
+                    else { None }
+                }
+                BatchCompareOp::Ge => {
+                    if seg_min >= c { Some(true) }
+                    else if seg_max < c { Some(false) }
+                    else { None }
+                }
+                BatchCompareOp::Lt => {
+                    if seg_max < c { Some(true) }
+                    else if seg_min >= c { Some(false) }
+                    else { None }
+                }
+                BatchCompareOp::Le => {
+                    if seg_max <= c { Some(true) }
+                    else if seg_min > c { Some(false) }
+                    else { None }
+                }
+                BatchCompareOp::InList | BatchCompareOp::Like | BatchCompareOp::NotLike => None,
+            }
+        }
+        pg_sys::FLOAT4OID => {
+            let seg_min = f32::from_bits(cm.min_datum.value() as u32) as f64;
+            let seg_max = f32::from_bits(cm.max_datum.value() as u32) as f64;
+            let c = f32::from_bits(const_datum.value() as u32) as f64;
+            match op {
+                BatchCompareOp::Eq => {
+                    if seg_min == c && seg_max == c { Some(true) }
+                    else if seg_max < c || seg_min > c { Some(false) }
+                    else { None }
+                }
+                BatchCompareOp::Ne => {
+                    if seg_min > c || seg_max < c { Some(true) }
+                    else if seg_min == c && seg_max == c { Some(false) }
+                    else { None }
+                }
+                BatchCompareOp::Gt => {
+                    if seg_min > c { Some(true) } else if seg_max <= c { Some(false) } else { None }
+                }
+                BatchCompareOp::Ge => {
+                    if seg_min >= c { Some(true) } else if seg_max < c { Some(false) } else { None }
+                }
+                BatchCompareOp::Lt => {
+                    if seg_max < c { Some(true) } else if seg_min >= c { Some(false) } else { None }
+                }
+                BatchCompareOp::Le => {
+                    if seg_max <= c { Some(true) } else if seg_min > c { Some(false) } else { None }
+                }
+                BatchCompareOp::InList | BatchCompareOp::Like | BatchCompareOp::NotLike => None,
+            }
+        }
+        pg_sys::FLOAT8OID => {
+            let seg_min = f64::from_bits(cm.min_datum.value() as u64);
+            let seg_max = f64::from_bits(cm.max_datum.value() as u64);
+            let c = f64::from_bits(const_datum.value() as u64);
+            match op {
+                BatchCompareOp::Eq => {
+                    if seg_min == c && seg_max == c { Some(true) }
+                    else if seg_max < c || seg_min > c { Some(false) }
+                    else { None }
+                }
+                BatchCompareOp::Ne => {
+                    if seg_min > c || seg_max < c { Some(true) }
+                    else if seg_min == c && seg_max == c { Some(false) }
+                    else { None }
+                }
+                BatchCompareOp::Gt => {
+                    if seg_min > c { Some(true) } else if seg_max <= c { Some(false) } else { None }
+                }
+                BatchCompareOp::Ge => {
+                    if seg_min >= c { Some(true) } else if seg_max < c { Some(false) } else { None }
+                }
+                BatchCompareOp::Lt => {
+                    if seg_max < c { Some(true) } else if seg_min >= c { Some(false) } else { None }
+                }
+                BatchCompareOp::Le => {
+                    if seg_max <= c { Some(true) } else if seg_min > c { Some(false) } else { None }
+                }
+                BatchCompareOp::InList | BatchCompareOp::Like | BatchCompareOp::NotLike => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Result of classifying whether all rows in a segment satisfy all quals.
+pub(super) enum SegmentQualResult {
+    /// Metadata proves all rows satisfy all quals and no NULLs in qual columns.
+    AllPass,
+    /// Cannot determine from metadata — must decompress.
+    Ambiguous,
+}
+
+/// Classify a segment: can we prove all rows pass all batch quals using metadata?
+pub(super) fn classify_segment_quals(
+    seg: &SegmentData,
+    batch_quals: &[BatchQual],
+    col_names: &[String],
+) -> SegmentQualResult {
+    for bq in batch_quals {
+        let col_name = &col_names[bq.col_idx];
+        let cm = match seg.col_minmax.get(col_name) {
+            Some(cm) => cm,
+            None => return SegmentQualResult::Ambiguous,
+        };
+        match segment_all_rows_pass(cm, bq.op, bq.const_datum) {
+            Some(true) => {} // this qual is satisfied for all rows
+            _ => return SegmentQualResult::Ambiguous,
+        }
+    }
+    // All quals passed via minmax. Now check for NULLs in qual columns:
+    // min/max covers only non-NULL values, so if NULLs exist, we can't trust row_count.
+    for bq in batch_quals {
+        let col_name = &col_names[bq.col_idx];
+        match seg.col_sums.get(col_name) {
+            Some(cs) => {
+                if cs.nonnull_count < seg.row_count as i64 {
+                    return SegmentQualResult::Ambiguous;
+                }
+            }
+            None => return SegmentQualResult::Ambiguous,
+        }
+    }
+    SegmentQualResult::AllPass
+}
+
 /// Per-column min/max metadata from the companion table.
 pub(super) struct ColMinMax {
     pub(super) min_datum: pg_sys::Datum,
