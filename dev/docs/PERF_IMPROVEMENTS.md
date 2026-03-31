@@ -801,3 +801,46 @@ require no SPI in workers).
 
 **Files:** `src/scan/exec/segments.rs` (`load_segments_heap` and metadata
 loading functions), `src/catalog.rs` (companion OID lookup)
+
+### 39. Pipelined detoast + parallel aggregation
+
+**Target: Q22 9.6s -> ~5s (ClickBench hot run)**
+**Complexity: Medium**
+
+In the DeltaXAgg parallel path, all segments are eagerly detoasted on the
+main thread before any parallel work begins. For Q22 this is 2.9s of
+single-core TOAST decompression (pglz) blocking 4 parallel workers.
+
+`pg_detoast_datum` is a PG API call that must run on the backend thread —
+it cannot be moved into worker threads. The solution is to **pipeline**
+detoasting with parallel processing so they overlap in time.
+
+**Approach:**
+
+1. Load all segments lazily (TOAST pointers only, ~100ms).
+2. Split segments into B batches (e.g. B = n_workers or 2 * n_workers).
+3. For batch 0: main thread detoasts all blobs, then spawns `thread::scope`
+   for workers to process batch 0.
+4. While workers process batch i, the main thread detoasts batch i+1.
+5. When workers finish batch i, they immediately start batch i+1 (already
+   detoasted). Main thread detoasts batch i+2, and so on.
+
+This requires a producer-consumer pattern: main thread pushes detoasted
+batches into a shared queue, workers pull from it. With `std::thread::scope`
+this can be done with a `Mutex<VecDeque<Range<usize>>>` work queue plus
+a `Condvar` for notification.
+
+**Expected overlap:** With 2.9s detoast and 3.7s parallel work across 4
+threads, the detoast is fully hidden behind parallel processing for all
+but the first batch. Net saving: ~2.5s (detoast of first batch ~0.3s
+remains serial).
+
+**Constraints:**
+- `pg_detoast_datum` must stay on the main thread (PG backend requirement).
+- Workers must not touch `SegmentData.toast_pointers` — only read
+  `compressed_blobs` after the main thread has detoasted them.
+- Each batch's segments must be fully detoasted before workers access them.
+
+**Files:** `src/scan/exec/agg.rs` (pipelined batch loop in compact and
+mixed parallel paths), `src/scan/exec/segments.rs` (lazy loading for
+agg path)

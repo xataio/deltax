@@ -25,6 +25,7 @@ use super::segments::{
     SegmentData, load_metadata, load_segments_heap,
     segment_skippable_by_dict, extract_segment_filters,
     classify_segment_quals, SegmentQualResult,
+    detoast_lazy_blobs,
 };
 use super::text_col::{SegTextColumn, TextQualInfo, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_like_filter, strcoll_cmp};
 
@@ -1388,13 +1389,17 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             &meta.time_column,
         );
         // Load segments from all companion tables (with lazy pruning)
+        let n_workers = crate::get_parallel_workers();
+        let use_lazy = n_workers > 1 && !group_specs.is_empty();
+        let lazy_cols: Vec<bool> = needed_cols.to_vec();
         let t1 = Instant::now();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         let mut total_detoast_us: u64 = 0;
         for &oid in &companion_oids {
             let (segs, _, _, _, dt_us) = load_segments_heap(
                 oid, &meta.col_names, &meta.segment_by, &needed_cols,
-                &meta.time_column, false, &seg_filters, time_min, time_max, None,
+                &meta.time_column, false, &seg_filters, time_min, time_max,
+                if use_lazy { Some(&lazy_cols) } else { None },
                 &batch_quals, false,
             );
             all_segments.extend(segs);
@@ -1527,7 +1532,6 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         // ============================================================
         // Conditions: compact keys + compact accs + all needed cols numeric +
         // all batch quals numeric + no regexp GROUP BY + enough segments.
-        let n_workers = crate::get_parallel_workers();
         let can_parallel = use_compact_keys
             && use_compact_accs
             && n_workers > 1
@@ -1565,14 +1569,76 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 topn_spec,
             };
 
-            let chunk_size = all_segments.len().div_ceil(n_workers);
-            let partial_results: Vec<ParallelCompactResult> = std::thread::scope(|s| {
-                let handles: Vec<_> = all_segments.chunks(chunk_size).map(|chunk| {
-                    let cfg = &config;
-                    s.spawn(move || process_segments_compact(chunk, cfg))
-                }).collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
+            // Pipeline detoast with parallel processing when enough segments
+            // to amortize thread::scope overhead; otherwise single scope.
+            let use_pipeline = use_lazy && all_segments.len() >= n_workers * 16;
+
+            if use_lazy {
+                let t_detoast = Instant::now();
+                if use_pipeline {
+                    // Detoast only the first batch; rest overlaps with workers
+                    let n_batches = (n_workers * 2).max(2).min(all_segments.len());
+                    let batch_size = all_segments.len().div_ceil(n_batches);
+                    let first_end = batch_size.min(all_segments.len());
+                    for seg in &mut all_segments[..first_end] {
+                        detoast_lazy_blobs(seg);
+                    }
+                } else {
+                    // Few segments — detoast all upfront, single scope below
+                    for seg in &mut all_segments {
+                        detoast_lazy_blobs(seg);
+                    }
+                }
+                total_detoast_us += t_detoast.elapsed().as_micros() as u64;
+            }
+
+            let partial_results: Vec<ParallelCompactResult> = if use_pipeline {
+                let n_batches = (n_workers * 2).max(2).min(all_segments.len());
+                let batch_size = all_segments.len().div_ceil(n_batches);
+                let mut results: Vec<ParallelCompactResult> = Vec::new();
+                let mut batch_start = 0;
+                let total_segs = all_segments.len();
+
+                while batch_start < total_segs {
+                    let batch_end = (batch_start + batch_size).min(total_segs);
+                    let next_end = (batch_end + batch_size).min(total_segs);
+
+                    let (done, pending) = all_segments.split_at_mut(batch_end);
+                    let current_batch = &done[batch_start..];
+
+                    std::thread::scope(|s| {
+                        let chunk_size = current_batch.len().div_ceil(n_workers);
+                        let handles: Vec<_> = current_batch.chunks(chunk_size).map(|chunk| {
+                            let cfg = &config;
+                            s.spawn(move || process_segments_compact(chunk, cfg))
+                        }).collect();
+
+                        // Main thread detoasts next batch while workers run
+                        if batch_end < total_segs {
+                            for seg in &mut pending[..next_end - batch_end] {
+                                detoast_lazy_blobs(seg);
+                            }
+                        }
+
+                        for h in handles {
+                            results.push(h.join().unwrap());
+                        }
+                    });
+
+                    batch_start = batch_end;
+                }
+                results
+            } else {
+                // Single scope — original path (or lazy already detoasted above)
+                let chunk_size = all_segments.len().div_ceil(n_workers);
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = all_segments.chunks(chunk_size).map(|chunk| {
+                        let cfg = &config;
+                        s.spawn(move || process_segments_compact(chunk, cfg))
+                    }).collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            };
 
             // Accumulate stats from all workers
             let scan_wall_us = t2.elapsed().as_micros() as u64;
@@ -2654,14 +2720,71 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 rust_regex_infos: &rust_regex_infos,
             };
 
-            let chunk_size = all_segments.len().div_ceil(n_workers);
-            let partial_results: Vec<ParallelMixedResult> = std::thread::scope(|s| {
-                let handles: Vec<_> = all_segments.chunks(chunk_size).map(|chunk| {
-                    let cfg = &config;
-                    s.spawn(move || process_segments_mixed(chunk, cfg))
-                }).collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
+            // Pipeline detoast with parallel processing when enough segments
+            let use_pipeline = use_lazy && all_segments.len() >= n_workers * 16;
+
+            if use_lazy {
+                let t_detoast = Instant::now();
+                if use_pipeline {
+                    let n_batches = (n_workers * 2).max(2).min(all_segments.len());
+                    let batch_size = all_segments.len().div_ceil(n_batches);
+                    let first_end = batch_size.min(all_segments.len());
+                    for seg in &mut all_segments[..first_end] {
+                        detoast_lazy_blobs(seg);
+                    }
+                } else {
+                    for seg in &mut all_segments {
+                        detoast_lazy_blobs(seg);
+                    }
+                }
+                total_detoast_us += t_detoast.elapsed().as_micros() as u64;
+            }
+
+            let partial_results: Vec<ParallelMixedResult> = if use_pipeline {
+                let n_batches = (n_workers * 2).max(2).min(all_segments.len());
+                let batch_size = all_segments.len().div_ceil(n_batches);
+                let mut results: Vec<ParallelMixedResult> = Vec::new();
+                let mut batch_start = 0;
+                let total_segs = all_segments.len();
+
+                while batch_start < total_segs {
+                    let batch_end = (batch_start + batch_size).min(total_segs);
+                    let next_end = (batch_end + batch_size).min(total_segs);
+
+                    let (done, pending) = all_segments.split_at_mut(batch_end);
+                    let current_batch = &done[batch_start..];
+
+                    std::thread::scope(|s| {
+                        let chunk_size = current_batch.len().div_ceil(n_workers);
+                        let handles: Vec<_> = current_batch.chunks(chunk_size).map(|chunk| {
+                            let cfg = &config;
+                            s.spawn(move || process_segments_mixed(chunk, cfg))
+                        }).collect();
+
+                        if batch_end < total_segs {
+                            for seg in &mut pending[..next_end - batch_end] {
+                                detoast_lazy_blobs(seg);
+                            }
+                        }
+
+                        for h in handles {
+                            results.push(h.join().unwrap());
+                        }
+                    });
+
+                    batch_start = batch_end;
+                }
+                results
+            } else {
+                let chunk_size = all_segments.len().div_ceil(n_workers);
+                std::thread::scope(|s| {
+                    let handles: Vec<_> = all_segments.chunks(chunk_size).map(|chunk| {
+                        let cfg = &config;
+                        s.spawn(move || process_segments_mixed(chunk, cfg))
+                    }).collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            };
 
             // Accumulate stats
             let scan_wall_us = t2.elapsed().as_micros() as u64;
@@ -3905,6 +4028,15 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         // ============================================================
         // SINGLE-THREADED PATH (original)
         // ============================================================
+        // If lazy loading was used (parallel was possible but conditions
+        // weren't met for compact/mixed), detoast all segments now.
+        if use_lazy {
+            let t_detoast = Instant::now();
+            for seg in &mut all_segments {
+                detoast_lazy_blobs(seg);
+            }
+            total_detoast_us += t_detoast.elapsed().as_micros() as u64;
+        }
         let t2 = Instant::now();
         let mut total_segments: u64 = 0;
         let mut total_rows_processed: u64 = 0;
