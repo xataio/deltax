@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS deltax_partition (
     raw_size        BIGINT,
     row_count       BIGINT,
     compressed_at   TIMESTAMPTZ,
+    column_ndistinct JSONB,
     UNIQUE(schema_name, table_name)
 );
 "#,

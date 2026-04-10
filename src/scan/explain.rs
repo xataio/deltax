@@ -78,6 +78,22 @@ pub unsafe extern "C-unwind" fn explain_count_scan(
                     stats_str.as_ptr(),
                     es,
                 );
+
+                if (*es).buffers {
+                    let b = &state.buf_stats;
+                    let buffers_str = std::ffi::CString::new(format!(
+                        "meta hit={} read={}  bloom hit={} read={}  blob hit={} read={}",
+                        b.meta_hit, b.meta_read,
+                        b.bloom_hit, b.bloom_read,
+                        b.blob_hit, b.blob_read,
+                    ))
+                    .unwrap();
+                    pg_sys::ExplainPropertyText(
+                        c"DeltaX Buffers".as_ptr(),
+                        buffers_str.as_ptr(),
+                        es,
+                    );
+                }
             }
         }
     }
@@ -130,6 +146,22 @@ pub unsafe extern "C-unwind" fn explain_minmax_scan(
                     stats_str.as_ptr(),
                     es,
                 );
+
+                if (*es).buffers {
+                    let b = &state.buf_stats;
+                    let buffers_str = std::ffi::CString::new(format!(
+                        "meta hit={} read={}  bloom hit={} read={}  blob hit={} read={}",
+                        b.meta_hit, b.meta_read,
+                        b.bloom_hit, b.bloom_read,
+                        b.blob_hit, b.blob_read,
+                    ))
+                    .unwrap();
+                    pg_sys::ExplainPropertyText(
+                        c"DeltaX Buffers".as_ptr(),
+                        buffers_str.as_ptr(),
+                        es,
+                    );
+                }
             }
         }
     }
@@ -222,6 +254,22 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
                         es,
                     );
                 }
+
+                if (*es).buffers {
+                    let b = &state.buf_stats;
+                    let buffers_str = std::ffi::CString::new(format!(
+                        "meta hit={} read={}  bloom hit={} read={}  blob hit={} read={}",
+                        b.meta_hit, b.meta_read,
+                        b.bloom_hit, b.bloom_read,
+                        b.blob_hit, b.blob_read,
+                    ))
+                    .unwrap();
+                    pg_sys::ExplainPropertyText(
+                        c"DeltaX Buffers".as_ptr(),
+                        buffers_str.as_ptr(),
+                        es,
+                    );
+                }
             }
         }
     }
@@ -280,6 +328,26 @@ unsafe fn explain_timing(
                     stats_str.as_ptr(),
                     es,
                 );
+
+                // Per-phase shared-buffer deltas. Custom scan work happens
+                // in BeginCustomScan, outside PG's node-level instrumentation,
+                // so the standard `Buffers:` line misses it. This surfaces
+                // the breakdown for cold-cache investigations.
+                if (*es).buffers {
+                    let b = &t.buf_stats;
+                    let buffers_str = std::ffi::CString::new(format!(
+                        "meta hit={} read={}  bloom hit={} read={}  blob hit={} read={}",
+                        b.meta_hit, b.meta_read,
+                        b.bloom_hit, b.bloom_read,
+                        b.blob_hit, b.blob_read,
+                    ))
+                    .unwrap();
+                    pg_sys::ExplainPropertyText(
+                        c"DeltaX Buffers".as_ptr(),
+                        buffers_str.as_ptr(),
+                        es,
+                    );
+                }
             }
         }
     }

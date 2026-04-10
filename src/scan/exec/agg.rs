@@ -307,6 +307,7 @@ pub(crate) struct AggScanState {
     pub(crate) n_workers: u64,
     pub(crate) bare_limit: i64,
     pub(crate) wall_us: u64,
+    pub(crate) buf_stats: super::segments::ScanBufferStats,
 }
 
 
@@ -777,7 +778,7 @@ fn try_catalog_shortcut(
         finalize_us: 0,
         topn_select_us: 0,
         n_workers: 0,
-        bare_limit: 0, wall_us: 0,
+        bare_limit: 0, wall_us: 0, buf_stats: super::segments::take_scan_buf_stats(),
     })
 }
 
@@ -1066,7 +1067,7 @@ fn try_metadata_fast_path(
         finalize_us: 0,
         topn_select_us: 0,
         n_workers: 0,
-        bare_limit: 0, wall_us: 0,
+        bare_limit: 0, wall_us: 0, buf_stats: super::segments::take_scan_buf_stats(),
     })
 }
 
@@ -1337,6 +1338,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 ) {
     unsafe {
         let t_wall = Instant::now();
+        // Reset per-phase buffer accumulator for this scan. `load_segments_heap`
+        // writes to the thread-local; the AggScanState ctor reads it back out
+        // via `take_scan_buf_stats()`.
+        super::segments::reset_scan_buf_stats();
         let custom_private = (*node).custom_ps;
         if custom_private.is_null() {
             pgrx::error!("pg_deltax: missing custom_private in DeltaXAgg state");
@@ -2058,7 +2063,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
                     };
 
                     let state_box = Box::new(state);
@@ -2224,7 +2229,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us: spec_fail_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
                     };
 
                     let state_box = Box::new(state);
@@ -2390,6 +2395,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     n_workers: n_workers as u64,
                     bare_limit,
                     wall_us: t_wall.elapsed().as_micros() as u64,
+                    buf_stats: super::segments::take_scan_buf_stats(),
                 };
 
                 let state_box = Box::new(state);
@@ -2650,7 +2656,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     finalize_us,
                     topn_select_us: 0,
                     n_workers: n_workers as u64,
-                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
+                    bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
                 };
 
                 let state_box = Box::new(state);
@@ -2801,7 +2807,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us,
                 topn_select_us,
                 n_workers: n_workers as u64,
-                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
             };
 
             let state_box = Box::new(state);
@@ -3260,7 +3266,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
                     };
 
                     let state_box = Box::new(state);
@@ -3437,7 +3443,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         finalize_us,
                         topn_select_us,
                         n_workers: n_workers as u64,
-                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
+                        bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
                     };
 
                     let state_box = Box::new(state);
@@ -3648,6 +3654,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     n_workers: n_workers as u64,
                     bare_limit,
                     wall_us: t_wall.elapsed().as_micros() as u64,
+                    buf_stats: super::segments::take_scan_buf_stats(),
                 };
 
                 let state_box = Box::new(state);
@@ -3943,7 +3950,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us,
                 topn_select_us,
                 n_workers: n_workers as u64,
-                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
             };
 
             let state_box = Box::new(state);
@@ -4238,7 +4245,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 finalize_us: 0,
                 topn_select_us: 0,
                 n_workers: actual_workers as u64,
-                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
+                bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
             };
 
             let state_box = Box::new(state);
@@ -5602,7 +5609,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             finalize_us,
             topn_select_us,
             n_workers: 0,
-            bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64,
+            bare_limit: 0, wall_us: t_wall.elapsed().as_micros() as u64, buf_stats: super::segments::take_scan_buf_stats(),
         };
 
         let state_box = Box::new(state);

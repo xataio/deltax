@@ -112,9 +112,15 @@ pub(super) fn get_row_count(companion_oid: pg_sys::Oid) -> Option<i64> {
     if row_count > 0 { Some(row_count) } else { None }
 }
 
-/// Get per-column ndistinct from the companion table for a companion OID.
-/// Reads MAX(_ndistinct_col) for each _ndistinct_* column in the companion relation.
-/// Returns a map from column name to ndistinct count, or empty if unavailable.
+/// Get per-column ndistinct for a companion OID from the catalog column
+/// `deltax_partition.column_ndistinct` (populated at compression time).
+/// Returns a map from column name to max-across-segments ndistinct count,
+/// or an empty map if the partition has no stored ndistinct info.
+///
+/// This used to scan the whole meta table via `MAX(_ndistinct_*)`, which
+/// was cheap warm but forced ~9 MB of cold reads on the meta table during
+/// planning on every fresh backend. Now the info is persisted once at
+/// compression time and read via a small catalog lookup.
 pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collections::HashMap<String, i64> {
     if let Some(cached) =
         NDISTINCT_CACHE.with(|cache| cache.borrow().get(&companion_oid).cloned())
@@ -122,78 +128,82 @@ pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collectio
         return cached;
     }
 
-    let (nd_columns, companion_name) = unsafe {
-        // Open companion table to inspect tuple descriptor for _ndistinct_* columns
-        let rel = pg_sys::table_open(companion_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
-        let tupdesc = (*rel).rd_att;
-        let natts = (*tupdesc).natts as usize;
-
-        let mut cols: Vec<(String, String)> = Vec::new(); // (col_name, attr_name)
-        for i in 0..natts {
-            let att = &*super::exec::datum_utils::tupdesc_get_attr(tupdesc, i);
-            if att.attisdropped {
-                continue;
-            }
-            let attr_name = std::ffi::CStr::from_ptr(att.attname.data.as_ptr())
-                .to_string_lossy()
-                .into_owned();
-            if let Some(col_name) = attr_name.strip_prefix("_ndistinct_") {
-                cols.push((col_name.to_string(), attr_name));
-            }
-        }
-
-        pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
-
-        if cols.is_empty() {
-            // Stable schema shape — safe to cache the empty result.
-            let empty = std::collections::HashMap::new();
-            NDISTINCT_CACHE
-                .with(|cache| cache.borrow_mut().insert(companion_oid, empty.clone()));
-            return empty;
-        }
-
+    let companion_name = unsafe {
         let name_ptr = pg_sys::get_rel_name(companion_oid);
         if name_ptr.is_null() {
             return std::collections::HashMap::new();
         }
-        let name = std::ffi::CStr::from_ptr(name_ptr)
-            .to_string_lossy()
-            .into_owned();
-
-        (cols, name)
+        std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
     };
+    // Strip _meta suffix to get the partition name for catalog lookup
+    let partition_name = companion_name.strip_suffix("_meta").unwrap_or(&companion_name);
 
-    // Build query: SELECT MAX("_ndistinct_col1"), ... FROM companion
-    let max_exprs: Vec<String> = nd_columns
-        .iter()
-        .map(|(_, attr)| format!("MAX(\"{}\")::int8", attr))
-        .collect();
-    let query = format!(
-        "SELECT {} FROM \"_deltax_compressed\".\"{}\"",
-        max_exprs.join(", "),
-        companion_name
+    let mut result_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+
+    // Retrieve the JSONB column as text and parse manually. This avoids
+    // pulling in a JSON dependency just for a trivial `{string: int}` map.
+    let json_text = Spi::get_one_with_args::<String>(
+        "SELECT column_ndistinct::text FROM deltax_partition
+         WHERE table_name = $1 AND is_compressed = true",
+        &[partition_name.into()],
     );
 
-    let mut result_map = std::collections::HashMap::new();
-    let _ = Spi::connect(|client| {
-        let result = client.select(&query, None, &[])?;
-        if let Some(row) = result.into_iter().next() {
-            for (i, (col_name, _)) in nd_columns.iter().enumerate() {
-                if let Some(nd) = row.get_datum_by_ordinal(i + 1)
-                    .unwrap()
-                    .value::<i64>()
-                    .unwrap()
-                {
-                    result_map.insert(col_name.clone(), nd);
-                }
-            }
-        }
-        Ok::<(), spi::Error>(())
-    });
+    if let Ok(Some(text)) = json_text {
+        parse_ndistinct_json(&text, &mut result_map);
+    }
 
     NDISTINCT_CACHE
         .with(|cache| cache.borrow_mut().insert(companion_oid, result_map.clone()));
     result_map
+}
+
+/// Parse a `{"col": int, ...}` JSON object (as emitted by
+/// `catalog::update_partition_column_ndistinct`) into the result map.
+/// Trivial hand-rolled parser — values are always integers, keys are
+/// always column names with limited escaping (backslash and quote).
+fn parse_ndistinct_json(text: &str, out: &mut std::collections::HashMap<String, i64>) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    // Skip leading whitespace and opening brace
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
+    if i >= bytes.len() || bytes[i] != b'{' { return; }
+    i += 1;
+
+    loop {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'}' { return; }
+        if bytes[i] != b'"' { return; }
+        i += 1;
+
+        // Parse key (with \" and \\ escapes).
+        let mut key = String::new();
+        while i < bytes.len() && bytes[i] != b'"' {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                key.push(bytes[i + 1] as char);
+                i += 2;
+            } else {
+                key.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        if i >= bytes.len() { return; }
+        i += 1; // closing quote
+
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b':') {
+            i += 1;
+        }
+
+        // Parse integer value (may be negative in principle).
+        let start = i;
+        if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') { i += 1; }
+        while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+        if let Ok(s) = std::str::from_utf8(&bytes[start..i])
+            && let Ok(v) = s.parse::<i64>() {
+            out.insert(key, v);
+        }
+    }
 }
 
 /// Get reltuples from pg_class for a relation OID.

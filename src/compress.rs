@@ -337,6 +337,16 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     )
     .expect("failed to update catalog");
 
+    // Persist per-column max ndistinct so planner cost estimation can do
+    // a catalog lookup instead of a cold full scan of the meta table.
+    let nd_col_names: Vec<String> = columns
+        .iter()
+        .filter(|c| !c.is_segment_by)
+        .map(|c| c.name.clone())
+        .collect();
+    catalog::update_partition_column_ndistinct(client, part_info.id, &meta_fqn, &nd_col_names)
+        .expect("failed to update partition column_ndistinct");
+
     crate::scan::invalidate_compressed_cache();
 
     format!(
@@ -656,8 +666,9 @@ fn apply_permutation<T: Clone>(v: &mut Vec<T>, perm: &[usize]) {
     *v = reordered;
 }
 
-/// Return type for flush_segment_metadata: (compressed_size, column blobs, bloom data).
-pub(crate) type FlushResult = (i64, Vec<(u16, Vec<u8>)>, Vec<u8>);
+/// Return type for flush_segment_metadata: (compressed_size, column blobs, per-column bloom entries).
+/// Each bloom entry is (col_idx, num_hashes, bloom_bytes).
+pub(crate) type FlushResult = (i64, Vec<(u16, Vec<u8>)>, Vec<(u16, u8, Vec<u8>)>);
 
 /// Compress accumulated typed column data and INSERT metadata into the meta table.
 /// Returns (compressed_size, vec of (col_idx, compressed_blob)) — blobs are NOT inserted,
@@ -673,7 +684,7 @@ pub(crate) fn flush_segment_metadata(
     row_count: u32,
     segment_id: i32,
 ) -> FlushResult {
-    // Returns (compressed_size, blobs, bloom_data)
+    // Returns (compressed_size, blobs, bloom_entries)
     // Compress each non-segment column, collect blobs for caller
     let mut blobs: Vec<(u16, Vec<u8>)> = Vec::new(); // (col_idx, compressed_data)
     let mut col_minmax: std::collections::HashMap<String, (Option<String>, Option<String>)> =
@@ -785,8 +796,8 @@ pub(crate) fn flush_segment_metadata(
     insert_cols.push("_row_count".to_string());
     insert_vals.push(row_count.to_string());
 
-    // Compute packed bloom filters (if enabled via GUC) — stored separately
-    let bloom_data = if crate::BLOOM_FILTERS.get() {
+    // Compute per-column bloom filters (if enabled via GUC) — stored separately
+    let bloom_entries = if crate::BLOOM_FILTERS.get() {
         compute_segment_blooms(typed_cols, columns, ndistinct_values)
     } else {
         Vec::new()
@@ -802,7 +813,7 @@ pub(crate) fn flush_segment_metadata(
         .update(&insert_sql, None, &[])
         .expect("failed to insert segment metadata");
 
-    (total_size, blobs, bloom_data)
+    (total_size, blobs, bloom_entries)
 }
 
 /// Slice a TypedColumn to a sub-range [start..end).
@@ -859,17 +870,18 @@ pub(crate) fn compute_segment_ndistinct(
     result
 }
 
-/// Compute packed bloom filters for a segment.
-/// Returns packed bytes (col_idx + 128-byte bloom per column), or empty if no columns qualify.
-/// Only builds bloom filters for numeric/date/timestamp columns with ndistinct ≤ threshold.
+/// Compute per-column bloom filters for a segment.
+/// Returns one (col_idx, num_hashes, bloom_bytes) entry per column that got a bloom,
+/// or empty if no columns qualify. Only builds bloom filters for numeric/date/timestamp
+/// columns with ndistinct > 0.
 pub(crate) fn compute_segment_blooms(
     typed_cols: &[TypedColumn],
     columns: &[ColumnMeta],
     ndistinct_values: &[i64],
-) -> Vec<u8> {
-    use crate::bloom::{self, BloomFilter, hash_datum_i64};
+) -> Vec<(u16, u8, Vec<u8>)> {
+    use crate::bloom::{BloomFilter, hash_datum_i64};
 
-    let mut filters: Vec<(u16, BloomFilter)> = Vec::new();
+    let mut entries: Vec<(u16, u8, Vec<u8>)> = Vec::new();
     let mut nd_idx: usize = 0;
     let mut col_idx: u16 = 0;
 
@@ -922,11 +934,11 @@ pub(crate) fn compute_segment_blooms(
             }
         }
 
-        filters.push((col_idx, bf));
+        entries.push((col_idx, bf.num_hashes(), bf.as_bytes().to_vec()));
         col_idx += 1;
     }
 
-    bloom::pack_blooms(&filters)
+    entries
 }
 
 /// Flush typed column data, splitting into segment_size chunks if needed.
@@ -942,7 +954,7 @@ pub(crate) fn flush_with_splitting(
     segment_size: usize,
     next_segment_id: &mut i32,
     blob_buffer: &mut Vec<(u16, i32, Vec<u8>)>,
-    bloom_buffer: &mut Vec<(i32, Vec<u8>)>,
+    bloom_buffer: &mut Vec<(u16, i32, u8, Vec<u8>)>,
 ) -> i64 {
     let mut total_size = 0i64;
     let mut offset = 0;
@@ -953,14 +965,14 @@ pub(crate) fn flush_with_splitting(
         *next_segment_id += 1;
         if offset == 0 && chunk_end == total_rows {
             let ndistinct = compute_segment_ndistinct(typed_cols, columns);
-            let (size, blobs, bloom_data) =
+            let (size, blobs, bloom_entries) =
                 flush_segment_metadata(client, meta_fqn, columns, typed_cols, seg_values, &ndistinct, chunk_rows, seg_id);
             total_size += size;
             for (col_idx, blob) in blobs {
                 blob_buffer.push((col_idx, seg_id, blob));
             }
-            if !bloom_data.is_empty() {
-                bloom_buffer.push((seg_id, bloom_data));
+            for (col_idx, num_hashes, bytes) in bloom_entries {
+                bloom_buffer.push((col_idx, seg_id, num_hashes, bytes));
             }
         } else {
             let chunk_cols: Vec<TypedColumn> = typed_cols
@@ -968,14 +980,14 @@ pub(crate) fn flush_with_splitting(
                 .map(|tc| slice_typed_column(tc, offset, chunk_end))
                 .collect();
             let ndistinct = compute_segment_ndistinct(&chunk_cols, columns);
-            let (size, blobs, bloom_data) =
+            let (size, blobs, bloom_entries) =
                 flush_segment_metadata(client, meta_fqn, columns, &chunk_cols, seg_values, &ndistinct, chunk_rows, seg_id);
             total_size += size;
             for (col_idx, blob) in blobs {
                 blob_buffer.push((col_idx, seg_id, blob));
             }
-            if !bloom_data.is_empty() {
-                bloom_buffer.push((seg_id, bloom_data));
+            for (col_idx, num_hashes, bytes) in bloom_entries {
+                bloom_buffer.push((col_idx, seg_id, num_hashes, bytes));
             }
         }
         offset = chunk_end;
@@ -1041,7 +1053,7 @@ pub(crate) fn build_companion_ddl(
     );
 
     let blooms_ddl = format!(
-        "CREATE TABLE {} (_segment_id INT PRIMARY KEY, _data BYTEA COMPRESSION lz4 NOT NULL)",
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _num_hashes SMALLINT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL, PRIMARY KEY (_col_idx, _segment_id))",
         blooms_fqn
     );
 
@@ -1143,7 +1155,7 @@ fn compress_partition_streaming(
     let mut meta_created = false;
     let mut next_segment_id: i32 = 1;
     let mut blob_buffer: Vec<(u16, i32, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, blob)
-    let mut bloom_buffer: Vec<(i32, Vec<u8>)> = Vec::new(); // (segment_id, packed_bloom_data)
+    let mut bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, num_hashes, bloom_bytes)
 
     loop {
         let result = client
@@ -1216,7 +1228,7 @@ fn compress_partition_streaming(
                 let seg_id = next_segment_id;
                 next_segment_id += 1;
                 let ndistinct = compute_segment_ndistinct(&typed_cols, columns);
-                let (size, blobs, bloom_data) = flush_segment_metadata(
+                let (size, blobs, bloom_entries) = flush_segment_metadata(
                     client,
                     meta_fqn,
                     columns,
@@ -1230,8 +1242,8 @@ fn compress_partition_streaming(
                 for (col_idx, blob) in blobs {
                     blob_buffer.push((col_idx, seg_id, blob));
                 }
-                if !bloom_data.is_empty() {
-                    bloom_buffer.push((seg_id, bloom_data));
+                for (col_idx, num_hashes, bytes) in bloom_entries {
+                    bloom_buffer.push((col_idx, seg_id, num_hashes, bytes));
                 }
                 typed_cols = init_typed_columns(columns, &kinds);
                 rows_in_segment = 0;
@@ -1301,15 +1313,21 @@ fn compress_partition_streaming(
         // Flush bloom filters into separate blooms table
         if !bloom_buffer.is_empty() {
             client.update(blooms_ddl, None, &[]).expect("failed to create blooms table");
-            for (seg_id, bloom_data) in bloom_buffer {
+
+            // Sort by (col_idx, segment_id) for column-major insertion order
+            bloom_buffer.sort_by_key(|&(col_idx, seg_id, _, _)| (col_idx, seg_id));
+
+            for (col_idx, seg_id, num_hashes, bloom_bytes) in bloom_buffer {
                 use pgrx::datum::DatumWithOid;
                 let insert_sql = format!(
-                    "INSERT INTO {} (_segment_id, _data) VALUES ($1, $2)",
+                    "INSERT INTO {} (_col_idx, _segment_id, _num_hashes, _data) VALUES ($1, $2, $3, $4)",
                     blooms_fqn
                 );
                 let args: Vec<DatumWithOid> = vec![
+                    (col_idx as i16).into(),
                     seg_id.into(),
-                    DatumWithOid::from(bloom_data),
+                    (num_hashes as i16).into(),
+                    DatumWithOid::from(bloom_bytes),
                 ];
                 client
                     .update(&insert_sql, None, &args)

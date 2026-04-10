@@ -286,7 +286,7 @@ struct PartitionBuffer {
     next_segment_id: i32,
     blob_buffer: Vec<(u16, i32, Vec<u8>)>,
     blob_buffer_size: usize,
-    bloom_buffer: Vec<(i32, Vec<u8>)>,
+    bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)>,
     total_compressed_size: i64,
     total_rows: i64,
     meta_table_created: bool,
@@ -1432,7 +1432,7 @@ struct CompressedSegment {
     seg_id: i32,
     row_count: usize,
     blobs: Vec<(u16, Vec<u8>)>,      // (col_idx, compressed_data)
-    bloom_data: Vec<u8>,              // empty if blooms disabled
+    bloom_entries: Vec<(u16, u8, Vec<u8>)>, // (col_idx, num_hashes, bytes); empty if blooms disabled
     meta_values_csv: String,          // pre-formatted VALUES clause innards
     total_compressed_size: i64,
 }
@@ -1617,7 +1617,7 @@ fn compress_segment(
     insert_vals.push((row_count as u32).to_string());
 
     // Bloom filters
-    let bloom_data = if bloom_enabled {
+    let bloom_entries = if bloom_enabled {
         compute_segment_blooms(&typed_cols, columns, &ndistinct)
     } else {
         Vec::new()
@@ -1628,7 +1628,7 @@ fn compress_segment(
         seg_id,
         row_count,
         blobs,
-        bloom_data,
+        bloom_entries,
         meta_values_csv: insert_vals.join(", "),
         total_compressed_size: total_size,
     }
@@ -1655,7 +1655,7 @@ fn flush_segment(
         ));
         if crate::BLOOM_FILTERS.get() {
             spi_exec(&format!(
-                "CREATE TABLE {} (_segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
+                "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _num_hashes SMALLINT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
                 blooms_fqn
             ));
         }
@@ -1852,7 +1852,7 @@ fn flush_segment(
     insert_vals.push((buf.row_count as u32).to_string());
 
     // Bloom filters
-    let bloom_data = if crate::BLOOM_FILTERS.get() {
+    let bloom_entries = if crate::BLOOM_FILTERS.get() {
         compute_segment_blooms(&buf.typed_cols, &state.columns, &ndistinct)
     } else {
         Vec::new()
@@ -1908,8 +1908,8 @@ fn flush_segment(
         buf.blob_buffer_size += blob.len();
         buf.blob_buffer.push((col_idx, seg_id, blob));
     }
-    if !bloom_data.is_empty() {
-        buf.bloom_buffer.push((seg_id, bloom_data));
+    for (col_idx, num_hashes, bytes) in bloom_entries {
+        buf.bloom_buffer.push((col_idx, seg_id, num_hashes, bytes));
     }
 
     // Flush blobs immediately if buffer exceeds threshold to bound memory usage.
@@ -1982,7 +1982,7 @@ fn flush_partition_blobs(
         ));
         if crate::BLOOM_FILTERS.get() {
             spi_exec(&format!(
-                "CREATE TABLE {} (_segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
+                "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _num_hashes SMALLINT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
                 blooms_fqn
             ));
         }
@@ -2049,6 +2049,9 @@ fn flush_partition_blobs(
 
     // Blooms: same approach with per-insert context reset
     if !buf.bloom_buffer.is_empty() {
+        // Sort column-major for sequential TOAST I/O on read
+        buf.bloom_buffer.sort_by_key(|&(col_idx, seg_id, _, _)| (col_idx, seg_id));
+
         let blooms_oid = *buf.blooms_oid_cached.get_or_insert_with(|| resolve_relation_oid(blooms_fqn));
         unsafe {
             let insert_ctx = pg_sys::AllocSetContextCreateInternal(
@@ -2064,17 +2067,19 @@ fn flush_partition_blobs(
             let bistate = pg_sys::GetBulkInsertState();
             let cid = pg_sys::GetCurrentCommandId(true);
 
-            for (seg_id, bloom_data) in buf.bloom_buffer.drain(..) {
+            for (col_idx, seg_id, num_hashes, bloom_data) in buf.bloom_buffer.drain(..) {
                 let old_ctx = pg_sys::MemoryContextSwitchTo(insert_ctx);
 
                 let (bytea_datum, _) = bytea_to_datum(&bloom_data);
                 drop(bloom_data);
 
-                let mut values: [pg_sys::Datum; 2] = [
+                let mut values: [pg_sys::Datum; 4] = [
+                    pg_sys::Datum::from(col_idx as i16),
                     pg_sys::Datum::from(seg_id),
+                    pg_sys::Datum::from(num_hashes as i16),
                     bytea_datum,
                 ];
-                let mut nulls: [bool; 2] = [false, false];
+                let mut nulls: [bool; 4] = [false, false, false, false];
 
                 let tuple = pg_sys::heap_form_tuple(
                     tupdesc,
@@ -2122,7 +2127,7 @@ fn write_compressed_segment(
         ));
         if crate::BLOOM_FILTERS.get() {
             spi_exec(&format!(
-                "CREATE TABLE {} (_segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
+                "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _num_hashes SMALLINT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
                 blooms_fqn
             ));
         }
@@ -2184,8 +2189,8 @@ fn write_compressed_segment(
         buf.blob_buffer_size += blob.len();
         buf.blob_buffer.push((col_idx, cs.seg_id, blob));
     }
-    if !cs.bloom_data.is_empty() {
-        buf.bloom_buffer.push((cs.seg_id, cs.bloom_data));
+    for (col_idx, num_hashes, bytes) in cs.bloom_entries {
+        buf.bloom_buffer.push((col_idx, cs.seg_id, num_hashes, bytes));
     }
 
     // Flush blobs when threshold reached
@@ -2214,7 +2219,7 @@ fn finalize_partition(
     ));
     if buf.blobs_table_created && crate::BLOOM_FILTERS.get() {
         spi_exec(&format!(
-            "ALTER TABLE {} ADD PRIMARY KEY (_segment_id)",
+            "ALTER TABLE {} ADD PRIMARY KEY (_col_idx, _segment_id)",
             blooms_fqn
         ));
     }
@@ -2230,6 +2235,11 @@ fn finalize_partition(
     let partition_id = buf.partition_id;
     let total_compressed_size = buf.total_compressed_size;
     let total_rows = buf.total_rows;
+    let nd_col_names: Vec<String> = columns
+        .iter()
+        .filter(|c| !c.is_segment_by)
+        .map(|c| c.name.clone())
+        .collect();
     Spi::connect_mut(|client| {
         catalog::mark_partition_compressed(
             client,
@@ -2239,6 +2249,13 @@ fn finalize_partition(
             total_rows,
         )
         .expect("failed to update partition catalog");
+        catalog::update_partition_column_ndistinct(
+            client,
+            partition_id,
+            &meta_fqn,
+            &nd_col_names,
+        )
+        .expect("failed to update partition column_ndistinct");
     });
 }
 

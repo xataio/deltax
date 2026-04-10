@@ -81,10 +81,6 @@ impl BloomFilter {
         self.num_hashes
     }
 
-    pub fn size_bytes(&self) -> usize {
-        self.bits.len()
-    }
-
     /// Compute bit positions for a given hash using double hashing.
     #[inline]
     fn bit_positions(&self, hash: u64, out: &mut [usize; 10]) -> usize {
@@ -118,53 +114,6 @@ impl BloomFilter {
         }
         true
     }
-}
-
-/// Packed bloom filters for multiple columns in a single segment.
-///
-/// Wire format (variable-size):
-/// ```text
-/// [col_idx: u16-le, num_hashes: u8, size: u16-le, bloom_data: [u8; size]] * N
-/// ```
-/// Header: 5 bytes per entry.
-const PACKED_HEADER_SIZE: usize = 5; // col_idx(2) + num_hashes(1) + size(2)
-
-/// Serialize a set of (col_idx, bloom_filter) pairs into a packed byte vector.
-pub fn pack_blooms(filters: &[(u16, BloomFilter)]) -> Vec<u8> {
-    let total: usize = filters
-        .iter()
-        .map(|(_, bf)| PACKED_HEADER_SIZE + bf.size_bytes())
-        .sum();
-    let mut buf = Vec::with_capacity(total);
-    for (col_idx, bf) in filters {
-        buf.extend_from_slice(&col_idx.to_le_bytes());
-        buf.push(bf.num_hashes());
-        buf.extend_from_slice(&(bf.size_bytes() as u16).to_le_bytes());
-        buf.extend_from_slice(bf.as_bytes());
-    }
-    buf
-}
-
-/// Look up a specific col_idx in packed bloom data.
-pub fn lookup_packed_bloom(data: &[u8], target_col_idx: u16) -> Option<BloomFilter> {
-    let mut offset = 0;
-    while offset + PACKED_HEADER_SIZE <= data.len() {
-        let col_idx = u16::from_le_bytes([data[offset], data[offset + 1]]);
-        let num_hashes = data[offset + 2];
-        let size = u16::from_le_bytes([data[offset + 3], data[offset + 4]]) as usize;
-        let entry_end = offset + PACKED_HEADER_SIZE + size;
-        if entry_end > data.len() {
-            return None;
-        }
-        if col_idx == target_col_idx {
-            return Some(BloomFilter::from_bytes(
-                &data[offset + PACKED_HEADER_SIZE..entry_end],
-                num_hashes,
-            ));
-        }
-        offset = entry_end;
-    }
-    None
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -244,26 +193,6 @@ mod tests {
         let bf2 = BloomFilter::from_bytes(&bytes, k);
         assert_eq!(bf.bits, bf2.bits);
         assert_eq!(bf.num_hashes, bf2.num_hashes);
-    }
-
-    #[pgrx::pg_test]
-    fn test_packed_bloom_lookup() {
-        let mut bf1 = BloomFilter::for_ndistinct(100);
-        bf1.insert(hash_datum_i64(100));
-        let mut bf2 = BloomFilter::for_ndistinct(5000);
-        bf2.insert(hash_datum_i64(200));
-
-        let packed = pack_blooms(&[(5, bf1), (10, bf2)]);
-
-        let found = lookup_packed_bloom(&packed, 5).unwrap();
-        assert!(found.might_contain(hash_datum_i64(100)));
-        assert!(!found.might_contain(hash_datum_i64(200)));
-
-        let found2 = lookup_packed_bloom(&packed, 10).unwrap();
-        assert!(found2.might_contain(hash_datum_i64(200)));
-        assert!(!found2.might_contain(hash_datum_i64(100)));
-
-        assert!(lookup_packed_bloom(&packed, 99).is_none());
     }
 
     #[pgrx::pg_test]

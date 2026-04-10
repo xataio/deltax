@@ -134,6 +134,8 @@ pub(crate) struct ScanTiming {
     pub(crate) segments_minmax_skipped: u64,
     /// Total segments skipped specifically by bloom filter checks.
     pub(crate) segments_bloom_skipped: u64,
+    /// Per-phase shared-buffer deltas captured during `load_segments_heap`.
+    pub(crate) buf_stats: super::segments::ScanBufferStats,
     /// Total segments where Phase 2 was skipped (no selected rows).
     pub(crate) phase2_skipped: u64,
     /// Top-N effective limit (0 = disabled).
@@ -423,6 +425,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         };
 
         // Load segments from ALL companion tables via heap scan (with lazy pruning)
+        super::segments::reset_scan_buf_stats();
         let t1 = Instant::now();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         let mut total_skipped: u64 = 0;
@@ -440,6 +443,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             total_bloom_skipped += bloom_skipped;
         }
         let heap_scan_us = t1.elapsed().as_micros() as u64;
+        let total_buf_stats = super::segments::take_scan_buf_stats();
 
         let compressed_bytes: u64 = all_segments
             .iter()
@@ -497,6 +501,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
                 segments_skipped: total_skipped,
                 segments_minmax_skipped: total_minmax_skipped,
                 segments_bloom_skipped: total_bloom_skipped,
+                buf_stats: total_buf_stats,
                 phase2_skipped: 0,
                 topn_limit: if topn_limit > 0 { topn_limit as u64 } else { 0 },
                 topn_candidates: 0,
@@ -605,6 +610,7 @@ fn load_decompress_state(
     };
 
     // Phase 2: Direct heap scan for segment data (bypasses SPI overhead)
+    super::segments::reset_scan_buf_stats();
     let t1 = Instant::now();
     let (segments_data, segments_skipped, minmax_skipped, bloom_skipped, _detoast_us) = unsafe {
         load_segments_heap(
@@ -614,6 +620,7 @@ fn load_decompress_state(
         )
     };
     let heap_scan_us = t1.elapsed().as_micros() as u64;
+    let buf_stats = super::segments::take_scan_buf_stats();
 
     let compressed_bytes: u64 = segments_data
         .iter()
@@ -656,6 +663,7 @@ fn load_decompress_state(
             segments_skipped,
             segments_minmax_skipped: minmax_skipped,
             segments_bloom_skipped: bloom_skipped,
+            buf_stats,
             phase2_skipped: 0,
             topn_limit: 0,
             topn_candidates: 0,

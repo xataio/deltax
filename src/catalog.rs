@@ -298,6 +298,60 @@ pub fn mark_partition_compressed(
     Ok(())
 }
 
+/// Compute per-column max ndistinct from the meta table and store the
+/// result as a JSONB map on `deltax_partition.column_ndistinct`. Called
+/// once at the end of compression so that planner-time cost estimation
+/// (see `scan::cost::get_column_ndistinct`) can do a catalog lookup
+/// instead of a cold full-scan of the wide meta table on every fresh
+/// backend.
+pub fn update_partition_column_ndistinct(
+    client: &mut SpiClient,
+    partition_id: i32,
+    meta_fqn: &str,
+    col_names: &[String],
+) -> spi::SpiResult<()> {
+    if col_names.is_empty() {
+        return Ok(());
+    }
+
+    // Build `SELECT MAX("_ndistinct_col1")::int8, MAX("_ndistinct_col2")::int8, ...`
+    let max_exprs: Vec<String> = col_names
+        .iter()
+        .map(|n| format!("MAX(\"_ndistinct_{}\")::int8", n))
+        .collect();
+    let query = format!("SELECT {} FROM {}", max_exprs.join(", "), meta_fqn);
+
+    let result = client.select(&query, None, &[])?;
+    let row = match result.into_iter().next() {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+
+    // Build JSON object string: {"col1": 123, "col2": 456, ...}. Skip
+    // NULLs (columns where every segment had NULL ndistinct, e.g. all-NULL
+    // data); the reader treats missing entries as "unknown".
+    let mut parts: Vec<String> = Vec::with_capacity(col_names.len());
+    for (i, name) in col_names.iter().enumerate() {
+        if let Some(nd) = row
+            .get_datum_by_ordinal(i + 1)
+            .ok()
+            .and_then(|d| d.value::<i64>().ok().flatten())
+        {
+            // Escape quotes/backslashes in column names to produce valid JSON.
+            let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+            parts.push(format!("\"{}\":{}", escaped, nd));
+        }
+    }
+    let json = format!("{{{}}}", parts.join(","));
+
+    client.update(
+        "UPDATE deltax_partition SET column_ndistinct = $1::jsonb WHERE id = $2",
+        None,
+        &[json.into(), partition_id.into()],
+    )?;
+    Ok(())
+}
+
 /// Mark a partition as decompressed.
 pub fn mark_partition_decompressed(
     client: &mut SpiClient,

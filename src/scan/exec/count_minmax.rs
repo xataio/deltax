@@ -5,7 +5,7 @@ use pgrx::pg_guard;
 use std::time::Instant;
 
 use super::{DELTAX_COUNT_EXEC_METHODS, DELTAX_MINMAX_EXEC_METHODS};
-use super::segments::{load_metadata, load_segments_heap};
+use super::segments::{load_metadata, load_segments_heap, ScanBufferStats};
 use super::datum_utils::compare_datums;
 
 /// State for DeltaXCount (COUNT(*) pushdown).
@@ -15,6 +15,7 @@ pub(crate) struct CountScanState {
     pub(crate) metadata_us: u64,
     pub(crate) heap_scan_us: u64,
     pub(crate) total_segments: u64,
+    pub(crate) buf_stats: ScanBufferStats,
 }
 
 /// Result for one MIN/MAX aggregate in a multi-aggregate pushdown.
@@ -34,6 +35,7 @@ pub(crate) struct MinMaxScanState {
     pub(crate) metadata_us: u64,
     pub(crate) heap_scan_us: u64,
     pub(crate) total_segments: u64,
+    pub(crate) buf_stats: ScanBufferStats,
 }
 
 /// CreateCustomScanState callback for DeltaXCount.
@@ -123,6 +125,7 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
                 metadata_us,
                 heap_scan_us: 0,
                 total_segments,
+                buf_stats: ScanBufferStats::default(),
             }
         } else {
             // Fallback path: scan meta tables to sum per-segment row counts.
@@ -146,6 +149,7 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
             let num_cols = meta.col_names.len();
             let needed_cols = vec![false; num_cols];
 
+            super::segments::reset_scan_buf_stats();
             let t1 = Instant::now();
             let mut total_count: i64 = 0;
             let mut total_segments: u64 = 0;
@@ -170,6 +174,7 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
                 total_segments += segs.len() as u64;
             }
             let heap_scan_us = t1.elapsed().as_micros() as u64;
+            let buf_stats = super::segments::take_scan_buf_stats();
 
             CountScanState {
                 total_count,
@@ -177,6 +182,7 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
                 metadata_us,
                 heap_scan_us,
                 total_segments,
+                buf_stats,
             }
         };
 
@@ -361,6 +367,7 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
         let needed_cols = vec![false; num_cols];
 
         // Load segments from all companion tables and find global min/max per aggregate
+        super::segments::reset_scan_buf_stats();
         let t1 = Instant::now();
         let mut results: Vec<MinMaxResult> = agg_specs
             .iter()
@@ -425,6 +432,7 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
             total_segments += segs.len() as u64;
         }
         let heap_scan_us = t1.elapsed().as_micros() as u64;
+        let buf_stats = super::segments::take_scan_buf_stats();
 
         let state = MinMaxScanState {
             results,
@@ -432,6 +440,7 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
             metadata_us,
             heap_scan_us,
             total_segments,
+            buf_stats,
         };
 
         let state_box = Box::new(state);
