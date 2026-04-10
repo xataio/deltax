@@ -1,5 +1,27 @@
 use pgrx::pg_sys;
 use pgrx::prelude::*;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+thread_local! {
+    /// Cache of companion_oid → (row_count, segment_count) from deltax_partition.
+    /// Only populated on successful lookups; misses are not cached because
+    /// companion lookups can race with partition creation.
+    static PARTITION_STATS_CACHE: RefCell<HashMap<pg_sys::Oid, (i64, i64)>> =
+        RefCell::new(HashMap::new());
+
+    /// Cache of companion_oid → per-column ndistinct counts from companion table.
+    /// An empty map is a valid cached value (stable schema shape with no
+    /// `_ndistinct_*` columns).
+    static NDISTINCT_CACHE: RefCell<HashMap<pg_sys::Oid, HashMap<String, i64>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Clear all cost-related caches. Called from `hook::invalidate_compressed_cache`.
+pub(super) fn invalidate_caches() {
+    PARTITION_STATS_CACHE.with(|cache| cache.borrow_mut().clear());
+    NDISTINCT_CACHE.with(|cache| cache.borrow_mut().clear());
+}
 
 /// Estimate the cost and row count for scanning a compressed partition.
 /// Returns (startup_cost, total_cost, estimated_rows).
@@ -29,6 +51,12 @@ pub unsafe fn estimate_cost(companion_oid: pg_sys::Oid) -> (f64, f64, f64) {
 
 /// Get partition stats from deltax_partition catalog.
 fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
+    if let Some(cached) =
+        PARTITION_STATS_CACHE.with(|cache| cache.borrow().get(&companion_oid).copied())
+    {
+        return cached;
+    }
+
     let name = unsafe {
         let name_ptr = pg_sys::get_rel_name(companion_oid);
         if name_ptr.is_null() {
@@ -49,8 +77,12 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
     match result {
         Ok(Some(row_count)) => {
             let segments = (row_count / 100_000).max(1);
-            (row_count, segments)
+            let stats = (row_count, segments);
+            PARTITION_STATS_CACHE
+                .with(|cache| cache.borrow_mut().insert(companion_oid, stats));
+            stats
         }
+        // Do not cache misses: companion lookups can race with partition creation.
         _ => (0, 0),
     }
 }
@@ -84,6 +116,12 @@ pub(super) fn get_row_count(companion_oid: pg_sys::Oid) -> Option<i64> {
 /// Reads MAX(_ndistinct_col) for each _ndistinct_* column in the companion relation.
 /// Returns a map from column name to ndistinct count, or empty if unavailable.
 pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collections::HashMap<String, i64> {
+    if let Some(cached) =
+        NDISTINCT_CACHE.with(|cache| cache.borrow().get(&companion_oid).cloned())
+    {
+        return cached;
+    }
+
     let (nd_columns, companion_name) = unsafe {
         // Open companion table to inspect tuple descriptor for _ndistinct_* columns
         let rel = pg_sys::table_open(companion_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
@@ -107,7 +145,11 @@ pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collectio
         pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
 
         if cols.is_empty() {
-            return std::collections::HashMap::new();
+            // Stable schema shape — safe to cache the empty result.
+            let empty = std::collections::HashMap::new();
+            NDISTINCT_CACHE
+                .with(|cache| cache.borrow_mut().insert(companion_oid, empty.clone()));
+            return empty;
         }
 
         let name_ptr = pg_sys::get_rel_name(companion_oid);
@@ -149,6 +191,8 @@ pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collectio
         Ok::<(), spi::Error>(())
     });
 
+    NDISTINCT_CACHE
+        .with(|cache| cache.borrow_mut().insert(companion_oid, result_map.clone()));
     result_map
 }
 
