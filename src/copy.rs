@@ -1439,6 +1439,7 @@ struct CompressedSegment {
 
 /// Sort, compress, and prepare metadata for a segment (pure Rust, no PG calls).
 /// Returns a CompressedSegment ready for heap_insert by the main thread.
+#[allow(clippy::too_many_arguments)]
 fn compress_segment(
     mut typed_cols: Vec<TypedColumn>,
     row_count: usize,
