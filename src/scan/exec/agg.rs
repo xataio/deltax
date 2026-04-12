@@ -10,6 +10,7 @@ use std::time::Instant;
 use regex::Regex;
 
 use crate::compression;
+use crate::compress::{decode_i64_to_f64, decode_i64_to_f32};
 use super::super::SyncStatic;
 use super::batch_qual::{BatchCompareOp, BatchQual,
     extract_batch_quals, evaluate_batch_quals,
@@ -45,6 +46,23 @@ fn hash128_str(data: &[u8]) -> u128 {
     h2.write(data);
     let hi = h2.finish();
     (hi as u128) << 64 | lo as u128
+}
+
+/// Decode a colstats-encoded i64 to the PG-native i64 representation.
+///
+/// For timestamps, converts Unix-epoch usec → PG-epoch usec.
+/// For dates, converts Unix-epoch usec → PG-epoch days.
+/// For plain integers, identity.
+fn decode_encoded_to_pg_i64(encoded: i64, type_oid: pg_sys::Oid) -> i64 {
+    match type_oid {
+        pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {
+            encoded - crate::compress::PG_EPOCH_OFFSET_USEC
+        }
+        pg_sys::DATEOID => {
+            (encoded / 86_400_000_000) - crate::compress::PG_EPOCH_OFFSET_DAYS
+        }
+        _ => encoded,
+    }
 }
 
 // ============================================================================
@@ -1144,7 +1162,27 @@ fn accumulate_segment_metadata(
                             }
                         }
                         AggAccumulator::SumFloat { sum, count } => {
-                            let f = f64::from_bits(cs.sum_datum.value() as u64);
+                            let f = if cs.type_oid == pg_sys::NUMERICOID {
+                                // Normalized colstats stores all sums as NUMERIC
+                                let s = unsafe {
+                                    let cstr = pg_sys::OidOutputFunctionCall(
+                                        pg_sys::Oid::from(1702u32), // numeric_out
+                                        cs.sum_datum,
+                                    );
+                                    let s = std::ffi::CStr::from_ptr(cstr)
+                                        .to_string_lossy()
+                                        .into_owned();
+                                    pg_sys::pfree(cstr as *mut _);
+                                    s
+                                };
+                                match s.parse::<f64>() {
+                                    Ok(v) => v,
+                                    Err(_) => continue,
+                                }
+                            } else {
+                                // Legacy wide meta table: sum stored as FLOAT8
+                                f64::from_bits(cs.sum_datum.value() as u64)
+                            };
                             *sum += f + add_const as f64 * cs.nonnull_count as f64;
                             *count += cs.nonnull_count;
                         }
@@ -1158,11 +1196,16 @@ fn accumulate_segment_metadata(
                     if cm.min_null { continue; }
                     match &mut accumulators[i] {
                         AggAccumulator::MinInt { val } => {
-                            let v = cm.min_datum.value() as i64;
+                            // Convert from colstats encoding to PG-native datum domain
+                            let v = decode_encoded_to_pg_i64(cm.min_encoded, cm.type_oid);
                             *val = Some(val.map_or(v, |cur| cur.min(v)));
                         }
                         AggAccumulator::MinFloat { val } => {
-                            let v = f64::from_bits(cm.min_datum.value() as u64);
+                            let v = if cm.type_oid == pg_sys::FLOAT4OID {
+                                decode_i64_to_f32(cm.min_encoded) as f64
+                            } else {
+                                decode_i64_to_f64(cm.min_encoded)
+                            };
                             *val = Some(val.map_or(v, |cur| if v < cur { v } else { cur }));
                         }
                         _ => {}
@@ -1175,11 +1218,16 @@ fn accumulate_segment_metadata(
                     if cm.max_null { continue; }
                     match &mut accumulators[i] {
                         AggAccumulator::MaxInt { val } => {
-                            let v = cm.max_datum.value() as i64;
+                            // Convert from colstats encoding to PG-native datum domain
+                            let v = decode_encoded_to_pg_i64(cm.max_encoded, cm.type_oid);
                             *val = Some(val.map_or(v, |cur| cur.max(v)));
                         }
                         AggAccumulator::MaxFloat { val } => {
-                            let v = f64::from_bits(cm.max_datum.value() as u64);
+                            let v = if cm.type_oid == pg_sys::FLOAT4OID {
+                                decode_i64_to_f32(cm.max_encoded) as f64
+                            } else {
+                                decode_i64_to_f64(cm.max_encoded)
+                            };
                             *val = Some(val.map_or(v, |cur| if v > cur { v } else { cur }));
                         }
                         _ => {}
@@ -1429,6 +1477,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     oid, &meta.col_names, &meta.segment_by, &no_blobs,
                     &meta.time_column, load_minmax, &seg_filters, time_min, time_max, None,
                     &fast_batch_quals, load_sums,
+                    &meta.col_types,
                 );
                 all_segments.extend(segs);
             }
@@ -1559,6 +1608,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 &meta.time_column, false, &seg_filters, time_min, time_max,
                 if use_lazy { Some(&lazy_cols) } else { None },
                 &batch_quals, false,
+                &meta.col_types,
             );
             all_segments.extend(segs);
             total_detoast_us += dt_us;
@@ -8788,16 +8838,16 @@ mod tests {
         let plan = make_plan(vec![make_agg_spec(AggType::Min, 1, 20)], Vec::new(), Vec::new(), true); // INT8OID=20
         let mut seg1 = make_empty_segment(100);
         seg1.col_minmax.insert("value".to_string(), ColMinMax {
-            min_datum: pg_sys::Datum::from(50i64 as usize),
-            max_datum: pg_sys::Datum::from(200i64 as usize),
+            min_encoded: 50i64,
+            max_encoded: 200i64,
             min_null: false,
             max_null: false,
             type_oid: pg_sys::Oid::from(20u32),
         });
         let mut seg2 = make_empty_segment(100);
         seg2.col_minmax.insert("value".to_string(), ColMinMax {
-            min_datum: pg_sys::Datum::from(10i64 as usize),
-            max_datum: pg_sys::Datum::from(300i64 as usize),
+            min_encoded: 10i64,
+            max_encoded: 300i64,
             min_null: false,
             max_null: false,
             type_oid: pg_sys::Oid::from(20u32),
@@ -8813,16 +8863,16 @@ mod tests {
         let plan = make_plan(vec![make_agg_spec(AggType::Max, 1, 20)], Vec::new(), Vec::new(), true);
         let mut seg1 = make_empty_segment(100);
         seg1.col_minmax.insert("value".to_string(), ColMinMax {
-            min_datum: pg_sys::Datum::from(10i64 as usize),
-            max_datum: pg_sys::Datum::from(200i64 as usize),
+            min_encoded: 10i64,
+            max_encoded: 200i64,
             min_null: false,
             max_null: false,
             type_oid: pg_sys::Oid::from(20u32),
         });
         let mut seg2 = make_empty_segment(100);
         seg2.col_minmax.insert("value".to_string(), ColMinMax {
-            min_datum: pg_sys::Datum::from(5i64 as usize),
-            max_datum: pg_sys::Datum::from(999i64 as usize),
+            min_encoded: 5i64,
+            max_encoded: 999i64,
             min_null: false,
             max_null: false,
             type_oid: pg_sys::Oid::from(20u32),
@@ -8838,16 +8888,16 @@ mod tests {
         let plan = make_plan(vec![make_agg_spec(AggType::Min, 1, 20)], Vec::new(), Vec::new(), true);
         let mut seg1 = make_empty_segment(100);
         seg1.col_minmax.insert("value".to_string(), ColMinMax {
-            min_datum: pg_sys::Datum::from(0usize),
-            max_datum: pg_sys::Datum::from(0usize),
+            min_encoded: 0i64,
+            max_encoded: 0i64,
             min_null: true,  // all nulls in this segment
             max_null: true,
             type_oid: pg_sys::Oid::from(20u32),
         });
         let mut seg2 = make_empty_segment(100);
         seg2.col_minmax.insert("value".to_string(), ColMinMax {
-            min_datum: pg_sys::Datum::from(77i64 as usize),
-            max_datum: pg_sys::Datum::from(77i64 as usize),
+            min_encoded: 77i64,
+            max_encoded: 77i64,
             min_null: false,
             max_null: false,
             type_oid: pg_sys::Oid::from(20u32),

@@ -664,6 +664,18 @@ fn apply_permutation<T: Clone>(v: &mut Vec<T>, perm: &[usize]) {
     *v = reordered;
 }
 
+/// A single row for the normalized colstats table.
+pub(crate) struct ColstatsRow {
+    pub(crate) col_idx: i16,
+    pub(crate) segment_id: i32,
+    pub(crate) min_val: Option<i64>,
+    pub(crate) max_val: Option<i64>,
+    pub(crate) sum_val: Option<String>,  // NUMERIC as string
+    pub(crate) nonnull_count: i32,
+    pub(crate) nonzero_count: i32,
+    pub(crate) ndistinct: i64,
+}
+
 /// Return type for flush_segment_metadata: (compressed_size, column blobs, per-column bloom entries).
 /// Each bloom entry is (col_idx, num_hashes, bloom_bytes).
 pub(crate) type FlushResult = (i64, Vec<(u16, Vec<u8>)>, Vec<(u16, u8, Vec<u8>)>);
@@ -764,75 +776,51 @@ pub(crate) fn flush_segment_metadata(
         .update(&meta_sql, None, &[])
         .expect("failed to insert segment metadata");
 
-    // Build INSERT for colstats table: non-time min/max, sum/count, ndistinct
-    let mut cs_cols = Vec::new();
-    let mut cs_vals = Vec::new();
-
-    cs_cols.push("_segment_id".to_string());
-    cs_vals.push(segment_id.to_string());
-
-    // Min/max for non-time orderable columns
-    for col in columns {
-        if !col.is_segment_by && !col.is_time_column && supports_minmax(&col.data_type) {
-            cs_cols.push(format!("\"_min_{}\"", col.name));
-            cs_cols.push(format!("\"_max_{}\"", col.name));
-            match col_minmax.get(&col.name) {
-                Some((Some(min_val), Some(max_val))) => {
-                    cs_vals.push(format_minmax_for_insert(min_val, &col.data_type));
-                    cs_vals.push(format_minmax_for_insert(max_val, &col.data_type));
-                }
-                _ => {
-                    cs_vals.push("NULL".to_string());
-                    cs_vals.push("NULL".to_string());
-                }
-            }
-        }
-    }
-
-    // Sum, non-null count, nonzero count
-    for col in columns {
-        if !col.is_segment_by && supports_sum(&col.data_type) {
-            cs_cols.push(format!("\"_sum_{}\"", col.name));
-            cs_cols.push(format!("\"_nonnull_count_{}\"", col.name));
-            cs_cols.push(format!("\"_nonzero_count_{}\"", col.name));
-            match col_sums.get(&col.name) {
-                Some((Some(sum_val), nonnull_count, nonzero_count)) => {
-                    cs_vals.push(sum_val.clone());
-                    cs_vals.push(nonnull_count.to_string());
-                    cs_vals.push(nonzero_count.to_string());
-                }
-                _ => {
-                    cs_vals.push("NULL".to_string());
-                    cs_vals.push("0".to_string());
-                    cs_vals.push("0".to_string());
-                }
-            }
-        }
-    }
-
-    // Ndistinct for all non-segment-by columns
+    // Build normalized colstats rows: one per non-segment-by column
+    let mut cs_rows: Vec<String> = Vec::new();
+    let mut col_idx_counter: i16 = 0;
     let mut nd_idx = 0;
-    for col in columns {
-        if !col.is_segment_by {
-            cs_cols.push(format!("\"_ndistinct_{}\"", col.name));
-            if nd_idx < ndistinct_values.len() {
-                cs_vals.push(ndistinct_values[nd_idx].to_string());
-            } else {
-                cs_vals.push("0".to_string());
-            }
-            nd_idx += 1;
+    for (i, col) in columns.iter().enumerate() {
+        if col.is_segment_by {
+            continue;
         }
+        let (min_enc, max_enc) = compute_minmax_encoded_i64(&typed_cols[i], &col.data_type);
+        let min_str = min_enc.map_or("NULL".to_string(), |v| v.to_string());
+        let max_str = max_enc.map_or("NULL".to_string(), |v| v.to_string());
+
+        let (sum_str, nonnull, nonzero) = if supports_sum(&col.data_type) {
+            let (s, nn, nz) = col_sums.get(&col.name)
+                .cloned()
+                .unwrap_or((None, 0, 0));
+            (s.unwrap_or_else(|| "NULL".to_string()), nn, nz)
+        } else {
+            ("NULL".to_string(), 0, 0)
+        };
+
+        let nd = if nd_idx < ndistinct_values.len() {
+            ndistinct_values[nd_idx]
+        } else {
+            0
+        };
+        nd_idx += 1;
+
+        cs_rows.push(format!(
+            "({}, {}, {}, {}, {}, {}, {}, {})",
+            col_idx_counter, segment_id, min_str, max_str, sum_str, nonnull, nonzero, nd
+        ));
+        col_idx_counter += 1;
     }
 
-    let cs_sql = format!(
-        "INSERT INTO {} ({}) VALUES ({})",
-        colstats_fqn,
-        cs_cols.join(", "),
-        cs_vals.join(", ")
-    );
-    client
-        .update(&cs_sql, None, &[])
-        .expect("failed to insert segment colstats");
+    if !cs_rows.is_empty() {
+        let cs_sql = format!(
+            "INSERT INTO {} (_col_idx, _segment_id, _min, _max, _sum, _nonnull_count, _nonzero_count, _ndistinct) VALUES {}",
+            colstats_fqn,
+            cs_rows.join(", ")
+        );
+        client
+            .update(&cs_sql, None, &[])
+            .expect("failed to insert segment colstats");
+    }
 
     // Compute per-column bloom filters (if enabled via GUC) — stored separately
     let bloom_entries = if crate::BLOOM_FILTERS.get() {
@@ -1074,40 +1062,19 @@ pub(crate) fn build_companion_ddl(
         meta_cols.join(", ")
     );
 
-    // Colstats table: all per-column stats for non-time columns
-    let mut colstats_cols = Vec::new();
-    colstats_cols.push("_segment_id INT PRIMARY KEY".to_string());
-    // Min/max for non-time orderable columns
-    for col in columns {
-        if !col.is_segment_by && !col.is_time_column && supports_minmax(&col.data_type) {
-            colstats_cols.push(format!("\"_min_{}\" {}", col.name, col.data_type));
-            colstats_cols.push(format!("\"_max_{}\" {}", col.name, col.data_type));
-        }
-    }
-    // Sum/count for numeric columns (including time if numeric, which it isn't typically)
-    for col in columns {
-        if !col.is_segment_by && supports_sum(&col.data_type) {
-            let sum_type = if is_float_type(&col.data_type) {
-                "DOUBLE PRECISION"
-            } else {
-                "NUMERIC"
-            };
-            colstats_cols.push(format!("\"_sum_{}\" {}", col.name, sum_type));
-            colstats_cols.push(format!("\"_nonnull_count_{}\" INT", col.name));
-            colstats_cols.push(format!("\"_nonzero_count_{}\" INT", col.name));
-        }
-    }
-    // Ndistinct for all non-segment-by columns
-    for col in columns {
-        if !col.is_segment_by {
-            colstats_cols.push(format!("\"_ndistinct_{}\" INT", col.name));
-        }
-    }
-
+    // Normalized colstats table: fixed 8-column schema
     let colstats_ddl = format!(
-        "CREATE TABLE {} ({})",
-        colstats_fqn,
-        colstats_cols.join(", ")
+        "CREATE TABLE {} (\
+         _col_idx SMALLINT NOT NULL, \
+         _segment_id INT NOT NULL, \
+         _min INT8, \
+         _max INT8, \
+         _sum NUMERIC, \
+         _nonnull_count INT, \
+         _nonzero_count INT, \
+         _ndistinct INT, \
+         PRIMARY KEY (_col_idx, _segment_id))",
+        colstats_fqn
     );
 
     // STORAGE EXTERNAL: skip TOAST pglz compression on _data — blobs are already zstd-compressed.
@@ -1514,6 +1481,94 @@ pub(crate) fn compress_typed_column(data: &TypedColumn, data_type: &str) -> Vec<
             // Delegate to existing string-based compression
             compress_column_values(values, data_type, "")
         }
+    }
+}
+
+/// Encode f64 to i64 in an order-preserving way.
+/// Positive floats map to positive i64s, negatives to negative i64s, preserving order.
+pub(crate) fn encode_f64_to_i64(v: f64) -> i64 {
+    let bits = v.to_bits() as i64;
+    if bits >= 0 { bits ^ i64::MIN } else { !bits }
+}
+
+/// Decode order-preserving i64 back to f64.
+pub(crate) fn decode_i64_to_f64(enc: i64) -> f64 {
+    let bits = if enc >= 0 { !enc } else { enc ^ i64::MIN };
+    f64::from_bits(bits as u64)
+}
+
+/// Encode f32 to i64 in an order-preserving way (via 32-bit transform, then sign-extend).
+pub(crate) fn encode_f32_to_i64(v: f32) -> i64 {
+    let bits = v.to_bits() as i32;
+    let i32_enc = if bits >= 0 { bits ^ i32::MIN } else { !bits };
+    i32_enc as i64
+}
+
+/// Decode order-preserving i64 back to f32.
+pub(crate) fn decode_i64_to_f32(enc: i64) -> f32 {
+    let i32_enc = enc as i32;
+    let bits = if i32_enc >= 0 { !i32_enc } else { i32_enc ^ i32::MIN };
+    f32::from_bits(bits as u32)
+}
+
+/// Compute min/max encoded as order-preserving i64, for use in normalized colstats table.
+/// Returns None for types without minmax support.
+pub(crate) fn compute_minmax_encoded_i64(data: &TypedColumn, data_type: &str) -> (Option<i64>, Option<i64>) {
+    if !supports_minmax(data_type) {
+        return (None, None);
+    }
+    match data {
+        TypedColumn::Int16(values) => {
+            let mut min_v: Option<i64> = None;
+            let mut max_v: Option<i64> = None;
+            for v in values.iter().flatten() {
+                let v64 = *v as i64;
+                min_v = Some(min_v.map_or(v64, |cur| cur.min(v64)));
+                max_v = Some(max_v.map_or(v64, |cur| cur.max(v64)));
+            }
+            (min_v, max_v)
+        }
+        TypedColumn::Int32(values) => {
+            let mut min_v: Option<i64> = None;
+            let mut max_v: Option<i64> = None;
+            for v in values.iter().flatten() {
+                let v64 = *v as i64;
+                min_v = Some(min_v.map_or(v64, |cur| cur.min(v64)));
+                max_v = Some(max_v.map_or(v64, |cur| cur.max(v64)));
+            }
+            (min_v, max_v)
+        }
+        TypedColumn::Int64(values) => {
+            // For int64, timestamp, timestamptz, date — identity (already i64)
+            let mut min_v: Option<i64> = None;
+            let mut max_v: Option<i64> = None;
+            for v in values.iter().flatten() {
+                min_v = Some(min_v.map_or(*v, |cur| cur.min(*v)));
+                max_v = Some(max_v.map_or(*v, |cur| cur.max(*v)));
+            }
+            (min_v, max_v)
+        }
+        TypedColumn::Float64(values) => {
+            let mut min_v: Option<i64> = None;
+            let mut max_v: Option<i64> = None;
+            for v in values.iter().flatten() {
+                let enc = encode_f64_to_i64(*v);
+                min_v = Some(min_v.map_or(enc, |cur| cur.min(enc)));
+                max_v = Some(max_v.map_or(enc, |cur| cur.max(enc)));
+            }
+            (min_v, max_v)
+        }
+        TypedColumn::Float32(values) => {
+            let mut min_v: Option<i64> = None;
+            let mut max_v: Option<i64> = None;
+            for v in values.iter().flatten() {
+                let enc = encode_f32_to_i64(*v);
+                min_v = Some(min_v.map_or(enc, |cur| cur.min(enc)));
+                max_v = Some(max_v.map_or(enc, |cur| cur.max(enc)));
+            }
+            (min_v, max_v)
+        }
+        _ => (None, None), // Text, Bool — no minmax
     }
 }
 

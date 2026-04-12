@@ -1149,7 +1149,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 let rte = *(*root).simple_rte_array.add(varno);
                 let relid = (*rte).relid;
 
-                // Verify the companion table has _min_{colname}
+                // Verify the companion table has _min_{colname} (time column in meta)
                 let col_name_ptr = pg_sys::get_attname(relid, varattno, true);
                 if col_name_ptr.is_null() {
                     return;
@@ -1160,7 +1160,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 let min_col_cname = std::ffi::CString::new(format!("_min_{}", col_name)).unwrap();
                 let attnum = pg_sys::get_attnum(companion_oids[0], min_col_cname.as_ptr());
                 if attnum == pg_sys::InvalidAttrNumber as i16 {
-                    // Check colstats table (non-time columns have min/max there)
+                    // Not in meta — check if normalized colstats table exists
                     let meta_name_ptr = pg_sys::get_rel_name(companion_oids[0]);
                     let meta_ns_oid = pg_sys::get_rel_namespace(companion_oids[0]);
                     let meta_name = std::ffi::CStr::from_ptr(meta_name_ptr).to_string_lossy();
@@ -1171,8 +1171,13 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     if colstats_oid == pg_sys::InvalidOid {
                         return;
                     }
-                    let cs_attnum = pg_sys::get_attnum(colstats_oid, min_col_cname.as_ptr());
-                    if cs_attnum == pg_sys::InvalidAttrNumber as i16 {
+                    // Normalized colstats only stores encoded i64 min/max — only orderable types
+                    let col_type_oid = pg_sys::get_atttype(relid, varattno);
+                    if !matches!(col_type_oid,
+                        pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+                        | pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
+                        | pg_sys::DATEOID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID)
+                    {
                         return;
                     }
                 }

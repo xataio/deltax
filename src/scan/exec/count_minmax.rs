@@ -7,6 +7,7 @@ use std::time::Instant;
 use super::{DELTAX_COUNT_EXEC_METHODS, DELTAX_MINMAX_EXEC_METHODS};
 use super::segments::{load_metadata, load_segments_heap, ScanBufferStats};
 use super::datum_utils::compare_datums;
+use crate::compress::{decode_i64_to_f64, decode_i64_to_f32};
 
 /// State for DeltaXCount (COUNT(*) pushdown).
 pub(crate) struct CountScanState {
@@ -167,6 +168,7 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
                     None,
                     &[],
                     false,
+                    &meta.col_types,
                 );
                 for seg in &segs {
                     total_count += seg.row_count as i64;
@@ -396,11 +398,12 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                 None,
                 &[],
                 false,
+                &meta.col_types,
             );
             for seg in &segs {
                 for (agg_idx, result) in results.iter_mut().enumerate() {
                     if let Some(cm) = seg.col_minmax.get(&agg_col_names[agg_idx]) {
-                        let seg_datum = if result.is_min { cm.min_datum } else { cm.max_datum };
+                        let seg_encoded = if result.is_min { cm.min_encoded } else { cm.max_encoded };
                         let seg_null = if result.is_min { cm.min_null } else { cm.max_null };
 
                         if seg_null {
@@ -411,6 +414,9 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                         if result.type_oid == pg_sys::InvalidOid {
                             result.type_oid = cm.type_oid;
                         }
+
+                        // Decode encoded i64 back to native Datum
+                        let seg_datum = decode_encoded_to_datum(seg_encoded, cm.type_oid);
 
                         if result.is_null {
                             result.datum = seg_datum;
@@ -511,5 +517,34 @@ pub(super) unsafe extern "C-unwind" fn rescan_minmax_scan(
     unsafe {
         let state = &mut *((*node).custom_ps as *mut MinMaxScanState);
         state.returned = false;
+    }
+}
+
+/// Decode an order-preserving i64 back to a native pg_sys::Datum for the given type OID.
+///
+/// Timestamps and dates are stored as Unix-epoch microseconds in the colstats table,
+/// but PG expects PG-epoch microseconds for timestamps and PG-epoch days for dates.
+fn decode_encoded_to_datum(encoded: i64, type_oid: pg_sys::Oid) -> pg_sys::Datum {
+    match type_oid {
+        pg_sys::FLOAT4OID => {
+            let f = decode_i64_to_f32(encoded);
+            pg_sys::Datum::from(f.to_bits() as usize)
+        }
+        pg_sys::FLOAT8OID => {
+            let f = decode_i64_to_f64(encoded);
+            pg_sys::Datum::from(f.to_bits() as usize)
+        }
+        pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {
+            // Convert Unix-epoch usec → PG-epoch usec
+            let pg_usec = encoded - crate::compress::PG_EPOCH_OFFSET_USEC;
+            pg_sys::Datum::from(pg_usec as usize)
+        }
+        pg_sys::DATEOID => {
+            // Convert Unix-epoch usec → PG-epoch days
+            let pg_days = (encoded / 86_400_000_000) - crate::compress::PG_EPOCH_OFFSET_DAYS;
+            pg_sys::Datum::from(pg_days as i32 as usize)
+        }
+        // INT2, INT4, INT8: identity encoding
+        _ => pg_sys::Datum::from(encoded as usize),
     }
 }

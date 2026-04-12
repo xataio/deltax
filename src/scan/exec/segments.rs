@@ -3,6 +3,7 @@ use pgrx::pg_sys;
 use std::collections::HashMap;
 
 use crate::compression;
+use crate::compress::{encode_f64_to_i64, encode_f32_to_i64};
 use super::batch_qual::{BatchQual, BatchCompareOp, LikeStrategy, sql_like_match};
 use super::datum_utils::{pg_type_oid, tupdesc_get_attr};
 
@@ -11,90 +12,75 @@ use super::datum_utils::{pg_type_oid, tupdesc_get_attr};
 #[derive(Clone, Copy, PartialEq)]
 enum DictCheck { Eq, Ne, Like, NotLike }
 
-/// Filter for pruning segments based on min/max metadata in the companion table.
+/// Filter for pruning segments based on min/max metadata in the normalized colstats table.
 /// Built from batch quals with orderable types (int, float, timestamp, date).
 pub(super) struct MinMaxFilter {
-    pub(super) min_attno: usize,          // attno of _min_{col} in companion tuple
-    pub(super) max_attno: usize,          // attno of _max_{col} in companion tuple
+    pub(super) col_idx: i16,              // _col_idx in normalized colstats
     pub(super) op: BatchCompareOp,        // Eq, Lt, Le, Gt, Ge, InList
-    pub(super) const_datum: pg_sys::Datum,
-    pub(super) type_oid: pg_sys::Oid,
-    pub(super) in_list_i64: Option<Vec<i64>>, // for InList op
+    pub(super) const_i64: i64,            // pre-encoded constant
+    pub(super) in_list_i64: Option<Vec<i64>>,
 }
 
-/// Check whether a segment might contain rows matching the filter.
+/// Check whether a segment might contain rows matching the filter using encoded i64 min/max.
 /// Returns `true` if the segment should be kept (may match), `false` if it can be skipped.
 pub(super) fn segment_passes_minmax_filter(
     f: &MinMaxFilter,
-    values: &[pg_sys::Datum],
-    nulls: &[bool],
+    seg_min: i64,
+    seg_max: i64,
 ) -> bool {
-    // If either min or max is null, we can't prove anything — keep the segment
-    if nulls[f.min_attno] || nulls[f.max_attno] {
-        return true;
-    }
-
-    let seg_min_datum = values[f.min_attno];
-    let seg_max_datum = values[f.max_attno];
-
-    // Extract values based on type
-    match f.type_oid {
-        pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
-        | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID | pg_sys::DATEOID => {
-            let seg_min = seg_min_datum.value() as i64;
-            let seg_max = seg_max_datum.value() as i64;
-            match f.op {
-                BatchCompareOp::InList => {
-                    // Skip segment if NO value in the list falls within [seg_min, seg_max]
-                    if let Some(ref values) = f.in_list_i64 {
-                        values.iter().any(|&v| v >= seg_min && v <= seg_max)
-                    } else {
-                        true
-                    }
-                }
-                _ => {
-                    let c = f.const_datum.value() as i64;
-                    match f.op {
-                        BatchCompareOp::Eq => seg_min <= c && seg_max >= c,
-                        BatchCompareOp::Ne => !(seg_min == c && seg_max == c),
-                        BatchCompareOp::Lt => seg_min < c,
-                        BatchCompareOp::Le => seg_min <= c,
-                        BatchCompareOp::Gt => seg_max > c,
-                        BatchCompareOp::Ge => seg_max >= c,
-                        _ => true, // Like, NotLike — can't prune
-                    }
-                }
+    match f.op {
+        BatchCompareOp::InList => {
+            if let Some(ref values) = f.in_list_i64 {
+                values.iter().any(|&v| v >= seg_min && v <= seg_max)
+            } else {
+                true
             }
+        }
+        _ => {
+            let c = f.const_i64;
+            match f.op {
+                BatchCompareOp::Eq => seg_min <= c && seg_max >= c,
+                BatchCompareOp::Ne => !(seg_min == c && seg_max == c),
+                BatchCompareOp::Lt => seg_min < c,
+                BatchCompareOp::Le => seg_min <= c,
+                BatchCompareOp::Gt => seg_max > c,
+                BatchCompareOp::Ge => seg_max >= c,
+                _ => true, // Like, NotLike — can't prune
+            }
+        }
+    }
+}
+
+/// Encode a pg_sys::Datum to i64 for the given type OID, matching the order-preserving
+/// encoding used in the colstats table.
+///
+/// Timestamps and dates are stored in the colstats table as Unix-epoch microseconds
+/// (matching the internal TypedColumn representation), so we must convert from PG's
+/// native representation (PG-epoch) when encoding filter constants.
+fn encode_datum_to_i64(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> Option<i64> {
+    match type_oid {
+        pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID => {
+            Some(datum.value() as i64)
+        }
+        pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {
+            // PG stores as PG-epoch microseconds; colstats stores as Unix-epoch microseconds
+            let pg_epoch_usec = datum.value() as i64;
+            Some(pg_epoch_usec + crate::compress::PG_EPOCH_OFFSET_USEC)
+        }
+        pg_sys::DATEOID => {
+            // PG stores as PG-epoch days (int32); colstats stores as Unix-epoch microseconds
+            let pg_epoch_days = datum.value() as i32 as i64;
+            Some((pg_epoch_days + crate::compress::PG_EPOCH_OFFSET_DAYS) * 86_400_000_000)
         }
         pg_sys::FLOAT4OID => {
-            let seg_min = f32::from_bits(seg_min_datum.value() as u32) as f64;
-            let seg_max = f32::from_bits(seg_max_datum.value() as u32) as f64;
-            let c = f32::from_bits(f.const_datum.value() as u32) as f64;
-            match f.op {
-                BatchCompareOp::Eq => seg_min <= c && seg_max >= c,
-                BatchCompareOp::Ne => !(seg_min == c && seg_max == c),
-                BatchCompareOp::Lt => seg_min < c,
-                BatchCompareOp::Le => seg_min <= c,
-                BatchCompareOp::Gt => seg_max > c,
-                BatchCompareOp::Ge => seg_max >= c,
-                _ => true,
-            }
+            let v = f32::from_bits(datum.value() as u32);
+            Some(encode_f32_to_i64(v))
         }
         pg_sys::FLOAT8OID => {
-            let seg_min = f64::from_bits(seg_min_datum.value() as u64);
-            let seg_max = f64::from_bits(seg_max_datum.value() as u64);
-            let c = f64::from_bits(f.const_datum.value() as u64);
-            match f.op {
-                BatchCompareOp::Eq => seg_min <= c && seg_max >= c,
-                BatchCompareOp::Ne => !(seg_min == c && seg_max == c),
-                BatchCompareOp::Lt => seg_min < c,
-                BatchCompareOp::Le => seg_min <= c,
-                BatchCompareOp::Gt => seg_max > c,
-                BatchCompareOp::Ge => seg_max >= c,
-                _ => true,
-            }
+            let v = f64::from_bits(datum.value() as u64);
+            Some(encode_f64_to_i64(v))
         }
-        _ => true, // Unknown type — can't prune
+        _ => None,
     }
 }
 
@@ -110,107 +96,43 @@ pub(super) fn segment_all_rows_pass(
         return None;
     }
 
-    match cm.type_oid {
-        pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
-        | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID | pg_sys::DATEOID => {
-            let seg_min = cm.min_datum.value() as i64;
-            let seg_max = cm.max_datum.value() as i64;
-            let c = const_datum.value() as i64;
-            match op {
-                BatchCompareOp::Eq => {
-                    if seg_min == c && seg_max == c { Some(true) }
-                    else if seg_max < c || seg_min > c { Some(false) }
-                    else { None }
-                }
-                BatchCompareOp::Ne => {
-                    if seg_min > c || seg_max < c { Some(true) }
-                    else if seg_min == c && seg_max == c { Some(false) }
-                    else { None }
-                }
-                BatchCompareOp::Gt => {
-                    if seg_min > c { Some(true) }
-                    else if seg_max <= c { Some(false) }
-                    else { None }
-                }
-                BatchCompareOp::Ge => {
-                    if seg_min >= c { Some(true) }
-                    else if seg_max < c { Some(false) }
-                    else { None }
-                }
-                BatchCompareOp::Lt => {
-                    if seg_max < c { Some(true) }
-                    else if seg_min >= c { Some(false) }
-                    else { None }
-                }
-                BatchCompareOp::Le => {
-                    if seg_max <= c { Some(true) }
-                    else if seg_min > c { Some(false) }
-                    else { None }
-                }
-                BatchCompareOp::InList | BatchCompareOp::Like | BatchCompareOp::NotLike => None,
-            }
+    // Encode the constant datum to i64 for comparison with stored encoded values
+    let c = encode_datum_to_i64(const_datum, cm.type_oid)?;
+    let seg_min = cm.min_encoded;
+    let seg_max = cm.max_encoded;
+
+    match op {
+        BatchCompareOp::Eq => {
+            if seg_min == c && seg_max == c { Some(true) }
+            else if seg_max < c || seg_min > c { Some(false) }
+            else { None }
         }
-        pg_sys::FLOAT4OID => {
-            let seg_min = f32::from_bits(cm.min_datum.value() as u32) as f64;
-            let seg_max = f32::from_bits(cm.max_datum.value() as u32) as f64;
-            let c = f32::from_bits(const_datum.value() as u32) as f64;
-            match op {
-                BatchCompareOp::Eq => {
-                    if seg_min == c && seg_max == c { Some(true) }
-                    else if seg_max < c || seg_min > c { Some(false) }
-                    else { None }
-                }
-                BatchCompareOp::Ne => {
-                    if seg_min > c || seg_max < c { Some(true) }
-                    else if seg_min == c && seg_max == c { Some(false) }
-                    else { None }
-                }
-                BatchCompareOp::Gt => {
-                    if seg_min > c { Some(true) } else if seg_max <= c { Some(false) } else { None }
-                }
-                BatchCompareOp::Ge => {
-                    if seg_min >= c { Some(true) } else if seg_max < c { Some(false) } else { None }
-                }
-                BatchCompareOp::Lt => {
-                    if seg_max < c { Some(true) } else if seg_min >= c { Some(false) } else { None }
-                }
-                BatchCompareOp::Le => {
-                    if seg_max <= c { Some(true) } else if seg_min > c { Some(false) } else { None }
-                }
-                BatchCompareOp::InList | BatchCompareOp::Like | BatchCompareOp::NotLike => None,
-            }
+        BatchCompareOp::Ne => {
+            if seg_min > c || seg_max < c { Some(true) }
+            else if seg_min == c && seg_max == c { Some(false) }
+            else { None }
         }
-        pg_sys::FLOAT8OID => {
-            let seg_min = f64::from_bits(cm.min_datum.value() as u64);
-            let seg_max = f64::from_bits(cm.max_datum.value() as u64);
-            let c = f64::from_bits(const_datum.value() as u64);
-            match op {
-                BatchCompareOp::Eq => {
-                    if seg_min == c && seg_max == c { Some(true) }
-                    else if seg_max < c || seg_min > c { Some(false) }
-                    else { None }
-                }
-                BatchCompareOp::Ne => {
-                    if seg_min > c || seg_max < c { Some(true) }
-                    else if seg_min == c && seg_max == c { Some(false) }
-                    else { None }
-                }
-                BatchCompareOp::Gt => {
-                    if seg_min > c { Some(true) } else if seg_max <= c { Some(false) } else { None }
-                }
-                BatchCompareOp::Ge => {
-                    if seg_min >= c { Some(true) } else if seg_max < c { Some(false) } else { None }
-                }
-                BatchCompareOp::Lt => {
-                    if seg_max < c { Some(true) } else if seg_min >= c { Some(false) } else { None }
-                }
-                BatchCompareOp::Le => {
-                    if seg_max <= c { Some(true) } else if seg_min > c { Some(false) } else { None }
-                }
-                BatchCompareOp::InList | BatchCompareOp::Like | BatchCompareOp::NotLike => None,
-            }
+        BatchCompareOp::Gt => {
+            if seg_min > c { Some(true) }
+            else if seg_max <= c { Some(false) }
+            else { None }
         }
-        _ => None,
+        BatchCompareOp::Ge => {
+            if seg_min >= c { Some(true) }
+            else if seg_max < c { Some(false) }
+            else { None }
+        }
+        BatchCompareOp::Lt => {
+            if seg_max < c { Some(true) }
+            else if seg_min >= c { Some(false) }
+            else { None }
+        }
+        BatchCompareOp::Le => {
+            if seg_max <= c { Some(true) }
+            else if seg_min > c { Some(false) }
+            else { None }
+        }
+        BatchCompareOp::InList | BatchCompareOp::Like | BatchCompareOp::NotLike => None,
     }
 }
 
@@ -295,10 +217,10 @@ pub(super) fn classify_segment_quals(
     SegmentQualResult::AllPass
 }
 
-/// Per-column min/max metadata from the companion table.
+/// Per-column min/max metadata from the companion table, stored as order-preserving i64 encodings.
 pub(super) struct ColMinMax {
-    pub(super) min_datum: pg_sys::Datum,
-    pub(super) max_datum: pg_sys::Datum,
+    pub(super) min_encoded: i64,
+    pub(super) max_encoded: i64,
     pub(super) min_null: bool,
     pub(super) max_null: bool,
     pub(super) type_oid: pg_sys::Oid,
@@ -637,6 +559,7 @@ pub(super) unsafe fn load_segments_heap(
     lazy_cols: Option<&[bool]>,
     batch_quals: &[BatchQual],
     load_sums: bool,
+    col_types: &[pg_sys::Oid],
 ) -> (Vec<SegmentData>, u64, u64, u64, u64) {  // skipped, minmax_skipped, bloom_skipped, detoast_us
     // Buffer stats are accumulated into a thread-local via `accumulate_scan_buf_stats`;
     // callers read them with `take_scan_buf_stats()` after all companion OIDs are processed.
@@ -724,37 +647,6 @@ pub(super) unsafe fn load_segments_heap(
                         .unwrap_or(pg_sys::InvalidOid);
                     sum_col_attnos.push((col_name.clone(), sum_att, nn_att, nz_att, type_oid));
                 }
-            }
-        }
-
-        // Build min/max predicate filters from batch quals
-        let mut minmax_filters: Vec<MinMaxFilter> = Vec::new();
-        for bq in batch_quals {
-            match bq.op {
-                BatchCompareOp::Like | BatchCompareOp::NotLike => continue,
-                _ => {}
-            }
-            match bq.type_oid {
-                pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
-                | pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
-                | pg_sys::DATEOID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {}
-                _ => continue,
-            }
-            let col_name = &col_names[bq.col_idx];
-            let min_name = format!("_min_{}", col_name);
-            let max_name = format!("_max_{}", col_name);
-            if let (Some(&min_att), Some(&max_att)) = (
-                attno_map.get(min_name.as_str()),
-                attno_map.get(max_name.as_str()),
-            ) {
-                minmax_filters.push(MinMaxFilter {
-                    min_attno: min_att,
-                    max_attno: max_att,
-                    op: bq.op,
-                    const_datum: bq.const_datum,
-                    type_oid: bq.type_oid,
-                    in_list_i64: bq.in_list_i64.clone(),
-                });
             }
         }
 
@@ -925,31 +817,20 @@ pub(super) unsafe fn load_segments_heap(
                 continue;
             }
 
-            if !minmax_filters.is_empty() {
-                let mut minmax_skip = false;
-                for f in &minmax_filters {
-                    if !segment_passes_minmax_filter(f, &values, &nulls) {
-                        minmax_skip = true;
-                        break;
-                    }
-                }
-                if minmax_skip {
-                    segments_skipped += 1;
-                    segments_minmax_skipped += 1;
-                    continue;
-                }
-            }
+            // --- Segment survived time/segment_by pruning ---
 
-            // --- Segment survived minmax pruning ---
-
-            // Extract per-column min/max
+            // Extract per-column min/max (time column from meta — identity encoding for timestamp/date)
             let mut col_minmax = HashMap::new();
             for (col_name, min_att, max_att, type_oid) in &minmax_col_attnos {
+                let min_null = nulls[*min_att];
+                let max_null = nulls[*max_att];
+                let min_enc = if min_null { 0i64 } else { values[*min_att].value() as i64 };
+                let max_enc = if max_null { 0i64 } else { values[*max_att].value() as i64 };
                 col_minmax.insert(col_name.clone(), ColMinMax {
-                    min_datum: if nulls[*min_att] { pg_sys::Datum::from(0usize) } else { values[*min_att] },
-                    max_datum: if nulls[*max_att] { pg_sys::Datum::from(0usize) } else { values[*max_att] },
-                    min_null: nulls[*min_att],
-                    max_null: nulls[*max_att],
+                    min_encoded: min_enc,
+                    max_encoded: max_enc,
+                    min_null,
+                    max_null,
                     type_oid: *type_oid,
                 });
             }
@@ -999,7 +880,7 @@ pub(super) unsafe fn load_segments_heap(
         buf_stats.meta_read = t1_read - t0_read;
 
         // ================================================================
-        // Phase 1b: Scan colstats table for per-column stats (minmax, sum)
+        // Phase 1b: Scan normalized colstats table for per-column stats
         // Only opened when we need non-time column stats and have surviving segments.
         // ================================================================
         let need_colstats = !segments.is_empty() && (
@@ -1017,7 +898,6 @@ pub(super) unsafe fn load_segments_heap(
                 && {
                     let col_name = &col_names[bq.col_idx];
                     let min_name = format!("_min_{}", col_name);
-                    // Not in meta attno_map = it's a non-time column
                     !attno_map.contains_key(min_name.as_str())
                 }
             })
@@ -1035,187 +915,292 @@ pub(super) unsafe fn load_segments_heap(
             let colstats_oid = pg_sys::get_relname_relid(colstats_cname.as_ptr(), meta_ns_oid);
 
             if colstats_oid != pg_sys::InvalidOid {
-                let cs_rel = pg_sys::table_open(colstats_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
-                let cs_tupdesc = (*cs_rel).rd_att;
-                let cs_natts = (*cs_tupdesc).natts as usize;
-
-                // Build colstats attno map
-                let mut cs_attno_map: HashMap<String, usize> = HashMap::new();
-                let mut cs_att_type_oids: HashMap<String, pg_sys::Oid> = HashMap::new();
-                for i in 0..cs_natts {
-                    let att = &*tupdesc_get_attr(cs_tupdesc, i);
-                    if att.attisdropped { continue; }
-                    let name = std::ffi::CStr::from_ptr(att.attname.data.as_ptr())
-                        .to_string_lossy()
-                        .into_owned();
-                    cs_att_type_oids.insert(name.clone(), att.atttypid);
-                    cs_attno_map.insert(name, i);
-                }
-
-                let cs_segment_id_attno = cs_attno_map.get("_segment_id").copied();
-
-                // Discover colstats min/max columns (non-time columns)
-                let mut cs_minmax_col_attnos: Vec<(String, usize, usize, pg_sys::Oid)> = Vec::new();
-                if load_minmax {
-                    for col_name in col_names {
-                        if segment_by.contains(col_name) { continue; }
-                        // Skip if already found in meta (time column)
-                        if minmax_col_attnos.iter().any(|(n, _, _, _)| n == col_name) { continue; }
-                        let min_name = format!("_min_{}", col_name);
-                        let max_name = format!("_max_{}", col_name);
-                        if let (Some(&min_att), Some(&max_att)) = (
-                            cs_attno_map.get(min_name.as_str()),
-                            cs_attno_map.get(max_name.as_str()),
-                        ) {
-                            let type_oid = cs_att_type_oids.get(min_name.as_str()).copied()
-                                .unwrap_or(pg_sys::InvalidOid);
-                            cs_minmax_col_attnos.push((col_name.clone(), min_att, max_att, type_oid));
-                        }
+                // Build col_idx -> (column_name, original_type_oid) mapping
+                // (non-segment-by columns, 0-based, same order as blob table)
+                let mut idx_to_col: Vec<(String, pg_sys::Oid)> = Vec::new();
+                for (i, name) in col_names.iter().enumerate() {
+                    if !segment_by.contains(name) {
+                        idx_to_col.push((name.clone(), col_types[i]));
                     }
                 }
 
-                // Discover colstats sum columns
-                let mut cs_sum_col_attnos: Vec<(String, usize, usize, Option<usize>, pg_sys::Oid)> = Vec::new();
-                if load_sums {
-                    for col_name in col_names {
-                        if segment_by.contains(col_name) { continue; }
-                        let sum_name = format!("_sum_{}", col_name);
-                        let nonnull_name = format!("_nonnull_count_{}", col_name);
-                        let nonzero_name = format!("_nonzero_count_{}", col_name);
-                        if let (Some(&sum_att), Some(&nn_att)) = (
-                            cs_attno_map.get(sum_name.as_str()),
-                            cs_attno_map.get(nonnull_name.as_str()),
-                        ) {
-                            let nz_att = cs_attno_map.get(nonzero_name.as_str()).copied();
-                            let type_oid = cs_att_type_oids.get(sum_name.as_str()).copied()
-                                .unwrap_or(pg_sys::InvalidOid);
-                            cs_sum_col_attnos.push((col_name.clone(), sum_att, nn_att, nz_att, type_oid));
-                        }
-                    }
+                // Build surviving segment_id -> index mapping
+                let mut seg_id_to_idx: HashMap<i32, usize> = HashMap::new();
+                for (idx, &sid) in surviving_segment_ids.iter().enumerate() {
+                    seg_id_to_idx.insert(sid, idx);
                 }
 
-                // Build minmax filters for colstats columns (non-time batch quals)
+                // Build minmax filters for colstats (batch quals on non-time orderable columns)
                 let mut cs_minmax_filters: Vec<MinMaxFilter> = Vec::new();
                 for bq in batch_quals {
                     match bq.op {
                         BatchCompareOp::Like | BatchCompareOp::NotLike => continue,
                         _ => {}
                     }
-                    match bq.type_oid {
-                        pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
-                        | pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
-                        | pg_sys::DATEOID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID => {}
-                        _ => continue,
-                    }
                     let col_name = &col_names[bq.col_idx];
                     let min_name = format!("_min_{}", col_name);
-                    let max_name = format!("_max_{}", col_name);
-                    // Only build filter if the column is in colstats (not in meta)
-                    if attno_map.contains_key(min_name.as_str()) { continue; }
-                    if let (Some(&min_att), Some(&max_att)) = (
-                        cs_attno_map.get(min_name.as_str()),
-                        cs_attno_map.get(max_name.as_str()),
-                    ) {
-                        cs_minmax_filters.push(MinMaxFilter {
-                            min_attno: min_att,
-                            max_attno: max_att,
-                            op: bq.op,
-                            const_datum: bq.const_datum,
-                            type_oid: bq.type_oid,
-                            in_list_i64: bq.in_list_i64.clone(),
-                        });
-                    }
-                }
+                    if attno_map.contains_key(min_name.as_str()) { continue; } // already in meta
+                    if segment_by.contains(col_name) { continue; }
 
-                // Build surviving segment_id → index mapping
-                let mut seg_id_to_idx: HashMap<i32, usize> = HashMap::new();
-                for (idx, &sid) in surviving_segment_ids.iter().enumerate() {
-                    seg_id_to_idx.insert(sid, idx);
-                }
-
-                // Scan colstats table
-                let cs_snapshot = pg_sys::GetActiveSnapshot();
-                let cs_flags: u32 = pg_sys::ScanOptions::SO_TYPE_SEQSCAN
-                    | pg_sys::ScanOptions::SO_ALLOW_STRAT
-                    | pg_sys::ScanOptions::SO_ALLOW_SYNC
-                    | pg_sys::ScanOptions::SO_ALLOW_PAGEMODE;
-                let cs_scan = (*(*cs_rel).rd_tableam).scan_begin.unwrap()(
-                    cs_rel, cs_snapshot, 0, std::ptr::null_mut(), std::ptr::null_mut(), cs_flags,
-                );
-
-                let mut cs_values = vec![pg_sys::Datum::from(0); cs_natts];
-                let mut cs_nulls = vec![true; cs_natts];
-                let mut cs_pruned_ids: std::collections::HashSet<i32> = std::collections::HashSet::new();
-
-                loop {
-                    let tuple = pg_sys::heap_getnext(
-                        cs_scan,
-                        pg_sys::ScanDirection::ForwardScanDirection,
-                    );
-                    if tuple.is_null() { break; }
-
-                    pg_sys::heap_deform_tuple(
-                        tuple, cs_tupdesc,
-                        cs_values.as_mut_ptr(), cs_nulls.as_mut_ptr(),
-                    );
-
-                    // Extract segment_id, skip if not in surviving set
-                    let seg_id = match cs_segment_id_attno {
-                        Some(attno) if !cs_nulls[attno] => cs_values[attno].value() as i32,
-                        _ => continue,
-                    };
-                    let seg_idx = match seg_id_to_idx.get(&seg_id) {
-                        Some(&idx) => idx,
+                    let ci = match col_idx_map[bq.col_idx] {
+                        Some(ci) => ci as i16,
                         None => continue,
                     };
 
-                    // Apply minmax filters from colstats columns
-                    if !cs_minmax_filters.is_empty() {
-                        let mut skip = false;
-                        for f in &cs_minmax_filters {
-                            if !segment_passes_minmax_filter(f, &cs_values, &cs_nulls) {
-                                skip = true;
-                                break;
+                    let const_i64 = match encode_datum_to_i64(bq.const_datum, bq.type_oid) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+
+                    // For float in-list, re-encode from raw datum bits to order-preserving i64
+                    let encoded_in_list = bq.in_list_i64.as_ref().map(|vals| {
+                        vals.iter().map(|&v| {
+                            match bq.type_oid {
+                                pg_sys::FLOAT4OID => encode_f32_to_i64(f32::from_bits(v as u32)),
+                                pg_sys::FLOAT8OID => encode_f64_to_i64(f64::from_bits(v as u64)),
+                                _ => v, // int/timestamp/date: identity
                             }
-                        }
-                        if skip {
-                            cs_pruned_ids.insert(seg_id);
-                            segments_minmax_skipped += 1;
-                            continue;
-                        }
-                    }
+                        }).collect()
+                    });
 
-                    // Extract per-column min/max from colstats
-                    for (col_name, min_att, max_att, type_oid) in &cs_minmax_col_attnos {
-                        segments[seg_idx].col_minmax.insert(col_name.clone(), ColMinMax {
-                            min_datum: if cs_nulls[*min_att] { pg_sys::Datum::from(0usize) } else { cs_values[*min_att] },
-                            max_datum: if cs_nulls[*max_att] { pg_sys::Datum::from(0usize) } else { cs_values[*max_att] },
-                            min_null: cs_nulls[*min_att],
-                            max_null: cs_nulls[*max_att],
-                            type_oid: *type_oid,
-                        });
-                    }
+                    cs_minmax_filters.push(MinMaxFilter {
+                        col_idx: ci,
+                        op: bq.op,
+                        const_i64,
+                        in_list_i64: encoded_in_list,
+                    });
+                }
 
-                    // Extract per-column sum/nonnull_count/nonzero_count from colstats
-                    for (col_name, sum_att, nn_att, nz_att, type_oid) in &cs_sum_col_attnos {
-                        let sum_null = cs_nulls[*sum_att];
-                        let sum_datum = if sum_null { pg_sys::Datum::from(0usize) } else { cs_values[*sum_att] };
-                        let nonnull_count = if cs_nulls[*nn_att] { 0i64 } else { cs_values[*nn_att].value() as i64 };
-                        let nonzero_count = match nz_att {
-                            Some(att) => if cs_nulls[*att] { -1i64 } else { cs_values[*att].value() as i64 },
-                            None => -1i64,
-                        };
-                        segments[seg_idx].col_sums.insert(col_name.clone(), ColSum {
-                            sum_datum,
-                            sum_null,
-                            nonnull_count,
-                            nonzero_count,
-                            type_oid: *type_oid,
-                        });
+                // Collect the set of _col_idx values we actually need:
+                // - minmax filter columns (from batch quals)
+                // - all non-segment-by columns if load_minmax or load_sums
+                let mut needed_col_idxs: std::collections::HashSet<i16> = std::collections::HashSet::new();
+                for f in &cs_minmax_filters {
+                    needed_col_idxs.insert(f.col_idx);
+                }
+                if load_minmax || load_sums {
+                    for ci in 0..idx_to_col.len() {
+                        needed_col_idxs.insert(ci as i16);
                     }
                 }
 
-                (*(*cs_rel).rd_tableam).scan_end.unwrap()(cs_scan);
+                // Open normalized colstats table and locate fixed columns
+                let cs_rel = pg_sys::table_open(colstats_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                let cs_tupdesc = (*cs_rel).rd_att;
+                let cs_natts = (*cs_tupdesc).natts as usize;
+
+                let mut cs_col_idx_att: Option<usize> = None;
+                let mut cs_seg_id_att: Option<usize> = None;
+                let mut cs_min_att: Option<usize> = None;
+                let mut cs_max_att: Option<usize> = None;
+                let mut cs_sum_att: Option<usize> = None;
+                let mut cs_nonnull_att: Option<usize> = None;
+                let mut cs_nonzero_att: Option<usize> = None;
+                let mut cs_ndistinct_att: Option<usize> = None;
+                for i in 0..cs_natts {
+                    let att = &*tupdesc_get_attr(cs_tupdesc, i);
+                    if att.attisdropped { continue; }
+                    let name = std::ffi::CStr::from_ptr(att.attname.data.as_ptr()).to_string_lossy();
+                    match name.as_ref() {
+                        "_col_idx" => cs_col_idx_att = Some(i),
+                        "_segment_id" => cs_seg_id_att = Some(i),
+                        "_min" => cs_min_att = Some(i),
+                        "_max" => cs_max_att = Some(i),
+                        "_sum" => cs_sum_att = Some(i),
+                        "_nonnull_count" => cs_nonnull_att = Some(i),
+                        "_nonzero_count" => cs_nonzero_att = Some(i),
+                        "_ndistinct" => cs_ndistinct_att = Some(i),
+                        _ => {}
+                    }
+                }
+
+                let mut cs_pruned_ids: std::collections::HashSet<i32> = std::collections::HashSet::new();
+
+                // Decide: index scan (few columns) vs seq scan (many columns).
+                // Index scan reads only needed col_idx rows via PK (_col_idx, _segment_id).
+                // Threshold: use index scan if < 50% of columns needed.
+                let use_index_scan = needed_col_idxs.len() < idx_to_col.len() / 2 + 1
+                    || needed_col_idxs.len() <= 4;
+
+                // Find PK index OID for index scan path
+                let pk_index_oid = if use_index_scan {
+                    let mut pk_oid = pg_sys::InvalidOid;
+                    let index_list = pg_sys::RelationGetIndexList(cs_rel);
+                    if !index_list.is_null() {
+                        let n = (*index_list).length;
+                        for i in 0..n {
+                            let idx_oid =
+                                (*(*index_list).elements.add(i as usize)).oid_value;
+                            let idx_rel = pg_sys::index_open(idx_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                            let is_primary = if !(*idx_rel).rd_index.is_null() {
+                                (*(*idx_rel).rd_index).indisprimary
+                            } else { false };
+                            pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                            if is_primary {
+                                pk_oid = idx_oid;
+                                break;
+                            }
+                        }
+                        pg_sys::list_free(index_list);
+                    }
+                    pk_oid
+                } else {
+                    pg_sys::InvalidOid
+                };
+
+                // Helper closure: process one colstats row from slot values/nulls
+                macro_rules! process_colstats_row {
+                    ($vals:expr, $nls:expr, $ci_att:expr, $sid_att:expr,
+                     $min_att:expr, $max_att:expr, $sum_att:expr, $nn_att:expr, $nz_att:expr) => {{
+                        let seg_id = if !$nls[$sid_att] { $vals[$sid_att].value() as i32 } else { continue; };
+                        let seg_idx = match seg_id_to_idx.get(&seg_id) {
+                            Some(&idx) => idx,
+                            None => continue,
+                        };
+                        if cs_pruned_ids.contains(&seg_id) { continue; }
+
+                        let col_idx_val = if !$nls[$ci_att] { $vals[$ci_att].value() as i16 } else { continue; };
+                        if col_idx_val < 0 || col_idx_val as usize >= idx_to_col.len() { continue; }
+                        let (ref col_name, orig_type_oid) = idx_to_col[col_idx_val as usize];
+
+                        let min_null = $nls[$min_att];
+                        let max_null = $nls[$max_att];
+                        let min_enc = if min_null { 0i64 } else { $vals[$min_att].value() as i64 };
+                        let max_enc = if max_null { 0i64 } else { $vals[$max_att].value() as i64 };
+
+                        if !cs_minmax_filters.is_empty() {
+                            let mut skip = false;
+                            for f in &cs_minmax_filters {
+                                if f.col_idx == col_idx_val && !min_null && !max_null
+                                    && !segment_passes_minmax_filter(f, min_enc, max_enc)
+                                {
+                                    skip = true;
+                                    break;
+                                }
+                            }
+                            if skip {
+                                cs_pruned_ids.insert(seg_id);
+                                segments_minmax_skipped += 1;
+                                continue;
+                            }
+                        }
+
+                        if load_minmax {
+                            segments[seg_idx].col_minmax.insert(col_name.clone(), ColMinMax {
+                                min_encoded: min_enc,
+                                max_encoded: max_enc,
+                                min_null,
+                                max_null,
+                                type_oid: orig_type_oid,
+                            });
+                        }
+
+                        if load_sums {
+                            let sum_null = $nls[$sum_att];
+                            let sum_datum = if sum_null { pg_sys::Datum::from(0usize) } else { $vals[$sum_att] };
+                            let nonnull_count = if $nls[$nn_att] { 0i64 } else { $vals[$nn_att].value() as i64 };
+                            let nonzero_count = if $nls[$nz_att] { -1i64 } else { $vals[$nz_att].value() as i64 };
+                            let sum_type_oid = if !sum_null {
+                                let sum_attr = &*tupdesc_get_attr(cs_tupdesc, $sum_att);
+                                sum_attr.atttypid
+                            } else {
+                                pg_sys::NUMERICOID
+                            };
+                            segments[seg_idx].col_sums.insert(col_name.clone(), ColSum {
+                                sum_datum,
+                                sum_null,
+                                nonnull_count,
+                                nonzero_count,
+                                type_oid: sum_type_oid,
+                            });
+                        }
+                    }};
+                }
+
+                if let (Some(ci_att), Some(sid_att), Some(min_att), Some(max_att),
+                        Some(sum_att), Some(nn_att), Some(nz_att), Some(_nd_att)) =
+                    (cs_col_idx_att, cs_seg_id_att, cs_min_att, cs_max_att,
+                     cs_sum_att, cs_nonnull_att, cs_nonzero_att, cs_ndistinct_att)
+                {
+                    if use_index_scan && pk_index_oid != pg_sys::InvalidOid {
+                        // Index scan path: one scan per needed col_idx
+                        let cs_snapshot = pg_sys::GetActiveSnapshot();
+                        let idx_rel = pg_sys::index_open(pk_index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                        let slot = pg_sys::table_slot_create(cs_rel, std::ptr::null_mut());
+
+                        for &col_idx_val in &needed_col_idxs {
+                            let mut skey = [pg_sys::ScanKeyData::default()];
+                            pg_sys::ScanKeyInit(
+                                &mut skey[0],
+                                1, // attnum 1 = _col_idx (first column in PK)
+                                pg_sys::BTEqualStrategyNumber as u16,
+                                pg_sys::F_INT2EQ.into(),
+                                pg_sys::Datum::from(col_idx_val),
+                            );
+
+                            #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+                            let scan = pg_sys::index_beginscan(cs_rel, idx_rel, cs_snapshot, 1, 0);
+                            #[cfg(feature = "pg18")]
+                            let scan = pg_sys::index_beginscan(cs_rel, idx_rel, cs_snapshot, std::ptr::null_mut(), 1, 0);
+                            pg_sys::index_rescan(scan, skey.as_mut_ptr(), 1, std::ptr::null_mut(), 0);
+
+                            loop {
+                                if !pg_sys::index_getnext_slot(scan, pg_sys::ScanDirection::ForwardScanDirection, slot) {
+                                    break;
+                                }
+                                pg_sys::slot_getallattrs(slot);
+                                let tts_values = std::slice::from_raw_parts((*slot).tts_values, cs_natts);
+                                let tts_isnull = std::slice::from_raw_parts((*slot).tts_isnull, cs_natts);
+
+                                process_colstats_row!(tts_values, tts_isnull, ci_att, sid_att,
+                                    min_att, max_att, sum_att, nn_att, nz_att);
+                            }
+
+                            pg_sys::index_endscan(scan);
+                        }
+
+                        pg_sys::ExecDropSingleTupleTableSlot(slot);
+                        pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                    } else {
+                        // Seq scan path: scan all rows, filter by needed col_idx
+                        let cs_snapshot = pg_sys::GetActiveSnapshot();
+                        let cs_flags: u32 = pg_sys::ScanOptions::SO_TYPE_SEQSCAN
+                            | pg_sys::ScanOptions::SO_ALLOW_STRAT
+                            | pg_sys::ScanOptions::SO_ALLOW_SYNC
+                            | pg_sys::ScanOptions::SO_ALLOW_PAGEMODE;
+                        let cs_scan = (*(*cs_rel).rd_tableam).scan_begin.unwrap()(
+                            cs_rel, cs_snapshot, 0, std::ptr::null_mut(), std::ptr::null_mut(), cs_flags,
+                        );
+
+                        let mut cs_values = vec![pg_sys::Datum::from(0); cs_natts];
+                        let mut cs_nulls = vec![true; cs_natts];
+
+                        loop {
+                            let tuple = pg_sys::heap_getnext(
+                                cs_scan,
+                                pg_sys::ScanDirection::ForwardScanDirection,
+                            );
+                            if tuple.is_null() { break; }
+
+                            pg_sys::heap_deform_tuple(
+                                tuple, cs_tupdesc,
+                                cs_values.as_mut_ptr(), cs_nulls.as_mut_ptr(),
+                            );
+
+                            // Skip columns we don't need in seq scan path
+                            if !needed_col_idxs.is_empty() {
+                                let ci = if !cs_nulls[ci_att] { cs_values[ci_att].value() as i16 } else { continue; };
+                                if !needed_col_idxs.contains(&ci) { continue; }
+                            }
+
+                            process_colstats_row!(cs_values, cs_nulls, ci_att, sid_att,
+                                min_att, max_att, sum_att, nn_att, nz_att);
+                        }
+
+                        (*(*cs_rel).rd_tableam).scan_end.unwrap()(cs_scan);
+                    }
+                }
+
                 pg_sys::table_close(cs_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
 
                 // Remove colstats-pruned segments

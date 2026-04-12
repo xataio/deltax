@@ -17,7 +17,7 @@ use crate::compress::{
     PG_EPOCH_OFFSET_USEC,
     build_companion_ddl, classify_column, compress_typed_column,
     compute_segment_blooms, compute_segment_ndistinct,
-    compute_typed_minmax, compute_typed_sum,
+    compute_typed_minmax, compute_typed_sum, compute_minmax_encoded_i64,
     format_minmax_for_insert, init_typed_columns, new_typed_column, get_column_metadata,
     sort_typed_columns, supports_minmax, supports_sum,
 };
@@ -297,9 +297,8 @@ struct PartitionBuffer {
     meta_insert_cols: Option<String>,
     /// Buffered VALUES clauses for batched meta INSERTs.
     meta_insert_rows: Vec<String>,
-    /// Cached colstats table FQN and column list for batched INSERTs.
+    /// Cached colstats table FQN for batched INSERTs.
     colstats_fqn: Option<String>,
-    colstats_insert_cols: Option<String>,
     /// Buffered VALUES clauses for batched colstats INSERTs.
     colstats_insert_rows: Vec<String>,
     /// Cached companion table FQNs and OIDs to avoid repeated SPI lookups.
@@ -487,7 +486,6 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
             meta_insert_cols: None,
             meta_insert_rows: Vec::new(),
             colstats_fqn: None,
-            colstats_insert_cols: None,
             colstats_insert_rows: Vec::new(),
             blobs_fqn_cached: None,
             blooms_fqn_cached: None,
@@ -1442,7 +1440,7 @@ struct CompressedSegment {
     blobs: Vec<(u16, Vec<u8>)>,      // (col_idx, compressed_data)
     bloom_entries: Vec<(u16, u8, Vec<u8>)>, // (col_idx, num_hashes, bytes); empty if blooms disabled
     meta_values_csv: String,          // pre-formatted VALUES clause for thin meta
-    colstats_values_csv: String,      // pre-formatted VALUES clause for colstats
+    colstats_rows_csv: Vec<String>,   // pre-formatted VALUES tuples, one per non-segment-by column
     total_compressed_size: i64,
 }
 
@@ -1593,52 +1591,34 @@ fn compress_segment(
 
     meta_vals.push((row_count as u32).to_string());
 
-    // Build VALUES clause for colstats: non-time min/max, sum/count, ndistinct
-    let mut cs_vals = Vec::new();
-    cs_vals.push(seg_id.to_string());
-
-    for (i, col) in columns.iter().enumerate() {
-        if !col.is_segment_by && !col.is_time_column && supports_minmax(&col.data_type) {
-            match col_minmax.get(&i) {
-                Some((Some(min_val), Some(max_val))) => {
-                    cs_vals.push(format_minmax_for_insert(min_val, &col.data_type));
-                    cs_vals.push(format_minmax_for_insert(max_val, &col.data_type));
-                }
-                _ => {
-                    cs_vals.push("NULL".to_string());
-                    cs_vals.push("NULL".to_string());
-                }
-            }
-        }
-    }
-
-    for (i, col) in columns.iter().enumerate() {
-        if !col.is_segment_by && supports_sum(&col.data_type) {
-            match col_sums.get(&i) {
-                Some((Some(sum_val), nonnull_count, nonzero_count)) => {
-                    cs_vals.push(sum_val.clone());
-                    cs_vals.push(nonnull_count.to_string());
-                    cs_vals.push(nonzero_count.to_string());
-                }
-                _ => {
-                    cs_vals.push("NULL".to_string());
-                    cs_vals.push("0".to_string());
-                    cs_vals.push("0".to_string());
-                }
-            }
-        }
-    }
-
+    // Build per-column colstats rows (normalized: one row per non-segment-by column)
+    let mut colstats_rows_csv: Vec<String> = Vec::new();
     let mut nd_idx = 0;
-    for col in columns {
-        if !col.is_segment_by {
-            if nd_idx < ndistinct.len() {
-                cs_vals.push(ndistinct[nd_idx].to_string());
-            } else {
-                cs_vals.push("0".to_string());
-            }
-            nd_idx += 1;
+    for (i, col) in columns.iter().enumerate() {
+        if col.is_segment_by {
+            continue;
         }
+        let col_idx = colstats_rows_csv.len() as i16;
+        let (min_enc, max_enc) = compute_minmax_encoded_i64(&typed_cols[i], &col.data_type);
+        let min_str = min_enc.map_or("NULL".to_string(), |v| v.to_string());
+        let max_str = max_enc.map_or("NULL".to_string(), |v| v.to_string());
+
+        let (sum_str, nonnull, nonzero) = if supports_sum(&col.data_type) {
+            match col_sums.get(&i) {
+                Some((Some(sum_val), nn, nz)) => (sum_val.clone(), *nn, *nz),
+                _ => ("NULL".to_string(), 0, 0),
+            }
+        } else {
+            ("NULL".to_string(), 0, 0)
+        };
+
+        let nd = if nd_idx < ndistinct.len() { ndistinct[nd_idx] } else { 0 };
+        nd_idx += 1;
+
+        colstats_rows_csv.push(format!(
+            "({}, {}, {}, {}, {}, {}, {}, {})",
+            col_idx, seg_id, min_str, max_str, sum_str, nonnull, nonzero, nd
+        ));
     }
 
     // Bloom filters
@@ -1655,7 +1635,7 @@ fn compress_segment(
         blobs,
         bloom_entries,
         meta_values_csv: meta_vals.join(", "),
-        colstats_values_csv: cs_vals.join(", "),
+        colstats_rows_csv,
         total_compressed_size: total_size,
     }
 }
@@ -1844,55 +1824,34 @@ fn flush_segment(
 
     meta_vals.push((buf.row_count as u32).to_string());
 
-    // Build VALUES clause for colstats row: non-time min/max, sum/count, ndistinct
-    let mut cs_vals = Vec::new();
-    cs_vals.push(seg_id.to_string());
-
-    // Non-time min/max columns
-    for (i, col) in state.columns.iter().enumerate() {
-        if !col.is_segment_by && !col.is_time_column && supports_minmax(&col.data_type) {
-            match col_minmax.get(&i) {
-                Some((Some(min_val), Some(max_val))) => {
-                    cs_vals.push(format_minmax_for_insert(min_val, &col.data_type));
-                    cs_vals.push(format_minmax_for_insert(max_val, &col.data_type));
-                }
-                _ => {
-                    cs_vals.push("NULL".to_string());
-                    cs_vals.push("NULL".to_string());
-                }
-            }
-        }
-    }
-
-    // Sum, non-null count, nonzero count
-    for (i, col) in state.columns.iter().enumerate() {
-        if !col.is_segment_by && supports_sum(&col.data_type) {
-            match col_sums.get(&i) {
-                Some((Some(sum_val), nonnull_count, nonzero_count)) => {
-                    cs_vals.push(sum_val.clone());
-                    cs_vals.push(nonnull_count.to_string());
-                    cs_vals.push(nonzero_count.to_string());
-                }
-                _ => {
-                    cs_vals.push("NULL".to_string());
-                    cs_vals.push("0".to_string());
-                    cs_vals.push("0".to_string());
-                }
-            }
-        }
-    }
-
-    // Ndistinct
+    // Build per-column colstats rows (normalized: one row per non-segment-by column)
+    let mut colstats_rows_csv: Vec<String> = Vec::new();
     let mut nd_idx = 0;
-    for col in &state.columns {
-        if !col.is_segment_by {
-            if nd_idx < ndistinct.len() {
-                cs_vals.push(ndistinct[nd_idx].to_string());
-            } else {
-                cs_vals.push("0".to_string());
-            }
-            nd_idx += 1;
+    for (i, col) in state.columns.iter().enumerate() {
+        if col.is_segment_by {
+            continue;
         }
+        let col_idx = colstats_rows_csv.len() as i16;
+        let (min_enc, max_enc) = compute_minmax_encoded_i64(&buf.typed_cols[i], &col.data_type);
+        let min_str = min_enc.map_or("NULL".to_string(), |v| v.to_string());
+        let max_str = max_enc.map_or("NULL".to_string(), |v| v.to_string());
+
+        let (sum_str, nonnull, nonzero) = if supports_sum(&col.data_type) {
+            match col_sums.get(&i) {
+                Some((Some(sum_val), nn, nz)) => (sum_val.clone(), *nn, *nz),
+                _ => ("NULL".to_string(), 0, 0),
+            }
+        } else {
+            ("NULL".to_string(), 0, 0)
+        };
+
+        let nd = if nd_idx < ndistinct.len() { ndistinct[nd_idx] } else { 0 };
+        nd_idx += 1;
+
+        colstats_rows_csv.push(format!(
+            "({}, {}, {}, {}, {}, {}, {}, {})",
+            col_idx, seg_id, min_str, max_str, sum_str, nonnull, nonzero, nd
+        ));
     }
 
     // Bloom filters
@@ -1924,33 +1883,13 @@ fn flush_segment(
     }
     if buf.colstats_fqn.is_none() {
         buf.colstats_fqn = Some(companion_ddl.colstats_fqn.clone());
-
-        let mut cols = Vec::new();
-        cols.push("_segment_id".to_string());
-        for col in &state.columns {
-            if !col.is_segment_by && !col.is_time_column && supports_minmax(&col.data_type) {
-                cols.push(format!("\"_min_{}\"", col.name));
-                cols.push(format!("\"_max_{}\"", col.name));
-            }
-        }
-        for col in &state.columns {
-            if !col.is_segment_by && supports_sum(&col.data_type) {
-                cols.push(format!("\"_sum_{}\"", col.name));
-                cols.push(format!("\"_nonnull_count_{}\"", col.name));
-                cols.push(format!("\"_nonzero_count_{}\"", col.name));
-            }
-        }
-        for col in &state.columns {
-            if !col.is_segment_by {
-                cols.push(format!("\"_ndistinct_{}\"", col.name));
-            }
-        }
-        buf.colstats_insert_cols = Some(cols.join(", "));
     }
 
     // Buffer the VALUES rows
     buf.meta_insert_rows.push(format!("({})", meta_vals.join(", ")));
-    buf.colstats_insert_rows.push(format!("({})", cs_vals.join(", ")));
+    for row in colstats_rows_csv {
+        buf.colstats_insert_rows.push(row);
+    }
 
     // Flush meta batch if full
     if buf.meta_insert_rows.len() >= META_BATCH_SIZE {
@@ -2009,11 +1948,9 @@ fn flush_meta_buffer(buf: &mut PartitionBuffer) {
     }
     if !buf.colstats_insert_rows.is_empty() {
         let colstats_fqn = buf.colstats_fqn.as_ref().expect("colstats_fqn not set");
-        let cols = buf.colstats_insert_cols.as_ref().expect("colstats_insert_cols not set");
         let insert_sql = format!(
-            "INSERT INTO {} ({}) VALUES {}",
+            "INSERT INTO {} (_col_idx, _segment_id, _min, _max, _sum, _nonnull_count, _nonzero_count, _ndistinct) VALUES {}",
             colstats_fqn,
-            cols,
             buf.colstats_insert_rows.join(", ")
         );
         spi_exec(&insert_sql);
@@ -2227,33 +2164,13 @@ fn write_compressed_segment(
     if buf.colstats_fqn.is_none() {
         let ddl = build_companion_ddl(&buf.partition_table, &state.columns);
         buf.colstats_fqn = Some(ddl.colstats_fqn);
-
-        let mut cols = Vec::new();
-        cols.push("_segment_id".to_string());
-        for col in &state.columns {
-            if !col.is_segment_by && !col.is_time_column && supports_minmax(&col.data_type) {
-                cols.push(format!("\"_min_{}\"", col.name));
-                cols.push(format!("\"_max_{}\"", col.name));
-            }
-        }
-        for col in &state.columns {
-            if !col.is_segment_by && supports_sum(&col.data_type) {
-                cols.push(format!("\"_sum_{}\"", col.name));
-                cols.push(format!("\"_nonnull_count_{}\"", col.name));
-                cols.push(format!("\"_nonzero_count_{}\"", col.name));
-            }
-        }
-        for col in &state.columns {
-            if !col.is_segment_by {
-                cols.push(format!("\"_ndistinct_{}\"", col.name));
-            }
-        }
-        buf.colstats_insert_cols = Some(cols.join(", "));
     }
 
     // Buffer meta and colstats rows
     buf.meta_insert_rows.push(format!("({})", cs.meta_values_csv));
-    buf.colstats_insert_rows.push(format!("({})", cs.colstats_values_csv));
+    for row in cs.colstats_rows_csv {
+        buf.colstats_insert_rows.push(row);
+    }
     if buf.meta_insert_rows.len() >= META_BATCH_SIZE {
         flush_meta_buffer(buf);
     }

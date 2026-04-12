@@ -314,32 +314,33 @@ pub fn update_partition_column_ndistinct(
         return Ok(());
     }
 
-    // Build `SELECT MAX("_ndistinct_col1")::int8, MAX("_ndistinct_col2")::int8, ...`
-    let max_exprs: Vec<String> = col_names
-        .iter()
-        .map(|n| format!("MAX(\"_ndistinct_{}\")::int8", n))
-        .collect();
-    let query = format!("SELECT {} FROM {}", max_exprs.join(", "), meta_fqn);
+    // Query normalized colstats table: one row per col_idx with MAX(ndistinct)
+    let query = format!(
+        "SELECT _col_idx, MAX(_ndistinct)::int8 FROM {} GROUP BY _col_idx ORDER BY _col_idx",
+        meta_fqn
+    );
 
     let result = client.select(&query, None, &[])?;
-    let row = match result.into_iter().next() {
-        Some(r) => r,
-        None => return Ok(()),
-    };
 
-    // Build JSON object string: {"col1": 123, "col2": 456, ...}. Skip
-    // NULLs (columns where every segment had NULL ndistinct, e.g. all-NULL
-    // data); the reader treats missing entries as "unknown".
+    // Build JSON object string: {"col1": 123, "col2": 456, ...}
     let mut parts: Vec<String> = Vec::with_capacity(col_names.len());
-    for (i, name) in col_names.iter().enumerate() {
-        if let Some(nd) = row
-            .get_datum_by_ordinal(i + 1)
+    for row in result {
+        let col_idx: i32 = row
+            .get_datum_by_ordinal(1)
             .ok()
-            .and_then(|d| d.value::<i64>().ok().flatten())
+            .and_then(|d| d.value::<i32>().ok().flatten())
+            .unwrap_or(-1);
+        let nd: Option<i64> = row
+            .get_datum_by_ordinal(2)
+            .ok()
+            .and_then(|d| d.value::<i64>().ok().flatten());
+
+        if col_idx >= 0 && (col_idx as usize) < col_names.len()
+            && let Some(nd_val) = nd
         {
-            // Escape quotes/backslashes in column names to produce valid JSON.
+            let name = &col_names[col_idx as usize];
             let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-            parts.push(format!("\"{}\":{}", escaped, nd));
+            parts.push(format!("\"{}\":{}", escaped, nd_val));
         }
     }
     let json = format!("{{{}}}", parts.join(","));

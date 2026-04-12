@@ -436,6 +436,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
                 oid, &meta.col_names, &meta.segment_by, &needed_cols,
                 &meta.time_column, false, &seg_filters, t_min, t_max,
                 lazy_cols.as_deref(), &batch_quals, false,
+                &meta.col_types,
             );
             all_segments.extend(segs);
             total_skipped += skipped;
@@ -617,6 +618,7 @@ fn load_decompress_state(
             companion_oid, &meta.col_names, &meta.segment_by, &needed_cols,
             &meta.time_column, false, &seg_filters, t_min, t_max,
             lazy_cols.as_deref(), &batch_quals, false,
+            &meta.col_types,
         )
     };
     let heap_scan_us = t1.elapsed().as_micros() as u64;
