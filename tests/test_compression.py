@@ -3933,3 +3933,236 @@ class TestTextDecompressionPaths:
         assert len(non_null_groups) == 7
         assert len(null_groups) == 1
         assert null_groups[0][1] == 20  # 200/10 nulls
+
+
+class TestAvgTopNCorrectness:
+    """Tests for AVG-based ORDER BY + LIMIT in partitioned parallel merge.
+
+    The partitioned merge path sorts by f64-approximated AVG (sum/count)
+    encoded as i64 bits.  These tests verify correctness against PG's exact
+    numeric AVG by comparing before-compression vs after-compression results.
+    """
+
+    def _setup(self, db):
+        """Create a table where groups have intentionally different counts
+        so that sorting by SUM and sorting by AVG give different orders.
+        This exposes bugs where the merge sorts by raw sum instead of avg."""
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE avg_topn (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                value INTEGER NOT NULL
+            )
+        """)
+        db.execute("SELECT deltax_create_table('avg_topn', 'ts', '1 day'::interval)")
+        db.commit()
+
+        # Create groups with different counts and means:
+        #   category 'A': 200 rows with values 1..200, avg=100.5, sum=20100
+        #   category 'B': 5 rows with values 198..202, avg=200.0, sum=1000
+        #   category 'C': 50 rows with values 50..99, avg=74.5, sum=3725
+        #   category 'D': 10 rows with values 180..189, avg=184.5, sum=1845
+        #   category 'E': 100 rows with values 10..109, avg=59.5, sum=5950
+        # Sorted by AVG DESC: B(200), D(184.5), A(100.5), C(74.5), E(59.5)
+        # Sorted by SUM DESC: A(20100), E(5950), C(3725), D(1845), B(1000)
+        groups = [
+            ('A', range(1, 201)),
+            ('B', range(198, 203)),
+            ('C', range(50, 100)),
+            ('D', range(180, 190)),
+            ('E', range(10, 110)),
+        ]
+        vals = []
+        row_i = 0
+        for cat, vrange in groups:
+            for v in vrange:
+                ts = f"'{BASE_TS}'::timestamptz + interval '{row_i} seconds'"
+                vals.append(f"({ts}, 'dev-0', '{cat}', {v})")
+                row_i += 1
+
+        batch_size = 500
+        for i in range(0, len(vals), batch_size):
+            batch = vals[i:i + batch_size]
+            db.execute(
+                "INSERT INTO avg_topn (ts, device_id, category, value) VALUES "
+                + ", ".join(batch)
+            )
+        db.commit()
+
+    def test_avg_order_by_limit(self, db):
+        """AVG(value) ORDER BY DESC LIMIT must sort by average, not by sum."""
+        self._setup(db)
+
+        query = (
+            "SELECT category, AVG(value)::numeric(10,2) AS avg_val, COUNT(*) "
+            "FROM avg_topn GROUP BY category "
+            "ORDER BY avg_val DESC LIMIT 3"
+        )
+
+        # Before compression
+        before = db.execute(query).fetchall()
+
+        # Compress
+        db.execute(
+            "SELECT deltax_enable_compression('avg_topn', "
+            "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, 'avg_topn')
+
+        # After compression
+        after = db.execute(query).fetchall()
+
+        assert len(after) == 3, f"Expected 3 rows, got {len(after)}"
+        # Categories must match (same order)
+        assert [r[0] for r in after] == [r[0] for r in before], (
+            f"Order mismatch: before={[r[0] for r in before]}, "
+            f"after={[r[0] for r in after]}"
+        )
+        # AVG values must match
+        for b, a in zip(before, after):
+            assert float(a[1]) == pytest.approx(float(b[1]), rel=1e-6), (
+                f"AVG mismatch for {a[0]}: before={b[1]}, after={a[1]}"
+            )
+
+    def test_avg_order_by_asc_limit(self, db):
+        """AVG(value) ORDER BY ASC LIMIT — ascending sort correctness."""
+        self._setup(db)
+
+        query = (
+            "SELECT category, AVG(value)::numeric(10,2) AS avg_val "
+            "FROM avg_topn GROUP BY category "
+            "ORDER BY avg_val ASC LIMIT 3"
+        )
+
+        before = db.execute(query).fetchall()
+
+        db.execute(
+            "SELECT deltax_enable_compression('avg_topn', "
+            "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, 'avg_topn')
+
+        after = db.execute(query).fetchall()
+
+        assert [r[0] for r in after] == [r[0] for r in before], (
+            f"ASC order mismatch: before={[r[0] for r in before]}, "
+            f"after={[r[0] for r in after]}"
+        )
+
+    def test_avg_having_order_by_limit(self, db):
+        """AVG + HAVING + ORDER BY + LIMIT (the Q28 pattern)."""
+        self._setup(db)
+
+        query = (
+            "SELECT category, AVG(value)::numeric(10,2) AS avg_val, "
+            "COUNT(*) AS c "
+            "FROM avg_topn GROUP BY category "
+            "HAVING COUNT(*) > 10 "
+            "ORDER BY avg_val DESC LIMIT 3"
+        )
+
+        before = db.execute(query).fetchall()
+
+        db.execute(
+            "SELECT deltax_enable_compression('avg_topn', "
+            "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, 'avg_topn')
+
+        after = db.execute(query).fetchall()
+
+        # HAVING COUNT(*) > 10 excludes B(5) and D(10)
+        # Remaining sorted by AVG DESC: A(100.5), C(74.5), E(59.5)
+        assert len(after) == 3
+        assert [r[0] for r in after] == [r[0] for r in before], (
+            f"HAVING+ORDER mismatch: before={[r[0] for r in before]}, "
+            f"after={[r[0] for r in after]}"
+        )
+        for b, a in zip(before, after):
+            assert float(a[1]) == pytest.approx(float(b[1]), rel=1e-6)
+            assert a[2] == b[2], f"COUNT mismatch for {a[0]}"
+
+    def test_avg_having_filters_groups(self, db):
+        """HAVING COUNT(*) filter correctly eliminates groups."""
+        self._setup(db)
+
+        query = (
+            "SELECT category, AVG(value)::numeric(10,2) AS avg_val, "
+            "COUNT(*) AS c "
+            "FROM avg_topn GROUP BY category "
+            "HAVING COUNT(*) >= 50 "
+            "ORDER BY avg_val DESC"
+        )
+
+        before = db.execute(query).fetchall()
+
+        db.execute(
+            "SELECT deltax_enable_compression('avg_topn', "
+            "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, 'avg_topn')
+
+        after = db.execute(query).fetchall()
+
+        # COUNT >= 50 keeps: A(200), C(50), E(100)
+        assert len(after) == len(before)
+        assert [r[0] for r in after] == [r[0] for r in before]
+
+    def test_avg_float_order_by_limit(self, db):
+        """AVG on float column with ORDER BY LIMIT."""
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE avg_float_topn (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                val DOUBLE PRECISION NOT NULL
+            )
+        """)
+        db.execute(
+            "SELECT deltax_create_table('avg_float_topn', 'ts', '1 day'::interval)"
+        )
+        db.commit()
+
+        # Group X: 100 rows of val=1.0, avg=1.0
+        # Group Y: 3 rows of val=50.0, avg=50.0
+        # Group Z: 30 rows of val=10.0, avg=10.0
+        groups = [('X', 100, 1.0), ('Y', 3, 50.0), ('Z', 30, 10.0)]
+        row_i = 0
+        for cat, n, v in groups:
+            for _ in range(n):
+                ts = f"'{BASE_TS}'::timestamptz + interval '{row_i} seconds'"
+                db.execute(
+                    f"INSERT INTO avg_float_topn VALUES "
+                    f"({ts}, 'dev-0', '{cat}', {v})"
+                )
+                row_i += 1
+        db.commit()
+
+        query = (
+            "SELECT category, AVG(val)::numeric(10,2) "
+            "FROM avg_float_topn GROUP BY category "
+            "ORDER BY AVG(val) DESC LIMIT 2"
+        )
+
+        before = db.execute(query).fetchall()
+
+        db.execute(
+            "SELECT deltax_enable_compression('avg_float_topn', "
+            "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, 'avg_float_topn')
+
+        after = db.execute(query).fetchall()
+
+        # Y(50.0) > Z(10.0) > X(1.0), top-2 = Y, Z
+        assert [r[0] for r in after] == [r[0] for r in before], (
+            f"Float AVG order mismatch: before={before}, after={after}"
+        )

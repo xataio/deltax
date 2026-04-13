@@ -2238,7 +2238,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
 
                                 if let Some(agg_idx) = sort_agg_idx {
                                     let spec = &classified_aggs[agg_idx];
-                                    // Only for i64-comparable result types
+                                    // Only for types where compact storage supports sorting
                                     let is_i64 = match spec.agg_type {
                                         AggType::CountStar
                                         | AggType::Count
@@ -2247,13 +2247,20 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                                             spec.col_type_oid,
                                             pg_sys::INT2OID | pg_sys::INT4OID
                                         ),
+                                        AggType::Avg => matches!(
+                                            spec.col_type_oid,
+                                            pg_sys::INT2OID
+                                                | pg_sys::INT4OID
+                                                | pg_sys::INT8OID
+                                                | pg_sys::FLOAT4OID
+                                                | pg_sys::FLOAT8OID
+                                        ),
                                         AggType::Min | AggType::Max => matches!(
                                             spec.col_type_oid,
                                             pg_sys::INT2OID
                                                 | pg_sys::INT4OID
                                                 | pg_sys::INT8OID
                                         ),
-                                        _ => false,
                                     };
                                     if is_i64 {
                                         // Determine sort direction

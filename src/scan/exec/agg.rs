@@ -1802,8 +1802,13 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     OutputEntry::Agg(ai) => ai,
                     _ => unreachable!(),
                 };
-                let k = (topn_limit as usize).max(1000);
-                Some((sort_slot, k, topn_ascending))
+                // AVG sort can't use raw sum for speculative top-K pruning
+                if agg_specs[sort_slot].agg_type == AggType::Avg {
+                    None
+                } else {
+                    let k = (topn_limit as usize).max(1000);
+                    Some((sort_slot, k, topn_ascending))
+                }
             } else {
                 None
             };
@@ -1924,7 +1929,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             );
             let _has_any_cd_agg = compact_storage.as_ref().unwrap().layout.slots.iter()
                 .any(|(_, k)| matches!(k, CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr));
-            if topn_limit > 0 && having_filters.is_empty() && !compact_sort_is_cd {
+            let compact_sort_is_avg = topn_limit > 0 && agg_specs[sort_slot_for_compact_spec].agg_type == AggType::Avg;
+            if topn_limit > 0 && having_filters.is_empty() && !compact_sort_is_cd && !compact_sort_is_avg {
                 let sort_slot = sort_slot_for_compact_spec;
                 let (_, sort_kind) = compact_storage.as_ref().unwrap().layout.slots[sort_slot];
                 let limit = topn_limit as usize;
@@ -2489,7 +2495,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             // across threads, each merges its slice and finds local
             // top-N, then merge the local results.
             // ----------------------------------------------------------
-            if topn_limit > 0 && having_filters.is_empty() {
+            if topn_limit > 0 {
                 let t_merge = Instant::now();
                 let limit = topn_limit as usize;
                 let sort_slot = match output_map[topn_sort_col] {
@@ -2510,6 +2516,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     let specs = &agg_specs;
                     let np = n_partitions;
                     let ascending = topn_ascending;
+                    let hfilters = &having_filters;
 
                     let handles: Vec<_> = (0..np).map(|p| {
                         s.spawn(move || {
@@ -2594,11 +2601,37 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
                             // Local top-N selection using a heap
                             let (_, sort_kind) = storage.layout.slots[sort_slot];
+                            let sort_is_avg = specs[sort_slot].agg_type == AggType::Avg;
                             let read_val = |gidx: u32| -> i64 {
-                                match sort_kind {
-                                    CompactAccKind::Count => storage.read_count(gidx, sort_slot),
-                                    CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(gidx, sort_slot).0,
-                                    _ => storage.read_count(gidx, sort_slot),
+                                if sort_is_avg {
+                                    let avg = match sort_kind {
+                                        CompactAccKind::SumIntNarrow => {
+                                            let (s, c) = storage.read_sum_int_narrow(gidx, sort_slot);
+                                            if c > 0 { s as f64 / c as f64 } else { 0.0 }
+                                        }
+                                        CompactAccKind::SumFloat => {
+                                            let (s, c) = storage.read_sum_float(gidx, sort_slot);
+                                            if c > 0 { s / c as f64 } else { 0.0 }
+                                        }
+                                        _ => storage.read_count(gidx, sort_slot) as f64,
+                                    };
+                                    let bits = avg.to_bits() as i64;
+                                    if bits >= 0 { bits } else { bits ^ i64::MAX }
+                                } else {
+                                    match sort_kind {
+                                        CompactAccKind::Count => storage.read_count(gidx, sort_slot),
+                                        CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(gidx, sort_slot).0,
+                                        _ => storage.read_count(gidx, sort_slot),
+                                    }
+                                }
+                            };
+
+                            let having_read_val = |gidx: u32, slot: usize| -> i64 {
+                                let (_, kind) = storage.layout.slots[slot];
+                                match kind {
+                                    CompactAccKind::Count => storage.read_count(gidx, slot),
+                                    CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(gidx, slot).0,
+                                    _ => storage.read_count(gidx, slot),
                                 }
                             };
 
@@ -2607,6 +2640,20 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 let mut heap: BinaryHeap<(i64, u128, u32)> =
                                     BinaryHeap::with_capacity(limit + 1);
                                 for (&key, &gidx) in &map {
+                                    let mut passes = true;
+                                    for hf in hfilters {
+                                        let val = having_read_val(gidx, hf.agg_idx);
+                                        let ok = match hf.op {
+                                            HavingOp::Gt => val > hf.const_val,
+                                            HavingOp::Lt => val < hf.const_val,
+                                            HavingOp::Ge => val >= hf.const_val,
+                                            HavingOp::Le => val <= hf.const_val,
+                                            HavingOp::Eq => val == hf.const_val,
+                                            HavingOp::Ne => val != hf.const_val,
+                                        };
+                                        if !ok { passes = false; break; }
+                                    }
+                                    if !passes { continue; }
                                     let val = read_val(gidx);
                                     heap.push((val, key, gidx));
                                     if heap.len() > limit { heap.pop(); }
@@ -2617,6 +2664,20 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 let mut heap: BinaryHeap<Reverse<(i64, u128, u32)>> =
                                     BinaryHeap::with_capacity(limit + 1);
                                 for (&key, &gidx) in &map {
+                                    let mut passes = true;
+                                    for hf in hfilters {
+                                        let val = having_read_val(gidx, hf.agg_idx);
+                                        let ok = match hf.op {
+                                            HavingOp::Gt => val > hf.const_val,
+                                            HavingOp::Lt => val < hf.const_val,
+                                            HavingOp::Ge => val >= hf.const_val,
+                                            HavingOp::Le => val <= hf.const_val,
+                                            HavingOp::Eq => val == hf.const_val,
+                                            HavingOp::Ne => val != hf.const_val,
+                                        };
+                                        if !ok { passes = false; break; }
+                                    }
+                                    if !passes { continue; }
                                     let val = read_val(gidx);
                                     heap.push(Reverse((val, key, gidx)));
                                     if heap.len() > limit { heap.pop(); }
@@ -2940,8 +3001,13 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     OutputEntry::Agg(ai) => ai,
                     _ => unreachable!(),
                 };
-                let k = (topn_limit as usize).max(1000);
-                Some((sort_slot, k, topn_ascending))
+                // AVG sort can't use raw sum for speculative top-K pruning
+                if agg_specs[sort_slot].agg_type == AggType::Avg {
+                    None
+                } else {
+                    let k = (topn_limit as usize).max(1000);
+                    Some((sort_slot, k, topn_ascending))
+                }
             } else {
                 None
             };
@@ -3122,7 +3188,8 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 compact_storage.as_ref().unwrap().layout.slots[sort_slot_for_spec].1,
                 CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr
             );
-            if topn_limit > 0 && having_filters.is_empty() && !sort_is_cd {
+            let sort_is_avg = topn_limit > 0 && agg_specs[sort_slot_for_spec].agg_type == AggType::Avg;
+            if topn_limit > 0 && having_filters.is_empty() && !sort_is_cd && !sort_is_avg {
                 let sort_slot = sort_slot_for_spec;
                 let (_, sort_kind) = compact_storage.as_ref().unwrap().layout.slots[sort_slot];
                 let limit = topn_limit as usize;
@@ -3752,7 +3819,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             // partition key space across threads, each merges its slice
             // and finds local top-N, then merge the local results.
             // ----------------------------------------------------------
-            if topn_limit > 0 && having_filters.is_empty() {
+            if topn_limit > 0 {
                 let t_merge = Instant::now();
                 let limit = topn_limit as usize;
                 let sort_slot = match output_map[topn_sort_col] {
@@ -3775,6 +3842,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     let np = n_partitions;
                     let ascending = topn_ascending;
                     let ngk = n_group_cols;
+                    let hfilters = &having_filters;
 
                     let handles: Vec<_> = (0..np).map(|p| {
                         s.spawn(move || {
@@ -3872,11 +3940,37 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
                             // Local top-N selection using a heap
                             let (_, sort_kind) = storage.layout.slots[sort_slot];
+                            let sort_is_avg = specs[sort_slot].agg_type == AggType::Avg;
                             let read_val = |gidx: u32| -> i64 {
-                                match sort_kind {
-                                    CompactAccKind::Count => storage.read_count(gidx, sort_slot),
-                                    CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(gidx, sort_slot).0,
-                                    _ => storage.read_count(gidx, sort_slot),
+                                if sort_is_avg {
+                                    let avg = match sort_kind {
+                                        CompactAccKind::SumIntNarrow => {
+                                            let (s, c) = storage.read_sum_int_narrow(gidx, sort_slot);
+                                            if c > 0 { s as f64 / c as f64 } else { 0.0 }
+                                        }
+                                        CompactAccKind::SumFloat => {
+                                            let (s, c) = storage.read_sum_float(gidx, sort_slot);
+                                            if c > 0 { s / c as f64 } else { 0.0 }
+                                        }
+                                        _ => storage.read_count(gidx, sort_slot) as f64,
+                                    };
+                                    let bits = avg.to_bits() as i64;
+                                    if bits >= 0 { bits } else { bits ^ i64::MAX }
+                                } else {
+                                    match sort_kind {
+                                        CompactAccKind::Count => storage.read_count(gidx, sort_slot),
+                                        CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(gidx, sort_slot).0,
+                                        _ => storage.read_count(gidx, sort_slot),
+                                    }
+                                }
+                            };
+
+                            let having_read_val = |gidx: u32, slot: usize| -> i64 {
+                                let (_, kind) = storage.layout.slots[slot];
+                                match kind {
+                                    CompactAccKind::Count => storage.read_count(gidx, slot),
+                                    CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(gidx, slot).0,
+                                    _ => storage.read_count(gidx, slot),
                                 }
                             };
 
@@ -3884,6 +3978,20 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 let mut heap: BinaryHeap<(i64, u128, u32)> =
                                     BinaryHeap::with_capacity(limit + 1);
                                 for (&key, &gidx) in &map {
+                                    let mut passes = true;
+                                    for hf in hfilters {
+                                        let val = having_read_val(gidx, hf.agg_idx);
+                                        let ok = match hf.op {
+                                            HavingOp::Gt => val > hf.const_val,
+                                            HavingOp::Lt => val < hf.const_val,
+                                            HavingOp::Ge => val >= hf.const_val,
+                                            HavingOp::Le => val <= hf.const_val,
+                                            HavingOp::Eq => val == hf.const_val,
+                                            HavingOp::Ne => val != hf.const_val,
+                                        };
+                                        if !ok { passes = false; break; }
+                                    }
+                                    if !passes { continue; }
                                     let val = read_val(gidx);
                                     heap.push((val, key, gidx));
                                     if heap.len() > limit { heap.pop(); }
@@ -3893,6 +4001,20 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 let mut heap: BinaryHeap<Reverse<(i64, u128, u32)>> =
                                     BinaryHeap::with_capacity(limit + 1);
                                 for (&key, &gidx) in &map {
+                                    let mut passes = true;
+                                    for hf in hfilters {
+                                        let val = having_read_val(gidx, hf.agg_idx);
+                                        let ok = match hf.op {
+                                            HavingOp::Gt => val > hf.const_val,
+                                            HavingOp::Lt => val < hf.const_val,
+                                            HavingOp::Ge => val >= hf.const_val,
+                                            HavingOp::Le => val <= hf.const_val,
+                                            HavingOp::Eq => val == hf.const_val,
+                                            HavingOp::Ne => val != hf.const_val,
+                                        };
+                                        if !ok { passes = false; break; }
+                                    }
+                                    if !passes { continue; }
                                     let val = read_val(gidx);
                                     heap.push(Reverse((val, key, gidx)));
                                     if heap.len() > limit { heap.pop(); }
@@ -4222,6 +4344,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 let top_entries = compact_topn_select(
                     &compact_group_map, storage, sort_slot,
                     topn_limit as usize, topn_ascending,
+                    agg_specs[sort_slot].agg_type == AggType::Avg,
                 );
                 topn_select_us = t_topn.elapsed().as_micros() as u64;
                 let mut rows = Vec::with_capacity(top_entries.len());
@@ -5812,6 +5935,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             let top_entries = compact_topn_select(
                 &compact_group_map, storage, sort_slot,
                 topn_limit as usize, topn_ascending,
+                agg_specs[sort_slot].agg_type == AggType::Avg,
             );
             topn_select_us = t_topn.elapsed().as_micros() as u64;
             let num_group_keys = group_specs.len();
@@ -6875,60 +6999,58 @@ unsafe fn compact_topn_select(
     sort_slot: usize,
     limit: usize,
     ascending: bool,
+    sort_is_avg: bool,
 ) -> Vec<(u128, u32)> {
     unsafe {
         let (_, kind) = storage.layout.slots[sort_slot];
+        let read_val = |group_idx: u32| -> i64 {
+            if sort_is_avg {
+                let avg = match kind {
+                    CompactAccKind::SumIntNarrow => {
+                        let (s, c) = storage.read_sum_int_narrow(group_idx, sort_slot);
+                        if c > 0 { s as f64 / c as f64 } else { 0.0 }
+                    }
+                    CompactAccKind::SumFloat => {
+                        let (s, c) = storage.read_sum_float(group_idx, sort_slot);
+                        if c > 0 { s / c as f64 } else { 0.0 }
+                    }
+                    _ => storage.read_count(group_idx, sort_slot) as f64,
+                };
+                let bits = avg.to_bits() as i64;
+                if bits >= 0 { bits } else { bits ^ i64::MAX }
+            } else {
+                match kind {
+                    CompactAccKind::Count => storage.read_count(group_idx, sort_slot),
+                    CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(group_idx, sort_slot).0,
+                    _ => storage.read_count(group_idx, sort_slot),
+                }
+            }
+        };
         if ascending {
             // Min-N: max-heap evicts the largest, keeping the smallest N
             let mut heap: BinaryHeap<(i64, u128, u32)> = BinaryHeap::with_capacity(limit + 1);
             for (&packed_key, &group_idx) in map {
-                let val = match kind {
-                    CompactAccKind::Count => storage.read_count(group_idx, sort_slot),
-                    CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(group_idx, sort_slot).0,
-                    _ => storage.read_count(group_idx, sort_slot),
-                };
+                let val = read_val(group_idx);
                 heap.push((val, packed_key, group_idx));
                 if heap.len() > limit {
                     heap.pop();
                 }
             }
             let mut result: Vec<(u128, u32)> = heap.into_iter().map(|(_, k, g)| (k, g)).collect();
-            // Sort ascending by re-reading values
-            result.sort_by_key(|&(_, g)| match kind {
-                CompactAccKind::Count => storage.read_count(g, sort_slot),
-                CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(g, sort_slot).0,
-                _ => storage.read_count(g, sort_slot),
-            });
+            result.sort_by_key(|&(_, g)| read_val(g));
             result
         } else {
             // Max-N: min-heap (via Reverse) evicts the smallest, keeping the largest N
             let mut heap: BinaryHeap<Reverse<(i64, u128, u32)>> = BinaryHeap::with_capacity(limit + 1);
             for (&packed_key, &group_idx) in map {
-                let val = match kind {
-                    CompactAccKind::Count => storage.read_count(group_idx, sort_slot),
-                    CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(group_idx, sort_slot).0,
-                    _ => storage.read_count(group_idx, sort_slot),
-                };
+                let val = read_val(group_idx);
                 heap.push(Reverse((val, packed_key, group_idx)));
                 if heap.len() > limit {
                     heap.pop();
                 }
             }
             let mut result: Vec<(u128, u32)> = heap.into_iter().map(|Reverse((_, k, g))| (k, g)).collect();
-            // Sort descending by re-reading values
-            result.sort_by(|&(_, ga), &(_, gb)| {
-                let va = match kind {
-                    CompactAccKind::Count => storage.read_count(ga, sort_slot),
-                    CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(ga, sort_slot).0,
-                    _ => storage.read_count(ga, sort_slot),
-                };
-                let vb = match kind {
-                    CompactAccKind::Count => storage.read_count(gb, sort_slot),
-                    CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(gb, sort_slot).0,
-                    _ => storage.read_count(gb, sort_slot),
-                };
-                vb.cmp(&va)
-            });
+            result.sort_by(|&(_, ga), &(_, gb)| read_val(gb).cmp(&read_val(ga)));
             result
         }
     }
