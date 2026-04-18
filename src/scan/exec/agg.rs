@@ -4838,33 +4838,97 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
             let agg_us = t2.elapsed().as_micros() as u64;
 
-            // Merge thread-local sets into global accumulators
-            let accumulators = global_accumulators.as_mut().unwrap();
             let mut total_segments = 0u64;
             for partial in &partial_results {
                 total_segments += partial.segments_processed;
-                for (spec_idx, _spec) in agg_specs.iter().enumerate() {
-                    match &mut accumulators[spec_idx] {
-                        AggAccumulator::CountDistinctInt { seen } => {
-                            for &v in &partial.int_sets[spec_idx] {
-                                seen.insert(v);
+            }
+
+            // Parallel partitioned merge of worker CD sets.
+            //
+            // Every path entering this block has `all_count_distinct == true`,
+            // so each spec is a `CountDistinct` and we only need the final
+            // `len()` — no need to materialize a global set. Partition the
+            // output keyspace into `CD_MERGE_PARTITIONS` buckets by a
+            // fixed-seed hash; each thread owns one bucket, walks every
+            // worker's set, and inserts only values that route to it. Buckets
+            // are disjoint → total distinct count = Σ bucket.len(). This
+            // removes the single-threaded 2.5 s stall on Q4 (workers were
+            // already parallel; the old final merge was not).
+            const CD_MERGE_PARTITIONS: usize = 16;
+            fn cd_part_int(v: i64) -> usize {
+                // SplitMix64-style finalizer — cheap, well-distributed.
+                let mut x = v as u64;
+                x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+                x ^= x >> 31;
+                (x >> 60) as usize & (CD_MERGE_PARTITIONS - 1)
+            }
+            fn cd_part_str(v: u128) -> usize {
+                // u128 values are already SipHash-128 digests; top bits are
+                // uniformly random.
+                ((v >> 124) as usize) & (CD_MERGE_PARTITIONS - 1)
+            }
+
+            let t_merge = Instant::now();
+            let n_specs = agg_specs.len();
+            // Per-partition counts: bucket_counts[partition][spec] = i64 distinct.
+            let partial_refs = &partial_results;
+            let is_str: Vec<bool> = agg_specs.iter()
+                .map(|s| matches!(s.col_type_oid,
+                    pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID))
+                .collect();
+            let is_str_ref = &is_str;
+            let bucket_counts: Vec<Vec<i64>> = std::thread::scope(|s| {
+                let handles: Vec<_> = (0..CD_MERGE_PARTITIONS).map(|p| {
+                    s.spawn(move || {
+                        // Per-spec local disjoint set; only the one matching
+                        // this spec's column type is used.
+                        let mut local_int: Vec<CdSetInt> = (0..n_specs)
+                            .map(|_| new_cd_set_int()).collect();
+                        let mut local_str: Vec<CdSetStr> = (0..n_specs)
+                            .map(|_| new_cd_set_str()).collect();
+                        for partial in partial_refs {
+                            for spec_idx in 0..n_specs {
+                                if is_str_ref[spec_idx] {
+                                    for &v in &partial.str_sets[spec_idx] {
+                                        if cd_part_str(v) == p {
+                                            local_str[spec_idx].insert(v);
+                                        }
+                                    }
+                                } else {
+                                    for &v in &partial.int_sets[spec_idx] {
+                                        if cd_part_int(v) == p {
+                                            local_int[spec_idx].insert(v);
+                                        }
+                                    }
+                                }
                             }
                         }
-                        AggAccumulator::CountDistinctStr { seen } => {
-                            for &v in &partial.str_sets[spec_idx] {
-                                seen.insert(v);
+                        (0..n_specs).map(|spec_idx| {
+                            if is_str_ref[spec_idx] {
+                                local_str[spec_idx].len() as i64
+                            } else {
+                                local_int[spec_idx].len() as i64
                             }
-                        }
-                        _ => {}
-                    }
+                        }).collect::<Vec<i64>>()
+                    })
+                }).collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let merge_us = t_merge.elapsed().as_micros() as u64;
+
+            // Sum bucket counts per spec to get final distinct count.
+            let mut final_counts: Vec<i64> = vec![0; n_specs];
+            for bucket in &bucket_counts {
+                for spec_idx in 0..n_specs {
+                    final_counts[spec_idx] += bucket[spec_idx];
                 }
             }
 
-            // Finalize
-            let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
-            for (spec_idx, spec) in agg_specs.iter().enumerate() {
-                agg_results.push(finalize_accumulator(&accumulators[spec_idx], spec));
-            }
+            // Build agg_results directly from counts (every spec is CD here).
+            let agg_results: Vec<(pg_sys::Datum, bool)> = final_counts.iter()
+                .map(|&c| (pg_sys::Datum::from(c as usize), false))
+                .collect();
             let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
             for entry in &output_map {
                 match entry {
@@ -4899,7 +4963,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 topn_sort_col: -1,
                 topn_ascending,
                 pre_topn_groups: 0,
-                merge_us: 0,
+                merge_us,
                 finalize_us: 0,
                 topn_select_us: 0,
                 n_workers: actual_workers as u64,
