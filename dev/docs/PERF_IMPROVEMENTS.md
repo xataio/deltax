@@ -1004,7 +1004,15 @@ LengthOf accumulators routed through `get_len()`).
 
 ### 43. HLL sketches for COUNT(DISTINCT)
 
-**Target (validated on EC2 100 M bench, hot best-of-3, 2026-04-18):**
+**Status (2026-04-21): deprioritized.** Pre-HLL fixes (a)+(b)+(c)
+captured the bulk of the original ~4.5 s target. Remaining
+HLL-specific saving is ~1.2 s cumulative (see bottleneck analysis
+below), against medium implementation cost + an approximate-semantics
+GUC. Not currently planned; leaving the design notes intact should
+the tradeoff change later (e.g. if the bench runs push Q8/Q9/Q13
+back up the priority list).
+
+**Original target (before (a)(b)(c) landed, on EC2 100 M bench, hot best-of-3, 2026-04-18):**
 Q4 3.04 s → ~0.2 s, Q5 1.78 s → ~0.3 s (pre-computed sketches).
 Q8 1.02 s → ~0.7 s, Q9 1.47 s → ~1.1 s, Q13 2.03 s → ~1.6 s
 (query-time sketches). **Cumulative ~4.5 s across the bench.**
@@ -1266,3 +1274,202 @@ not depend on or conflict with any map-layout change (e.g. #36).
 - `src/scan/exec/segments.rs` — `load_hll_sketches` PK index scan
   (analogous to `load_text_length_sidecars`).
 - `src/lib.rs` — `pg_deltax.exact_count_distinct` GUC.
+
+### 44. Early termination for `GROUP BY … LIMIT N` without `ORDER BY`
+
+**Target: Q17 1.69 s → ~0.02 s (ClickBench hot run)**
+**Complexity: Low (~50 LOC)**
+
+Q17 is `SELECT UserID, SearchPhrase, COUNT(*) FROM hits GROUP BY
+UserID, SearchPhrase LIMIT 10` — no ORDER BY. Today we still
+materialize every group (`pre_topn_groups ≈ 17 M`), then PG's Limit
+node picks 10. EXPLAIN shows `agg=813 ms` on top of `detoast=523 ms`
+to build a hash table that's 99.9999 % thrown away.
+
+Under PostgreSQL's semantics, `LIMIT N` without `ORDER BY` is
+allowed to return any N rows in any order. Once aggregation has
+accumulated ≥ N distinct groups, the remaining segments cannot
+change the result.
+
+**Approach.** In the planner hook (`plan_agg_path`), detect the
+shape `GROUP BY … LIMIT N` with no sort key, and flag
+`GroupByLimit::EarlyTerm { limit: N }` in `custom_private`. In the
+phase-1 mixed/compact worker loop in `agg.rs`, after processing
+each segment check `local_map.len() >= limit` and, if so, set an
+`early_done` atomic flag observed by other workers to stop their
+segment loops. Phase-2 merge proceeds normally on the (small)
+accumulated state; each worker's map has ≥ `limit` groups but
+probably far more (workers don't coordinate on which groups they
+already covered), so the global map is still typically larger than
+`limit`. That's fine — the LIMIT at the top of the plan truncates.
+
+**Gating.** Only trigger when:
+- `parse->hasLimit && parse->limitCount` is a positive const
+- `parse->sortClause.is_null()` (no ORDER BY)
+- `parse->groupClause.is_not_null()` (actually has GROUP BY —
+  otherwise the existing TopN path or plain aggregate applies)
+- No HAVING clause
+
+**Scope.** Only one ClickBench query hits this exact shape (Q17),
+so the bench-level win is ~1.5 s; but the change is small, safe,
+and the same shape shows up in interactive exploration queries
+(people frequently prototype with `GROUP BY … LIMIT 10` before
+adding an ORDER BY).
+
+**Files:** `src/scan/hook.rs` (shape detection + `custom_private`
+encoding), `src/scan/exec/agg.rs` (atomic `early_done` flag, segment
+loop check in both compact and mixed paths).
+
+### 45. Dict sidecar blob for dict-encoded text columns
+
+**Target: Q5 0.76 s → ~0.2 s, Q25 1.91 s → ~0.15 s (ClickBench hot run). Cumulative ~3 s.**
+**Complexity: Medium**
+
+Several queries only need the dictionary portion of a dict-encoded
+blob, not the per-row index array:
+
+- `COUNT(DISTINCT SearchPhrase)` (Q5) — current dict-only fast path
+  hashes only ~500 dict entries per segment, but still detoasts the
+  full ~200 KB main blob to reach the dict header.
+- `ORDER BY text_col LIMIT N` (Q25) — only needs the lex-smallest
+  dict entry per segment to produce top-N candidates.
+- Dict-accelerated LIKE pre-check (#40 pre-phase) — tests the
+  pattern against ~500 dict entries without touching the index
+  array.
+
+**Approach.** At compress time, emit the dict as its own LZ4 blob
+in a new `*_text_dicts` companion table (analogous to
+`*_text_lengths` in #42). Wire format can be identical to the
+leading bytes of the existing main blob's dict header — just split
+out. Storage cost: per segment, roughly the same size as the dict
+section of the main blob (~2–10 KB), minus some framing overhead.
+
+Query-time: segments.rs gains a `load_text_dict_sidecars` PK scan,
+activated when all query-time references to the column are
+dict-resolvable (COUNT DISTINCT / MIN/MAX by lex / dict-LIKE
+pre-check). The main blob detoast is then skipped for those
+segments.
+
+**Gating & disqualifications.** Same pattern as #42:
+- Any per-row reference (equality with non-dict constant, GROUP BY,
+  emit in projection) disqualifies and forces main-blob detoast.
+- Only activated when the aggregate dispatcher knows the fast path
+  applies (`count_distinct_only_str`, `topn_dict_only_text`,
+  dict-LIKE pre-check in Phase 1).
+
+**Interaction with #40.** When #40 lands, the dict-accelerated
+LIKE pre-phase reads only the dict. Pairing with this sidecar lets
+the pre-phase skip the main blob entirely for non-matching
+segments, compounding the gain.
+
+**Storage cost estimate.** 3338 segments × ~5 KB avg per text dict
+column × 3 dict columns (SearchPhrase, Title, one more) ≈ 50 MB —
+negligible against the existing ~14 GB on-disk footprint.
+
+**Files:** `src/compress.rs` (`compress_text_dict` or emit during
+`compress_text_column`, companion DDL), `src/copy.rs` (direct
+backfill: buffer + `heap_insert`), `src/scan/exec/segments.rs`
+(`load_text_dict_sidecars`), `src/scan/exec/text_col.rs`
+(`SegTextColumn::DictOnly` variant), `src/scan/exec/agg.rs`
+(dict-only dispatchers detect sidecar availability).
+
+### 46. Text-empty segment pruning via `nonzero_count`
+
+**Target: Q30 1.03 s → ~0.9 s, Q31 1.79 s → ~1.5 s; smaller margins on Q10, Q11, Q12, Q21, Q22.**
+**Cumulative: ~0.3–0.6 s.** **Complexity: Low (~20 LOC).**
+
+The compressor already tracks `_nonzero_count_<col>` for text
+columns (number of non-empty rows per segment — see
+`compress.rs::compute_typed_sum` extended for text in #42).
+`segments.rs::check_all_pass` already uses `nonzero_count` to prune
+segments for `Ne 0` / `Eq 0` on integers — but only when the qual
+constant is numeric zero (`is_zero_const`). Text `<> ''` is lowered
+to `BatchCompareOp::Ne` with a text-empty constant and misses the
+gate.
+
+**Approach.** Extend `is_zero_const` (or add
+`is_empty_text_const`) to recognize the empty varlena constant.
+Then the existing path works unchanged:
+- Segment with `nonzero_count == 0` → filter eliminates every row → `NonePass` → skip segment.
+- Segment with `nonzero_count == row_count` and `nonnull_count == row_count` → filter is satisfied for every row → `AllPass` → strip the qual.
+
+**Datasets where this helps.** The optimization is worth the gain
+proportional to clumpiness of empty-text values in segments. In
+ClickBench, SearchPhrase is only 13 % non-empty globally on Q30/Q31;
+MobilePhoneModel is 50 % non-empty on Q10/Q11 — both are time-
+clustered in the source data, so some (likely many) segments are
+fully empty and can be skipped entirely. Measured exact benefit
+would need a run; rough lower bound is 10–30 % of the affected
+queries' detoast cost.
+
+**Files:** `src/scan/exec/segments.rs`
+(`is_zero_const` → also matches empty varlena;
+`check_all_pass` unchanged), possibly
+`src/scan/exec/batch_eval.rs` (ensure `Ne` on empty text lands in
+the same constant canonicalization).
+
+### 47. Partition-level bloom filter for point lookups
+
+**Target: Q19 43 ms → ~15 ms (ClickBench hot run)**
+**Complexity: Low-Medium**
+
+Q19 (`WHERE UserID = <const>`) already benefits from per-segment
+min/max pruning (1870 segments skipped) and per-segment bloom
+filters (1418 more skipped). But EXPLAIN shows `bloom hit=5926`
+buffer pages read on warm — those are the 1468 surviving segments'
+blooms being loaded and tested to produce 50 surviving segments.
+
+**Approach.** Store a coarser bloom filter per **partition** (18
+total) in the partition-level metadata. At query time, test the
+point-lookup constant against each partition's bloom first; skip
+all segments in partitions that reject. Remaining partitions fall
+through to the existing per-segment bloom path.
+
+Sizing: each partition holds ~185 segments × ~30 K rows ≈ 5.5 M
+rows. A 256 KB bloom at 4 hashes gives ~1 % FPR at that scale —
+small enough to fit comfortably in a companion row.
+
+**Expected effect.** On Q19, partition-level blooms would likely
+reject ~15 of 18 partitions, dropping the per-segment bloom checks
+from ~1468 to ~550 and the buffer reads proportionally. The 30 ms
+saving is small in absolute terms but the change is cheap; same
+infrastructure extends to equality predicates in general.
+
+**Scope.** Only helps equality predicates on columns with bloom
+filters. Bench-level impact is ~30 ms (Q19 alone). Worth doing as
+part of a broader partition-level pruning pass if/when other
+partition-level optimizations land; marginal on its own.
+
+**Files:** `src/compress.rs` (partition-level bloom build — runs
+during `deltax_create_table` and on partition compaction),
+`src/scan/exec/segments.rs` (partition-level bloom load + test
+before per-segment bloom).
+
+### 48. Q40 column-pruning audit
+
+**Target: Q40 138 ms → ~80 ms**
+**Complexity: Investigation**
+
+Q40 (`CounterID=62 URLHash range query`) shows `decompress=71 ms`
+for only 89,914 rows out of 100 M — roughly 0.8 µs/row, which is
+an order of magnitude higher than other range queries on similar
+row counts (Q36 `decompress=12 ms` for 671 K rows). The 6 batch
+quals narrow to a tiny working set, but the scan appears to be
+decompressing more columns than strictly needed.
+
+**Investigation.** Add per-column decompress timing to the
+`decompress` phase of DeltaXAgg (via a feature-flagged or
+debug-only dump), run Q40 under it, and identify which columns are
+being materialized beyond the ones referenced in SELECT, GROUP BY,
+and WHERE. Likely suspects: a fallback in `needed_cols`
+construction that adds a column for qual evaluation even when the
+qual was batch-handled, or Phase 2 kicking in for columns that
+Phase 1 quals already eliminated.
+
+**Expected outcome.** Either a targeted fix (tighten `needed_cols`
+at the specific call site), or confirmation that Q40's decompress
+cost is fundamental and the query is well-optimized. ~60 ms saving
+on Q40 is the plausible ceiling.
+
+**Files:** probably `src/scan/exec/agg.rs` (`needed_cols`
+computation) and `src/scan/exec/decompress.rs` (phase boundary).
