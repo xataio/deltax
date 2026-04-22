@@ -95,9 +95,12 @@ for t in customers products orders order_items; do
     sudo -u postgres psql "$DB" -c "COPY $t FROM '$DATA_DIR/$t.csv' WITH (FORMAT csv)"
 done
 
-# Load order_events via direct backfill (compress in-flight)
-echo "Loading order_events (FORMAT deltax_compress)..."
-sudo -u postgres psql "$DB" -c "COPY order_events FROM '$DATA_DIR/order_events.csv' WITH (FORMAT deltax_compress)"
+# Load order_events via direct backfill (compress in-flight).
+# FORMAT deltax_compress_csv uses PG's CSV parser under the hood so that
+# the quoted jsonb event_payload column (embedded commas and quotes) is
+# handled correctly.
+echo "Loading order_events (FORMAT deltax_compress_csv)..."
+sudo -u postgres psql "$DB" -c "COPY order_events FROM '$DATA_DIR/order_events.csv' WITH (FORMAT deltax_compress_csv)"
 LOAD_END=$(date +%s)
 echo "Load time: $((LOAD_END - LOAD_START))s"
 
@@ -125,9 +128,17 @@ DATA_SIZE=$DATA_SIZE
 STATS
 echo "Saved load stats to ~/rtabench/load_stats.env (load_time=${LOAD_TIME}s, data_size=${DATA_SIZE})"
 
-# Lower work_mem and disable JIT for the query phase
-sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '256MB'"
+# Tune PG for query phase (sized for c6a.4xlarge: 16 vCPU, 32 GB RAM).
+# shared_buffers + max_worker_processes require a server restart; set them
+# via ALTER SYSTEM and restart once before queries run.
+sudo -u postgres psql -c "ALTER SYSTEM SET shared_buffers = '8GB'"
+sudo -u postgres psql -c "ALTER SYSTEM SET effective_cache_size = '24GB'"
+sudo -u postgres psql -c "ALTER SYSTEM SET max_worker_processes = 16"
+sudo -u postgres psql -c "ALTER SYSTEM SET max_parallel_workers = 16"
+sudo -u postgres psql -c "ALTER SYSTEM SET max_parallel_workers_per_gather = 8"
+sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '8GB'"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET jit TO off"
+sudo systemctl restart postgresql
 
 # Report partition / compression info and check for default-partition pollution
 sudo -u postgres psql "$DB" -c "SELECT * FROM deltax_partition_info('order_events')"

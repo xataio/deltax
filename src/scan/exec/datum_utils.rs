@@ -233,29 +233,51 @@ unsafe fn decode_compressed_datums(
                 cc.data
             };
             let slices = compression::dictionary::decode_to_slices(dict_data, non_null_count);
-            unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
+            if type_oid == pg_sys::JSONBOID {
+                let byte_slices: Vec<&[u8]> = slices.iter().map(|s| s.as_bytes()).collect();
+                unsafe { byte_slices_to_jsonb_datums_arena(&byte_slices) }
+            } else {
+                unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
+            }
         }
         CompressionType::Lz4 => {
             let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
-            let slices: Vec<&str> = ranges
-                .iter()
-                .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len])
-                        .expect("invalid UTF-8 in LZ4 data")
-                })
-                .collect();
-            unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
+            if type_oid == pg_sys::JSONBOID {
+                // Skip UTF-8 validation — stored bytes are jsonb varlena payload.
+                let byte_slices: Vec<&[u8]> = ranges
+                    .iter()
+                    .map(|&(off, len)| &buf[off..off + len])
+                    .collect();
+                unsafe { byte_slices_to_jsonb_datums_arena(&byte_slices) }
+            } else {
+                let slices: Vec<&str> = ranges
+                    .iter()
+                    .map(|&(off, len)| {
+                        std::str::from_utf8(&buf[off..off + len])
+                            .expect("invalid UTF-8 in LZ4 data")
+                    })
+                    .collect();
+                unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
+            }
         }
         CompressionType::Lz4Blocked => {
             let (buf, ranges) = compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
-            let slices: Vec<&str> = ranges
-                .iter()
-                .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len])
-                        .expect("invalid UTF-8 in LZ4 data")
-                })
-                .collect();
-            unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
+            if type_oid == pg_sys::JSONBOID {
+                let byte_slices: Vec<&[u8]> = ranges
+                    .iter()
+                    .map(|&(off, len)| &buf[off..off + len])
+                    .collect();
+                unsafe { byte_slices_to_jsonb_datums_arena(&byte_slices) }
+            } else {
+                let slices: Vec<&str> = ranges
+                    .iter()
+                    .map(|&(off, len)| {
+                        std::str::from_utf8(&buf[off..off + len])
+                            .expect("invalid UTF-8 in LZ4 data")
+                    })
+                    .collect();
+                unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
+            }
         }
         CompressionType::BooleanBitmap => {
             let bools = compression::boolean::decode(cc.data, non_null_count);
@@ -1188,9 +1210,10 @@ pub(super) unsafe fn str_slices_to_text_datums_arena(
         return Vec::new();
     }
 
-    // bpchar needs the input function for padding; jsonb needs it to
-    // produce a real jsonb binary Datum from the stored text (otherwise
-    // jsonb operators like ->> segfault on raw text bytes).
+    // bpchar needs the input function for padding. jsonb should normally go
+    // through `byte_slices_to_jsonb_datums_arena` (the bytes are binary, not
+    // UTF-8); this branch is only a safety net for any caller that still
+    // hands us text.
     if type_oid == pg_sys::BPCHAROID || type_oid == pg_sys::JSONBOID {
         return unsafe {
             slices
@@ -1226,6 +1249,55 @@ pub(super) unsafe fn str_slices_to_text_datums_arena(
                 s.as_ptr(),
                 (varlena_ptr as *mut u8).add(VARHDRSZ),
                 s.len(),
+            );
+            datums.push(pg_sys::Datum::from(varlena_ptr as usize));
+            offset += ((total_len as usize) + MAXALIGN - 1) & !(MAXALIGN - 1);
+        }
+
+        datums
+    }
+}
+
+/// Build jsonb Datums from raw byte slices already in PG's binary jsonb
+/// representation (the payload after `VARDATA_ANY`, i.e. without varlena
+/// header). Each slice is wrapped in a fresh short-varlena header and
+/// returned as a `pg_sys::Datum`. This is the hot path that replaces the
+/// per-row `jsonb_in` parse — parsing happened once at ingest.
+///
+/// Arena-allocates a single contiguous palloc block for all varlenas to
+/// keep cache locality good on large row batches (mirrors
+/// `str_slices_to_text_datums_arena`).
+pub(super) unsafe fn byte_slices_to_jsonb_datums_arena(
+    slices: &[&[u8]],
+) -> Vec<pg_sys::Datum> {
+    if slices.is_empty() {
+        return Vec::new();
+    }
+
+    unsafe {
+        const VARHDRSZ: usize = pg_sys::VARHDRSZ;
+        const MAXALIGN: usize = 8;
+
+        let total_size: usize = slices
+            .iter()
+            .map(|b| {
+                let varlena_size = VARHDRSZ + b.len();
+                (varlena_size + MAXALIGN - 1) & !(MAXALIGN - 1)
+            })
+            .sum();
+
+        let arena = pg_sys::palloc(total_size) as *mut u8;
+        let mut datums = Vec::with_capacity(slices.len());
+        let mut offset = 0;
+
+        for b in slices {
+            let varlena_ptr = arena.add(offset) as *mut pg_sys::varlena;
+            let total_len = (VARHDRSZ + b.len()) as i32;
+            pgrx::set_varsize_4b(varlena_ptr, total_len);
+            std::ptr::copy_nonoverlapping(
+                b.as_ptr(),
+                (varlena_ptr as *mut u8).add(VARHDRSZ),
+                b.len(),
             );
             datums.push(pg_sys::Datum::from(varlena_ptr as usize));
             offset += ((total_len as usize) + MAXALIGN - 1) & !(MAXALIGN - 1);

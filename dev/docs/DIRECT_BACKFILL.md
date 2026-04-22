@@ -35,14 +35,18 @@ PostgreSQL has no native pluggable COPY format API (a patch for PG19 exists but 
 
 ### FORMAT Option Handling
 
-`FORMAT deltax_compress` is not a real PostgreSQL format — it's a signal for our hook to intercept the COPY. The hook strips the custom format option from the `CopyStmt.options` list and defaults to CSV for the underlying COPY parser. Additional standard COPY options (e.g., `DELIMITER`, `HEADER`, `NULL`) are preserved and passed through to `BeginCopyFrom`.
+`FORMAT deltax_compress` is not a real PostgreSQL format — it's a signal for our hook to intercept the COPY. The hook strips the custom format option and leaves PG to default to TEXT format (tab-delimited, `\N` for NULL, backslash escapes). Additional standard COPY options (`DELIMITER`, `HEADER`, `NULL`) are preserved and passed through to `BeginCopyFrom`.
+
+For CSV-formatted input (quoted fields, embedded commas — common when any column is jsonb or free-form text), use the companion `deltax_compress_csv` variant. The hook replaces the FORMAT with `FORMAT csv` before calling `BeginCopyFrom`, so PG's CSV parser handles quoting and `""` escapes. The CSV variant always routes through the legacy (non-parallel) path because the fast Rust parser is TEXT-only.
 
 ```sql
--- These all work:
-COPY hits FROM '/data/file.csv' WITH (FORMAT deltax_compress);
-COPY hits FROM '/data/file.csv' WITH (FORMAT deltax_compress, HEADER true);
+-- TEXT variant (tab-delimited by default)
 COPY hits FROM '/data/file.tsv' WITH (FORMAT deltax_compress, DELIMITER E'\t');
 COPY hits FROM STDIN WITH (FORMAT deltax_compress);
+
+-- CSV variant (for files with quoted fields / embedded commas)
+COPY events FROM '/data/events.csv' WITH (FORMAT deltax_compress_csv);
+COPY events FROM '/data/events.csv' WITH (FORMAT deltax_compress_csv, HEADER true);
 ```
 
 ### Data Flow

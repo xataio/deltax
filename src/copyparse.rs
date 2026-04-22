@@ -371,6 +371,17 @@ pub fn parse_raw_field_and_append(
             }
             Ok(())
         }
+        ColumnKind::Jsonb => {
+            // Direct backfill: unescape the field to canonical JSON text
+            // and convert to jsonb's binary form once. Scan side just
+            // wraps the stored bytes in a varlena (no per-row jsonb_in).
+            let unescaped = unescape_field_always(raw);
+            let bytes = unsafe { crate::compress::jsonb_text_to_binary(&unescaped) };
+            if let TypedColumn::Bytes(vec) = typed_col {
+                vec.push(Some(bytes));
+            }
+            Ok(())
+        }
         _ => {
             // For non-text: if no backslash, parse directly from raw bytes as &str
             // This is the fast path — no String allocation
@@ -399,6 +410,7 @@ fn push_null(typed_col: &mut TypedColumn) -> Result<(), ParseError> {
         TypedColumn::Float64(v) => v.push(None),
         TypedColumn::Bool(v) => v.push(None),
         TypedColumn::Text(v) => v.push(None),
+        TypedColumn::Bytes(v) => v.push(None),
     }
     Ok(())
 }
@@ -507,6 +519,16 @@ fn parse_str_and_append(
             }
             Ok(())
         }
+        ColumnKind::Jsonb => {
+            // Direct backfill from COPY: the raw field bytes are canonical
+            // JSON text; convert once to jsonb's binary form so the scan
+            // path can return it directly without per-row jsonb_in.
+            let bytes = unsafe { crate::compress::jsonb_text_to_binary(s) };
+            if let TypedColumn::Bytes(vec) = typed_col {
+                vec.push(Some(bytes));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -533,6 +555,7 @@ pub fn parse_and_append(
                 TypedColumn::Float64(v) => v.push(None),
                 TypedColumn::Bool(v) => v.push(None),
                 TypedColumn::Text(v) => v.push(None),
+                TypedColumn::Bytes(v) => v.push(None),
             }
             Ok(())
         }
@@ -620,6 +643,13 @@ pub fn parse_and_append(
             ColumnKind::Text => {
                 if let TypedColumn::Text(vec) = typed_col {
                     vec.push(Some(s.to_string()));
+                }
+                Ok(())
+            }
+            ColumnKind::Jsonb => {
+                let bytes = unsafe { crate::compress::jsonb_text_to_binary(s) };
+                if let TypedColumn::Bytes(vec) = typed_col {
+                    vec.push(Some(bytes));
                 }
                 Ok(())
             }

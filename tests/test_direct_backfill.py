@@ -270,6 +270,33 @@ def test_normal_copy_still_works(db):
     assert result[0] == 1
 
 
+def test_csv_format_with_quoted_fields(db):
+    """FORMAT deltax_compress_csv handles CSV-quoted fields (embedded
+    commas, quotes) by routing through PG's CSV parser."""
+    _setup_table(db)
+
+    # CSV data: JSON-like text in 'device' column with embedded commas,
+    # plus a row with a double-quote that needs CSV escaping ("").
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    csv_data = (
+        f'{now.isoformat()},"{{""terminal"": ""Berlin"", ""lane"": 3}}",1.0\n'
+        f'{now.isoformat()},"dev with, comma",2.0\n'
+        f'{now.isoformat()},dev_plain,3.0\n'
+    )
+    sql = "COPY backfill FROM STDIN WITH (FORMAT deltax_compress_csv)"
+    with db.cursor() as cur:
+        with cur.copy(sql) as copy:
+            copy.write(csv_data.encode())
+    db.commit()
+
+    rows = db.execute(
+        "SELECT device, value FROM backfill ORDER BY value"
+    ).fetchall()
+    assert rows[0] == ('{"terminal": "Berlin", "lane": 3}', 1.0)
+    assert rows[1] == ("dev with, comma", 2.0)
+    assert rows[2] == ("dev_plain", 3.0)
+
+
 def test_with_segment_by(db):
     """Direct backfill with segment_by columns — stores data without segment grouping.
 

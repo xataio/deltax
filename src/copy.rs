@@ -116,8 +116,8 @@ unsafe extern "C-unwind" fn deltax_process_utility(
         return;
     }
 
-    // Check for FORMAT deltax_compress in options
-    let format_idx = find_deltax_format_option(cs.options);
+    // Check for FORMAT deltax_compress / deltax_compress_csv in options
+    let (format_idx, is_csv) = find_deltax_format_option(cs.options);
     if format_idx < 0 {
         unsafe {
             chain_to_prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
@@ -126,7 +126,7 @@ unsafe extern "C-unwind" fn deltax_process_utility(
     }
 
     // This is our COPY — handle it
-    handle_copy_from_deltax_compress(copy_stmt, format_idx);
+    handle_copy_from_deltax_compress(copy_stmt, format_idx, is_csv);
 
     // Set QueryCompletion to report rows
     if !qc.is_null() {
@@ -137,11 +137,14 @@ unsafe extern "C-unwind" fn deltax_process_utility(
     }
 }
 
-/// Walk the options list looking for `FORMAT 'deltax_compress'`.
-/// Returns the list index of the matching DefElem, or -1 if not found.
-fn find_deltax_format_option(options: *mut pg_sys::List) -> i32 {
+/// Walk the options list looking for `FORMAT 'deltax_compress'` or
+/// `FORMAT 'deltax_compress_csv'`. Returns `(list_idx, is_csv)` where
+/// `is_csv` indicates whether the underlying parser should be CSV-mode
+/// (quoted fields) rather than the default TEXT (tab-delimited, backslash
+/// escapes). A list_idx of -1 means no match.
+fn find_deltax_format_option(options: *mut pg_sys::List) -> (i32, bool) {
     if options.is_null() {
-        return -1;
+        return (-1, false);
     }
     let list = unsafe { &*options };
     let len = list.length;
@@ -168,14 +171,19 @@ fn find_deltax_format_option(options: *mut pg_sys::List) -> i32 {
             continue;
         }
         let val = unsafe { CStr::from_ptr(val_str) };
-        if val.to_bytes().eq_ignore_ascii_case(b"deltax_compress") {
-            return i;
+        let bytes = val.to_bytes();
+        if bytes.eq_ignore_ascii_case(b"deltax_compress") {
+            return (i, false);
+        }
+        if bytes.eq_ignore_ascii_case(b"deltax_compress_csv") {
+            return (i, true);
         }
     }
-    -1
+    (-1, false)
 }
 
-/// Build a new options list without the FORMAT defelem (so PG defaults to CSV).
+/// Build a new options list without the FORMAT defelem (so PG defaults to
+/// TEXT format for the underlying COPY parser).
 unsafe fn strip_format_option(options: *mut pg_sys::List, format_idx: i32) -> *mut pg_sys::List {
     if options.is_null() {
         return std::ptr::null_mut();
@@ -191,6 +199,43 @@ unsafe fn strip_format_option(options: *mut pg_sys::List, format_idx: i32) -> *m
         new_list = unsafe { pg_sys::lappend(new_list, cell.ptr_value) };
     }
     new_list
+}
+
+/// Build a new options list with the FORMAT defelem at `format_idx` replaced
+/// by `FORMAT <new_format>`. Used to swap `deltax_compress_csv` for `csv`
+/// before handing the options to PG's `BeginCopyFrom`.
+unsafe fn replace_format_option(
+    options: *mut pg_sys::List,
+    format_idx: i32,
+    new_format: &str,
+) -> *mut pg_sys::List {
+    unsafe {
+        let c_format_name = std::ffi::CString::new("format").unwrap();
+        let c_format_value = std::ffi::CString::new(new_format).unwrap();
+        // Leak the CStrings — PG owns the buffers once they're attached to
+        // the DefElem node (the node lives in the current memory context,
+        // which PG frees at end of COPY).
+        let name_ptr = c_format_name.into_raw();
+        let value_ptr = c_format_value.into_raw();
+        let value_node = pg_sys::makeString(value_ptr) as *mut pg_sys::Node;
+        let new_defelem = pg_sys::makeDefElem(name_ptr, value_node, -1);
+
+        if options.is_null() {
+            return pg_sys::lappend(std::ptr::null_mut(), new_defelem as *mut std::ffi::c_void);
+        }
+        let list = &*options;
+        let len = list.length;
+        let mut new_list: *mut pg_sys::List = std::ptr::null_mut();
+        for i in 0..len {
+            if i == format_idx {
+                new_list = pg_sys::lappend(new_list, new_defelem as *mut std::ffi::c_void);
+            } else {
+                let cell = &*list.elements.add(i as usize);
+                new_list = pg_sys::lappend(new_list, cell.ptr_value);
+            }
+        }
+        new_list
+    }
 }
 
 /// Execute SQL via a short-lived SPI connection.
@@ -323,11 +368,11 @@ struct BackfillState {
     time_col_index: usize,
 }
 
-fn handle_copy_from_deltax_compress(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
+fn handle_copy_from_deltax_compress(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_csv: bool) {
     // Bypass DML-on-compressed check for our companion table writes
     crate::scan::set_dml_bypass(true);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        handle_copy_from_inner(copy_stmt, format_idx);
+        handle_copy_from_inner(copy_stmt, format_idx, is_csv);
     }));
     crate::scan::set_dml_bypass(false);
     if let Err(e) = result {
@@ -394,7 +439,7 @@ fn extract_copy_text_options(options: *mut pg_sys::List, format_idx: i32) -> Cop
     opts
 }
 
-fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
+fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_csv: bool) {
     let cs = unsafe { &*copy_stmt };
 
     // 1. Resolve table
@@ -512,8 +557,10 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
         time_col_index,
     };
 
-    // Branch: file-path → pure-Rust parser, stdin → legacy PG parser
-    if !cs.filename.is_null() && !cs.is_program {
+    // Branch: file-path → pure-Rust parser, stdin → legacy PG parser.
+    // CSV variant always routes through legacy (BeginCopyFrom supports CSV
+    // quoting; the fast Rust parser is TEXT-format only).
+    if !cs.filename.is_null() && !cs.is_program && !is_csv {
         let filename = unsafe { CStr::from_ptr(cs.filename) }
             .to_str()
             .unwrap_or_else(|_| pgrx::error!("pg_deltax: filename is not valid UTF-8"));
@@ -558,6 +605,7 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32) {
         handle_copy_from_legacy(
             cs,
             format_idx,
+            is_csv,
             &state,
             &mut part_buffers,
             &partitions,
@@ -1257,17 +1305,28 @@ fn handle_copy_from_file_sequential(
 /// Stdin/program COPY path: use PG's BeginCopyFrom for protocol handling,
 /// but NextCopyFromRawFields for line/field parsing (skipping PG's InputFunctionCall),
 /// then Rust type conversion via `parse_and_append`.
+///
+/// When `is_csv` is true, the stripped `FORMAT deltax_compress_csv` option is
+/// replaced with `FORMAT csv` so PG's CSV parser handles quoting / escaping
+/// (used for files with embedded commas, e.g. jsonb columns).
 fn handle_copy_from_legacy(
     cs: &pg_sys::CopyStmt,
     format_idx: i32,
+    is_csv: bool,
     state: &BackfillState,
     part_buffers: &mut [PartitionBuffer],
     partitions: &[crate::catalog::PartitionInfo],
     range_starts: &[i64],
     range_ends: &[i64],
 ) {
-    // Strip FORMAT deltax_compress; PG defaults to TEXT format (tab-separated).
-    let final_options = unsafe { strip_format_option(cs.options, format_idx) };
+    let final_options = unsafe {
+        if is_csv {
+            replace_format_option(cs.options, format_idx, "csv")
+        } else {
+            // TEXT default (tab-separated with backslash escapes)
+            strip_format_option(cs.options, format_idx)
+        }
+    };
 
     let rel_oid = unsafe {
         pg_sys::RangeVarGetRelidExtended(

@@ -368,7 +368,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
 // ============================================================================
 
 /// Classifies how to read a column from SPI.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum ColumnKind {
     Text,         // text, varchar, char — read as String
     Int16,        // smallint/int2
@@ -380,12 +380,21 @@ pub(crate) enum ColumnKind {
     Timestamp,    // timestamp without time zone — read as pgrx::Timestamp → i64 usec
     TimestampTz,  // timestamp with time zone — read as pgrx::TimestampWithTimeZone → i64 usec
     Date,         // date — read as pgrx::Date → i64 usec
+    Jsonb,        // jsonb — stored as the binary varlena form produced by jsonb_in
 }
 
 /// Column data stored in native types.
+///
+/// `Bytes` holds opaque byte blobs (used for jsonb, where the stored payload is
+/// PG's binary jsonb varlena, which is not UTF-8 and therefore cannot fit in a
+/// Rust `String`). On-disk compression, sort, and ndistinct paths treat it
+/// identically to `Text` — both are variable-length byte sequences — but the
+/// decompression-to-Datum path skips UTF-8 validation and hands the raw bytes
+/// back to PG wrapped in a varlena header tagged with `JSONBOID`.
 #[derive(Debug, PartialEq)]
 pub(crate) enum TypedColumn {
     Text(Vec<Option<String>>),
+    Bytes(Vec<Option<Vec<u8>>>),
     Int16(Vec<Option<i16>>),
     Int32(Vec<Option<i32>>),
     Int64(Vec<Option<i64>>),
@@ -400,6 +409,7 @@ impl TypedColumn {
     pub(crate) fn split_off(&mut self, at: usize) -> Self {
         match self {
             TypedColumn::Text(v) => TypedColumn::Text(v.split_off(at)),
+            TypedColumn::Bytes(v) => TypedColumn::Bytes(v.split_off(at)),
             TypedColumn::Int16(v) => TypedColumn::Int16(v.split_off(at)),
             TypedColumn::Int32(v) => TypedColumn::Int32(v.split_off(at)),
             TypedColumn::Int64(v) => TypedColumn::Int64(v.split_off(at)),
@@ -412,6 +422,7 @@ impl TypedColumn {
     pub(crate) fn extend(&mut self, other: Self) {
         match (self, other) {
             (TypedColumn::Text(a), TypedColumn::Text(b)) => a.extend(b),
+            (TypedColumn::Bytes(a), TypedColumn::Bytes(b)) => a.extend(b),
             (TypedColumn::Int16(a), TypedColumn::Int16(b)) => a.extend(b),
             (TypedColumn::Int32(a), TypedColumn::Int32(b)) => a.extend(b),
             (TypedColumn::Int64(a), TypedColumn::Int64(b)) => a.extend(b),
@@ -426,6 +437,7 @@ impl TypedColumn {
     pub(crate) fn push_from(&mut self, src: &Self, idx: usize) {
         match (self, src) {
             (TypedColumn::Text(dst), TypedColumn::Text(s)) => dst.push(s[idx].clone()),
+            (TypedColumn::Bytes(dst), TypedColumn::Bytes(s)) => dst.push(s[idx].clone()),
             (TypedColumn::Int16(dst), TypedColumn::Int16(s)) => dst.push(s[idx]),
             (TypedColumn::Int32(dst), TypedColumn::Int32(s)) => dst.push(s[idx]),
             (TypedColumn::Int64(dst), TypedColumn::Int64(s)) => dst.push(s[idx]),
@@ -460,6 +472,8 @@ pub(crate) fn classify_column(data_type: &str, is_segment_by: bool) -> ColumnKin
         ColumnKind::Timestamp
     } else if dt == "date" {
         ColumnKind::Date
+    } else if dt == "jsonb" {
+        ColumnKind::Jsonb
     } else {
         ColumnKind::Text
     }
@@ -468,6 +482,7 @@ pub(crate) fn classify_column(data_type: &str, is_segment_by: bool) -> ColumnKin
 pub(crate) fn new_typed_column(kind: ColumnKind) -> TypedColumn {
     match kind {
         ColumnKind::Text => TypedColumn::Text(Vec::new()),
+        ColumnKind::Jsonb => TypedColumn::Bytes(Vec::new()),
         ColumnKind::Int16 => TypedColumn::Int16(Vec::new()),
         ColumnKind::Int32 => TypedColumn::Int32(Vec::new()),
         ColumnKind::Int64 => TypedColumn::Int64(Vec::new()),
@@ -608,7 +623,83 @@ fn append_row_to_columns(
                     vec.push(v);
                 }
             }
+            ColumnKind::Jsonb => {
+                // Classic compression path (post-INSERT). jsonb comes through
+                // SPI as canonical JSON text (via jsonb_out); we re-parse via
+                // jsonb_in to store the binary varlena representation, so the
+                // scan path can skip jsonb_in per row. rtabench's hot path is
+                // direct-backfill, not this one — the extra roundtrip is fine.
+                let text_opt = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<String>()
+                    .unwrap();
+                let bytes_opt = text_opt.map(|t| unsafe { jsonb_text_to_binary(&t) });
+                if let TypedColumn::Bytes(vec) = &mut typed_cols[i] {
+                    vec.push(bytes_opt);
+                }
+            }
         }
+    }
+}
+
+thread_local! {
+    /// Reusable scratch memory context for per-row `jsonb_in` calls.
+    /// `jsonb_in` leaves its parse-tree allocations in `CurrentMemoryContext`
+    /// and doesn't free them — for a 181M-row rtabench load that's tens of GB
+    /// of leaked parse nodes. We switch to this scratch context for each call
+    /// and `MemoryContextReset` after, which reclaims everything cheaply.
+    static JSONB_SCRATCH_CTX: std::cell::Cell<pgrx::pg_sys::MemoryContext> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// Convert canonical JSON text to the binary jsonb varlena payload
+/// (everything after the varlena header) by calling PG's `jsonb_in`.
+/// Caller stores the returned bytes verbatim; to reconstruct a Datum, wrap
+/// them in a fresh varlena header. See `byte_slices_to_jsonb_datums_arena`
+/// in datum_utils.
+pub(crate) unsafe fn jsonb_text_to_binary(text: &str) -> Vec<u8> {
+    unsafe {
+        let scratch = JSONB_SCRATCH_CTX.with(|c| {
+            let p = c.get();
+            if p.is_null() {
+                let new_ctx = pgrx::pg_sys::AllocSetContextCreateInternal(
+                    pgrx::pg_sys::TopMemoryContext,
+                    c"pg_deltax_jsonb_scratch".as_ptr(),
+                    pgrx::pg_sys::ALLOCSET_SMALL_MINSIZE as usize,
+                    pgrx::pg_sys::ALLOCSET_SMALL_INITSIZE as usize,
+                    pgrx::pg_sys::ALLOCSET_SMALL_MAXSIZE as usize,
+                );
+                c.set(new_ctx);
+                new_ctx
+            } else {
+                p
+            }
+        });
+
+        let old = pgrx::pg_sys::MemoryContextSwitchTo(scratch);
+
+        let c_text = std::ffi::CString::new(text).expect("jsonb text contains null byte");
+        let mut typinput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
+        let mut typioparam: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
+        pgrx::pg_sys::getTypeInputInfo(pgrx::pg_sys::JSONBOID, &mut typinput, &mut typioparam);
+        let datum = pgrx::pg_sys::OidInputFunctionCall(
+            typinput,
+            c_text.as_ptr() as *mut _,
+            typioparam,
+            -1,
+        );
+        let varlena = datum.cast_mut_ptr::<pgrx::pg_sys::varlena>();
+        let detoasted = pgrx::pg_sys::pg_detoast_datum(varlena);
+        let total_len = pgrx::varsize_any_exhdr(detoasted);
+        let data_ptr = pgrx::vardata_any(detoasted) as *const u8;
+        // Copy into Rust heap before resetting the scratch context.
+        let bytes = std::slice::from_raw_parts(data_ptr, total_len).to_vec();
+
+        pgrx::pg_sys::MemoryContextSwitchTo(old);
+        pgrx::pg_sys::MemoryContextReset(scratch);
+
+        bytes
     }
 }
 
@@ -639,6 +730,7 @@ pub(crate) fn sort_typed_columns(typed_cols: &mut [TypedColumn], order_col_indic
                 }
                 TypedColumn::Bool(v) => v[a].cmp(&v[b]),
                 TypedColumn::Text(v) => v[a].cmp(&v[b]),
+                TypedColumn::Bytes(v) => v[a].cmp(&v[b]),
             };
             if cmp != std::cmp::Ordering::Equal {
                 return cmp;
@@ -657,6 +749,7 @@ pub(crate) fn sort_typed_columns(typed_cols: &mut [TypedColumn], order_col_indic
             TypedColumn::Float64(v) => apply_permutation(v, &perm),
             TypedColumn::Bool(v) => apply_permutation(v, &perm),
             TypedColumn::Text(v) => apply_permutation(v, &perm),
+            TypedColumn::Bytes(v) => apply_permutation(v, &perm),
         }
     }
 }
@@ -866,6 +959,8 @@ fn slice_typed_column(tc: &TypedColumn, start: usize, end: usize) -> TypedColumn
         TypedColumn::Float64(v) => TypedColumn::Float64(v[start..end].to_vec()),
         TypedColumn::Bool(v) if v.is_empty() => TypedColumn::Bool(Vec::new()),
         TypedColumn::Bool(v) => TypedColumn::Bool(v[start..end].to_vec()),
+        TypedColumn::Bytes(v) if v.is_empty() => TypedColumn::Bytes(Vec::new()),
+        TypedColumn::Bytes(v) => TypedColumn::Bytes(v[start..end].to_vec()),
     }
 }
 
@@ -896,6 +991,7 @@ pub(crate) fn compute_segment_ndistinct(
             TypedColumn::Float64(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(&x.to_bits())); } }
             TypedColumn::Bool(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
             TypedColumn::Text(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
+            TypedColumn::Bytes(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
         }
         result.push(hll.estimate() as i64);
     }
@@ -1584,6 +1680,11 @@ pub(crate) fn compress_typed_column(data: &TypedColumn, data_type: &str) -> Vec<
             // Delegate to existing string-based compression
             compress_column_values(values, data_type, "")
         }
+        TypedColumn::Bytes(values) => {
+            // jsonb varlena payloads: treat as opaque byte blobs, reuse the
+            // same variable-length compression pipeline as text.
+            compress_byte_values(values)
+        }
     }
 }
 
@@ -1737,6 +1838,7 @@ pub(crate) fn compute_typed_minmax(data: &TypedColumn, data_type: &str) -> (Opti
             (min_v.map(|v| v.to_string()), max_v.map(|v| v.to_string()))
         }
         TypedColumn::Text(values) => compute_column_minmax(values, data_type),
+        TypedColumn::Bytes(_) => (None, None), // jsonb has no meaningful minmax
         TypedColumn::Bool(_) => (None, None), // booleans don't support minmax
     }
 }
@@ -1773,6 +1875,27 @@ fn compress_column_values(values: &[Option<String>], _data_type: &str, _col_name
         }
         .to_bytes()
     }
+}
+
+/// Compress opaque byte blobs (used for jsonb column payloads). Mirrors the
+/// text pipeline: try dictionary encoding for low-cardinality data, else
+/// Lz4Blocked. `&[u8]` fits transparently into the existing string-oriented
+/// codecs via `std::str::from_utf8_unchecked` — the codecs only ever treat
+/// their input as byte slices (length-prefixed blocks / dictionary indexing),
+/// so passing non-UTF-8 jsonb varlena bytes is safe as long as we don't try
+/// to iterate chars.
+fn compress_byte_values(values: &[Option<Vec<u8>>]) -> Vec<u8> {
+    // Convert Option<Vec<u8>> → Option<String> via an unsafe wrapper so we can
+    // reuse the existing codecs. The String is never read as a valid UTF-8
+    // string (compressors only inspect bytes / lengths); it is immediately
+    // dropped after compression.
+    let as_strings: Vec<Option<String>> = values
+        .iter()
+        .map(|opt| opt.as_ref().map(|bytes| unsafe {
+            String::from_utf8_unchecked(bytes.clone())
+        }))
+        .collect();
+    compress_column_values(&as_strings, "jsonb", "")
 }
 
 /// Get column metadata for a table.
@@ -2314,6 +2437,10 @@ pub(crate) fn compute_typed_sum(data: &TypedColumn) -> (Option<String>, i64, i64
             } else {
                 (None, 0, 0)
             }
+        }
+        TypedColumn::Bytes(_) => {
+            // jsonb columns — no meaningful numeric SUM / length sidecar.
+            (None, 0, 0)
         }
     }
 }

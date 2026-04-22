@@ -162,7 +162,15 @@ fn read_column(
                 .read_records(num_rows, Some(&mut def_levels), None, &mut values)
                 .map_err(|e| format!("pg_deltax: parquet read error: {}", e))?;
             let unpacked = unpack_nullable_byte_array(&values, &def_levels, num_rows, num_values)?;
-            Ok(TypedColumn::Text(unpacked))
+            if matches!(kind, ColumnKind::Jsonb) {
+                let bytes: Vec<Option<Vec<u8>>> = unpacked
+                    .into_iter()
+                    .map(|opt| opt.map(|s| unsafe { crate::compress::jsonb_text_to_binary(&s) }))
+                    .collect();
+                Ok(TypedColumn::Bytes(bytes))
+            } else {
+                Ok(TypedColumn::Text(unpacked))
+            }
         }
         ColumnReader::FixedLenByteArrayColumnReader(r) => {
             let mut values = Vec::new();

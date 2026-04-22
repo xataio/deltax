@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rtabench — pg_deltax</title>
+<style>
+  body { font: 14px/1.5 -apple-system, system-ui, sans-serif; margin: 2em; color: #222; max-width: 1100px; }
+  h1 { margin: 0 0 .25em; font-size: 1.5em; }
+  h2 { font-size: 1.1em; margin-top: 2em; }
+  .meta { display: grid; grid-template-columns: max-content 1fr; gap: 4px 1em; margin: 1em 0; }
+  .meta dt { color: #666; }
+  .summary { background: #f4f4f4; padding: .75em 1em; border-radius: 4px; margin: 1em 0; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: 4px 10px; border-bottom: 1px solid #eee; }
+  th:nth-child(1), th:nth-child(2),
+  td:nth-child(1), td:nth-child(2) { text-align: left; }
+  th { background: #fafafa; font-weight: 600; border-bottom: 2px solid #ddd; }
+  .idx { color: #888; font-family: ui-monospace, Menlo, monospace; }
+  .qname { font-family: ui-monospace, Menlo, monospace; font-size: .92em; }
+  .null { color: #bbb; }
+  .fast { color: #2a7; }
+  .ratio { margin-left: .3em; font-size: .85em; }
+  .ratio.faster { color: #070; }
+  .ratio.slower { color: #b00; }
+  .ratio.neutral { color: #888; }
+  .footer { color: #888; font-size: .85em; margin-top: 3em; }
+</style>
+</head>
+<body>
+
+<h1>RTABench results — pg_deltax</h1>
+
+<dl class="meta">
+<dt>System</dt><dd>pg_deltax</dd><dt>Date</dt><dd>2026-04-22</dd><dt>Machine</dt><dd>c6a.4xlarge</dd><dt>Tags</dt><dd>Rust, PostgreSQL compatible, column-oriented, time-series, real-time-analytics, lukewarm-cold-run</dd><dt>Load time</dt><dd>12m 37s</dd><dt>Data size</dt><dd>12.9 GiB</dd><dt>Queries</dt><dd>31</dd>
+</dl>
+
+<div class="summary">
+<b>Cold (1st run):</b> 227.022 s total, 7323.3 ms avg<br>
+<b>Warm (best of runs 2–3):</b> 56.295 s total, 1816.0 ms avg
+</div>
+
+<table>
+<thead><tr>
+<th>#</th><th>Query</th><th>Cold</th><th>Warm</th><th>Min</th>
+</tr></thead>
+<tbody>
+<tr><td class="idx">Q00</td><td class="qname">0000_terminal_hourly_stats</td><td>278.0 ms</td><td>197.0 ms</td><td>197.0 ms</td></tr><tr><td class="idx">Q01</td><td class="qname">0001_count_orders_from_terminal</td><td>304.0 ms</td><td>217.0 ms</td><td>217.0 ms</td></tr><tr><td class="idx">Q02</td><td class="qname">0002_global_agg</td><td><b>1.137 s</b></td><td><b>1.067 s</b></td><td><b>1.067 s</b></td></tr><tr><td class="idx">Q03</td><td class="qname">0003_exists_order_delivered_from_terminal</td><td>333.0 ms</td><td>246.0 ms</td><td>246.0 ms</td></tr><tr><td class="idx">Q04</td><td class="qname">0004_count_delayed_orders_per_day</td><td>278.0 ms</td><td>192.0 ms</td><td>192.0 ms</td></tr><tr><td class="idx">Q05</td><td class="qname">0005_search_events_for_processor</td><td>177.0 ms</td><td>121.0 ms</td><td>121.0 ms</td></tr><tr><td class="idx">Q06</td><td class="qname">0006_order_events_without_backups</td><td>90.0 ms</td><td>48.0 ms</td><td>48.0 ms</td></tr><tr><td class="idx">Q07</td><td class="qname">0007_last_order_event_for_order</td><td>79.0 ms</td><td>40.0 ms</td><td>40.0 ms</td></tr><tr><td class="idx">Q08</td><td class="qname">0008_most_week_delayed_order</td><td>117.0 ms</td><td>67.0 ms</td><td>67.0 ms</td></tr><tr><td class="idx">Q09</td><td class="qname">0009_departed_orders_count</td><td>51.0 ms</td><td>20.0 ms</td><td>20.0 ms</td></tr><tr><td class="idx">Q10</td><td class="qname">0010_last_event_for_an_order</td><td>74.0 ms</td><td>32.0 ms</td><td>32.0 ms</td></tr><tr><td class="idx">Q11</td><td class="qname">0011_events_for_an_order</td><td>46.0 ms</td><td>13.0 ms</td><td>13.0 ms</td></tr><tr><td class="idx">Q12</td><td class="qname">0012_max_satisfaction_for_order_per_day</td><td>84.0 ms</td><td>45.0 ms</td><td>45.0 ms</td></tr><tr><td class="idx">Q13</td><td class="qname">0013_satisfaction_with_without_backup</td><td>82.0 ms</td><td>44.0 ms</td><td>44.0 ms</td></tr><tr><td class="idx">Q14</td><td class="qname">0014_sum_prod_stock_price_per_category</td><td>5.0 ms</td><td>2.0 ms</td><td>2.0 ms</td></tr><tr><td class="idx">Q15</td><td class="qname">0015_exists_order_delivered_for_customer</td><td>767.0 ms</td><td>637.0 ms</td><td>637.0 ms</td></tr><tr><td class="idx">Q16</td><td class="qname">0016_customers_with_most_orders</td><td>209.0 ms</td><td>185.0 ms</td><td>185.0 ms</td></tr><tr><td class="idx">Q17</td><td class="qname">0017_top_selling_month_product</td><td><b>21.165 s</b></td><td><b>18.423 s</b></td><td><b>18.423 s</b></td></tr><tr><td class="idx">Q18</td><td class="qname">0018_customer_month_value</td><td><b>16.846 s</b></td><td><b>1.554 s</b></td><td><b>1.554 s</b></td></tr><tr><td class="idx">Q19</td><td class="qname">0019_out_of_stock_products</td><td><b>17.962 s</b></td><td><b>2.275 s</b></td><td><b>2.275 s</b></td></tr><tr><td class="idx">Q20</td><td class="qname">0020_customers_outstanding</td><td><b>3.141 s</b></td><td><b>3.006 s</b></td><td><b>3.006 s</b></td></tr><tr><td class="idx">Q21</td><td class="qname">0021_sales_volume_by_country</td><td><b>16.365 s</b></td><td><b>1.548 s</b></td><td><b>1.548 s</b></td></tr><tr><td class="idx">Q22</td><td class="qname">0022_sales_volume_by_country_state</td><td><b>16.983 s</b></td><td><b>1.667 s</b></td><td><b>1.667 s</b></td></tr><tr><td class="idx">Q23</td><td class="qname">0023_top_sales_volume_product_from_terminal</td><td><b>20.300 s</b></td><td><b>1.299 s</b></td><td><b>1.299 s</b></td></tr><tr><td class="idx">Q24</td><td class="qname">0024_top_customer_by_revenue</td><td><b>15.861 s</b></td><td>959.0 ms</td><td>959.0 ms</td></tr><tr><td class="idx">Q25</td><td class="qname">0025_product_category_performance</td><td><b>18.409 s</b></td><td><b>7.670 s</b></td><td><b>7.670 s</b></td></tr><tr><td class="idx">Q26</td><td class="qname">0026_average_order_value</td><td><b>15.961 s</b></td><td><b>1.239 s</b></td><td><b>1.239 s</b></td></tr><tr><td class="idx">Q27</td><td class="qname">0027_country_category_performance</td><td><b>16.241 s</b></td><td><b>1.656 s</b></td><td><b>1.656 s</b></td></tr><tr><td class="idx">Q28</td><td class="qname">0028_sales_volume_by_age_group</td><td><b>15.141 s</b></td><td><b>1.185 s</b></td><td><b>1.185 s</b></td></tr><tr><td class="idx">Q29</td><td class="qname">0029_top_product_in_age_group</td><td><b>14.984 s</b></td><td>962.0 ms</td><td>962.0 ms</td></tr><tr><td class="idx">Q30</td><td class="qname">0030_customers_with_most_orders_delivered</td><td><b>13.552 s</b></td><td><b>9.679 s</b></td><td><b>9.679 s</b></td></tr>
+</tbody>
+</table>
+
+<h2>History (warm sum = sum of min-of-warm-runs across queries)</h2><table><thead><tr><th>Snapshot</th><th>Load</th><th>Size</th><th>#Q</th><th>Warm sum</th><th>Warm avg</th></tr></thead><tbody><tr><td>20260422_213357_34e2d96</td><td>12m 37s</td><td>12.9 GiB</td><td>31</td><td>56.295 s</td><td>1816.0 ms</td></tr></tbody></table>
+
+<p class="footer">
+Generated by rtabench/generate-report.py ·
+Cold = run 1 · Warm = min(run 2, run 3) · Min = min of all 3 runs.
+</p>
+
+</body>
+</html>

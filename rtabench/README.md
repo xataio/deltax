@@ -24,6 +24,6 @@ Results land in `results/pg_deltax.json` and are archived to `results/history/{T
 
 ## Configuration
 
-`benchmark.sh` partitions `order_events` with `interval '3 days'` and 125 partitions ahead of `mock_now = 2024-01-01`, covering the full 2024 dataset. Compression uses `order_by => ['order_id', 'event_created']` and `segment_size => 30000`, mirroring the TimescaleDB baseline. Loading goes through `COPY ... FORMAT deltax_compress` for direct-backfill (compress in-flight, no heap intermediate).
+`benchmark.sh` partitions `order_events` with `interval '3 days'` and 125 partitions ahead of `mock_now = 2024-01-01`, covering the full 2024 dataset. Compression uses `order_by => ['order_id', 'event_created']` and `segment_size => 30000`, mirroring the TimescaleDB baseline. Loading goes through `COPY ... FORMAT deltax_compress_csv` for direct-backfill (compress in-flight, no heap intermediate). The `_csv` variant is required because `order_events.csv` contains quoted jsonb payloads with embedded commas.
 
 The other four tables are plain Postgres tables loaded via standard `COPY`. Only one extra index is created: `orders(customer_id)`, matching the upstream postgres baseline.

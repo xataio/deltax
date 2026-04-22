@@ -26,10 +26,16 @@ PG_DELTAX_SRC = $(CURDIR)/..
 RESULTS_DIR = results
 HISTORY_DIR = $(RESULTS_DIR)/history
 
+# Path of our db subdir inside the public rtabench checkout — same shape
+# CLICKBENCH_DIR uses for ClickBench. When this exists, `make bench` copies
+# the JSON in, generates an HTML comparison report at rtabench's root
+# (reading whatever *other* sibling databases have checked in), and opens it.
+RTABENCH_DIR ?= $(CURDIR)/../../../rtabench/pg_deltax
+
 AWS_PROFILE ?= management
 AWS_NAME = rtabench-pg-deltax
 
-.PHONY: launch-ec2 destroy-ec2 ssh setup deploy bench query query-cold sql psql
+.PHONY: launch-ec2 destroy-ec2 ssh setup deploy bench report fetch-competitors query query-cold sql psql
 
 # Launch a new EC2 instance (terminates any existing one with the same name)
 launch-ec2:
@@ -102,6 +108,36 @@ bench:
 	cp $(RESULTS_DIR)/pg_deltax.json $(HISTORY_DIR)/$(TS)_$(COMMIT)/pg_deltax.json
 	@echo "=== Results saved to $(RESULTS_DIR)/pg_deltax.json ==="
 	@echo "=== Archived to $(HISTORY_DIR)/$(TS)_$(COMMIT)/ ==="
+	@if [ -d "$(RTABENCH_DIR)" ] || [ -d "$(dir $(RTABENCH_DIR))" ]; then \
+		echo "=== Generating rtabench HTML report ==="; \
+		mkdir -p $(RTABENCH_DIR)/results; \
+		cp $(RESULTS_DIR)/pg_deltax.json $(RTABENCH_DIR)/results/c6a.4xlarge.json; \
+		python3 $(CURDIR)/generate-report.py $(RTABENCH_DIR)/..; \
+		open $(RTABENCH_DIR)/../index.html; \
+	else \
+		echo "=== $(RTABENCH_DIR) not found — skipping rtabench HTML report ==="; \
+	fi
+
+# Regenerate the HTML report from existing results JSON — no bench run.
+# Useful after dropping competitor JSONs (e.g. timescaledb/results/*.json)
+# into ~/src/rtabench/ for a side-by-side comparison.
+report:
+	@test -d "$(RTABENCH_DIR)" || test -d "$(dir $(RTABENCH_DIR))" || \
+		(echo "$(RTABENCH_DIR) not found — clone https://github.com/timescale/rtabench first"; exit 1)
+	@mkdir -p $(RTABENCH_DIR)/results
+	@test -f $(RESULTS_DIR)/pg_deltax.json && \
+		cp $(RESULTS_DIR)/pg_deltax.json $(RTABENCH_DIR)/results/c6a.4xlarge.json || true
+	python3 $(CURDIR)/generate-report.py $(RTABENCH_DIR)/..
+	@open $(RTABENCH_DIR)/../index.html
+
+# Download comparison results from rtabench.com and drop one JSON per system
+# into ~/src/rtabench/<system>/results/c6a.4xlarge.json. After this runs once,
+# `make report` shows every database as a column in the comparison table.
+# The competitor JSONs aren't checked into the rtabench repo (unlike ClickBench),
+# so this step is needed to bootstrap the comparison.
+fetch-competitors:
+	@test -d "$(RTABENCH_DIR)/.." || (echo "$(RTABENCH_DIR)/.. not found — clone https://github.com/timescale/rtabench first"; exit 1)
+	python3 $(CURDIR)/fetch-competitors.py --rtabench-root $(RTABENCH_DIR)/..
 
 # EXPLAIN ANALYZE a single query. Usage: make query EC2=<ip> Q=10 [SET="SET pg_deltax.parallel_workers=4"]
 query:
