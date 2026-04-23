@@ -8,9 +8,10 @@ cache. Raw plans live in `rtabench_explain_raw.txt`.
 
 Originally captured against a serial-only `DeltaXAppend`. The table below
 (and the category analysis that follows) reflects that state and is
-preserved as the problem description. A later pass implemented the P0
-parallel-safe fix — see **§5 Progress** at the bottom for the current
-numbers and which items are done.
+preserved as the problem description. Later passes implemented the P0
+parallel-safe fix and the P1 metadata-only aggregate fast path — see
+**§5 Progress** at the bottom for current numbers and which items are
+done.
 
 ## Setup
 
@@ -157,9 +158,16 @@ table; the right answer is `SELECT max(_max_counter) FROM
 _deltax_compressed.order_events_pXXXX_meta` over ~510 segments, which
 should run in < 10 ms.
 
-**DeltaXAgg lacks a metadata-only fast path for trivial aggregates**
-(`max`/`min`/`sum`/`count` with no GROUP BY, no WHERE except on the
-segment-key column). DuckDB does this in 7 ms; ClickHouse in 47 ms.
+**Fixed in P1 (2026-04, see §5.6).** The fast path answers `MIN / MAX
+/ SUM / COUNT(col) / COUNT(*)` straight from per-segment metadata.
+For time-range WHEREs, a planner-time check (`partitions_contain_time_range`)
+verifies each surviving partition's `[range_start, range_end)` is
+fully inside the WHERE interval before firing — so Q02's month-range
+WHERE aligned to daily partition boundaries is covered, while a WHERE
+slicing through a partition falls back to `DeltaXAgg`.
+
+Q02 **now 9 ms warm** (was 1055 ms) — beats DuckDB's 7 ms target for
+this query class.
 
 Q12 (`max(satisfaction)` grouped by `order_id`, 15 ms) also goes through
 DeltaXAgg but is fast because the grouping column is in `order_by` and
@@ -254,10 +262,12 @@ would do it in ~0.6 s.
    segment-level `_ndistinct`/`_min`/`_max` metadata have the data; the
    estimator just doesn't consume them.
 
-3. **No metadata-only fast path for simple aggregates** (Q02, ~760 ms
-   savings). `DeltaXAgg` should detect `max/min/sum/count` with no GROUP
-   BY and no predicate beyond time-column range, and answer from the
-   segment-metadata table alone. ~100× speedup on Q02.
+3. ~~No metadata-only fast path for simple aggregates~~ **(fixed P1,
+   §5.6)**. Q02 warm 1055 ms → 9 ms (117×). `DeltaXMinMax` / `DeltaXCount`
+   now answer `max/min/sum/count(col)/count(*)` from per-segment
+   metadata when the WHERE is empty, a segment-by equality, or a
+   time-range whose bounds fully contain every surviving partition's
+   bounds.
 
 4. **DeltaXAgg decompress is single-threaded** (affects every query in
    category H). Related to #1 — fixing parallel-safe unblocks multi-core
@@ -314,7 +324,7 @@ issue — TimescaleDB shows similar cold/warm ratios.
 | P0 | Make `DeltaXAppend` parallel-safe (partial-path + DSM cursor) | **✓ done** (2026-04) | **−49 s** realized on Q17/Q23/Q25/Q30 |
 | P0 | Filter-selectivity in cost estimator (via `pg_statistic` + `get_relation_info_hook`) | **✓ done** (2026-04) | closes §5.3 small-query regressions + aligns cost-model for Cat A |
 | P0 | `DeltaXAgg` parallel-safe | open | unknown — likely helps Cat H queries |
-| P1 | Metadata-only fast path for global min/max/sum/count (DeltaXAgg) | open | **−700 ms** (Q02, also Q06 pattern) |
+| P1 | Metadata-only fast path for global min/max/sum/count (DeltaXAgg) | **✓ done** (2026-04) | **−1046 ms** realized on Q02 (1055 → 9 ms, 117×) |
 | P2 | Share segment metadata via DSM in parallel scan | open — §5.6 (fixes Q15's 9× metadata duplication) | improves parallel-scan efficiency on selective queries |
 | P2 | Trim column-blob decompress set to referenced columns only | open | helps Q15 (EXISTS) and any narrow-projection query |
 | P2 | Partition-level `order_id` min/max pruning hook | open | 5–7× on Q07, Q09–Q13 |
@@ -463,7 +473,56 @@ cost isn't modeled yet) — the fix for this is item §5.6 below.
 
 
 
-### 5.6 · DSM metadata sharing for selective parallel scans (open)
+### 5.6 · P1 — Metadata-only aggregate fast path (done, 2026-04)
+
+`MIN / MAX / SUM / COUNT(col) / COUNT(*)` on compressed tables now
+route through the extended `DeltaXMinMax` / `DeltaXCount` custom-scan
+paths and answer directly from the per-segment `col_minmax` /
+`col_sums` / `row_count` metadata without decompressing blobs. No PG
+Aggregate / Gather is planted on top.
+
+**Q02 win (EC2, warm, 181M events):**
+
+| Query | Before | After | Speedup |
+|---|---:|---:|---:|
+| Q02 `global_agg` (`max(counter) WHERE event_created in [A,B)`) | 1055 ms | **9 ms** | **117×** |
+
+WHERE-clause coverage:
+- No WHERE → fast path.
+- Segment-by equality (`device_id = 7`) → fast path.
+- Time-column range (`ts >= A AND ts < B`, or either side alone) →
+  fast path **iff** every surviving partition's `[range_start,
+  range_end)` is fully contained in the WHERE interval. Enforced at
+  plan time by `partitions_contain_time_range` (SPI lookup on
+  `deltax_partition`). If any boundary partition is only partially
+  covered by the WHERE, we fall back to `DeltaXAgg`.
+- Time-column equality (`ts = C`) → fall back. A row satisfies it
+  only for `ts = C`, but a segment containing it also has rows with
+  `ts ≠ C`; metadata aggregates over the whole segment would
+  overcount.
+- Any non-segment-by / non-time qual (or OR) → fall back.
+
+Scope & types:
+- MIN/MAX supported on INT2/INT4/INT8/FLOAT4/FLOAT8/DATE/TIMESTAMP/TIMESTAMPTZ
+  (any column type whose min/max is stored as an order-preserving i64
+  in colstats). TEXT / VARCHAR / BYTEA / BOOL fall through.
+- SUM supported on INT2/INT4/FLOAT4/FLOAT8. SUM(INT8) / SUM(NUMERIC)
+  → NUMERIC falls through (pgrx `PGFunction` binding for `numeric_in`
+  is a follow-up).
+- COUNT(col) and COUNT(*) always eligible.
+- Runtime escape hatch via `pg_deltax.disable_meta_agg_fastpath = on`
+  for A/B correctness comparison. (Only gates the new SUM / COUNT(col)
+  / time-range path; the pre-existing no-WHERE MIN/MAX path is
+  unaffected.)
+
+The time-range safety argument relies on day-aligned WHERE boundaries
+vs. the declared partition interval — the RTABench Q02 case. Queries
+that slice through a partition boundary (e.g. `WHERE ts >= '2024-04-20
+06:00'` with daily partitions) pay the full `DeltaXAgg` cost; a
+follow-up can add in-executor decompression of the column needed for
+just the partial boundary segments.
+
+### 5.7 · DSM metadata sharing for selective parallel scans (open)
 
 Residual cost on selective parallel scans: each of the 8 workers
 re-runs `load_metadata` + `load_segments_heap` for every companion

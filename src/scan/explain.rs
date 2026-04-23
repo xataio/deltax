@@ -108,7 +108,7 @@ pub unsafe extern "C-unwind" fn explain_minmax_scan(
 ) {
     unsafe {
         let label = c"Storage";
-        let value = c"Compressed (DeltaXMinMax - MIN/MAX pushdown)";
+        let value = c"Compressed (DeltaXMinMax - metadata-only aggregate)";
         pg_sys::ExplainPropertyText(label.as_ptr(), value.as_ptr(), es);
 
         if (*es).analyze {
@@ -131,9 +131,21 @@ pub unsafe extern "C-unwind" fn explain_minmax_scan(
                     es,
                 );
 
+                use crate::scan::path::MetaAggKind;
                 let agg_parts: Vec<String> = state.results.iter().map(|r| {
-                    let agg_name = if r.is_min { "MIN" } else { "MAX" };
-                    format!("{}({})=null={}", agg_name, r.col_name, r.is_null)
+                    let agg_name = match r.kind {
+                        MetaAggKind::Min => "MIN",
+                        MetaAggKind::Max => "MAX",
+                        MetaAggKind::Sum => "SUM",
+                        MetaAggKind::CountCol => "COUNT",
+                        MetaAggKind::CountStar => "COUNT*",
+                    };
+                    let target = if matches!(r.kind, MetaAggKind::CountStar) {
+                        "*".to_string()
+                    } else {
+                        r.col_name.clone()
+                    };
+                    format!("{}({})=null={}", agg_name, target, r.is_null)
                 }).collect();
                 let stats_str = std::ffi::CString::new(format!(
                     "{} segments={}",

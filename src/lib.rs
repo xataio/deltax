@@ -31,6 +31,12 @@ pub(crate) static BLOOM_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(true
 pub(crate) static MAX_PARALLEL_WORKERS_PER_SCAN: GucSetting<i32> =
     GucSetting::<i32>::new(-1);
 
+/// When true, the hook skips `DeltaXCount`/`DeltaXMinMax` fast paths for
+/// queries with WHERE clauses. Used by tests and operators to force the
+/// generic `DeltaXAgg` path for A/B correctness comparisons.
+pub(crate) static DISABLE_META_AGG_FASTPATH: GucSetting<bool> =
+    GucSetting::<bool>::new(false);
+
 /// Resolve the effective number of parallel workers.
 /// 0 = auto (num_cpus, capped at 16), 1 = single-threaded, 2..=64 = explicit.
 pub(crate) fn get_parallel_workers() -> usize {
@@ -138,6 +144,14 @@ pub extern "C-unwind" fn _PG_init() {
         &MAX_PARALLEL_WORKERS_PER_SCAN,
         -1,
         64,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.disable_meta_agg_fastpath",
+        c"Disable DeltaXCount/DeltaXMinMax fast paths for queries with WHERE clauses",
+        c"When ON, queries that could be answered from per-segment metadata fall through to the generic DeltaXAgg path instead. Used for correctness A/B testing.",
+        &DISABLE_META_AGG_FASTPATH,
         GucContext::Userset,
         GucFlags::default(),
     );

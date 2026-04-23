@@ -268,6 +268,7 @@ pub unsafe fn add_count_star_path(
     _root: *mut pg_sys::PlannerInfo,
     output_rel: *mut pg_sys::RelOptInfo,
     companion_oids: &[pg_sys::Oid],
+    qual_list: *mut pg_sys::List,
 ) {
     unsafe {
         let cpath =
@@ -286,10 +287,24 @@ pub unsafe fn add_count_star_path(
         (*cpath).path.parallel_aware = false;
         (*cpath).path.parallel_safe = false;
 
-        // Store companion OIDs in custom_private
+        // Store in custom_private (int list for consistency with MinMax
+        // serialization): [oid1, ..., oidN, -1, qual_bytes_len, bytes...]
         let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
         for &oid in companion_oids {
-            private_list = pg_sys::lappend_oid(private_list, oid);
+            private_list = pg_sys::lappend_int(private_list, u32::from(oid) as i32);
+        }
+        private_list = pg_sys::lappend_int(private_list, -1);
+        if !qual_list.is_null() {
+            let s = pg_sys::nodeToString(qual_list as *const _);
+            let s_bytes = std::ffi::CStr::from_ptr(s).to_bytes();
+            let len = s_bytes.len() as i32;
+            private_list = pg_sys::lappend_int(private_list, len);
+            for &b in s_bytes {
+                private_list = pg_sys::lappend_int(private_list, b as i32);
+            }
+            pg_sys::pfree(s as *mut _);
+        } else {
+            private_list = pg_sys::lappend_int(private_list, 0);
         }
         (*cpath).custom_private = private_list;
 
@@ -361,15 +376,15 @@ pub unsafe extern "C-unwind" fn plan_count_star_path(
         );
         (*cscan).scan.plan.targetlist = pg_sys::lappend(std::ptr::null_mut(), plan_tle as *mut _);
 
-        // Build custom_private: [oid1, oid2, ..., -1 (sentinel)]
-        let oid_list = (*best_path).custom_private;
-        let num_oids = (*oid_list).length;
+        // Forward custom_private verbatim — already int-encoded with
+        // [oids..., -1, qual_bytes_len, bytes...] shape.
+        let path_private = (*best_path).custom_private;
+        let path_len = (*path_private).length;
         let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
-        for i in 0..num_oids {
-            let oid = pg_sys::list_nth_oid(oid_list, i);
-            private_list = pg_sys::lappend_int(private_list, u32::from(oid) as i32);
+        for i in 0..path_len {
+            let val = pg_sys::list_nth_int(path_private, i);
+            private_list = pg_sys::lappend_int(private_list, val);
         }
-        private_list = pg_sys::lappend_int(private_list, -1);
 
         (*cscan).custom_private = private_list;
         (*cscan).custom_plans = std::ptr::null_mut();
@@ -401,25 +416,58 @@ static DELTAX_MINMAX_SCAN_METHODS: SyncStatic<pg_sys::CustomScanMethods> =
         CreateCustomScanState: Some(super::exec::create_minmax_scan_state),
     });
 
-/// Specification for one MIN/MAX aggregate in a multi-aggregate pushdown.
+/// Kind of metadata-only aggregate handled by the (historically-named)
+/// `DeltaXMinMax` path. Besides MIN/MAX this path now also answers
+/// `SUM(col)`, `COUNT(col)`, and `COUNT(*)` directly from the per-segment
+/// stats stored in `_<partition>_colstats` and `_<partition>_meta`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetaAggKind {
+    Min      = 0,
+    Max      = 1,
+    Sum      = 2,
+    CountCol = 3,
+    CountStar = 4,
+}
+
+impl MetaAggKind {
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            0 => MetaAggKind::Min,
+            1 => MetaAggKind::Max,
+            2 => MetaAggKind::Sum,
+            3 => MetaAggKind::CountCol,
+            4 => MetaAggKind::CountStar,
+            _ => unreachable!("pg_deltax: invalid MetaAggKind encoding: {}", v),
+        }
+    }
+}
+
+/// Specification for one metadata-only aggregate in a multi-aggregate
+/// pushdown. Name kept as `MinMaxAggSpec` for backwards compatibility
+/// with existing call sites (hook + plan + executor).
 pub struct MinMaxAggSpec {
-    pub is_min: bool,
-    pub varattno: i16,
-    pub result_type_oid: pg_sys::Oid,
+    pub kind: MetaAggKind,
+    pub varattno: i16,                  // 0 for CountStar
+    pub result_type_oid: pg_sys::Oid,   // PG return type of the aggregate
+    pub col_type_oid: pg_sys::Oid,      // source column type (InvalidOid for CountStar)
     pub typlen: i16,
     pub typbyval: bool,
 }
 
 /// Add a DeltaXMinMax custom path to the grouped relation's pathlist.
 ///
-/// This replaces the Aggregate → Scan pipeline with a single CustomScan
-/// that returns the pre-computed MIN/MAX values from segment metadata.
-/// Supports multiple aggregates (e.g., `SELECT MIN(col), MAX(col)`).
+/// Despite the name, this path now serves MIN/MAX/SUM/COUNT(col)/COUNT(*)
+/// from per-segment metadata. Optionally accepts a filter-qual list
+/// (time-range and/or segment-by equality) — segments that don't match
+/// are skipped inside the executor via `extract_segment_filters` +
+/// `load_segments_heap`.
 pub unsafe fn add_minmax_path(
     _root: *mut pg_sys::PlannerInfo,
     output_rel: *mut pg_sys::RelOptInfo,
     companion_oids: &[pg_sys::Oid],
     agg_specs: &[MinMaxAggSpec],
+    qual_list: *mut pg_sys::List,
 ) {
     unsafe {
         let cpath =
@@ -440,8 +488,9 @@ pub unsafe fn add_minmax_path(
 
         // Store in custom_private:
         // [oid1, oid2, ..., -1, num_aggs,
-        //  is_min_0, varattno_0, type_oid_0, typlen_0, typbyval_0,
-        //  is_min_1, varattno_1, type_oid_1, typlen_1, typbyval_1, ...]
+        //  kind_0, varattno_0, result_type_0, col_type_0, typlen_0, typbyval_0,
+        //  kind_1, varattno_1, ...,
+        //  qual_bytes_len, qual_byte0, qual_byte1, ...]
         let mut private_list: *mut pg_sys::List = std::ptr::null_mut();
         for &oid in companion_oids {
             private_list = pg_sys::lappend_int(private_list, u32::from(oid) as i32);
@@ -449,11 +498,25 @@ pub unsafe fn add_minmax_path(
         private_list = pg_sys::lappend_int(private_list, -1);
         private_list = pg_sys::lappend_int(private_list, agg_specs.len() as i32);
         for spec in agg_specs {
-            private_list = pg_sys::lappend_int(private_list, if spec.is_min { 1 } else { 0 });
+            private_list = pg_sys::lappend_int(private_list, spec.kind as i32);
             private_list = pg_sys::lappend_int(private_list, spec.varattno as i32);
             private_list = pg_sys::lappend_int(private_list, u32::from(spec.result_type_oid) as i32);
+            private_list = pg_sys::lappend_int(private_list, u32::from(spec.col_type_oid) as i32);
             private_list = pg_sys::lappend_int(private_list, spec.typlen as i32);
             private_list = pg_sys::lappend_int(private_list, if spec.typbyval { 1 } else { 0 });
+        }
+        // Serialize quals via nodeToString so they survive plan caching.
+        if !qual_list.is_null() {
+            let s = pg_sys::nodeToString(qual_list as *const _);
+            let s_bytes = std::ffi::CStr::from_ptr(s).to_bytes();
+            let len = s_bytes.len() as i32;
+            private_list = pg_sys::lappend_int(private_list, len);
+            for &b in s_bytes {
+                private_list = pg_sys::lappend_int(private_list, b as i32);
+            }
+            pg_sys::pfree(s as *mut _);
+        } else {
+            private_list = pg_sys::lappend_int(private_list, 0);
         }
         (*cpath).custom_private = private_list;
 
@@ -467,9 +530,10 @@ pub unsafe fn add_minmax_path(
 
 /// Per-aggregate info parsed from custom_private during plan creation.
 struct PlanAggSpec {
-    is_min: bool,
+    kind: MetaAggKind,
     varattno: i32,
-    type_oid: pg_sys::Oid,
+    result_type_oid: pg_sys::Oid,
+    col_type_oid: pg_sys::Oid,
     typlen: i32,
     typbyval: bool,
 }
@@ -502,40 +566,53 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
 
         let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
         let mut agg_specs: Vec<PlanAggSpec> = Vec::new();
+        let mut qual_bytes: Vec<u8> = Vec::new();
         let mut found_sentinel = false;
-        let mut num_aggs: i32 = 0;
-        let mut after_sentinel_idx = 0;
-        let mut current_spec_fields: Vec<i32> = Vec::new();
+        let mut i: i32 = 0;
 
-        for i in 0..path_len {
+        // Parse companion OIDs until the -1 sentinel.
+        while i < path_len {
             let val = pg_sys::list_nth_int(path_private, i);
-            if !found_sentinel {
-                if val == -1 {
-                    found_sentinel = true;
-                    continue;
-                }
-                companion_oids.push(pg_sys::Oid::from(val as u32));
-            } else {
-                if after_sentinel_idx == 0 {
-                    num_aggs = val;
-                    after_sentinel_idx += 1;
-                    continue;
-                }
-                current_spec_fields.push(val);
-                if current_spec_fields.len() == 5 {
-                    agg_specs.push(PlanAggSpec {
-                        is_min: current_spec_fields[0] != 0,
-                        varattno: current_spec_fields[1],
-                        type_oid: pg_sys::Oid::from(current_spec_fields[2] as u32),
-                        typlen: current_spec_fields[3],
-                        typbyval: current_spec_fields[4] != 0,
-                    });
-                    current_spec_fields.clear();
-                }
-                after_sentinel_idx += 1;
+            i += 1;
+            if val == -1 {
+                found_sentinel = true;
+                break;
+            }
+            companion_oids.push(pg_sys::Oid::from(val as u32));
+        }
+        if !found_sentinel {
+            pgrx::error!("pg_deltax: DeltaXMinMax custom_private missing -1 sentinel");
+        }
+
+        // Parse num_aggs.
+        let num_aggs = pg_sys::list_nth_int(path_private, i);
+        i += 1;
+
+        // Parse 6 ints per agg spec.
+        for _ in 0..num_aggs {
+            let fields: Vec<i32> = (0..6)
+                .map(|off| pg_sys::list_nth_int(path_private, i + off))
+                .collect();
+            i += 6;
+            agg_specs.push(PlanAggSpec {
+                kind: MetaAggKind::from_i32(fields[0]),
+                varattno: fields[1],
+                result_type_oid: pg_sys::Oid::from(fields[2] as u32),
+                col_type_oid: pg_sys::Oid::from(fields[3] as u32),
+                typlen: fields[4],
+                typbyval: fields[5] != 0,
+            });
+        }
+
+        // Parse trailing qual bytes.
+        if i < path_len {
+            let qlen = pg_sys::list_nth_int(path_private, i);
+            i += 1;
+            for _ in 0..qlen {
+                qual_bytes.push(pg_sys::list_nth_int(path_private, i) as u8);
+                i += 1;
             }
         }
-        let _ = num_aggs; // validated by agg_specs.len()
 
         // Build custom_scan_tlist and plan.targetlist: one entry per aggregate
         let mut scan_tlist: *mut pg_sys::List = std::ptr::null_mut();
@@ -546,7 +623,7 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
 
             // custom_scan_tlist entry
             let const_node = pg_sys::makeConst(
-                spec.type_oid,
+                spec.result_type_oid,
                 -1,                     // consttypmod
                 pg_sys::InvalidOid,     // constcollid
                 spec.typlen,            // constlen
@@ -564,7 +641,7 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
 
             // plan.targetlist entry (PG setrefs will match to custom_scan_tlist)
             let const_node2 = pg_sys::makeConst(
-                spec.type_oid,
+                spec.result_type_oid,
                 -1,
                 pg_sys::InvalidOid,
                 spec.typlen,
@@ -584,7 +661,10 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
         (*cscan).custom_scan_tlist = scan_tlist;
         (*cscan).scan.plan.targetlist = plan_tlist;
 
-        // Build plan's custom_private: [oid1, ..., -1, num_aggs, is_min_0, varattno_0, ...]
+        // Build plan's custom_private: same shape as the path's —
+        // [oid1, ..., -1, num_aggs, <6 ints per spec>, qual_bytes_len, bytes...]
+        // Executor needs col_type_oid for SUM dispatch and the quals for
+        // segment pruning, so forward everything.
         let mut plan_private: *mut pg_sys::List = std::ptr::null_mut();
         for &oid in &companion_oids {
             plan_private = pg_sys::lappend_int(plan_private, u32::from(oid) as i32);
@@ -592,8 +672,16 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
         plan_private = pg_sys::lappend_int(plan_private, -1);
         plan_private = pg_sys::lappend_int(plan_private, agg_specs.len() as i32);
         for spec in &agg_specs {
-            plan_private = pg_sys::lappend_int(plan_private, if spec.is_min { 1 } else { 0 });
+            plan_private = pg_sys::lappend_int(plan_private, spec.kind as i32);
             plan_private = pg_sys::lappend_int(plan_private, spec.varattno);
+            plan_private = pg_sys::lappend_int(plan_private, u32::from(spec.result_type_oid) as i32);
+            plan_private = pg_sys::lappend_int(plan_private, u32::from(spec.col_type_oid) as i32);
+            plan_private = pg_sys::lappend_int(plan_private, spec.typlen);
+            plan_private = pg_sys::lappend_int(plan_private, if spec.typbyval { 1 } else { 0 });
+        }
+        plan_private = pg_sys::lappend_int(plan_private, qual_bytes.len() as i32);
+        for &b in &qual_bytes {
+            plan_private = pg_sys::lappend_int(plan_private, b as i32);
         }
 
         (*cscan).custom_private = plan_private;

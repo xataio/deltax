@@ -1,5 +1,6 @@
 use pgrx::pg_sys;
 use pgrx::pg_guard;
+use pgrx::prelude::Spi;
 use std::collections::HashMap;
 use std::ffi::c_int;
 use std::sync::atomic::Ordering;
@@ -24,6 +25,13 @@ thread_local! {
     static SEGMENT_BY_CACHE: std::cell::RefCell<HashMap<pg_sys::Oid, bool>> =
         std::cell::RefCell::new(HashMap::new());
 
+    /// Cache of parent table OID → (time_column_name, segment_by_names).
+    /// Used by the metadata-only aggregate fast path (classify_meta_quals)
+    /// so we can compare a qual's Var column name against the deltatable's
+    /// time and segment-by columns without re-running SPI per query.
+    static META_COLS_CACHE: std::cell::RefCell<HashMap<pg_sys::Oid, (String, Vec<String>)>> =
+        std::cell::RefCell::new(HashMap::new());
+
     /// When true, the ExecutorStart hook skips the DML-on-compressed check.
     /// Used by internal operations like deltax_decompress_partition.
     static DML_BYPASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -33,8 +41,58 @@ pub fn invalidate_compressed_cache() {
     COMPRESSED_CACHE.with(|cache| cache.borrow_mut().clear());
     TIME_COLUMN_CACHE.with(|cache| cache.borrow_mut().clear());
     SEGMENT_BY_CACHE.with(|cache| cache.borrow_mut().clear());
+    META_COLS_CACHE.with(|cache| cache.borrow_mut().clear());
     cost::invalidate_caches();
     super::exec::segments::invalidate_colstats_cache();
+}
+
+/// Look up the deltatable's `(time_column, segment_by[])` configuration
+/// for a parent relation OID, cached thread-locally. Returns `None` if
+/// the relation isn't registered in `deltax_deltatable`.
+unsafe fn get_meta_cols(parent_oid: pg_sys::Oid) -> Option<(String, Vec<String>)> {
+    if let Some(v) = META_COLS_CACHE.with(|cache| cache.borrow().get(&parent_oid).cloned()) {
+        if v.0.is_empty() { return None; }
+        return Some(v);
+    }
+    unsafe {
+        let schema_name_ptr = pg_sys::get_namespace_name(pg_sys::get_rel_namespace(parent_oid));
+        let table_name_ptr = pg_sys::get_rel_name(parent_oid);
+        if schema_name_ptr.is_null() || table_name_ptr.is_null() {
+            META_COLS_CACHE.with(|c| c.borrow_mut().insert(parent_oid, (String::new(), Vec::new())));
+            return None;
+        }
+        let schema = std::ffi::CStr::from_ptr(schema_name_ptr).to_string_lossy().into_owned();
+        let table = std::ffi::CStr::from_ptr(table_name_ptr).to_string_lossy().into_owned();
+
+        let result = Spi::connect(|client| {
+            let row = client
+                .select(
+                    "SELECT time_column, coalesce(segment_by, ARRAY[]::text[]) \
+                     FROM deltax_deltatable WHERE schema_name = $1 AND table_name = $2",
+                    Some(1),
+                    &[schema.clone().into(), table.clone().into()],
+                )
+                .ok()?;
+            let first = row.first();
+            let time_col: Option<String> = first.get(1).ok().flatten();
+            let seg_by: Option<Vec<String>> = first.get(2).ok().flatten();
+            match (time_col, seg_by) {
+                (Some(t), Some(s)) => Some((t, s)),
+                _ => None,
+            }
+        });
+
+        match result {
+            Some(v) => {
+                META_COLS_CACHE.with(|c| c.borrow_mut().insert(parent_oid, v.clone()));
+                Some(v)
+            }
+            None => {
+                META_COLS_CACHE.with(|c| c.borrow_mut().insert(parent_oid, (String::new(), Vec::new())));
+                None
+            }
+        }
+    }
 }
 
 /// Set or clear the DML bypass flag for internal operations.
@@ -104,6 +162,28 @@ unsafe fn get_time_column_attno(parent_oid: pg_sys::Oid) -> Option<i16> {
 }
 
 /// Find the parent table OID for a child partition via append_rel_list.
+/// Find the partitioned parent OID for an input_rel in the upper-paths
+/// hook by scanning `simple_rte_array` for the first RTE_RELATION with
+/// `inh = true` (inheritance). For a single-table `SELECT agg FROM t`
+/// query there's only one such RTE; for joins we take the first —
+/// acceptable since the metadata-only fast path never fires for joins
+/// (aggrefs from other tables fail the aggref classifier).
+unsafe fn find_inh_parent_oid(root: *mut pg_sys::PlannerInfo) -> Option<pg_sys::Oid> {
+    unsafe {
+        let array_size = (*root).simple_rel_array_size;
+        for rti in 1..array_size {
+            let rte = *(*root).simple_rte_array.add(rti as usize);
+            if rte.is_null() {
+                continue;
+            }
+            if (*rte).rtekind == pg_sys::RTEKind::RTE_RELATION && (*rte).inh {
+                return Some((*rte).relid);
+            }
+        }
+        None
+    }
+}
+
 unsafe fn find_parent_oid(
     root: *mut pg_sys::PlannerInfo,
     child_rti: pg_sys::Index,
@@ -614,6 +694,369 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
 }
 
 /// Unwrap a RelabelType node to get the inner expression.
+/// Extract the flat qual list (after `make_ands_implicit`) from the
+/// parse tree, falling back to `baserestrictinfo`. Returns null if
+/// there are no WHERE clauses.
+unsafe fn extract_query_quals(
+    root: *mut pg_sys::PlannerInfo,
+) -> *mut pg_sys::List {
+    unsafe {
+        let parse = (*root).parse;
+        let jointree = (*parse).jointree;
+        if !jointree.is_null() && !(*jointree).quals.is_null() {
+            let quals_node = (*jointree).quals as *const pg_sys::Node;
+            if (*quals_node).type_ == pg_sys::NodeTag::T_List {
+                return pg_sys::copyObjectImpl(quals_node as *const _) as *mut pg_sys::List;
+            }
+            let qual_copy = pg_sys::copyObjectImpl(quals_node as *const _) as *mut pg_sys::Node;
+            return pg_sys::make_ands_implicit(qual_copy as *mut pg_sys::Expr);
+        }
+        // Fallback: sometimes quals live on baserestrictinfo only.
+        let array_size = (*root).simple_rel_array_size;
+        for rti in 1..array_size {
+            let rel = *(*root).simple_rel_array.add(rti as usize);
+            if rel.is_null() {
+                continue;
+            }
+            let bri = (*rel).baserestrictinfo;
+            if bri.is_null() || (*bri).length == 0 {
+                continue;
+            }
+            let mut result: *mut pg_sys::List = std::ptr::null_mut();
+            for i in 0..(*bri).length {
+                let ri = pg_sys::list_nth(bri, i) as *const pg_sys::RestrictInfo;
+                if ri.is_null() || (*ri).clause.is_null() {
+                    continue;
+                }
+                let clause_copy =
+                    pg_sys::copyObjectImpl((*ri).clause as *const _) as *mut pg_sys::Expr;
+                result = pg_sys::lappend(result, clause_copy as *mut _);
+            }
+            if !result.is_null() {
+                return result;
+            }
+        }
+        std::ptr::null_mut()
+    }
+}
+
+/// Walk a qual list and verify every clause is either
+/// - `OpExpr(Var(time_col), Const)` or `(Const, Var(time_col))` with op
+///   in `{=, <, <=, >, >=}`; or
+/// - `OpExpr(Var(segment_by_col), Const)` or `(Const, Var(segment_by_col))`
+///   with op `=`; or
+/// - `BoolExpr(AND)` that recursively satisfies the rules.
+///
+/// Returns `true` iff every clause qualifies the metadata-only fast
+/// path. `BETWEEN` expands to two AND'd OpExprs, so covered by the
+/// time-column branch.
+///
+/// Used by the DeltaXCount/DeltaXMinMax gates to decide whether the
+/// `_meta.min_time`/`max_time` + segment_by pruning in
+/// `load_segments_heap` is sufficient — if any other predicate is
+/// present we fall through to `DeltaXAgg` which decompresses + filters
+/// correctly.
+/// Types whose per-segment MIN/MAX is stored as order-preserving i64 in
+/// the colstats table and can be decoded back to a PG datum.  TEXT/BYTEA/
+/// BOOL fall outside this set — a MIN/MAX on them must go through the
+/// generic aggregate path.
+fn is_minmax_meta_type(col_type_oid: pg_sys::Oid) -> bool {
+    matches!(
+        col_type_oid,
+        pg_sys::INT2OID
+            | pg_sys::INT4OID
+            | pg_sys::INT8OID
+            | pg_sys::FLOAT4OID
+            | pg_sys::FLOAT8OID
+            | pg_sys::DATEOID
+            | pg_sys::TIMESTAMPOID
+            | pg_sys::TIMESTAMPTZOID
+    )
+}
+
+/// Half-open time interval `[lo, hi)` in PG-epoch microseconds
+/// (the internal TIMESTAMPTZ representation — same units as the
+/// `deltax_partition.range_start/range_end` datums and the `Const`
+/// values extracted from WHERE clauses).
+///
+/// `None` on either side means unbounded; combining multiple quals
+/// narrows the interval (`max` on lo, `min` on hi).
+#[derive(Default, Debug, Clone, Copy)]
+struct TimeBounds {
+    lo: Option<i64>, // inclusive
+    hi: Option<i64>, // exclusive
+}
+
+impl TimeBounds {
+    fn narrow_lo(&mut self, v: i64) {
+        self.lo = Some(self.lo.map_or(v, |l| l.max(v)));
+    }
+    fn narrow_hi(&mut self, v: i64) {
+        self.hi = Some(self.hi.map_or(v, |h| h.min(v)));
+    }
+    fn any(&self) -> bool {
+        self.lo.is_some() || self.hi.is_some()
+    }
+}
+
+unsafe fn classify_meta_quals(
+    qual_list: *mut pg_sys::List,
+    relid: pg_sys::Oid,
+    time_column: &str,
+    segment_by: &[String],
+) -> Option<TimeBounds> {
+    unsafe {
+        let mut bounds = TimeBounds::default();
+        if qual_list.is_null() {
+            return Some(bounds);
+        }
+        for i in 0..(*qual_list).length {
+            let node = pg_sys::list_nth(qual_list, i) as *const pg_sys::Node;
+            if node.is_null() {
+                return None;
+            }
+            if !classify_meta_qual_node(node, relid, time_column, segment_by, &mut bounds) {
+                return None;
+            }
+        }
+        Some(bounds)
+    }
+}
+
+unsafe fn classify_meta_qual_node(
+    node: *const pg_sys::Node,
+    relid: pg_sys::Oid,
+    time_column: &str,
+    segment_by: &[String],
+    bounds: &mut TimeBounds,
+) -> bool {
+    unsafe {
+        if node.is_null() {
+            return false;
+        }
+        // AND: recurse into every arm.
+        if (*node).type_ == pg_sys::NodeTag::T_BoolExpr {
+            let be = node as *const pg_sys::BoolExpr;
+            if (*be).boolop != pg_sys::BoolExprType::AND_EXPR {
+                return false;
+            }
+            let args = (*be).args;
+            if args.is_null() {
+                return false;
+            }
+            for i in 0..(*args).length {
+                let arg = pg_sys::list_nth(args, i) as *const pg_sys::Node;
+                if !classify_meta_qual_node(arg, relid, time_column, segment_by, bounds) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (*node).type_ != pg_sys::NodeTag::T_OpExpr {
+            return false;
+        }
+        let opexpr = node as *const pg_sys::OpExpr;
+        let args = (*opexpr).args;
+        if args.is_null() || (*args).length != 2 {
+            return false;
+        }
+        let a0 = unwrap_relabel_node(pg_sys::list_nth(args, 0) as *const pg_sys::Node);
+        let a1 = unwrap_relabel_node(pg_sys::list_nth(args, 1) as *const pg_sys::Node);
+        // Identify which side is the Var; the other side must be Const.
+        let (var_node, const_node, is_const_left) =
+            if (*a0).type_ == pg_sys::NodeTag::T_Var && (*a1).type_ == pg_sys::NodeTag::T_Const {
+                (a0, a1, false)
+            } else if (*a1).type_ == pg_sys::NodeTag::T_Var
+                && (*a0).type_ == pg_sys::NodeTag::T_Const
+            {
+                (a1, a0, true)
+            } else {
+                return false;
+            };
+
+        let var = var_node as *const pg_sys::Var;
+        let attno = (*var).varattno;
+        if attno <= 0 {
+            return false;
+        }
+        let col_name_ptr = pg_sys::get_attname(relid, attno, true);
+        if col_name_ptr.is_null() {
+            return false;
+        }
+        let col_name = std::ffi::CStr::from_ptr(col_name_ptr)
+            .to_string_lossy()
+            .into_owned();
+
+        let is_time = col_name == time_column;
+        let is_seg = segment_by.iter().any(|s| s == &col_name);
+        if !is_time && !is_seg {
+            return false;
+        }
+
+        let opname_ptr = pg_sys::get_opname((*opexpr).opno);
+        if opname_ptr.is_null() {
+            return false;
+        }
+        let opname = std::ffi::CStr::from_ptr(opname_ptr).to_string_lossy();
+
+        if is_seg {
+            // Segment-by: equality only — `extract_segment_filters`
+            // only matches `=`, and equality on segment_by is safe
+            // because segmentation partitions rows along that value
+            // (every row in a surviving segment satisfies the eq).
+            return opname == "=";
+        }
+
+        // Time column: accept range bounds.  Reject equality — a row
+        // with ts=C survives the WHERE but other rows in the same
+        // segment (with ts≠C) don't; segment aggregates would overcount.
+        // Safety of range bounds is enforced separately by
+        // `partitions_contain_time_range` (see hook call site).
+        let c = const_node as *const pg_sys::Const;
+        if (*c).constisnull {
+            return false;
+        }
+        if !matches!(
+            (*c).consttype,
+            pg_sys::TIMESTAMPTZOID | pg_sys::TIMESTAMPOID | pg_sys::DATEOID
+        ) {
+            // Only the internal-i64-encoded time types are comparable
+            // to our `deltax_partition.range_start/range_end` datums.
+            return false;
+        }
+        let v = (*c).constvalue.value() as i64;
+        let v_pg_us = if (*c).consttype == pg_sys::DATEOID {
+            // DATE datum is int32 days since PG epoch; convert to µs.
+            (v as i32 as i64) * 86_400_000_000
+        } else {
+            v
+        };
+
+        // Normalize: when the Const is on the LEFT (`C op ts`),
+        // commute the operator so we reason as `ts op' C`.
+        let normalized: &str = if is_const_left {
+            match opname.as_ref() {
+                "<" => ">",
+                "<=" => ">=",
+                ">" => "<",
+                ">=" => "<=",
+                "=" => "=",
+                _ => return false,
+            }
+        } else {
+            match opname.as_ref() {
+                "<" | "<=" | ">" | ">=" | "=" => opname.as_ref(),
+                _ => return false,
+            }
+        };
+
+        match normalized {
+            ">=" => {
+                bounds.narrow_lo(v_pg_us);
+                true
+            }
+            ">" => {
+                bounds.narrow_lo(v_pg_us.saturating_add(1));
+                true
+            }
+            "<" => {
+                bounds.narrow_hi(v_pg_us);
+                true
+            }
+            "<=" => {
+                bounds.narrow_hi(v_pg_us.saturating_add(1));
+                true
+            }
+            "=" => false, // unsafe: see comment above
+            _ => false,
+        }
+    }
+}
+
+/// Verify that every surviving partition's `[range_start, range_end)`
+/// is fully contained in `bounds`.  When that's true, every row in
+/// every segment of every surviving partition also satisfies the
+/// time-WHERE — so `row_count` / `col_sums` / `col_minmax` from the
+/// per-segment metadata are exact for the query.
+///
+/// Called from the planner when a time-range WHERE is present.
+/// Returns `false` on any lookup failure so we fall through to
+/// DeltaXAgg rather than risk overcounting.
+unsafe fn partitions_contain_time_range(
+    companion_oids: &[pg_sys::Oid],
+    bounds: &TimeBounds,
+) -> bool {
+    unsafe {
+        if !bounds.any() {
+            return true;
+        }
+        // Collect partition names by stripping the `_meta` suffix from
+        // each companion table name.
+        let mut part_names: Vec<String> = Vec::with_capacity(companion_oids.len());
+        for &oid in companion_oids {
+            let name_ptr = pg_sys::get_rel_name(oid);
+            if name_ptr.is_null() {
+                return false;
+            }
+            let name = std::ffi::CStr::from_ptr(name_ptr).to_string_lossy();
+            let part_name = name.strip_suffix("_meta").unwrap_or(&name).to_string();
+            part_names.push(part_name);
+        }
+
+        // Build an ANY($1) query to fetch all partition ranges in one
+        // round trip.  TIMESTAMPTZ columns return i64 PG-epoch µs —
+        // same unit we normalized `bounds` to.
+        let rows: Option<Vec<(i64, i64)>> = Spi::connect(|client| {
+            let names_array: Vec<&str> = part_names.iter().map(|s| s.as_str()).collect();
+            let tuples = client
+                .select(
+                    "SELECT range_start, range_end FROM deltax_partition \
+                     WHERE table_name = ANY($1)",
+                    None,
+                    &[names_array.into()],
+                )
+                .ok()?;
+            let mut out = Vec::new();
+            for row in tuples {
+                let rs = row
+                    .get_datum_by_ordinal(1)
+                    .ok()?
+                    .value::<pgrx::datum::TimestampWithTimeZone>()
+                    .ok()??;
+                let re = row
+                    .get_datum_by_ordinal(2)
+                    .ok()?
+                    .value::<pgrx::datum::TimestampWithTimeZone>()
+                    .ok()??;
+                // Into PG-epoch microseconds (the internal TIMESTAMPTZ rep).
+                let rs_us: i64 = pg_sys::TimestampTz::from(rs);
+                let re_us: i64 = pg_sys::TimestampTz::from(re);
+                out.push((rs_us, re_us));
+            }
+            Some(out)
+        });
+
+        let rows = match rows {
+            Some(r) if r.len() == part_names.len() => r,
+            _ => return false, // any lookup gap → bail to the slow path
+        };
+
+        for (rs, re) in rows {
+            if let Some(lo) = bounds.lo
+                && rs < lo
+            {
+                return false;
+            }
+            if let Some(hi) = bounds.hi
+                && re > hi
+            {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 unsafe fn unwrap_relabel_node(n: *const pg_sys::Node) -> *const pg_sys::Node {
     unsafe {
         if !n.is_null() && (*n).type_ == pg_sys::NodeTag::T_RelabelType {
@@ -975,11 +1418,33 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         };
 
         // =====================================================================
-        // Fast path: Single COUNT(*) with no GROUP BY, no WHERE → DeltaXCount
+        // Fast path: Single COUNT(*) with no GROUP BY, no HAVING → DeltaXCount
+        //
+        // - No WHERE:  catalog lookup of `deltax_partition.row_count`.
+        // - With WHERE, if every qual is a time-column range/equality
+        //   or segment-by equality, serialize the quals into the path
+        //   and prune at segment level inside the executor. Otherwise
+        //   fall through to DeltaXAgg which decompresses and filters.
         // =====================================================================
-        if aggrefs.len() == 1 && (*aggrefs[0]).aggstar && !has_group_by && !has_where {
-            path::add_count_star_path(root, output_rel, &companion_oids);
-            return;
+        if aggrefs.len() == 1 && (*aggrefs[0]).aggstar && !has_group_by && !has_having {
+            if !has_where {
+                path::add_count_star_path(root, output_rel, &companion_oids, std::ptr::null_mut());
+                return;
+            }
+            if !crate::DISABLE_META_AGG_FASTPATH.get()
+                && let Some(parent_oid) = find_inh_parent_oid(root)
+                && let Some((time_col, seg_by)) = get_meta_cols(parent_oid)
+            {
+                let quals = extract_query_quals(root);
+                if !quals.is_null()
+                    && let Some(bounds) = classify_meta_quals(quals, parent_oid, &time_col, &seg_by)
+                    && partitions_contain_time_range(&companion_oids, &bounds)
+                {
+                    path::add_count_star_path(root, output_rel, &companion_oids, quals);
+                    return;
+                }
+            }
+            // Else: fall through to DeltaXAgg.
         }
 
 
@@ -991,6 +1456,11 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         let mut classified_aggs: Vec<path::AggSpec> = Vec::new();
         let mut all_minmax = true;
         let mut has_non_minmax = false;
+        // Parallel flag for the broader "metadata-only answerable" path:
+        // MIN/MAX/SUM/COUNT(col)/COUNT(*) on supported column types with
+        // expr_kind == Column. SUM on INT8/NUMERIC falls out (result
+        // type is NUMERIC; we don't build NUMERIC datums from i128 yet).
+        let mut all_meta_answerable = true;
 
         for &aggref in &aggrefs {
             // FILTER clause not supported
@@ -1010,6 +1480,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 });
                 all_minmax = false;
                 has_non_minmax = true;
+                // COUNT(*) is always meta-answerable.
                 continue;
             }
 
@@ -1156,6 +1627,16 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
             let is_distinct = !(*aggref).aggdistinct.is_null()
                 && (*(*aggref).aggdistinct).length > 0;
 
+            // Helper: meta-path eligibility for SUM depends on the
+            // source column type. NUMERIC output (SUM(int8)/SUM(numeric))
+            // isn't handled by the current sum_i128_to_datum (would need
+            // numeric_in, see count_minmax.rs). Fall through to DeltaXAgg.
+            let sum_meta_ok = matches!(
+                effective_col_type_oid,
+                pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
+            ) && matches!(expr_kind, AggExpr::Column);
+            let count_meta_ok = matches!(expr_kind, AggExpr::Column);
+
             match func_name {
                 "sum" => {
                     classified_aggs.push(path::AggSpec {
@@ -1168,6 +1649,9 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     });
                     all_minmax = false;
                     has_non_minmax = true;
+                    if !sum_meta_ok {
+                        all_meta_answerable = false;
+                    }
                 }
                 "avg" => {
                     classified_aggs.push(path::AggSpec {
@@ -1180,6 +1664,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     });
                     all_minmax = false;
                     has_non_minmax = true;
+                    all_meta_answerable = false; // AVG not yet meta-answerable
                 }
                 "count" => {
                     if is_distinct {
@@ -1191,6 +1676,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             expr_kind,
                             const_offset: agg_const_offset,
                         });
+                        all_meta_answerable = false;
                     } else {
                         classified_aggs.push(path::AggSpec {
                             agg_type: AggType::Count,
@@ -1200,6 +1686,9 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             expr_kind,
                             const_offset: agg_const_offset,
                         });
+                        if !count_meta_ok {
+                            all_meta_answerable = false;
+                        }
                     }
                     all_minmax = false;
                     has_non_minmax = true;
@@ -1217,6 +1706,11 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         // Mixed MIN/MAX with SUM/COUNT/AVG → falls through to general AggScan
                         all_minmax = false;
                     }
+                    if !matches!(expr_kind, AggExpr::Column)
+                        || !is_minmax_meta_type(effective_col_type_oid)
+                    {
+                        all_meta_answerable = false;
+                    }
                     // else: keep all_minmax = true for potential metadata-only path
                 }
                 "max" => {
@@ -1231,6 +1725,11 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     if has_non_minmax {
                         all_minmax = false;
                     }
+                    if !matches!(expr_kind, AggExpr::Column)
+                        || !is_minmax_meta_type(effective_col_type_oid)
+                    {
+                        all_meta_answerable = false;
+                    }
                 }
                 _ => {
                     return;
@@ -1244,8 +1743,102 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
 
 
         // =====================================================================
-        // Fast path: All MIN/MAX, no GROUP BY, no WHERE → DeltaXMinMax
+        // Fast path: Every aggregate is MIN/MAX/SUM/COUNT(col)/COUNT(*)
+        // answerable from per-segment metadata. Optionally with time-
+        // column and/or segment-by equality WHERE clauses.
         // =====================================================================
+        if all_meta_answerable
+            && !has_group_by
+            && !has_having
+            && !crate::DISABLE_META_AGG_FASTPATH.get()
+        {
+            // Build the per-spec list, translating AggSpec into the
+            // MinMaxAggSpec/MetaAggKind vocabulary.
+            let mut minmax_specs: Vec<path::MinMaxAggSpec> = Vec::new();
+            let mut ok = true;
+            for (idx, &aggref) in aggrefs.iter().enumerate() {
+                let agg = &classified_aggs[idx];
+                let kind = match agg.agg_type {
+                    AggType::Min => path::MetaAggKind::Min,
+                    AggType::Max => path::MetaAggKind::Max,
+                    AggType::Sum => path::MetaAggKind::Sum,
+                    AggType::Count => path::MetaAggKind::CountCol,
+                    AggType::CountStar => path::MetaAggKind::CountStar,
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                };
+                // For non-CountStar, extract varattno from the aggref's arg Var.
+                let varattno: i16 = if matches!(kind, path::MetaAggKind::CountStar) {
+                    0
+                } else {
+                    let args = (*aggref).args;
+                    if args.is_null() || (*args).length == 0 {
+                        ok = false;
+                        break;
+                    }
+                    let arg_te = pg_sys::list_nth(args, 0) as *const pg_sys::TargetEntry;
+                    let arg_expr = (*arg_te).expr as *const pg_sys::Node;
+                    let arg_expr = unwrap_relabel_node(arg_expr);
+                    if (*arg_expr).type_ != pg_sys::NodeTag::T_Var {
+                        ok = false;
+                        break;
+                    }
+                    let var = arg_expr as *const pg_sys::Var;
+                    (*var).varattno
+                };
+                let result_type_oid = (*aggref).aggtype;
+                let mut typlen: i16 = 0;
+                let mut typbyval: bool = false;
+                pg_sys::get_typlenbyval(result_type_oid, &mut typlen, &mut typbyval);
+                minmax_specs.push(path::MinMaxAggSpec {
+                    kind,
+                    varattno,
+                    result_type_oid,
+                    col_type_oid: agg.col_type_oid,
+                    typlen,
+                    typbyval,
+                });
+            }
+
+            if ok && !minmax_specs.is_empty() {
+                let qual_list_opt: Option<*mut pg_sys::List> = if has_where {
+                    let quals = extract_query_quals(root);
+                    if quals.is_null() {
+                        None
+                    } else {
+                        let parent_oid = find_inh_parent_oid(root);
+                        let cl = parent_oid
+                            .and_then(|p| get_meta_cols(p).map(|m| (p, m)))
+                            .and_then(|(p, (tc, sb))| {
+                                classify_meta_quals(quals, p, &tc, &sb).map(|b| (p, b))
+                            });
+                        match cl {
+                            Some((_, bounds))
+                                if partitions_contain_time_range(&companion_oids, &bounds) =>
+                            {
+                                Some(quals)
+                            }
+                            _ => None, // fall through to DeltaXAgg
+                        }
+                    }
+                } else {
+                    Some(std::ptr::null_mut())
+                };
+
+                if let Some(qual_list) = qual_list_opt {
+                    path::add_minmax_path(
+                        root, output_rel, &companion_oids, &minmax_specs, qual_list,
+                    );
+                    return;
+                }
+                // else: fall through to DeltaXAgg
+            }
+        }
+
+        // Legacy MIN/MAX-only path for backwards compatibility when
+        // `all_meta_answerable` bailed out above (e.g. AVG in the mix).
         if all_minmax && !has_group_by && !has_where {
             let mut minmax_specs: Vec<path::MinMaxAggSpec> = Vec::new();
             for &aggref in &aggrefs {
@@ -1301,17 +1894,22 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 let mut typbyval: bool = false;
                 pg_sys::get_typlenbyval(result_type_oid, &mut typlen, &mut typbyval);
 
+                let col_type_oid = pg_sys::get_atttype(relid, varattno);
                 minmax_specs.push(path::MinMaxAggSpec {
-                    is_min,
+                    kind: if is_min { path::MetaAggKind::Min } else { path::MetaAggKind::Max },
                     varattno,
                     result_type_oid,
+                    col_type_oid,
                     typlen,
                     typbyval,
                 });
             }
 
             if !minmax_specs.is_empty() {
-                path::add_minmax_path(root, output_rel, &companion_oids, &minmax_specs);
+                path::add_minmax_path(
+                    root, output_rel, &companion_oids, &minmax_specs,
+                    std::ptr::null_mut(),
+                );
             }
             return;
         }
