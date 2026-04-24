@@ -542,3 +542,105 @@ DSM at `InitializeDSMCustomScan` and have workers attach via
 `load_segments_heap` pass. Tracked as item (c) in the
 Recommendations table above.
 
+### 5.8 · Aborted attempt — parallel-safe `DeltaXAgg` (2026-04)
+
+A 5-commit branch built out the scaffolding + a restricted parallel
+executor for `DeltaXAgg` (GUC + cost-factoring + DSM plumbing +
+accumulator serialize/merge + a worker/leader split covering GROUP BY
+on Column/DateTrunc/Extract/AddConst and SUM/COUNT/AVG/MIN/MAX).
+Correctness verified end-to-end on local + EC2 (31/31 OK vs
+`order_events_plain`). The whole branch was reverted because it
+produced **zero speedup** on RTABench. Capturing why here so the
+next attempt doesn't repeat the same dead ends.
+
+**Three distinct reasons it didn't help the benchmark:**
+
+1. **Category H queries don't actually route through `DeltaXAgg`.**
+   The §5.7a-style expectation "Category H ~11 s → ~1.5 s via
+   parallel DeltaXAgg" was wrong — confirmed on EC2 by EXPLAIN. All
+   four (Q00/Q01/Q04/Q08) combine `GROUP BY date_trunc(...)` with a
+   JSONB predicate (`event_payload->>'terminal'` or
+   `event_payload @> '[…]'`). Our agg-pushdown hook (`hook.rs
+   deltax_create_upper_paths`) can't pattern-match those WHEREs, so
+   the plan is `Parallel DeltaXAppend → Sort → Partial
+   GroupAggregate → Gather Merge → Finalize GroupAggregate` — already
+   8-way parallel via the existing DeltaXAppend P0 work. There is
+   nothing for a parallel DeltaXAgg to do on these queries.
+
+   The RTABench queries that do route through `DeltaXAgg` (Q02, Q09,
+   Q12, Q14) all answer in microseconds via the §5.6 metadata fast
+   paths (`DeltaXMinMax` / `DeltaXCount`) and never reach the agg
+   executor body — so parallelising that body is moot.
+
+   **Lesson for next time:** before starting *any* DeltaXAgg work,
+   run `EXPLAIN` on the target queries and confirm `Custom Scan
+   (DeltaXAgg)` actually appears above the non-fast-path code. Don't
+   infer from query shape or the original Category labels.
+
+2. **The artificial serial cost interacts badly with
+   `parallel_setup_cost`.** `add_agg_path` hard-codes the serial
+   `DeltaXAgg` total to `(10.0, 20.0)` — a pre-existing hack so
+   DeltaXAgg always beats plain Append+Agg on planner cost (where
+   realistic seq scan costs run into the thousands). Any partial
+   path's cost on top of which PG adds `Gather` (setup_cost default
+   = 1000) can never beat 20. So even when workers > 1 and the
+   partial-path divisor math works, PG won't pick parallel.
+
+   Forcing it (`SET parallel_setup_cost=0; SET
+   min_parallel_table_scan_size=0`) did produce a live `Parallel
+   Custom Scan (DeltaXAgg) Workers Launched: 8` plan — confirming
+   the executor is correct — but at 7M rows / 435 segments it ran
+   **4× slower** than serial (532 ms vs 122 ms).
+
+   **Lesson:** parallel planner selection under PG's default
+   `parallel_setup_cost = 1000` requires realistic scan costs on
+   *both* the serial and partial paths. The `(10.0, 20.0)` artificial
+   floor has to go. But §5.3–§5.5 already showed that replacing it
+   with a realistic formula regresses small `DeltaXAgg` queries on
+   plan selection (plain Append+Agg wins because `pg_statistic`
+   on compressed partitions advertises empty tables unless §5.4's
+   `get_relation_info_hook` fires correctly). Any future pass has
+   to tune the two paths together — parallel DeltaXAgg *and* a
+   calibrated cost model are a single package, not separate commits.
+
+3. **Per-worker metadata duplication is a showstopper at scale.**
+   In the live-parallel test above, each of the 9 processes (leader +
+   8 workers) independently re-runs `load_metadata` +
+   `load_segments_heap` for every companion partition during its own
+   `begin_agg_scan`, before ever consulting the shared segment
+   cursor. For DeltaXAppend this same pattern (see §5.3, §5.7) has
+   known ~2 s × N-workers overhead on selective queries; for
+   DeltaXAgg it's the same story. The shared segment cursor amortises
+   only the decompress work — metadata remains process-local.
+
+   **Lesson:** the §5.7 DSM metadata-sharing work is a hard
+   prerequisite for a useful parallel DeltaXAgg. Doing parallel-agg
+   first, as this attempt did, is premature optimisation — even
+   when correctness is right, per-worker metadata re-scan eats the
+   parallelism win until segments-per-worker is >> metadata-cost /
+   per-row-decompress-cost. On 4.6M-event local and 181M-event
+   EC2 it wasn't close.
+
+**Concrete prerequisites for a retry:**
+- (a) Ship §5.7 DSM metadata sharing — serialised segment metadata
+  broadcast once via `InitializeDSMCustomScan`; workers attach
+  instead of rebuilding. Benefits both DeltaXAppend and
+  DeltaXAgg parallel paths.
+- (b) Replace the artificial `(10.0, 20.0)` serial `DeltaXAgg` cost
+  with a realistic formula calibrated so (i) plain Append+Agg
+  still loses, (ii) the partial path cost + `parallel_setup_cost`
+  sits below serial for workloads where parallel genuinely helps.
+  Requires verifying the §5.4 `pg_statistic` pipeline fires on
+  compressed partitions across query shapes. Benchmark small-
+  query-plan-selection under this change before doing anything
+  else.
+- (c) Only *after* (a) and (b) — consider widening `DeltaXAgg`
+  pushdown eligibility to cover JSONB operators, so Category H
+  queries actually route through `DeltaXAgg` in the first place.
+  Significant scope; worth its own design pass.
+
+The scaffolding for the parallel executor itself (DSM layout,
+accumulator wire format, leader drain, worker segment cursor) is
+well-defined in this attempt's reverted commits; recovering it from
+git history will be straightforward once (a) and (b) are in place.
+
