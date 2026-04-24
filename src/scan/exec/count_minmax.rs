@@ -198,6 +198,7 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
                     &[],
                     &meta.col_types,
                     &[],
+                    false,
                 );
                 for seg in &segs {
                     total_count += seg.row_count as i64;
@@ -493,6 +494,7 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                 &stats_cols,
                 &meta.col_types,
                 &minmax_cols,
+                false,
             );
             for seg in &segs {
                 for (spec_idx, spec) in agg_specs.iter().enumerate() {

@@ -1527,6 +1527,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     &fast_batch_quals, &needed_stats_cols,
                     &meta.col_types,
                     &needed_minmax_cols,
+                    false,
                 );
                 all_segments.extend(segs);
             }
@@ -1735,6 +1736,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 &batch_quals, &[],
                 &meta.col_types,
                 &[],
+                false,
             );
             // Load text-length sidecars for the columns in sidecar-only mode.
             if sidecar_only_cols.iter().any(|&s| s) {
@@ -9814,6 +9816,7 @@ mod tests {
 
     fn make_empty_segment(row_count: i32) -> SegmentData {
         SegmentData {
+            companion_oid: pg_sys::InvalidOid,
             segment_id: 0,
             segment_values: Vec::new(),
             compressed_blobs: Vec::new(),

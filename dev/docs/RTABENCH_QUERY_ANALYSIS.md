@@ -644,3 +644,119 @@ accumulator wire format, leader drain, worker segment cursor) is
 well-defined in this attempt's reverted commits; recovering it from
 git history will be straightforward once (a) and (b) are in place.
 
+### 5.9 · §5.7 DSM segment-metadata sharing (done, 2026-04)
+
+Shipped the prerequisite flagged in §5.7 and §5.8(a): segment metadata
+is now serialised once by the leader into DSM and read zero-copy by
+every worker, instead of each of the 9 processes independently running
+`load_metadata` + `load_segments_heap`. Blobs stay out of DSM — each
+claimant fetches only the blobs for segments it actually processes via
+a new `fetch_segment_blobs` helper (per-segment `(_col_idx, _segment_id)`
+PK-index probe on `{partition}_blobs`).
+
+**Wire format** (`src/scan/exec/append_wire.rs`, V1):
+
+- Fixed-header `DeltaXAppendMeta` with offset table (magic `DXAW`,
+  version 1) + `ColInfo[]` (typoid/typmod + name offsets) +
+  `segment_by` / `order_by` / `companion_oids` index lists + header
+  arena (column-name bytes).
+- Fixed 64-byte `SegmentEntry` × `num_segments` → shared cursor
+  indexes directly. Carries `companion_oid`, `segment_id`, `row_count`,
+  `min/max_time`, and offsets into a seg-arena for `segment_values`.
+- Reserved slots for `col_minmax` / `col_sums` (empty in V1; DeltaXAgg
+  retry populates them without bumping `WIRE_VERSION`).
+
+**Lifecycle**. `begin_deltax_append` short-circuits when
+`ParallelWorkerNumber >= 0` (installs a stub `DecompressState`; no
+SPI, no heap scan). `estimate_dsm_deltax_append` walks the leader's
+`segments_data` via the same `layout()` the serialiser uses (single
+source of truth — estimator and serialiser can't drift).
+`initialize_dsm_deltax_append` writes the wire after
+`DeltaXAppendPState`. Workers' `init_worker_deltax_append` attaches
+the view, hydrates `col_names` / `col_types` / `segment_by` /
+`time_column` / `segments_data`, and re-runs `extract_batch_quals` /
+`extract_segment_filters` against the now-live columns.
+`shutdown_deltax_append` drops the view and nulls `wire_base` before
+PG tears DSM down.
+
+**Blob fetch unified**. The serial (non-Top-N) leader path also
+switched to `skip_blob_load = true` at `load_segments_heap` + per-segment
+`fetch_segment_blobs` on claim. One code path across leader / worker /
+serial — no branching on process role at exec time. The cost on the
+serial path is ~10 µs × segments_surviving_pruning of PK-index
+overhead, dwarfed by decompression time.
+
+**Local RTABench**. All 31 queries correctness-pass post-change
+(byte-equal row sets vs. plain-PG baseline, via the existing
+`test_parallel_produces_same_rows_as_serial` gate and the
+`make bench-rtabench` tie-relaxed checker). Warm totals: 3376 ms →
+3368 ms (within noise) — the local subset is too small for the DSM
+win to show; it manifests on EC2 where N_partitions × N_workers
+redundant heap scans dominated.
+
+**EC2 RTABench (c6a.4xlarge, 181M events, warm)**. Suite total
+**33.4 s → 23.1 s (1.45×, −10.3 s)**. ClickBench confirmed no
+regressions.
+
+| Query | Before (ms) | After (ms) | Speedup |
+|---|---:|---:|---:|
+| Q15 `exists_order_delivered_for_customer` | 1359 | **54** | **25.2×** |
+| Q03 `exists_order_delivered_from_terminal` | 579 | **61** | **9.5×** |
+| Q01 `count_orders_from_terminal` | 668 | 240 | 2.8× |
+| Q23 `top_sales_volume_product_from_terminal` | 4492 | 2042 | 2.2× |
+| Q00 `terminal_hourly_stats` | 793 | 415 | 1.9× |
+| Q30 `customers_with_most_orders_delivered` | 4233 | 2249 | 1.9× |
+| Q07 `last_order_event_for_order` | 83 | 45 | 1.8× |
+| Q13 `satisfaction_with_without_backup` | 84 | 46 | 1.8× |
+| Q20 `customers_outstanding` | 1920 | 1110 | 1.7× |
+| Q19 `out_of_stock_products` | 2856 | 1706 | 1.7× |
+| Q04 `count_delayed_orders_per_day` | 1011 | 624 | 1.6× |
+| Q08 `most_week_delayed_order` | 340 | 234 | 1.5× |
+| Q27 `country_category_performance` | 1513 | 1222 | 1.2× |
+| Q17 `top_selling_month_product` | 2559 | 2247 | 1.1× |
+
+Every other query held within ±1% of its prior number. Q15 is the
+headline — that's the §5.3 regression (435 ms baseline → 1.36 s
+after parallel-safe). Now at **54 ms**, below the pre-parallel
+baseline, because per-segment PK-probe fetch beats scanning 55K
+`_meta` rows on every worker.
+
+**Two mechanisms paid off together**:
+
+1. *Eliminated redundant `load_segments_heap` on workers* — the
+   primary §5.7 target. Biggest win on selective queries (Q15, Q03)
+   where one-of-many-thousands-of-segments survives pruning. Each
+   worker's old 2 s heap_scan collapses to ~3–4 ms DSM attach +
+   segment-entry decode.
+2. *Parallelised blob detoast via `fetch_segment_blobs`* — a
+   second-order win not in the original §5.7 design. The leader no
+   longer serializes full blob detoast upfront in
+   `load_segments_heap`; both leader and workers fetch blobs
+   per-claim from `{partition}_blobs` via `(_col_idx, _segment_id)`
+   PK-index probe. This accidentally turned every join-heavy
+   Category A query and every Category H jsonb-heavy scan into a
+   real parallel workload on the blob side too.
+
+**EXPLAIN confirms the path is engaged** (local, 4 workers):
+
+```
+Parallel Custom Scan (DeltaXAppend)
+  DeltaX Worker: leader segs=1 rows_out=22473 total=5.623ms ...
+  Worker 0:  actual time=3.695..6.505 rows=25159 loops=1
+  Worker 1:  actual time=3.514..6.393 rows=25993 loops=1
+  Worker 2:  actual time=3.968..6.723 rows=24735 loops=1
+  Worker 3:  actual time=4.348..6.786 rows=22366 loops=1
+```
+
+~3–4 ms per worker for setup (DSM attach + decode 155 `SegmentEntry`
+records + hydrate plan-qual state) vs. the ~2 s per worker each
+process spent re-running `load_segments_heap` pre-change. On EC2
+with 55K segments the ratio is even larger, which is why the Q15
+improvement is so dramatic.
+
+**Unblocks §5.8 prerequisite (a)**: a parallel-`DeltaXAgg` retry can
+now reuse the same `DeltaXAppendMeta` + `SegmentEntry` wire format
+(the `has_col_minmax` / `has_col_sums` flags + reserved arena slots
+are already there). The remaining prerequisites are (b) realistic
+cost model and (c) JSONB pushdown eligibility, unchanged.
+

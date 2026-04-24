@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use super::{CUSTOM_EXEC_METHODS, DELTAX_APPEND_EXEC_METHODS};
+use super::append_wire::{self, DeltaXAppendView};
 use super::batch_qual::{BatchQual, BatchCompareOp, evaluate_batch_quals, extract_batch_quals, is_text_type};
 use super::datum_utils::{
     decompress_blob_to_datums, decompress_blob_to_datums_truncated,
@@ -16,7 +17,8 @@ use super::datum_utils::{
 };
 use super::segments::{
     SegmentData, load_metadata, load_segments_heap,
-    detoast_lazy_blobs, detoast_lazy_blobs_selective, segment_skippable_by_dict,
+    detoast_lazy_blobs, detoast_lazy_blobs_selective, fetch_segment_blobs,
+    segment_skippable_by_dict,
     extract_segment_filters,
 };
 use super::text_col::{TextQualInfo, decompress_text_to_seg_col, apply_text_eq_filter, apply_text_like_filter, strcoll_cmp};
@@ -98,6 +100,23 @@ pub(crate) struct DecompressState {
     /// Null in the serial path; non-null after `InitializeDSMCustomScan`
     /// (leader) or `InitializeWorkerCustomScan` (worker) wires it up.
     pub(crate) pscan: *mut DeltaXAppendPState,
+
+    /// Pointer to the serialised metadata region that starts immediately
+    /// after `DeltaXAppendPState` in the DSM buffer. Populated in
+    /// `InitializeDSMCustomScan` (leader) and `InitializeWorkerCustomScan`
+    /// (worker). Workers use this to hydrate `col_names` / `segments_data`
+    /// without re-running `load_metadata` + `load_segments_heap`.
+    pub(crate) wire_base: *const u8,
+
+    /// Decoded view over `wire_base`. Set lazily on first worker-side access
+    /// and cleared in `ShutdownCustomScan` before DSM detach.
+    pub(crate) wire_view: Option<DeltaXAppendView>,
+
+    /// True when this `DecompressState` was constructed as a parallel
+    /// worker (no SPI/heap-scan load ran in `begin_deltax_append`). Ensures
+    /// `init_worker_deltax_append` must run before `exec_custom_scan` reads
+    /// segment data.
+    pub(crate) is_worker_stub: bool,
 
     /// Snapshot of DSM per-worker timings, copied by the leader in
     /// `ShutdownCustomScan` before the DSM is torn down. Empty on workers
@@ -412,6 +431,75 @@ pub(crate) unsafe extern "C-unwind" fn create_deltax_append_state(
     }
 }
 
+/// Construct a worker-side stub `DecompressState` that `init_worker_deltax_append`
+/// fills in from the leader's serialised DSM metadata. Every field starts
+/// empty/default; `is_worker_stub = true` catches exec-time bugs that would
+/// otherwise silently run against empty state.
+fn make_worker_stub_state() -> DecompressState {
+    DecompressState {
+        col_names: Vec::new(),
+        col_types: Vec::new(),
+        col_typmods: Vec::new(),
+        segment_by: Vec::new(),
+        current_segment: Vec::new(),
+        current_row_count: 0,
+        row_cursor: 0,
+        segment_index: 0,
+        segments_data: Vec::new(),
+        needed_cols: Vec::new(),
+        needed_col_indices: Vec::new(),
+        segment_mcxt: std::ptr::null_mut(),
+        timing: ScanTiming {
+            metadata_us: 0,
+            heap_scan_us: 0,
+            decompress_us: 0,
+            phase1_us: 0,
+            phase2_us: 0,
+            phase2_text_us: 0,
+            phase2_nontext_us: 0,
+            phase2_text_cols: 0,
+            phase2_nontext_cols: 0,
+            emit_us: 0,
+            rows_emitted: 0,
+            rows_filtered: 0,
+            batch_eval_us: 0,
+            rows_batch_filtered: 0,
+            segments_decompressed: 0,
+            compressed_bytes: 0,
+            segments_skipped: 0,
+            segments_minmax_skipped: 0,
+            segments_bloom_skipped: 0,
+            buf_stats: super::segments::ScanBufferStats::default(),
+            phase2_skipped: 0,
+            topn_limit: 0,
+            topn_candidates: 0,
+            topn_phase2_segments: 0,
+        },
+        instrument: None,
+        _time_column: String::new(),
+        rows_sorted_by_time: true,
+        segment_by_filters: Vec::new(),
+        time_min: None,
+        time_max: None,
+        batch_quals: Vec::new(),
+        all_quals_batch_handled: false,
+        selection_vector: Vec::new(),
+        topn_limit: 0,
+        topn_ascending: true,
+        topn_multi_col_sort: false,
+        topn_sort_col: None,
+        topn_buffer: Vec::new(),
+        topn_cursor: 0,
+        topn_done: false,
+        topn_sort_is_text: false,
+        pscan: std::ptr::null_mut(),
+        wire_base: std::ptr::null(),
+        wire_view: None,
+        is_worker_stub: true,
+        cached_worker_timings: Vec::new(),
+    }
+}
+
 /// BeginCustomScan callback for DeltaXAppend: load segments from all companion tables.
 #[pg_guard]
 pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
@@ -420,6 +508,16 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
     _eflags: i32,
 ) {
     unsafe {
+        // Parallel-worker short-circuit (§5.7). The worker's `begin` is called
+        // before DSM is attached, so we cannot read metadata here. Install a
+        // stub `DecompressState` and defer full hydration to
+        // `init_worker_deltax_append`, which runs once DSM is wired up.
+        if pg_sys::ParallelWorkerNumber >= 0 {
+            let stub = Box::new(make_worker_stub_state());
+            (*node).custom_ps = Box::into_raw(stub) as *mut pg_sys::List;
+            return;
+        }
+
         let custom_private = (*node).custom_ps;
         if custom_private.is_null() {
             pgrx::error!("pg_deltax: missing companion table OIDs in DeltaXAppend state");
@@ -528,6 +626,13 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         // Segments are processed in time order with early stop, so segments
         // beyond the threshold are never detoasted — critical for cold-run I/O.
         // Phase 1 blobs are detoasted per-segment inside exec_topn_two_pass.
+        //
+        // For non-Top-N, we pass `skip_blob_load = true` below so compressed_blobs
+        // are *not* loaded at `begin` time; each segment's blobs are fetched
+        // on-claim by `fetch_segment_blobs` in `load_next_segment`. This
+        // amortises the blob-detoast cost across workers and lets workers share
+        // segment metadata via DSM (they fetch only the blobs for segments they
+        // actually claim).
         let lazy_cols: Option<Vec<bool>> = if topn_limit > 0 {
             let mut lc = vec![false; num_cols];
             for idx in 0..num_cols {
@@ -539,6 +644,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         } else {
             None
         };
+        let skip_blob_load = topn_limit == 0;
 
         // Load segments from ALL companion tables via heap scan (with lazy pruning)
         super::segments::reset_scan_buf_stats();
@@ -548,13 +654,19 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         let mut total_minmax_skipped: u64 = 0;
         let mut total_bloom_skipped: u64 = 0;
         for &oid in &companion_oids {
-            let (segs, skipped, mm_skipped, bloom_skipped, _dt_us) = load_segments_heap(
+            // Segments carry their source companion OID so `fetch_segment_blobs`
+            // can re-open the right `_blobs` table per claimed segment.
+            let (mut segs, skipped, mm_skipped, bloom_skipped, _dt_us) = load_segments_heap(
                 oid, &meta.col_names, &meta.segment_by, &needed_cols,
                 &meta.time_column, false, &seg_filters, t_min, t_max,
                 lazy_cols.as_deref(), &batch_quals, &[],
                 &meta.col_types,
                 &[],
+                skip_blob_load,
             );
+            for s in &mut segs {
+                s.companion_oid = oid;
+            }
             all_segments.extend(segs);
             total_skipped += skipped;
             total_minmax_skipped += mm_skipped;
@@ -643,6 +755,9 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             topn_done: false,
             topn_sort_is_text,
             pscan: std::ptr::null_mut(),
+            wire_base: std::ptr::null(),
+            wire_view: None,
+            is_worker_stub: false,
             cached_worker_timings: Vec::new(),
         };
 
@@ -739,6 +854,7 @@ fn load_decompress_state(
             lazy_cols.as_deref(), &batch_quals, &[],
             &meta.col_types,
             &[],
+            false,
         )
     };
     let heap_scan_us = t1.elapsed().as_micros() as u64;
@@ -809,6 +925,9 @@ fn load_decompress_state(
         topn_done: false,
         topn_sort_is_text: false,
         pscan: std::ptr::null_mut(),
+        wire_base: std::ptr::null(),
+        wire_view: None,
+        is_worker_stub: false,
         cached_worker_timings: Vec::new(),
     }
 }
@@ -2895,10 +3014,11 @@ unsafe fn load_next_segment(
                 }
             }
 
-            let seg = &state.segments_data[state.segment_index];
+            let seg_idx = state.segment_index;
             if state.pscan.is_null() {
                 state.segment_index += 1;
             }
+            let seg = &state.segments_data[seg_idx];
 
             if seg.row_count == 0 {
                 continue;
@@ -2930,6 +3050,22 @@ unsafe fn load_next_segment(
                     continue;
                 }
             }
+
+            // Fetch needed blobs for this segment. `begin_deltax_append` runs with
+            // `skip_blob_load = true`, so compressed_blobs are empty until we claim
+            // the segment — blob I/O is amortised across workers in the parallel
+            // path and kept sequential on the serial path (at a few µs of per-segment
+            // PK-lookup overhead).
+            let fetch_us = fetch_segment_blobs(
+                state.segments_data[seg_idx].companion_oid,
+                state.segments_data[seg_idx].segment_id,
+                &state.col_names,
+                &state.segment_by,
+                &state.needed_cols,
+                &mut state.segments_data[seg_idx],
+            );
+            state.timing.heap_scan_us += fetch_us;
+            let seg = &state.segments_data[seg_idx];
 
             // Dictionary-based LIKE pruning
             if segment_skippable_by_dict(
@@ -3213,12 +3349,44 @@ pub(super) unsafe extern "C-unwind" fn rescan_custom_scan(
 // ============================================================================
 
 /// EstimateDSMCustomScan: how much shared memory this node needs.
+///
+/// Size = fixed `DeltaXAppendPState` (cursor + timing slots) + metadata-wire
+/// region sized by `append_wire::layout` against the leader's pre-loaded
+/// `segments_data`. The leader has already run `begin_deltax_append` by the
+/// time this is called, so segment count and string lengths are known.
 #[pg_guard]
 pub(super) unsafe extern "C-unwind" fn estimate_dsm_deltax_append(
-    _node: *mut pg_sys::CustomScanState,
+    node: *mut pg_sys::CustomScanState,
     _pcxt: *mut pg_sys::ParallelContext,
 ) -> pg_sys::Size {
-    std::mem::size_of::<DeltaXAppendPState>() as pg_sys::Size
+    unsafe {
+        let state = &*((*node).custom_ps as *const DecompressState);
+        let companion_oids = extract_companion_oids_from_segments(&state.segments_data);
+        let input = append_wire::WireInput {
+            col_names: &state.col_names,
+            col_types: &state.col_types,
+            col_typmods: &state.col_typmods,
+            segment_by: &state.segment_by,
+            order_by: &[], // order_by not tracked in DecompressState; workers don't need it post-hydrate
+            time_column: &state._time_column,
+            companion_oids: &companion_oids,
+            segments: &state.segments_data,
+        };
+        let layout = append_wire::layout(&input);
+        (std::mem::size_of::<DeltaXAppendPState>() + layout.total_size as usize) as pg_sys::Size
+    }
+}
+
+/// Collect unique companion OIDs from `segments_data` (the leader doesn't
+/// keep the original slice around, but every segment carries its companion).
+fn extract_companion_oids_from_segments(segments: &[SegmentData]) -> Vec<pg_sys::Oid> {
+    let mut seen: Vec<pg_sys::Oid> = Vec::new();
+    for seg in segments {
+        if !seen.contains(&seg.companion_oid) {
+            seen.push(seg.companion_oid);
+        }
+    }
+    seen
 }
 
 /// InitializeDSMCustomScan: leader populates the shared state after its own
@@ -3250,6 +3418,25 @@ pub(super) unsafe extern "C-unwind" fn initialize_dsm_deltax_append(
         (*ps).n_worker_slots = (nworkers + 1) as u32;
 
         state.pscan = ps;
+
+        // Serialise leader's metadata + segments into the region immediately
+        // after `DeltaXAppendPState`. Workers read this in
+        // `init_worker_deltax_append` instead of re-running SPI + heap scan.
+        let wire_base = (coordinate as *mut u8).add(std::mem::size_of::<DeltaXAppendPState>());
+        let companion_oids = extract_companion_oids_from_segments(&state.segments_data);
+        let input = append_wire::WireInput {
+            col_names: &state.col_names,
+            col_types: &state.col_types,
+            col_typmods: &state.col_typmods,
+            segment_by: &state.segment_by,
+            order_by: &[],
+            time_column: &state._time_column,
+            companion_oids: &companion_oids,
+            segments: &state.segments_data,
+        };
+        let layout = append_wire::layout(&input);
+        append_wire::serialize_into(wire_base, &input, &layout);
+        state.wire_base = wire_base as *const u8;
     }
 }
 
@@ -3269,9 +3456,14 @@ pub(super) unsafe extern "C-unwind" fn reinit_dsm_deltax_append(
     }
 }
 
-/// InitializeWorkerCustomScan: worker picks up the shared state pointer.
-/// The worker's own BeginCustomScan has already run and loaded its own
-/// `segments_data`; we only need to wire `pscan`.
+/// InitializeWorkerCustomScan: worker picks up the shared DSM pointers and
+/// hydrates its `DecompressState` from the serialised metadata region.
+///
+/// The worker's `begin_deltax_append` ran earlier but skipped SPI + heap
+/// scan (see `is_worker_stub`). This function reads the wire written by the
+/// leader's `initialize_dsm_deltax_append`, rebuilds col_names / col_types /
+/// segment_by / time_column / segments_data, and re-runs the plan-qual
+/// extraction passes that depend on those fields.
 #[pg_guard]
 pub(super) unsafe extern "C-unwind" fn init_worker_deltax_append(
     node: *mut pg_sys::CustomScanState,
@@ -3281,7 +3473,152 @@ pub(super) unsafe extern "C-unwind" fn init_worker_deltax_append(
     unsafe {
         let state = &mut *((*node).custom_ps as *mut DecompressState);
         state.pscan = coordinate as *mut DeltaXAppendPState;
+        let wire_base = (coordinate as *mut u8).add(std::mem::size_of::<DeltaXAppendPState>())
+            as *const u8;
+        state.wire_base = wire_base;
+
+        let view = match DeltaXAppendView::attach(wire_base) {
+            Some(v) => v,
+            None => pgrx::error!(
+                "pg_deltax: DSM wire magic mismatch — worker cannot attach to leader's metadata",
+            ),
+        };
+
+        let header = view.decode_header();
+        state.col_names = header.col_names;
+        state.col_types = header.col_types;
+        state.col_typmods = header.col_typmods;
+        state.segment_by = header.segment_by;
+        state._time_column = header.time_column;
+
+        // Pre-decode every SegmentEntry into a process-local `SegmentData`.
+        // Each decode is a small memcpy + a UTF-8 validation on segment_values,
+        // so the per-worker cost is proportional to (num_segments × avg_seg_values_bytes).
+        // Blobs are still fetched lazily inside `load_next_segment` via
+        // `fetch_segment_blobs`; this only populates the metadata fields.
+        let mut segments_data: Vec<SegmentData> = Vec::with_capacity(header.num_segments);
+        for idx in 0..header.num_segments {
+            let b = view.decode_segment(idx);
+            let num_blob_cols = state.col_names.iter()
+                .filter(|n| !state.segment_by.contains(*n))
+                .count();
+            segments_data.push(SegmentData {
+                companion_oid: b.companion_oid,
+                segment_id: b.segment_id,
+                segment_values: b.segment_values,
+                compressed_blobs: vec![Vec::new(); num_blob_cols],
+                text_length_blobs: vec![Vec::new(); num_blob_cols],
+                row_count: b.row_count,
+                min_time: b.min_time,
+                max_time: b.max_time,
+                col_minmax: std::collections::HashMap::new(),
+                col_sums: std::collections::HashMap::new(),
+                toast_pointers: vec![Vec::new(); num_blob_cols],
+            });
+        }
+        state.segments_data = segments_data;
+        state.wire_view = Some(view);
+
+        // Now that col_names / col_types are live, rebuild qual-driven state
+        // that the leader built in `begin_deltax_append`.
+        let plan_qual = (*(*node).ss.ps.plan).qual;
+        let (batch_quals, handled_count) = extract_batch_quals(
+            plan_qual,
+            &state.col_names,
+            &state.col_types,
+        );
+        let nquals = if plan_qual.is_null() { 0 } else { (*plan_qual).length as usize };
+        let all_quals_batch_handled = handled_count > 0 && handled_count == nquals;
+        if all_quals_batch_handled {
+            (*node).ss.ps.qual = std::ptr::null_mut();
+        }
+        state.batch_quals = batch_quals;
+        state.all_quals_batch_handled = all_quals_batch_handled;
+
+        let (seg_filters, t_min, t_max) = extract_segment_filters(
+            plan_qual,
+            &state.col_names,
+            &state.segment_by,
+            &state._time_column,
+        );
+        state.segment_by_filters = seg_filters;
+        state.time_min = t_min;
+        state.time_max = t_max;
+
+        // Build needed_cols / needed_col_indices from the planner-supplied
+        // column-index list in custom_private (bytes after the -1 sentinel),
+        // plus any extra columns that batch_quals references. The plan node
+        // is a `CustomScan` — cast via `*mut _` and read `custom_private`.
+        let cscan = (*node).ss.ps.plan as *mut pg_sys::CustomScan;
+        let custom_private_list = (*cscan).custom_private;
+        let (needed_cols, needed_col_indices) = build_needed_cols_from_custom_private(
+            custom_private_list,
+            &state.col_names,
+            &state.batch_quals,
+        );
+        state.needed_cols = needed_cols;
+        state.needed_col_indices = needed_col_indices;
+
+        // Create per-segment memory context (leader did this in begin).
+        if state.segment_mcxt.is_null() {
+            let query_ctx = (*(*node).ss.ps.state).es_query_cxt;
+            state.segment_mcxt = pg_sys::AllocSetContextCreateInternal(
+                query_ctx,
+                c"DeltaXSegment".as_ptr(),
+                pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
+                pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
+                pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
+            );
+        }
+
+        state.is_worker_stub = false;
     }
+}
+
+/// Parse a `DeltaXAppend` `custom_private` list and compute the needed-column
+/// mask + dense-index list against the freshly-hydrated `col_names`. Mirrors
+/// the leader's inline logic in `begin_deltax_append`.
+fn build_needed_cols_from_custom_private(
+    custom_private: *mut pg_sys::List,
+    col_names: &[String],
+    batch_quals: &[BatchQual],
+) -> (Vec<bool>, Vec<usize>) {
+    let num_cols = col_names.len();
+    let mut needed_cols = vec![false; num_cols];
+    let mut needed_col_indices: Vec<usize> = Vec::new();
+
+    unsafe {
+        if !custom_private.is_null() {
+            let list_len = (*custom_private).length;
+            let mut found_sentinel = false;
+            for i in 0..list_len {
+                let val = pg_sys::list_nth_int(custom_private, i);
+                if val == -1 && !found_sentinel {
+                    found_sentinel = true;
+                    continue;
+                }
+                if val == -2 && found_sentinel {
+                    break; // Top-N sentinel — Top-N disabled in parallel plans.
+                }
+                if found_sentinel && val >= 0 {
+                    let idx = val as usize;
+                    if idx < num_cols && !needed_cols[idx] {
+                        needed_cols[idx] = true;
+                        needed_col_indices.push(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    for bq in batch_quals {
+        if bq.col_idx < num_cols && !needed_cols[bq.col_idx] {
+            needed_cols[bq.col_idx] = true;
+            needed_col_indices.push(bq.col_idx);
+        }
+    }
+
+    (needed_cols, needed_col_indices)
 }
 
 /// ShutdownCustomScan: flush this process's timing counters into the shared
@@ -3309,6 +3646,13 @@ pub(super) unsafe extern "C-unwind" fn shutdown_deltax_append(
             let n = (ps.n_worker_slots as usize).min(MAX_WORKER_SLOTS);
             state.cached_worker_timings = ps.worker_timings[..n].to_vec();
         }
+
+        // Clear DSM-borrowed pointers before PG tears the DSM region down.
+        // `wire_view` borrows from `wire_base`; drop it first. The backing
+        // `SegmentData` Vec we decoded in `init_worker` is process-local and
+        // stays valid until `EndCustomScan`.
+        state.wire_view = None;
+        state.wire_base = std::ptr::null();
     }
 }
 

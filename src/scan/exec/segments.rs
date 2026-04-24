@@ -364,6 +364,10 @@ pub(super) fn segment_skippable_by_dict(
 }
 
 pub(super) struct SegmentData {
+    /// Source companion-table OID. Populated by the caller after
+    /// `load_segments_heap` returns; used by `fetch_segment_blobs` to re-open
+    /// the right `_blobs` table when blobs are materialised on-claim.
+    pub(super) companion_oid: pg_sys::Oid,
     /// Companion-table segment id (used to fetch sidecar/bloom data after
     /// the main load).
     pub(super) segment_id: i32,
@@ -600,6 +604,10 @@ pub(super) unsafe fn load_segments_heap(
     needed_stats_cols: &[String],
     col_types: &[pg_sys::Oid],
     needed_minmax_cols: &[String],
+    // `skip_blob_load = true` skips Phase 2 entirely. Callers that fetch blobs
+    // on-claim via `fetch_segment_blobs` pass true — compressed_blobs and
+    // toast_pointers stay empty at return.
+    skip_blob_load: bool,
 ) -> (Vec<SegmentData>, u64, u64, u64, u64) {  // skipped, minmax_skipped, bloom_skipped, detoast_us
     // Buffer stats are accumulated into a thread-local via `accumulate_scan_buf_stats`;
     // callers read them with `take_scan_buf_stats()` after all companion OIDs are processed.
@@ -939,6 +947,7 @@ pub(super) unsafe fn load_segments_heap(
 
             surviving_segment_ids.push(segment_id);
             segments.push(SegmentData {
+                companion_oid: meta_oid,
                 segment_id,
                 segment_values,
                 compressed_blobs,
@@ -1648,7 +1657,7 @@ pub(super) unsafe fn load_segments_heap(
             !segment_by.contains(name) && needed_cols[i]
         });
 
-        if !segments.is_empty() && any_blobs_needed {
+        if !segments.is_empty() && any_blobs_needed && !skip_blob_load {
             // Derive blob table OID from meta table name
             let meta_name_ptr = pg_sys::get_rel_name(meta_oid);
             let meta_name = std::ffi::CStr::from_ptr(meta_name_ptr)
@@ -2051,6 +2060,168 @@ pub(super) unsafe fn load_text_length_sidecars(
 
         t_start.elapsed().as_micros() as u64
     }
+}
+
+/// Fetch compressed blobs for a single segment via `(_col_idx, _segment_id)`
+/// PK lookup on the companion `_blobs` table. Populates
+/// `seg.compressed_blobs[col_idx]` for every non-segment-by column marked in
+/// `needed_cols`, detoasting each value in place. Idempotent (skips columns
+/// already populated).
+///
+/// Called on-claim from `load_next_segment` (parallel and serial paths after
+/// §5.7 DSM sharing): instead of the leader eagerly detoasting every
+/// segment's blobs in `load_segments_heap`, each claimant fetches only the
+/// blobs for segments it actually processes — so blob I/O is parallelised
+/// across workers.
+pub(super) unsafe fn fetch_segment_blobs(
+    companion_oid: pg_sys::Oid,
+    segment_id: i32,
+    col_names: &[String],
+    segment_by: &[String],
+    needed_cols: &[bool],
+    seg: &mut SegmentData,
+) -> u64 {
+    let t_start = std::time::Instant::now();
+    unsafe {
+        // Pre-size blob slots if empty (first fetch).
+        let num_blob_cols = col_names.iter()
+            .filter(|n| !segment_by.contains(*n))
+            .count();
+        if seg.compressed_blobs.is_empty() {
+            seg.compressed_blobs = vec![Vec::new(); num_blob_cols];
+        }
+
+        // Derive `{partition}_blobs` OID from meta OID.
+        let meta_name_ptr = pg_sys::get_rel_name(companion_oid);
+        if meta_name_ptr.is_null() {
+            return t_start.elapsed().as_micros() as u64;
+        }
+        let meta_name = std::ffi::CStr::from_ptr(meta_name_ptr)
+            .to_string_lossy()
+            .into_owned();
+        let meta_ns_oid = pg_sys::get_rel_namespace(companion_oid);
+        let partition_name = meta_name.strip_suffix("_meta").unwrap_or(&meta_name);
+        let blobs_name = format!("{}_blobs", partition_name);
+        let blobs_cname = std::ffi::CString::new(blobs_name).unwrap();
+        let blob_oid = pg_sys::get_relname_relid(blobs_cname.as_ptr(), meta_ns_oid);
+        if blob_oid == pg_sys::InvalidOid {
+            return t_start.elapsed().as_micros() as u64;
+        }
+
+        // Build col_idx mapping: each non-segment-by col_name → dense col_idx
+        // (used as the first PK column in `_blobs`). Same rule as `load_segments_heap`.
+        let mut col_idx_map: Vec<Option<u16>> = Vec::new();
+        {
+            let mut ci: u16 = 0;
+            for name in col_names {
+                if segment_by.contains(name) {
+                    col_idx_map.push(None);
+                } else {
+                    col_idx_map.push(Some(ci));
+                    ci += 1;
+                }
+            }
+        }
+
+        let blob_rel = pg_sys::table_open(blob_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+        // Find PK index OID on `_blobs` — assumed `(_col_idx, _segment_id)`.
+        let pk_index_oid = {
+            let mut pk_oid = pg_sys::InvalidOid;
+            let index_list = pg_sys::RelationGetIndexList(blob_rel);
+            if !index_list.is_null() {
+                let n = (*index_list).length;
+                for i in 0..n {
+                    let idx_oid = (*(*index_list).elements.add(i as usize)).oid_value;
+                    let idx_rel = pg_sys::index_open(idx_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                    let is_primary = if !(*idx_rel).rd_index.is_null() {
+                        (*(*idx_rel).rd_index).indisprimary
+                    } else { false };
+                    pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                    if is_primary {
+                        pk_oid = idx_oid;
+                        break;
+                    }
+                }
+                pg_sys::list_free(index_list);
+            }
+            pk_oid
+        };
+
+        if pk_index_oid == pg_sys::InvalidOid {
+            pg_sys::table_close(blob_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            return t_start.elapsed().as_micros() as u64;
+        }
+
+        let idx_rel = pg_sys::index_open(pk_index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let snapshot = pg_sys::GetActiveSnapshot();
+
+        for (i, name) in col_names.iter().enumerate() {
+            if segment_by.contains(name) || !needed_cols[i] {
+                continue;
+            }
+            let col_idx = match col_idx_map[i] {
+                Some(ci) => ci,
+                None => continue,
+            };
+            let blob_slot = col_idx as usize;
+            if !seg.compressed_blobs[blob_slot].is_empty() {
+                continue; // already fetched
+            }
+
+            // Two-column PK scankey: (_col_idx = ci, _segment_id = seg_id).
+            let mut skeys = [pg_sys::ScanKeyData::default(); 2];
+            pg_sys::ScanKeyInit(
+                &mut skeys[0],
+                1,
+                pg_sys::BTEqualStrategyNumber as u16,
+                pg_sys::F_INT2EQ.into(),
+                pg_sys::Datum::from(col_idx as i16),
+            );
+            pg_sys::ScanKeyInit(
+                &mut skeys[1],
+                2,
+                pg_sys::BTEqualStrategyNumber as u16,
+                pg_sys::F_INT4EQ.into(),
+                pg_sys::Datum::from(segment_id),
+            );
+
+            #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+            let scan = pg_sys::index_beginscan(blob_rel, idx_rel, snapshot, 2, 0);
+            #[cfg(feature = "pg18")]
+            let scan = pg_sys::index_beginscan(blob_rel, idx_rel, snapshot, std::ptr::null_mut(), 2, 0);
+            pg_sys::index_rescan(scan, skeys.as_mut_ptr(), 2, std::ptr::null_mut(), 0);
+
+            let slot = pg_sys::table_slot_create(blob_rel, std::ptr::null_mut());
+
+            if pg_sys::index_getnext_slot(scan, pg_sys::ScanDirection::ForwardScanDirection, slot) {
+                pg_sys::slot_getallattrs(slot);
+                let tts_isnull = (*slot).tts_isnull;
+                let tts_values = (*slot).tts_values;
+                let data_null = *tts_isnull.add(2);
+                if !data_null {
+                    let data_datum = *tts_values.add(2);
+                    let varlena_ptr: *mut pg_sys::varlena = data_datum.cast_mut_ptr();
+                    let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                    let len = pgrx::varsize_any_exhdr(detoasted);
+                    let data = pgrx::vardata_any(detoasted);
+                    #[allow(clippy::unnecessary_cast)]
+                    let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
+                    if detoasted != varlena_ptr {
+                        pg_sys::pfree(detoasted as *mut _);
+                    }
+                    seg.compressed_blobs[blob_slot] = bytes;
+                }
+            }
+
+            pg_sys::ExecDropSingleTupleTableSlot(slot);
+            pg_sys::index_endscan(scan);
+        }
+
+        pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        pg_sys::table_close(blob_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+    }
+    t_start.elapsed().as_micros() as u64
 }
 
 /// Materialize deferred TOAST pointers for a segment.
