@@ -9,6 +9,7 @@ use super::PREV_HOOK;
 use super::PREV_UPPER_HOOK;
 use super::PREV_EXECUTOR_START_HOOK;
 use super::PREV_GET_RELATION_INFO_HOOK;
+use super::PREV_PLANNER_HOOK;
 use super::path;
 use super::cost;
 
@@ -3542,5 +3543,49 @@ unsafe fn call_prev_executor_start(query_desc: *mut pg_sys::QueryDesc, eflags: c
         } else {
             pg_sys::standard_ExecutorStart(query_desc, eflags);
         }
+    }
+}
+
+/// Planner hook entry point. Wraps `standard_planner` (or the previous hook
+/// in the chain) and post-processes the resulting `PlannedStmt` to substitute
+/// JSONB-extract chains in upper plans with `Var(OUTER_VAR, attno)` referring
+/// to a `DeltaXDecompress`'s pre-computed synthetic columns.
+///
+/// PG's `set_plan_references` (which runs inside `standard_planner`) cannot
+/// match the upper plan's chain `Expr` against our scan's tlist because
+/// `set_customscan_references` already rewrote the scan's tlist to
+/// `Var(INDEX_VAR, …)` by then — `tlist_member` (equal()) doesn't match
+/// `Expr` to `Var`. So we do the matching ourselves on the final plan tree.
+#[pg_guard]
+pub unsafe extern "C-unwind" fn deltax_planner(
+    parse: *mut pg_sys::Query,
+    query_string: *const std::ffi::c_char,
+    cursor_options: c_int,
+    bound_params: pg_sys::ParamListInfo,
+) -> *mut pg_sys::PlannedStmt {
+    unsafe {
+        // Chain to previous hook (if installed) or fall back to standard_planner.
+        let prev = PREV_PLANNER_HOOK.load(Ordering::SeqCst);
+        let pstmt: *mut pg_sys::PlannedStmt = if !prev.is_null() {
+            let prev_fn: unsafe extern "C-unwind" fn(
+                *mut pg_sys::Query,
+                *const std::ffi::c_char,
+                c_int,
+                pg_sys::ParamListInfo,
+            ) -> *mut pg_sys::PlannedStmt = std::mem::transmute(prev);
+            prev_fn(parse, query_string, cursor_options, bound_params)
+        } else {
+            pg_sys::standard_planner(parse, query_string, cursor_options, bound_params)
+        };
+
+        if !pstmt.is_null() && !(*pstmt).planTree.is_null() {
+            // Walk the final plan tree and rewrite chain Exprs in upper plans
+            // to point at the synthetic columns produced by DeltaXDecompress.
+            // The walker is a no-op when no DeltaXDecompress with json_extract
+            // is found in the tree.
+            super::json_extract::rewrite_plan_tree((*pstmt).planTree);
+        }
+
+        pstmt
     }
 }

@@ -626,6 +626,299 @@ unsafe fn make_text_const(s: &str) -> *mut pg_sys::Const {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Plan-tree walker (post-`set_plan_references`)
+// ---------------------------------------------------------------------------
+//
+// Walks the final `Plan` tree produced by `standard_planner` and rewrites
+// JSONB-extract chains in upper-plan expressions to read pre-computed
+// synthetic columns from a `DeltaXDecompress`'s slot. See `planner_hook`
+// installation in `src/scan/hook.rs::deltax_planner` and the design notes
+// in the plan file (`Plan rewrite — refined: post-set_plan_references walker
+// via planner_hook`).
+//
+// Top-down recursion. Each plan node returns its `SubplanTlist` describing
+// what's available at each tlist position from the parent's perspective —
+// physical column from the underlying rel, synthetic JSON-extract column,
+// or anything else we can't reason about. Parents use that information to
+// substitute matching chain Exprs in their own expressions with
+// `Var(OUTER_VAR, k)` referring to the synthetic position.
+//
+// Status: stub walker that traverses the tree and logs discovery via
+// `pgrx::log!`. Full substitution lands incrementally.
+
+/// What's at one tlist position of a plan node, from the perspective of the
+/// parent plan (which references it via `Var(OUTER_VAR, attno)`).
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // fields read by the substitution walker (next iteration)
+pub(crate) enum SubplanColumn {
+    /// A physical column of the underlying relation. `rel_var_attno` is the
+    /// `pg_attribute.attnum` in that rel. Useful for chain matching: a chain
+    /// `Var(OUTER_VAR, k)->>'kind'` whose Var resolves through us to a
+    /// physical column with attno N is the same as `data->>'kind'` where
+    /// `data` is column N.
+    Physical { rel_var_attno: i16 },
+    /// A synthetic JSON-extract column produced by a DeltaXDecompress
+    /// somewhere below us. The walker substitutes matching chain Exprs at
+    /// the parent level with `Var(OUTER_VAR, attno_pointing_here)`.
+    Synthetic {
+        path: Vec<String>,
+        target_kind: ColumnKind,
+        /// Attno of the source jsonb column in the underlying rel — used to
+        /// disambiguate when multiple jsonb columns are extracted.
+        src_var_attno: i16,
+    },
+    /// Any other expression we don't try to reason about.
+    Other,
+}
+
+/// Per-plan-node summary returned by `rewrite_plan_subtree`.
+pub(crate) type SubplanTlist = Vec<SubplanColumn>;
+
+/// Top-level entry called by `planner_hook`. Walks the plan tree and applies
+/// JSON-extract chain substitutions. Returns nothing — mutates plan nodes
+/// in place.
+pub(crate) unsafe fn rewrite_plan_tree(plan: *mut pg_sys::Plan) {
+    unsafe {
+        let _ = rewrite_plan_subtree(plan);
+    }
+}
+
+/// Walk a plan subtree. Returns the `SubplanTlist` describing what each
+/// position of THIS plan's targetlist provides to the parent.
+unsafe fn rewrite_plan_subtree(plan: *mut pg_sys::Plan) -> SubplanTlist {
+    unsafe {
+        if plan.is_null() {
+            return Vec::new();
+        }
+
+        // Leaf cases first.
+        if (*plan).type_ == pg_sys::NodeTag::T_CustomScan {
+            let cscan = plan as *mut pg_sys::CustomScan;
+            return subplan_tlist_from_deltax_decompress(cscan).unwrap_or_default();
+        }
+
+        // Recursive case: collect children's SubplanTlists.
+        let _child_stl = collect_child_subplan_tlist(plan);
+
+        // TODO(json-extract): substitute matched chain Exprs in this plan's
+        // expressions using `_child_stl`. For now this is a no-op walker so we
+        // can validate plumbing without changing query results.
+
+        // Compute MY SubplanTlist by walking my targetlist (post-substitution).
+        compute_my_subplan_tlist(plan, &_child_stl)
+    }
+}
+
+/// Inspect a `CustomScan` and, if it's a `DeltaXDecompress` carrying
+/// json_extract specs in its `custom_private`, return a `SubplanTlist` that
+/// describes its `custom_scan_tlist` shape (physical Vars + synthetic
+/// extracts). Returns `None` for any other CustomScan or when no specs are
+/// configured.
+unsafe fn subplan_tlist_from_deltax_decompress(
+    cscan: *mut pg_sys::CustomScan,
+) -> Option<SubplanTlist> {
+    unsafe {
+        if cscan.is_null() {
+            return None;
+        }
+        // Identify by methods name. Avoids depending on a specific layout.
+        let methods = (*cscan).methods;
+        if methods.is_null() {
+            return None;
+        }
+        let name_ptr = (*methods).CustomName;
+        if name_ptr.is_null() {
+            return None;
+        }
+        let name = std::ffi::CStr::from_ptr(name_ptr);
+        if name != crate::scan::CUSTOM_NAME {
+            return None;
+        }
+
+        // custom_scan_tlist null → no synthetic columns; treat as plain
+        // physical-only scan and let the caller fall through.
+        let cstlist = (*cscan).custom_scan_tlist;
+        if cstlist.is_null() {
+            return None;
+        }
+
+        // Build SubplanTlist by inspecting each TargetEntry. Physical entries
+        // are Var nodes referencing the rel; synthetic entries are chain
+        // OpExprs (or CoerceViaIO-wrapped chains).
+        let len = (*cstlist).length;
+        let mut stl: SubplanTlist = Vec::with_capacity(len as usize);
+        for i in 0..len {
+            let tle = pg_sys::list_nth(cstlist, i) as *mut pg_sys::TargetEntry;
+            if tle.is_null() || (*tle).expr.is_null() {
+                stl.push(SubplanColumn::Other);
+                continue;
+            }
+            let expr = (*tle).expr as *mut pg_sys::Node;
+            stl.push(classify_custom_scan_tlist_entry(expr));
+        }
+        Some(stl)
+    }
+}
+
+/// Classify one `custom_scan_tlist` entry: physical Var, JSON-extract chain,
+/// or other. The chain detection mirrors `match_extract_chain` but without
+/// the spec-list lookup — we only need to surface its shape upward, the
+/// matching against user expressions happens at parent-level rewrite.
+unsafe fn classify_custom_scan_tlist_entry(expr: *mut pg_sys::Node) -> SubplanColumn {
+    unsafe {
+        // Physical: a top-level Var referencing the underlying rel.
+        if (*expr).type_ == pg_sys::NodeTag::T_Var {
+            let v = expr as *mut pg_sys::Var;
+            return SubplanColumn::Physical {
+                rel_var_attno: (*v).varattno,
+            };
+        }
+
+        // Synthetic: peel cast wrappers and walk the `->`/`->>` chain.
+        let (chain_root, leaf_kind) = strip_outer_cast(expr);
+        let mut path_keys: Vec<String> = Vec::new();
+        let mut cursor = chain_root;
+        let Some((k, deeper)) = match_op_step(cursor, JSONB_OBJECT_FIELD_TEXT_OPNO) else {
+            return SubplanColumn::Other;
+        };
+        path_keys.push(k);
+        cursor = deeper;
+        loop {
+            cursor = unwrap_relabel(cursor);
+            match match_op_step(cursor, JSONB_OBJECT_FIELD_OPNO) {
+                Some((k, deeper)) => {
+                    path_keys.push(k);
+                    cursor = deeper;
+                }
+                None => break,
+            }
+        }
+        cursor = unwrap_relabel(cursor);
+        if (*cursor).type_ != pg_sys::NodeTag::T_Var {
+            return SubplanColumn::Other;
+        }
+        let v = cursor as *mut pg_sys::Var;
+        path_keys.reverse();
+        SubplanColumn::Synthetic {
+            path: path_keys,
+            target_kind: leaf_kind,
+            src_var_attno: (*v).varattno,
+        }
+    }
+}
+
+/// Recurse into children. For Append/MergeAppend take the intersection of
+/// child SubplanTlists at each position so a synthetic only propagates if
+/// every child can serve it. For everything else, take the lefttree's STL.
+unsafe fn collect_child_subplan_tlist(plan: *mut pg_sys::Plan) -> SubplanTlist {
+    unsafe {
+        match (*plan).type_ {
+            pg_sys::NodeTag::T_Append => {
+                let app = plan as *mut pg_sys::Append;
+                intersect_children_subplan_tlists((*app).appendplans)
+            }
+            pg_sys::NodeTag::T_MergeAppend => {
+                let mapp = plan as *mut pg_sys::MergeAppend;
+                intersect_children_subplan_tlists((*mapp).mergeplans)
+            }
+            _ => {
+                if !(*plan).lefttree.is_null() {
+                    rewrite_plan_subtree((*plan).lefttree)
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+}
+
+unsafe fn intersect_children_subplan_tlists(plan_list: *mut pg_sys::List) -> SubplanTlist {
+    unsafe {
+        if plan_list.is_null() || (*plan_list).length == 0 {
+            return Vec::new();
+        }
+        let n = (*plan_list).length;
+        let first = pg_sys::list_nth(plan_list, 0) as *mut pg_sys::Plan;
+        let mut acc = rewrite_plan_subtree(first);
+        for i in 1..n {
+            let child = pg_sys::list_nth(plan_list, i) as *mut pg_sys::Plan;
+            let stl = rewrite_plan_subtree(child);
+            // Intersect element-wise: positions disagreeing become Other.
+            // If lengths differ, truncate to shorter — over-approximation that
+            // never produces wrong substitutions.
+            let common = acc.len().min(stl.len());
+            acc.truncate(common);
+            for k in 0..common {
+                if !subplan_columns_equivalent(&acc[k], &stl[k]) {
+                    acc[k] = SubplanColumn::Other;
+                }
+            }
+        }
+        acc
+    }
+}
+
+fn subplan_columns_equivalent(a: &SubplanColumn, b: &SubplanColumn) -> bool {
+    match (a, b) {
+        (
+            SubplanColumn::Physical { rel_var_attno: a_n },
+            SubplanColumn::Physical { rel_var_attno: b_n },
+        ) => a_n == b_n,
+        (
+            SubplanColumn::Synthetic {
+                path: a_p,
+                target_kind: a_k,
+                src_var_attno: a_s,
+            },
+            SubplanColumn::Synthetic {
+                path: b_p,
+                target_kind: b_k,
+                src_var_attno: b_s,
+            },
+        ) => a_p == b_p && a_k == b_k && a_s == b_s,
+        _ => false,
+    }
+}
+
+/// Build THIS plan's SubplanTlist by walking its targetlist (post any
+/// substitution we made). Each TargetEntry's expr tells us what's at its
+/// resno: a forwarding `Var(OUTER_VAR, k)` carries the child's STL[k-1]
+/// upward; anything else is Other.
+unsafe fn compute_my_subplan_tlist(
+    plan: *mut pg_sys::Plan,
+    child_stl: &SubplanTlist,
+) -> SubplanTlist {
+    unsafe {
+        let tlist = (*plan).targetlist;
+        if tlist.is_null() {
+            return Vec::new();
+        }
+        let mut my_stl: SubplanTlist = Vec::with_capacity((*tlist).length as usize);
+        for i in 0..(*tlist).length {
+            let tle = pg_sys::list_nth(tlist, i) as *mut pg_sys::TargetEntry;
+            if tle.is_null() || (*tle).expr.is_null() {
+                my_stl.push(SubplanColumn::Other);
+                continue;
+            }
+            let expr = (*tle).expr as *mut pg_sys::Node;
+            // Forwarding Var(OUTER_VAR, k)?
+            if (*expr).type_ == pg_sys::NodeTag::T_Var {
+                let v = expr as *mut pg_sys::Var;
+                if (*v).varno == pg_sys::OUTER_VAR {
+                    let k = (*v).varattno as usize;
+                    if k >= 1 && k <= child_stl.len() {
+                        my_stl.push(child_stl[k - 1].clone());
+                        continue;
+                    }
+                }
+            }
+            my_stl.push(SubplanColumn::Other);
+        }
+        my_stl
+    }
+}
+
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {

@@ -24,6 +24,12 @@ static PREV_EXECUTOR_START_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_m
 /// Previous hook to chain (get_relation_info_hook).
 static PREV_GET_RELATION_INFO_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
 
+/// Previous hook to chain (planner_hook). Used by the json_extract feature
+/// to walk the final plan tree post-`set_plan_references` and substitute
+/// JSONB-extract chains with `Var(OUTER_VAR, attno)` referring to a
+/// DeltaXDecompress's pre-computed synthetic columns.
+static PREV_PLANNER_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
+
 /// Custom scan method name (NUL-terminated, static lifetime).
 const CUSTOM_NAME: &std::ffi::CStr = c"DeltaXDecompress";
 
@@ -95,6 +101,14 @@ pub unsafe fn register_hook() {
             PREV_GET_RELATION_INFO_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
         }
         pg_sys::get_relation_info_hook = Some(hook::deltax_get_relation_info);
+
+        // Register planner_hook so we can post-process the final plan tree
+        // and rewrite JSONB-extract chains in upper plans (json_extract feature).
+        let prev_planner = pg_sys::planner_hook;
+        if let Some(prev_fn) = prev_planner {
+            PREV_PLANNER_HOOK.store(prev_fn as *mut (), Ordering::SeqCst);
+        }
+        pg_sys::planner_hook = Some(hook::deltax_planner);
 
         // Register CustomScanMethods by name so parallel workers can
         // deserialize custom scan nodes from DSM.
