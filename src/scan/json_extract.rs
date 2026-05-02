@@ -650,7 +650,6 @@ unsafe fn make_text_const(s: &str) -> *mut pg_sys::Const {
 /// What's at one tlist position of a plan node, from the perspective of the
 /// parent plan (which references it via `Var(OUTER_VAR, attno)`).
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // fields read by the substitution walker (next iteration)
 pub(crate) enum SubplanColumn {
     /// A physical column of the underlying relation. `rel_var_attno` is the
     /// `pg_attribute.attnum` in that rel. Useful for chain matching: a chain
@@ -660,13 +659,17 @@ pub(crate) enum SubplanColumn {
     Physical { rel_var_attno: i16 },
     /// A synthetic JSON-extract column produced by a DeltaXDecompress
     /// somewhere below us. The walker substitutes matching chain Exprs at
-    /// the parent level with `Var(OUTER_VAR, attno_pointing_here)`.
+    /// the parent level with `Var(OUTER_VAR, forwarder_resno)`.
     Synthetic {
         path: Vec<String>,
         target_kind: ColumnKind,
         /// Attno of the source jsonb column in the underlying rel — used to
         /// disambiguate when multiple jsonb columns are extracted.
         src_var_attno: i16,
+        /// Position (resno) of the forwarder TargetEntry in this plan's
+        /// `scan.plan.targetlist`, i.e. the attno that the parent plan should
+        /// use in its `Var(OUTER_VAR, _)` to read this synthetic value.
+        forwarder_resno: i16,
     },
     /// Any other expression we don't try to reason about.
     Other,
@@ -679,11 +682,21 @@ pub(crate) type SubplanTlist = Vec<SubplanColumn>;
 /// JSON-extract chain substitutions. Returns nothing — mutates plan nodes
 /// in place. `rtable` is the PlannedStmt's range table, used to resolve
 /// `cscan->scan.scanrelid` to a relation OID for the SPI spec lookup.
+///
+/// Gated on `pg_deltax.json_extract_mode`. With `none`, the walker is a
+/// complete no-op (queries fall through to the slow path and return
+/// correct results). With `fields`, the walker rewrites — but the
+/// executor-side population of synthetic slot positions must also be
+/// wired up (Step 5) for results to be correct. With this commit alone,
+/// `mode = fields` causes synthetic slot positions to read NULL.
 pub(crate) unsafe fn rewrite_plan_tree(
     plan: *mut pg_sys::Plan,
     rtable: *mut pg_sys::List,
 ) {
     unsafe {
+        if !matches!(crate::get_json_extract_mode(), crate::JsonExtractMode::Fields) {
+            return;
+        }
         let _ = rewrite_plan_subtree(plan, rtable);
     }
 }
@@ -938,20 +951,20 @@ unsafe fn match_chain_against_child_stl(
 
         // Find a matching synthetic in child_stl with that source attno
         // and our (path_keys, leaf_kind).
-        for (j, col) in child_stl.iter().enumerate() {
+        for col in child_stl.iter() {
             if let SubplanColumn::Synthetic {
                 path,
                 target_kind,
                 src_var_attno,
+                forwarder_resno,
             } = col
                 && *src_var_attno == physical_attno
                 && *target_kind == leaf_kind
                 && path == &path_keys
             {
-                let synth_attno = (j + 1) as i16;
                 let new_var = pg_sys::makeVar(
                     pg_sys::OUTER_VAR,
-                    synth_attno,
+                    *forwarder_resno,
                     kind_to_type_oid(*target_kind),
                     -1,
                     if matches!(target_kind, ColumnKind::Text) {
@@ -1010,30 +1023,179 @@ unsafe fn subplan_tlist_from_deltax_decompress(
             return None;
         }
         (*cscan).custom_scan_tlist = cstlist;
-        // TODO(json-extract): also extend `scan.plan.targetlist` with
-        // synthetic forwarder TargetEntries — each `Var(INDEX_VAR, k)`
-        // referring to a synthetic position in `custom_scan_tlist`. Upper
-        // plans reference the subplan's output via OUTER_VAR refs that index
-        // into `scan.plan.targetlist`, not `custom_scan_tlist`. Without the
-        // extension, our walker's `Var(OUTER_VAR, k_synth)` substitutions
-        // would point at slot positions that don't exist in the projected
-        // tuple. This is the next iteration on top of this commit.
 
-        // Build SubplanTlist by inspecting each TargetEntry. Physical entries
-        // are Var nodes referencing the rel; synthetic entries are chain
-        // OpExprs (or CoerceViaIO-wrapped chains).
-        let len = (*cstlist).length;
-        let mut stl: SubplanTlist = Vec::with_capacity(len as usize);
-        for i in 0..len {
-            let tle = pg_sys::list_nth(cstlist, i) as *mut pg_sys::TargetEntry;
+        // Rewrite scan.plan.targetlist so it (a) has its existing Var(rti)
+        // entries replaced with `Var(INDEX_VAR, k)` (matching the slot
+        // semantics tlistvarno=INDEX_VAR that PG assumes when
+        // custom_scan_tlist is set), and (b) is extended with synthetic
+        // forwarder TargetEntries — one per chain Expr in cstlist — so
+        // upper plans' `Var(OUTER_VAR, forwarder_resno)` refs resolve to
+        // the right slot positions.
+        let _ = extend_scan_targetlist_with_forwarders(cscan, cstlist);
+
+        // Build SubplanTlist by walking scan.plan.targetlist, NOT
+        // custom_scan_tlist. Upper plans' OUTER_VAR refs index into
+        // scan.plan.targetlist, so the SubplanTlist Vec must align with
+        // it position-by-position. Each entry is classified by following
+        // its `Var(INDEX_VAR, k_in_cstlist)` back into cstlist.
+        Some(build_subplan_tlist_from_scan_targetlist(
+            (*cscan).scan.plan.targetlist,
+            cstlist,
+        ))
+    }
+}
+
+/// Build a `SubplanTlist` aligned 1:1 with `scan_targetlist`. For each
+/// `TargetEntry`, follow `Var(INDEX_VAR, k)` back into `cstlist[k-1]` and
+/// classify (physical Var on the rel → `Physical { rel_var_attno }`; chain
+/// expression → `Synthetic { path, kind, src, forwarder_resno = entry.resno }`;
+/// anything else → `Other`).
+unsafe fn build_subplan_tlist_from_scan_targetlist(
+    scan_targetlist: *mut pg_sys::List,
+    cstlist: *mut pg_sys::List,
+) -> SubplanTlist {
+    unsafe {
+        if scan_targetlist.is_null() {
+            return Vec::new();
+        }
+        let n = (*scan_targetlist).length;
+        let mut stl: SubplanTlist = Vec::with_capacity(n as usize);
+        for i in 0..n {
+            let tle = pg_sys::list_nth(scan_targetlist, i) as *mut pg_sys::TargetEntry;
             if tle.is_null() || (*tle).expr.is_null() {
                 stl.push(SubplanColumn::Other);
                 continue;
             }
             let expr = (*tle).expr as *mut pg_sys::Node;
-            stl.push(classify_custom_scan_tlist_entry(expr));
+            // Resolve `Var(INDEX_VAR, k)` → cstlist[k-1].
+            if (*expr).type_ != pg_sys::NodeTag::T_Var {
+                stl.push(SubplanColumn::Other);
+                continue;
+            }
+            let v = expr as *mut pg_sys::Var;
+            if (*v).varno != pg_sys::INDEX_VAR {
+                stl.push(SubplanColumn::Other);
+                continue;
+            }
+            let k = (*v).varattno;
+            if k < 1 || cstlist.is_null() || k as i32 > (*cstlist).length {
+                stl.push(SubplanColumn::Other);
+                continue;
+            }
+            let cs_tle = pg_sys::list_nth(cstlist, (k - 1) as i32) as *mut pg_sys::TargetEntry;
+            if cs_tle.is_null() || (*cs_tle).expr.is_null() {
+                stl.push(SubplanColumn::Other);
+                continue;
+            }
+            let cs_expr = (*cs_tle).expr as *mut pg_sys::Node;
+            stl.push(classify_custom_scan_tlist_entry(cs_expr, (*tle).resno));
         }
-        Some(stl)
+        stl
+    }
+}
+
+/// Rewrite the cscan's `scan.plan.targetlist`:
+///   - Existing Var(varno=rti) entries → `Var(INDEX_VAR, k_in_cstlist)` where
+///     k matches by varattno (preserves resnos so any pre-built upper-plan
+///     `Var(OUTER_VAR, k)` refs into this tlist still resolve correctly).
+///   - Append one forwarder TargetEntry per chain Expr in cstlist, with
+///     `expr = Var(INDEX_VAR, k_in_cstlist, vartype=chain.result_type)` and
+///     a fresh resno > current max. Returns the resnos of the appended
+///     forwarders, in cstlist order.
+unsafe fn extend_scan_targetlist_with_forwarders(
+    cscan: *mut pg_sys::CustomScan,
+    cstlist: *mut pg_sys::List,
+) -> Vec<i16> {
+    unsafe {
+        // Build (varno, varattno) -> k_in_cstlist map for physical entries.
+        let mut physical_map: Vec<(i32, i16, i16)> = Vec::new();
+        let cs_len = (*cstlist).length;
+        for i in 0..cs_len {
+            let tle = pg_sys::list_nth(cstlist, i) as *mut pg_sys::TargetEntry;
+            if tle.is_null() || (*tle).expr.is_null() {
+                continue;
+            }
+            let expr = (*tle).expr as *mut pg_sys::Node;
+            if (*expr).type_ == pg_sys::NodeTag::T_Var {
+                let v = expr as *mut pg_sys::Var;
+                physical_map.push(((*v).varno, (*v).varattno, (*tle).resno));
+            }
+        }
+
+        // Rewrite existing entries' Vars in scan.plan.targetlist.
+        let tlist = (*cscan).scan.plan.targetlist;
+        if !tlist.is_null() {
+            for i in 0..(*tlist).length {
+                let tle = pg_sys::list_nth(tlist, i) as *mut pg_sys::TargetEntry;
+                if tle.is_null() || (*tle).expr.is_null() {
+                    continue;
+                }
+                let expr = (*tle).expr as *mut pg_sys::Node;
+                if (*expr).type_ != pg_sys::NodeTag::T_Var {
+                    continue;
+                }
+                let v = expr as *mut pg_sys::Var;
+                for &(p_varno, p_attno, p_resno) in &physical_map {
+                    if (*v).varno == p_varno && (*v).varattno == p_attno {
+                        let new_var = pg_sys::makeVar(
+                            pg_sys::INDEX_VAR,
+                            p_resno,
+                            (*v).vartype,
+                            (*v).vartypmod,
+                            (*v).varcollid,
+                            (*v).varlevelsup,
+                        );
+                        (*tle).expr = new_var as *mut pg_sys::Expr;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Append synthetic forwarder TargetEntries.
+        let mut next_resno: i16 = if (*cscan).scan.plan.targetlist.is_null() {
+            1
+        } else {
+            ((*(*cscan).scan.plan.targetlist).length + 1) as i16
+        };
+        let mut forwarder_resnos: Vec<i16> = Vec::new();
+        for i in 0..cs_len {
+            let cs_tle = pg_sys::list_nth(cstlist, i) as *mut pg_sys::TargetEntry;
+            if cs_tle.is_null() || (*cs_tle).expr.is_null() {
+                continue;
+            }
+            let cs_expr = (*cs_tle).expr;
+            if (*(cs_expr as *mut pg_sys::Node)).type_ == pg_sys::NodeTag::T_Var {
+                continue; // skip physical entries
+            }
+            let vartype = pg_sys::exprType(cs_expr as *const _);
+            let varcollid = pg_sys::exprCollation(cs_expr as *const _);
+            let new_var = pg_sys::makeVar(
+                pg_sys::INDEX_VAR,
+                (*cs_tle).resno,
+                vartype,
+                -1,
+                varcollid,
+                0,
+            );
+            let resname = if !(*cs_tle).resname.is_null() {
+                pg_sys::pstrdup((*cs_tle).resname)
+            } else {
+                std::ptr::null_mut()
+            };
+            let new_tle = pg_sys::makeTargetEntry(
+                new_var as *mut pg_sys::Expr,
+                next_resno,
+                resname,
+                true, // resjunk: not part of the user-visible projection
+            );
+            (*cscan).scan.plan.targetlist =
+                pg_sys::lappend((*cscan).scan.plan.targetlist, new_tle as *mut _);
+            forwarder_resnos.push(next_resno);
+            next_resno += 1;
+        }
+
+        forwarder_resnos
     }
 }
 
@@ -1041,7 +1203,13 @@ unsafe fn subplan_tlist_from_deltax_decompress(
 /// or other. The chain detection mirrors `match_extract_chain` but without
 /// the spec-list lookup — we only need to surface its shape upward, the
 /// matching against user expressions happens at parent-level rewrite.
-unsafe fn classify_custom_scan_tlist_entry(expr: *mut pg_sys::Node) -> SubplanColumn {
+/// `forwarder_resno` is the resno the caller chose for the corresponding
+/// forwarder TargetEntry in `scan.plan.targetlist`; it's stored so the
+/// matcher can produce `Var(OUTER_VAR, forwarder_resno)`.
+unsafe fn classify_custom_scan_tlist_entry(
+    expr: *mut pg_sys::Node,
+    forwarder_resno: i16,
+) -> SubplanColumn {
     unsafe {
         // Physical: a top-level Var referencing the underlying rel.
         if (*expr).type_ == pg_sys::NodeTag::T_Var {
@@ -1080,6 +1248,7 @@ unsafe fn classify_custom_scan_tlist_entry(expr: *mut pg_sys::Node) -> SubplanCo
             path: path_keys,
             target_kind: leaf_kind,
             src_var_attno: (*v).varattno,
+            forwarder_resno,
         }
     }
 }
@@ -1191,13 +1360,15 @@ fn subplan_columns_equivalent(a: &SubplanColumn, b: &SubplanColumn) -> bool {
                 path: a_p,
                 target_kind: a_k,
                 src_var_attno: a_s,
+                forwarder_resno: a_r,
             },
             SubplanColumn::Synthetic {
                 path: b_p,
                 target_kind: b_k,
                 src_var_attno: b_s,
+                forwarder_resno: b_r,
             },
-        ) => a_p == b_p && a_k == b_k && a_s == b_s,
+        ) => a_p == b_p && a_k == b_k && a_s == b_s && a_r == b_r,
         _ => false,
     }
 }

@@ -38,12 +38,19 @@ pub(crate) static DISABLE_META_AGG_FASTPATH: GucSetting<bool> =
     GucSetting::<bool>::new(false);
 
 /// Controls how COPY ... FORMAT deltax_compress extracts JSON paths into
-/// extra columnar columns alongside the original JSONB. Values:
-///   `none`   — disable extraction (ignores any json_extract config).
-///   `fields` — extract the user-specified path list from `deltax_enable_compression`.
+/// extra columnar columns alongside the original JSONB, and whether the
+/// planner_hook walker rewrites upper-plan chain Exprs to read from
+/// synthetic slot positions. Values:
+///   `none`   — disable extraction AND walker rewrite (ignores any
+///              json_extract config; queries fall through to slow path).
+///   `fields` — extract the user-specified path list from
+///              `deltax_enable_compression` AND enable the walker rewrite.
+///              Requires Step 5's executor wiring for correct results.
 ///   `all`    — auto-discover all scalar leaves (not yet implemented).
+///
+/// Default is `none` until Step 5 (executor synthetic slot population) lands.
 pub(crate) static JSON_EXTRACT_MODE: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(Some(c"fields"));
+    GucSetting::<Option<CString>>::new(Some(c"none"));
 
 /// Resolve the effective number of parallel workers.
 /// 0 = auto (num_cpus, capped at 16), 1 = single-threaded, 2..=64 = explicit.
