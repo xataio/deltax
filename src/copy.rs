@@ -528,6 +528,22 @@ struct BackfillState {
     order_col_indices: Vec<usize>,
     segment_size: usize,
     time_col_index: usize,
+    /// `extract_targets[i]` is the JSON-extraction config for physical column
+    /// `i`, or `None` if column `i` has no extracted children. Indexed by
+    /// physical column position; entries beyond physical columns are absent.
+    /// Empty Vec when no json_extract is configured.
+    extract_targets: Vec<Option<crate::compress::ColumnExtractTargets>>,
+}
+
+impl BackfillState {
+    /// Number of physical columns (i.e. TSV/COPY field count). Excludes
+    /// synthetic extracted columns appended at the end of `columns`.
+    fn physical_column_count(&self) -> usize {
+        self.columns
+            .iter()
+            .position(|c| c.extracted.is_some())
+            .unwrap_or(self.columns.len())
+    }
 }
 
 fn handle_copy_from_deltax_compress(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_csv: bool) {
@@ -720,12 +736,15 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_
         });
     }
 
+    let extract_targets = crate::compress::build_extract_targets_per_column(&columns);
+
     let state = BackfillState {
         columns,
         kinds,
         order_col_indices,
         segment_size,
         time_col_index,
+        extract_targets,
     };
 
     // Branch: file-path → pure-Rust parser, stdin → legacy PG parser.
@@ -845,6 +864,7 @@ fn parse_lines_worker(
     opts_delimiter: u8,
     opts_null_string: &[u8],
     kinds: &[ColumnKind],
+    extract_targets: &[Option<crate::compress::ColumnExtractTargets>],
     time_col_index: usize,
     range_starts: &[i64],
     range_ends: &[i64],
@@ -852,20 +872,28 @@ fn parse_lines_worker(
     n_partitions: usize,
     base_line_number: u64,
 ) -> Result<WorkerResult, crate::copyparse::ParseError> {
-    let num_columns = kinds.len();
+    // `kinds.len()` covers physical + extracted columns (extracted sit at the
+    // tail). `physical_count` is the number of TSV fields per row, and is
+    // also the prefix of `kinds` we drive through the parser.
+    let physical_count = if extract_targets.is_empty() {
+        kinds.len()
+    } else {
+        extract_targets.len()
+    };
+    let total_columns = kinds.len();
     let mut partitions: Vec<Option<WorkerPartitionResult>> = (0..n_partitions).map(|_| None).collect();
-    let mut field_offsets: Vec<(usize, usize)> = Vec::with_capacity(num_columns);
+    let mut field_offsets: Vec<(usize, usize)> = Vec::with_capacity(physical_count);
 
     for (row_idx, &(s, e)) in line_ranges.iter().enumerate() {
         let line_number = base_line_number + row_idx as u64 + 1;
         let line = &buf[s..e];
         split_field_offsets(line, opts_delimiter, &mut field_offsets);
 
-        if field_offsets.len() != num_columns {
+        if field_offsets.len() != physical_count {
             return Err(crate::copyparse::ParseError {
                 message: format!(
                     "expected {} fields, got {}",
-                    num_columns,
+                    physical_count,
                     field_offsets.len()
                 ),
                 column: 0,
@@ -931,8 +959,11 @@ fn parse_lines_worker(
             }
         });
 
-        // Parse each field into the partition's typed columns
-        for (i, kind) in kinds.iter().enumerate() {
+        // Parse each physical field into the partition's typed columns. Then
+        // run JSON-path extraction for any source columns that have specs —
+        // this populates the synthetic extracted columns at typed_cols
+        // positions [physical_count..total_columns).
+        for (i, kind) in kinds.iter().take(physical_count).enumerate() {
             let (fs, fe) = field_offsets[i];
             let raw_field = &line[fs..fe];
             parse_raw_field_and_append(
@@ -944,7 +975,20 @@ fn parse_lines_worker(
                 line_number,
             )?;
         }
+        for (i, targets) in extract_targets.iter().enumerate() {
+            let Some(targets) = targets else { continue };
+            let (fs, fe) = field_offsets[i];
+            let raw_field = &line[fs..fe];
+            crate::compress::extract_from_raw_field(
+                raw_field,
+                opts_null_string,
+                targets,
+                &mut wp.typed_cols,
+            );
+        }
         wp.row_count += 1;
+        // total_columns sanity (silences unused warning when extract is empty)
+        let _ = total_columns;
     }
 
     Ok(WorkerResult { partitions })
@@ -1009,7 +1053,7 @@ fn handle_copy_from_file(
         }
     }
 
-    let num_columns = state.columns.len();
+    let num_columns = state.physical_column_count();
     let is_compressed: Vec<bool> = partitions.iter().map(|p| p.is_compressed).collect();
     let n_partitions = part_buffers.len();
 
@@ -1083,6 +1127,7 @@ fn handle_copy_from_file(
         let buf_ref = &buf;
         let null_string_ref = &opts.null_string;
         let kinds_ref = &state.kinds;
+        let extract_targets_ref = &state.extract_targets;
         let is_compressed_ref = &is_compressed;
         let delimiter = opts.delimiter;
         let time_col_index = state.time_col_index;
@@ -1101,6 +1146,7 @@ fn handle_copy_from_file(
                                 delimiter,
                                 null_string_ref,
                                 kinds_ref,
+                                extract_targets_ref,
                                 time_col_index,
                                 range_starts,
                                 range_ends,
@@ -1236,7 +1282,13 @@ fn handle_trailing_line(
     }
 
     let pbuf = &mut part_buffers[part_idx];
-    for (i, (raw_field, kind)) in raw_fields.iter().zip(state.kinds.iter()).enumerate() {
+    let physical_count = state.physical_column_count();
+    for (i, (raw_field, kind)) in raw_fields
+        .iter()
+        .zip(state.kinds.iter())
+        .take(physical_count)
+        .enumerate()
+    {
         if let Err(e) = parse_raw_field_and_append(
             raw_field,
             &opts.null_string,
@@ -1248,6 +1300,18 @@ fn handle_trailing_line(
             pgrx::error!(
                 "pg_deltax: parse error at line {}, column {}: {}",
                 e.line, e.column, e.message
+            );
+        }
+    }
+    // Apply JSON-path extraction for any source column with specs.
+    for (i, targets) in state.extract_targets.iter().enumerate() {
+        let Some(targets) = targets else { continue };
+        if i < raw_fields.len() {
+            crate::compress::extract_from_raw_field(
+                raw_fields[i],
+                &opts.null_string,
+                targets,
+                &mut pbuf.typed_cols,
             );
         }
     }
@@ -1363,7 +1427,7 @@ fn handle_copy_from_file_sequential(
         }
     }
 
-    let num_columns = state.columns.len();
+    let num_columns = state.physical_column_count();
     let mut pos: usize = 0;
     let mut field_offsets: Vec<(usize, usize)> = Vec::with_capacity(num_columns);
 
@@ -1427,7 +1491,7 @@ fn handle_copy_from_file_sequential(
                 last_part_idx = Some(part_idx);
 
                 let pbuf = &mut part_buffers[part_idx];
-                for (i, kind) in state.kinds.iter().enumerate() {
+                for (i, kind) in state.kinds.iter().take(num_columns).enumerate() {
                     let (fs, fe) = field_offsets[i];
                     let raw_field = &buf[line_start + fs..line_start + fe];
                     if let Err(e) = parse_raw_field_and_append(
@@ -1446,6 +1510,18 @@ fn handle_copy_from_file_sequential(
                             e.message
                         );
                     }
+                }
+                // Apply JSON-path extraction for any source column with specs.
+                for (i, targets) in state.extract_targets.iter().enumerate() {
+                    let Some(targets) = targets else { continue };
+                    let (fs, fe) = field_offsets[i];
+                    let raw_field = &buf[line_start + fs..line_start + fe];
+                    crate::compress::extract_from_raw_field(
+                        raw_field,
+                        &opts.null_string,
+                        targets,
+                        &mut pbuf.typed_cols,
+                    );
                 }
                 pbuf.row_count += 1;
                 total_rows += 1;
@@ -1563,7 +1639,7 @@ fn handle_copy_from_legacy(
         )
     };
 
-    let num_columns = state.columns.len();
+    let num_columns = state.physical_column_count();
 
     let mut total_rows: i64 = 0;
     let mut last_part_idx: Option<usize> = None;
@@ -1668,6 +1744,22 @@ fn handle_copy_from_legacy(
                     e.column,
                     state.columns[i].name,
                     e.message
+                );
+            }
+            // Apply JSON-path extraction for this source column if it has specs.
+            if let Some(Some(targets)) = state.extract_targets.get(i) {
+                let field_str_for_extract: Option<&str> = unsafe {
+                    let ptr = *raw_fields.add(i);
+                    if ptr.is_null() {
+                        None
+                    } else {
+                        CStr::from_ptr(ptr).to_str().ok()
+                    }
+                };
+                crate::compress::extract_from_str_field(
+                    field_str_for_extract,
+                    targets,
+                    &mut pbuf.typed_cols,
                 );
             }
         }

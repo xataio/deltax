@@ -427,7 +427,7 @@ fn push_null(typed_col: &mut TypedColumn) -> Result<(), ParseError> {
 }
 
 /// Unescape a field that is known not to be NULL.
-fn unescape_field_always(raw: &[u8]) -> String {
+pub(crate) fn unescape_field_always(raw: &[u8]) -> String {
     // Fast path: no backslash
     if memchr::memchr(b'\\', raw).is_none() {
         return unsafe { std::str::from_utf8_unchecked(raw) }.to_string();

@@ -154,6 +154,194 @@ pub(crate) fn parse_extract_specs(value: &serde_json::Value) -> Vec<ExtractSpec>
     specs
 }
 
+/// Per-source-column extraction targets. Built once per COPY (or compress)
+/// pass and threaded through the parser as `Option<&ColumnExtractTargets>`
+/// alongside each physical column. `targets[k] = (idx_in_typed_cols, spec)`
+/// means "after parsing this row's source jsonb column, extract spec.path
+/// and write the leaf into typed_cols[idx_in_typed_cols]".
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ColumnExtractTargets {
+    pub(crate) targets: Vec<(usize, ExtractSpec)>,
+}
+
+/// Build `Vec<Option<ColumnExtractTargets>>` indexed by physical column index
+/// (matching the physical column ordinal in the parent table). Extracted
+/// columns sit beyond the last physical column in `columns`; we look them up
+/// by name.
+pub(crate) fn build_extract_targets_per_column(
+    columns: &[ColumnMeta],
+) -> Vec<Option<ColumnExtractTargets>> {
+    let physical_count = columns
+        .iter()
+        .position(|c| c.extracted.is_some())
+        .unwrap_or(columns.len());
+
+    let mut per_col: Vec<Option<ColumnExtractTargets>> = (0..physical_count).map(|_| None).collect();
+
+    for (target_idx, col) in columns.iter().enumerate() {
+        let Some(spec) = col.extracted.as_ref() else { continue };
+        let src_idx = match columns.iter().take(physical_count).position(|c| c.name == spec.src_column) {
+            Some(idx) => idx,
+            None => {
+                pgrx::error!(
+                    "pg_deltax: json_extract spec for {:?}: src column {:?} not found in physical columns",
+                    spec.target_name, spec.src_column
+                )
+            }
+        };
+        per_col[src_idx]
+            .get_or_insert_with(ColumnExtractTargets::default)
+            .targets
+            .push((target_idx, spec.clone()));
+    }
+
+    per_col
+}
+
+/// Driven by the per-row caller: unescape the raw COPY field, run NULL check,
+/// and apply extraction targets. NULL source -> NULL for every target.
+/// Same NULL-on-error contract as `apply_extract_targets`.
+pub(crate) fn extract_from_raw_field(
+    raw: &[u8],
+    null_string: &[u8],
+    targets: &ColumnExtractTargets,
+    typed_cols: &mut [TypedColumn],
+) {
+    if raw == null_string {
+        for (idx, _) in &targets.targets {
+            push_typed_null(&mut typed_cols[*idx]);
+        }
+        return;
+    }
+    let unescaped = crate::copyparse::unescape_field_always(raw);
+    apply_extract_targets(&unescaped, targets, typed_cols);
+}
+
+/// Same as `extract_from_raw_field` but for an already-unescaped &str field
+/// (legacy/STDIN path: PG hands us decoded `Option<&str>` directly).
+pub(crate) fn extract_from_str_field(
+    field: Option<&str>,
+    targets: &ColumnExtractTargets,
+    typed_cols: &mut [TypedColumn],
+) {
+    let Some(text) = field else {
+        for (idx, _) in &targets.targets {
+            push_typed_null(&mut typed_cols[*idx]);
+        }
+        return;
+    };
+    apply_extract_targets(text, targets, typed_cols);
+}
+
+/// Apply a JSON extraction context to a row's just-parsed source-column text.
+/// `json_text` is the unescaped UTF-8 JSON for this row's source jsonb column;
+/// for each spec in `targets`, descend `spec.path` and push a coerced leaf
+/// into `typed_cols[target_idx]`. Missing paths and type mismatches yield NULL.
+/// Malformed JSON yields NULL for every target (we never abort the COPY here —
+/// the source jsonb's own conversion via `jsonb_in` will surface a real error
+/// if the row truly isn't valid JSON).
+pub(crate) fn apply_extract_targets(
+    json_text: &str,
+    targets: &ColumnExtractTargets,
+    typed_cols: &mut [TypedColumn],
+) {
+    let value: serde_json::Value = match serde_json::from_str(json_text) {
+        Ok(v) => v,
+        Err(_) => {
+            for (idx, _) in &targets.targets {
+                push_typed_null(&mut typed_cols[*idx]);
+            }
+            return;
+        }
+    };
+    for (idx, spec) in &targets.targets {
+        let leaf = descend_json_path(&value, &spec.path);
+        push_extracted_leaf(leaf, spec.target_kind, &mut typed_cols[*idx]);
+    }
+}
+
+/// Walk a JSON Value down a sequence of object-key steps. Returns `None` if
+/// any step is missing or the intermediate value isn't an object.
+fn descend_json_path<'a>(
+    root: &'a serde_json::Value,
+    path: &[String],
+) -> Option<&'a serde_json::Value> {
+    let mut cursor = root;
+    for step in path {
+        cursor = cursor.as_object()?.get(step)?;
+    }
+    Some(cursor)
+}
+
+/// Coerce a JSON leaf value to `kind` and push to the typed column. NULL on
+/// type mismatch — the user opted into a target type, so we don't try to
+/// stringify numbers etc. silently.
+fn push_extracted_leaf(
+    leaf: Option<&serde_json::Value>,
+    kind: ColumnKind,
+    typed_col: &mut TypedColumn,
+) {
+    let leaf = match leaf {
+        Some(v) if !v.is_null() => v,
+        _ => {
+            push_typed_null(typed_col);
+            return;
+        }
+    };
+    match (kind, typed_col, leaf) {
+        // Text: accept strings; numbers/bools/etc. stringify via to_string()
+        (ColumnKind::Text, TypedColumn::Text(vec), serde_json::Value::String(s)) => {
+            vec.push(Some(s.clone()));
+        }
+        (ColumnKind::Int16, TypedColumn::Int16(vec), serde_json::Value::Number(n)) => {
+            vec.push(n.as_i64().and_then(|x| i16::try_from(x).ok()));
+        }
+        (ColumnKind::Int32, TypedColumn::Int32(vec), serde_json::Value::Number(n)) => {
+            vec.push(n.as_i64().and_then(|x| i32::try_from(x).ok()));
+        }
+        (ColumnKind::Int64, TypedColumn::Int64(vec), serde_json::Value::Number(n)) => {
+            vec.push(n.as_i64());
+        }
+        (ColumnKind::Int16, TypedColumn::Int16(vec), serde_json::Value::String(s)) => {
+            vec.push(s.parse::<i16>().ok());
+        }
+        (ColumnKind::Int32, TypedColumn::Int32(vec), serde_json::Value::String(s)) => {
+            vec.push(s.parse::<i32>().ok());
+        }
+        (ColumnKind::Int64, TypedColumn::Int64(vec), serde_json::Value::String(s)) => {
+            vec.push(s.parse::<i64>().ok());
+        }
+        (ColumnKind::Float32, TypedColumn::Float32(vec), serde_json::Value::Number(n)) => {
+            vec.push(n.as_f64().map(|x| x as f32));
+        }
+        (ColumnKind::Float64, TypedColumn::Float64(vec), serde_json::Value::Number(n)) => {
+            vec.push(n.as_f64());
+        }
+        (ColumnKind::Bool, TypedColumn::Bool(vec), serde_json::Value::Bool(b)) => {
+            vec.push(Some(*b));
+        }
+        (ColumnKind::Timestamp | ColumnKind::TimestampTz, TypedColumn::Int64(vec), serde_json::Value::String(s)) => {
+            // PG-format timestamp text. Best-effort parse; NULL on miss.
+            // Wrap parse_timestamp_to_usec which currently doesn't return Result —
+            // catch panics from malformed inputs and treat as NULL.
+            let parsed = std::panic::catch_unwind(|| {
+                crate::timeparse::parse_timestamp_to_usec(s)
+            });
+            vec.push(parsed.ok());
+        }
+        (ColumnKind::Date, TypedColumn::Int64(vec), serde_json::Value::String(s)) => {
+            let parsed = std::panic::catch_unwind(|| {
+                crate::timeparse::parse_timestamp_to_usec(s)
+            });
+            vec.push(parsed.ok());
+        }
+        // Anything else: type mismatch -> NULL.
+        (_, typed_col, _) => {
+            push_typed_null(typed_col);
+        }
+    }
+}
+
 fn is_valid_identifier(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
