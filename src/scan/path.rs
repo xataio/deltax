@@ -168,6 +168,78 @@ pub unsafe fn add_decompress_path(
     }
 }
 
+/// Resolve a planner range-table index to the actual relation OID via
+/// `simple_rte_array`. Returns `InvalidOid` on out-of-range / null entry.
+unsafe fn rti_to_rel_oid(
+    root: *mut pg_sys::PlannerInfo,
+    rti: pg_sys::Index,
+) -> pg_sys::Oid {
+    unsafe {
+        if root.is_null() {
+            return pg_sys::InvalidOid;
+        }
+        let array_size = (*root).simple_rel_array_size;
+        if rti as i32 == 0 || (rti as i32) >= array_size {
+            return pg_sys::InvalidOid;
+        }
+        let rte = *(*root).simple_rte_array.add(rti as usize);
+        if rte.is_null() {
+            return pg_sys::InvalidOid;
+        }
+        (*rte).relid
+    }
+}
+
+/// SPI-look up the json_extract config for the deltatable that owns this
+/// relation. `rel_oid` may be either the partitioned parent (matched against
+/// `deltax_deltatable`) or a partition (matched via `deltax_partition`).
+/// Returns an empty Vec on any failure (no deltatable, no json_extract,
+/// parse error) — extraction is silently skipped rather than aborting
+/// query planning.
+unsafe fn load_extract_specs_for_rel(
+    rel_oid: pg_sys::Oid,
+) -> Vec<crate::compress::ExtractSpec> {
+    if rel_oid == pg_sys::InvalidOid {
+        return Vec::new();
+    }
+    pgrx::Spi::connect(|client| -> Vec<crate::compress::ExtractSpec> {
+        // Single SQL: resolve rel_oid via name to its containing deltatable,
+        // matching either the parent table or a partition. Returns
+        // json_extract from the deltatable.
+        // Resolve rel_oid → (schema, table). Then look up the deltatable
+        // either by the parent's name OR via a partition row that points back
+        // at it. UNION ALL keeps the SQL simple and lets either match win.
+        let row = client
+            .select(
+                "WITH ident AS (
+                     SELECT n.nspname AS s, c.relname AS t
+                     FROM pg_class c
+                     JOIN pg_namespace n ON c.relnamespace = n.oid
+                     WHERE c.oid = $1
+                 )
+                 SELECT h.json_extract FROM deltax_deltatable h, ident i
+                  WHERE h.schema_name = i.s AND h.table_name = i.t
+                  UNION ALL
+                 SELECT h.json_extract FROM deltax_deltatable h
+                  JOIN deltax_partition p ON p.deltatable_id = h.id
+                  JOIN ident i ON p.schema_name = i.s AND p.table_name = i.t
+                  LIMIT 1",
+                None,
+                &[rel_oid.into()],
+            )
+            .ok();
+        let Some(row) = row else { return Vec::new() };
+        let jx_value = row
+            .first()
+            .get_one::<pgrx::datum::JsonB>()
+            .ok()
+            .flatten()
+            .map(|j| j.0);
+        let Some(jx_value) = jx_value else { return Vec::new() };
+        crate::compress::parse_extract_specs(&jx_value)
+    })
+}
+
 /// PlanCustomPath callback: converts a CustomPath into a CustomScan plan node.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn plan_custom_path(
@@ -189,8 +261,28 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
         let final_clauses = pg_sys::extract_actual_clauses(clauses, false);
         (*cscan).scan.plan.qual = final_clauses;
 
-        // Build custom_private: [companion_oid_as_int, -1 (sentinel), col0, col1, ...]
+        // Read companion_oid from the path's OidList custom_private.
         let companion_oid = pg_sys::list_nth_oid((*best_path).custom_private, 0);
+
+        // Look up json_extract config via the rel's actual OID (works for
+        // both partition-direct and parent-baserel queries — the loader
+        // matches on partition or parent name). SPI is fine here: we're
+        // inside the planner with a valid snapshot. Returns an empty Vec
+        // when extraction isn't configured.
+        let rti = (*rel).relid;
+        let scan_rel_oid = rti_to_rel_oid(_root, rti);
+        let extract_specs: Vec<crate::compress::ExtractSpec> =
+            load_extract_specs_for_rel(scan_rel_oid);
+
+        // Plan-side scaffolding for json_extract is wired up but the actual
+        // upper-plan / scan-qual rewriting is not yet enabled — `setrefs`
+        // matches against `subplan->targetlist` (not `custom_scan_tlist`),
+        // so to make rewriting fire we need to also publish the chain Exprs
+        // in `cscan->scan.plan.targetlist` and re-do projection. Until then
+        // the scaffolding just confirms config plumbing works end-to-end.
+        let _ = (scan_rel_oid, &extract_specs, rti); // suppress unused warnings
+
+        // Build int-form custom_private: [companion_oid_as_int, -1 (sentinel), col0, col1, ...]
         let mut private_list =
             pg_sys::lappend_int(std::ptr::null_mut(), u32::from(companion_oid) as i32);
 
@@ -199,7 +291,7 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
         let mut needed_attrs: *mut pg_sys::Bitmapset = std::ptr::null_mut();
         pg_sys::pull_varattnos(tlist as *mut pg_sys::Node, varno, &mut needed_attrs);
         pg_sys::pull_varattnos(
-            final_clauses as *mut pg_sys::Node,
+            (*cscan).scan.plan.qual as *mut pg_sys::Node,
             varno,
             &mut needed_attrs,
         );

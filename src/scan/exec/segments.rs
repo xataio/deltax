@@ -601,7 +601,8 @@ pub(super) fn load_metadata(
     // Get the partition's deltatable info
     let mut ht_result = client
         .select(
-            "SELECT h.segment_by, h.order_by, h.time_column, h.schema_name, h.table_name
+            "SELECT h.segment_by, h.order_by, h.time_column, h.schema_name, h.table_name,
+                    h.json_extract
              FROM deltax_partition p
              JOIN deltax_deltatable h ON h.id = p.deltatable_id
              WHERE p.table_name = $1 AND p.is_compressed = true",
@@ -647,6 +648,12 @@ pub(super) fn load_metadata(
         .value::<String>()
         .unwrap()
         .unwrap();
+    let json_extract: Option<serde_json::Value> = ht_row
+        .get_datum_by_ordinal(6)
+        .unwrap()
+        .value::<pgrx::datum::JsonB>()
+        .unwrap()
+        .map(|j| j.0);
 
     // Get column info from the parent table (pg_attribute gives us atttypmod)
     let col_result = client
@@ -676,7 +683,21 @@ pub(super) fn load_metadata(
         col_typmods.push(typmod);
     }
 
-    let col_types: Vec<pg_sys::Oid> = col_type_names.iter().map(|tn| pg_type_oid(tn)).collect();
+    let mut col_types: Vec<pg_sys::Oid> = col_type_names.iter().map(|tn| pg_type_oid(tn)).collect();
+
+    // Append synthetic columns from json_extract (in spec order). These map
+    // 1-to-1 with the extracted ColumnMeta entries that were appended at
+    // compress time, so their `_col_idx` slots are physical_count + i. The
+    // executor uses col_names/col_types indexed by `_col_idx`, so they need
+    // to be visible here too.
+    if let Some(jx) = json_extract {
+        let specs = crate::compress::parse_extract_specs(&jx);
+        for spec in specs {
+            col_names.push(spec.target_name.clone());
+            col_types.push(crate::scan::json_extract::kind_to_type_oid(spec.target_kind));
+            col_typmods.push(-1);
+        }
+    }
 
     MetadataInfo {
         col_names,

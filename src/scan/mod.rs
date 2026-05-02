@@ -6,6 +6,7 @@ mod cost;
 pub(crate) mod exec;
 mod explain;
 mod hook;
+pub(crate) mod json_extract;
 mod path;
 
 use std::sync::atomic::{AtomicPtr, Ordering};
