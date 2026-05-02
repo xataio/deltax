@@ -128,6 +128,33 @@ make -C rtabench fetch-competitors        # one-time: drops Postgres/TimescaleDB
 
 `make bench` saves `rtabench/results/pg_deltax.json`, archives by timestamp+commit in `rtabench/results/history/`, copies the JSON to `~/src/rtabench/pg_deltax/results/c6a.4xlarge.json` (ClickBench-style mirror layout), and generates `~/src/rtabench/index.html` with every system as a comparison column.
 
+### JSONBench Workflow
+
+[JSONBench](https://github.com/ClickHouse/JSONBench) tests JSON-heavy analytical workloads using 1B Bluesky events (ndjson). Upstream supports four scales (1m, 10m, 100m, 1000m). The pg_deltax harness extends the upstream PostgreSQL schema with a top-level `ts TIMESTAMPTZ` column extracted from `data->>'time_us'` so pg_deltax can partition and order on it; the JSONB payload otherwise stays untouched. EC2-only (no Docker variant). Queries live in `jsonbench/queries.sql` (one per line, 5 total — index from 0).
+
+```bash
+# First-time setup on m6i.8xlarge (JSONBench reference machine)
+make -C jsonbench setup EC2=<ip>                # SCALE=100 default (100m rows)
+make -C jsonbench setup EC2=<ip> SCALE=1        # 1m smoke test
+make -C jsonbench setup EC2=<ip> SCALE=1000     # full 1B rows (hours)
+
+# Iterating
+make -C jsonbench deploy EC2=<ip>               # rsync source, recompile, restart PG
+make -C jsonbench bench EC2=<ip>                # run all 5 queries (3x each), download results
+
+# Investigating specific queries (Q=0..4)
+make -C jsonbench query EC2=<ip> Q=2
+make -C jsonbench query-cold EC2=<ip> Q=2
+
+# Ad-hoc
+make -C jsonbench sql EC2=<ip> SQL="SELECT count(*) FROM bluesky"
+make -C jsonbench psql EC2=<ip>
+```
+
+Results land in `jsonbench/results/pg_deltax.json` and are archived by timestamp+commit in `jsonbench/results/history/`. If `JSONBENCH_DIR` (default `/Users/tsg/src/JSONBench`) exists, the result is also copied to `<JSONBENCH_DIR>/postgresql/results/pg_deltax_m6i.8xlarge_<scale>.json` so the upstream dashboard generator picks it up.
+
+Schema caveat: the extracted `ts` column and absence of upstream's functional B-tree index mean pg_deltax results aren't a strict apples-to-apples comparison with the upstream `postgresql/` JSONBench numbers — pg_deltax relies on segment-level minmax pruning over the sort key instead. Qualify any side-by-side comparisons with this.
+
 If you need to reference pgrx source code, it is in ~/src/pgrx.
 If you need to reference the postgres source code, is in ~/src/postgres.
 Use the source there, it's much faster than looking into the docker images.

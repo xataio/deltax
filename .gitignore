@@ -2,6 +2,7 @@
 /coverage
 /.venv
 tests/__pycache__/
+.claude/
 *.swp
 *.swo
 *~
@@ -16,3 +17,5 @@ clickbench/data.generated.js.new
 clickbench/.env
 rtabench/results/
 rtabench/.env
+jsonbench/results/
+jsonbench/.env

@@ -1,0 +1,4 @@
+CREATE TABLE bluesky (
+    ts TIMESTAMPTZ NOT NULL,
+    data JSONB NOT NULL
+);

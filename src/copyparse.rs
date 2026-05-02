@@ -10,6 +10,7 @@ use crate::timeparse;
 // Configuration
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct CopyTextOptions {
     pub delimiter: u8,
     pub null_string: Vec<u8>,
@@ -26,6 +27,7 @@ impl Default for CopyTextOptions {
     }
 }
 
+#[derive(Clone)]
 pub enum HeaderMode {
     None,
     Skip,

@@ -752,17 +752,22 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_
                 );
             }
         } else {
-            // Existing TSV path (single file, no glob support for TSV)
+            // TSV path: loop over globbed files within a single COPY so
+            // partition finalization happens once at the end (same as parquet).
+            // Per-file COPYs would mark partitions compressed after the first
+            // file and reject subsequent loads into the same time range.
             let copy_opts = extract_copy_text_options(cs.options, format_idx);
-            handle_copy_from_file(
-                &files[0],
-                copy_opts,
-                &state,
-                &mut part_buffers,
-                &partitions,
-                &range_starts,
-                &range_ends,
-            );
+            for file in &files {
+                handle_copy_from_file(
+                    file,
+                    copy_opts.clone(),
+                    &state,
+                    &mut part_buffers,
+                    &partitions,
+                    &range_starts,
+                    &range_ends,
+                );
+            }
         }
     } else {
         handle_copy_from_legacy(

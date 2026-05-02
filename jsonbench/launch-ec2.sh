@@ -1,0 +1,144 @@
+#!/bin/bash
+set -euo pipefail
+
+PROFILE=management
+INSTANCE_TYPE=m6i.8xlarge
+AMI=ami-04eaa218f1349d88b
+KEY_NAME=tsg
+KEY_FILE=~/.ssh/tsg.pem
+SUBNET=subnet-228cc17d
+SG=sg-add473b4
+VOLUME_SIZE=1000
+NAME=jsonbench-pg-deltax
+TERMINATE_ONLY=false
+
+# Parse options
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --terminate-only)
+      TERMINATE_ONLY=true
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      echo "Usage: $0 [--terminate-only]" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# Enable serial console access (idempotent, account-level setting)
+echo "Ensuring serial console access is enabled..."
+aws ec2 enable-serial-console-access --profile "$PROFILE" --region us-east-1 >/dev/null 2>&1 || true
+
+# Terminate any existing instances with the same name
+EXISTING=$(aws ec2 describe-instances --profile "$PROFILE" \
+  --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=running,stopped,pending" \
+  --query 'Reservations[*].Instances[*].InstanceId' --output text)
+
+if [ -n "$EXISTING" ]; then
+  echo "Terminating existing instance(s): $EXISTING"
+  aws ec2 terminate-instances --profile "$PROFILE" --instance-ids $EXISTING --output text
+  aws ec2 wait instance-terminated --profile "$PROFILE" --instance-ids $EXISTING
+  echo "Terminated."
+fi
+
+if $TERMINATE_ONLY; then
+  echo "Terminate-only mode; exiting."
+  exit 0
+fi
+
+# User-data script: OOM diagnostics + serial console access
+USER_DATA=$(cat <<'USERDATA'
+#!/bin/bash
+set -x
+
+# Set root password for serial console login
+echo 'root:Jb3nch!s3rial#2026' | chpasswd
+
+# Enable root login on serial console
+mkdir -p /etc/systemd/system/serial-getty@ttyS0.service.d
+cat > /etc/systemd/system/serial-getty@ttyS0.service.d/override.conf <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --keep-baud 115200,38400,9600 ttyS0 \$TERM
+EOF
+systemctl daemon-reload
+systemctl enable serial-getty@ttyS0.service
+systemctl start serial-getty@ttyS0.service
+
+# Configure kernel OOM verbosity
+sysctl -w vm.oom_dump_tasks=1
+sysctl -w vm.panic_on_oom=0
+echo 'vm.oom_dump_tasks=1' >> /etc/sysctl.conf
+
+# Log memory stats every 30s for post-mortem analysis
+cat > /usr/local/bin/memlog.sh <<'MEMLOG'
+#!/bin/bash
+while true; do
+  echo "=== $(date -Iseconds) ===" >> /var/log/memlog.txt
+  free -m >> /var/log/memlog.txt
+  head -5 /proc/meminfo >> /var/log/memlog.txt
+  ps aux --sort=-%mem | head -10 >> /var/log/memlog.txt
+  sleep 30
+done
+MEMLOG
+chmod +x /usr/local/bin/memlog.sh
+nohup /usr/local/bin/memlog.sh &
+
+# Enable GRUB serial console output (for next boot / panic messages)
+sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="console=tty0 console=ttyS0,115200n8"/' /etc/default/grub
+update-grub 2>/dev/null || true
+USERDATA
+)
+
+# Launch new instance
+echo "Launching $INSTANCE_TYPE instance..."
+INSTANCE_ID=$(aws ec2 run-instances --profile "$PROFILE" \
+  --image-id "$AMI" \
+  --instance-type "$INSTANCE_TYPE" \
+  --key-name "$KEY_NAME" \
+  --subnet-id "$SUBNET" \
+  --security-group-ids "$SG" \
+  --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$VOLUME_SIZE,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \
+  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME}]" \
+  --user-data "$USER_DATA" \
+  --query 'Instances[0].InstanceId' --output text)
+
+echo "Instance ID: $INSTANCE_ID"
+echo "Waiting for instance to be running..."
+aws ec2 wait instance-running --profile "$PROFILE" --instance-ids "$INSTANCE_ID"
+
+IP=$(aws ec2 describe-instances --profile "$PROFILE" \
+  --instance-ids "$INSTANCE_ID" \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+
+echo "Instance ready: $IP"
+echo ""
+echo "  ssh -i $KEY_FILE ubuntu@$IP"
+echo ""
+
+# Wait for user-data to complete (cloud-init)
+echo "Waiting for cloud-init to finish..."
+for i in $(seq 1 30); do
+  if ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no -o ConnectTimeout=5 "ubuntu@$IP" "cloud-init status --wait" 2>/dev/null; then
+    break
+  fi
+  sleep 5
+done
+
+echo ""
+echo "Instance ready. Next steps:"
+echo ""
+echo "  export EC2=$IP"
+echo ""
+echo "  make setup EC2=$IP             # full setup with default SCALE=100 (100m rows)"
+echo "  make setup EC2=$IP SCALE=1     # smoke test with 1m rows"
+echo "  make setup EC2=$IP SCALE=1000  # full JSONBench scale (1B rows, takes hours)"
+echo "  make deploy EC2=$IP            # just recompile + restart"
+echo "  make bench EC2=$IP             # run benchmark"
+echo ""
+echo "Serial console (if SSH is down):"
+echo "  aws ec2-instance-connect send-serial-console-ssh-public-key --profile $PROFILE --instance-id $INSTANCE_ID --serial-port 0 --ssh-public-key file://~/.ssh/tsg.pub --region us-east-1"
+echo "  ssh -i $KEY_FILE $INSTANCE_ID.port0@serial-console.ec2-instance-connect.us-east-1.aws"
+echo "  Login: root / Jb3nch!s3rial#2026"
