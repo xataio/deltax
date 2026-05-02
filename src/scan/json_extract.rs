@@ -1033,6 +1033,14 @@ unsafe fn subplan_tlist_from_deltax_decompress(
         // the right slot positions.
         let _ = extend_scan_targetlist_with_forwarders(cscan, cstlist);
 
+        // Append synthetic col_idx values to custom_private under the `-3`
+        // sentinel so the executor's `build_needed_cols_from_custom_private`
+        // loads the corresponding companion-blob columns. cstlist is
+        // physical-first, synthetic-after; physical entries are top-level
+        // Vars, synthetic entries are chain Exprs. Position k (0-indexed)
+        // in cstlist == col_idx k in `col_names`.
+        append_synthetic_col_indices_to_custom_private(cscan, cstlist);
+
         // Build SubplanTlist by walking scan.plan.targetlist, NOT
         // custom_scan_tlist. Upper plans' OUTER_VAR refs index into
         // scan.plan.targetlist, so the SubplanTlist Vec must align with
@@ -1091,6 +1099,43 @@ unsafe fn build_subplan_tlist_from_scan_targetlist(
             stl.push(classify_custom_scan_tlist_entry(cs_expr, (*tle).resno));
         }
         stl
+    }
+}
+
+/// Append `[-3, col_idx_0, col_idx_1, ...]` to `cscan->custom_private` for
+/// each synthetic column in `cstlist`. The executor's
+/// `build_needed_cols_from_custom_private` recognizes the `-3` sentinel and
+/// adds these col_idx values to the needed-cols mask so the decompress
+/// loop loads them from companion blobs.
+unsafe fn append_synthetic_col_indices_to_custom_private(
+    cscan: *mut pg_sys::CustomScan,
+    cstlist: *mut pg_sys::List,
+) {
+    unsafe {
+        if cstlist.is_null() {
+            return;
+        }
+        let mut col_indices: Vec<i32> = Vec::new();
+        for i in 0..(*cstlist).length {
+            let tle = pg_sys::list_nth(cstlist, i) as *mut pg_sys::TargetEntry;
+            if tle.is_null() || (*tle).expr.is_null() {
+                continue;
+            }
+            let expr = (*tle).expr as *mut pg_sys::Node;
+            // Synthetic = non-Var entry. Position i in cstlist == col_idx i
+            // in `col_names` (load_metadata layout).
+            if (*expr).type_ != pg_sys::NodeTag::T_Var {
+                col_indices.push(i);
+            }
+        }
+        if col_indices.is_empty() {
+            return;
+        }
+        // Append sentinel + col_idx values to custom_private.
+        (*cscan).custom_private = pg_sys::lappend_int((*cscan).custom_private, -3);
+        for idx in col_indices {
+            (*cscan).custom_private = pg_sys::lappend_int((*cscan).custom_private, idx);
+        }
     }
 }
 

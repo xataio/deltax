@@ -325,7 +325,8 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
             pg_sys::Oid::from(pg_sys::list_nth_int(custom_private, 0) as u32);
 
         // Parse needed column indices from custom_private (after sentinel -1)
-        // Also parse Top-N info after sentinel -2 if present
+        // Also parse Top-N info after sentinel -2 and json-extract synthetic
+        // col_idx values after sentinel -3 if present.
         let list_len = (*custom_private).length;
         let mut needed_indices: Vec<usize> = Vec::new();
         let mut found_sentinel = false;
@@ -333,13 +334,17 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
         let mut topn_ascending: bool = true;
         let mut topn_multi_col_sort: bool = false;
         let mut topn_sort_col_attno: i32 = 0;
-        for i in 1..list_len {
+        let mut in_synth_section = false;
+        let mut i: i32 = 1;
+        while i < list_len {
             let val = pg_sys::list_nth_int(custom_private, i);
             if val == -1 && !found_sentinel {
                 found_sentinel = true;
+                in_synth_section = false;
+                i += 1;
                 continue;
             }
-            if val == -2 && found_sentinel {
+            if val == -2 && found_sentinel && !in_synth_section {
                 // Top-N sentinel: next values are effective_limit, sort_ascending, multi_col_sort, sort_col_attno
                 if i + 2 < list_len {
                     topn_limit = pg_sys::list_nth_int(custom_private, i + 1) as i64;
@@ -351,11 +356,19 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
                 if i + 4 < list_len {
                     topn_sort_col_attno = pg_sys::list_nth_int(custom_private, i + 4);
                 }
-                break;
+                // Skip past the topn block to look for a `-3` synth section.
+                i += 5;
+                continue;
             }
-            if found_sentinel && val >= 0 {
+            if val == -3 && found_sentinel {
+                in_synth_section = true;
+                i += 1;
+                continue;
+            }
+            if (found_sentinel || in_synth_section) && val >= 0 {
                 needed_indices.push(val as usize);
             }
+            i += 1;
         }
 
         // Get companion table name
@@ -3619,22 +3632,35 @@ fn build_needed_cols_from_custom_private(
     unsafe {
         if !custom_private.is_null() {
             let list_len = (*custom_private).length;
-            let mut found_sentinel = false;
+            #[derive(PartialEq)]
+            enum Section { Header, Cols, Topn, Synth }
+            let mut sec = Section::Header;
             for i in 0..list_len {
                 let val = pg_sys::list_nth_int(custom_private, i);
-                if val == -1 && !found_sentinel {
-                    found_sentinel = true;
+                if val == -1 && sec == Section::Header {
+                    sec = Section::Cols;
                     continue;
                 }
-                if val == -2 && found_sentinel {
-                    break; // Top-N sentinel — Top-N disabled in parallel plans.
+                if val == -2 && sec == Section::Cols {
+                    sec = Section::Topn;
+                    continue;
                 }
-                if found_sentinel && val >= 0 {
-                    let idx = val as usize;
-                    if idx < num_cols && !needed_cols[idx] {
-                        needed_cols[idx] = true;
-                        needed_col_indices.push(idx);
+                if val == -3 {
+                    // json-extract synthetic col_idx sentinel. Subsequent
+                    // ints are 0-based col_idx values into col_names that
+                    // the executor must load from companion blobs.
+                    sec = Section::Synth;
+                    continue;
+                }
+                match sec {
+                    Section::Cols | Section::Synth if val >= 0 => {
+                        let idx = val as usize;
+                        if idx < num_cols && !needed_cols[idx] {
+                            needed_cols[idx] = true;
+                            needed_col_indices.push(idx);
+                        }
                     }
+                    _ => {}
                 }
             }
         }
