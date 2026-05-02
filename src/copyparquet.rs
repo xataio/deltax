@@ -524,7 +524,13 @@ mod tests {
     }
 
     fn col_meta(name: &str, is_segment_by: bool) -> ColumnMeta {
-        ColumnMeta { name: name.into(), data_type: "bigint".into(), is_segment_by, is_time_column: false }
+        ColumnMeta {
+            name: name.into(),
+            data_type: "bigint".into(),
+            is_segment_by,
+            is_time_column: false,
+            extracted: None,
+        }
     }
 
     #[test]

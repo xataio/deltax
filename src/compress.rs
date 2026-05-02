@@ -12,24 +12,31 @@ pub(crate) const PG_EPOCH_OFFSET_USEC: i64 = 946_684_800_000_000;
 /// Days between Unix epoch (1970-01-01) and PG epoch (2000-01-01).
 pub(crate) const PG_EPOCH_OFFSET_DAYS: i64 = 10_957;
 
-/// Column metadata from information_schema.
+/// Column metadata from information_schema, plus any synthetic columns
+/// introduced by `json_extract` configuration. Extracted columns sit at the
+/// end of the slice and carry `extracted = Some(_)`; all other paths through
+/// this struct ignore them or special-case them based on that flag.
 #[derive(Debug, Clone)]
 pub(crate) struct ColumnMeta {
     pub(crate) name: String,
     pub(crate) data_type: String,
     pub(crate) is_segment_by: bool,
     pub(crate) is_time_column: bool,
+    /// `Some` for synthetic columns produced by JSON-path extraction at COPY
+    /// time. `None` for physical columns of the parent table.
+    pub(crate) extracted: Option<ExtractSpec>,
 }
 
 /// One JSON-path extraction directive — extract `path` from JSONB column
 /// `src_column`, store as a synthetic columnar column named `target_name` of
 /// `target_kind`. Built by `parse_extract_specs` from the user-supplied JSONB.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Wired up incrementally across the json-extract feature.
 pub(crate) struct ExtractSpec {
     pub(crate) src_column: String,
+    #[allow(dead_code)] // consumed by COPY-time extraction in step 3
     pub(crate) path: Vec<String>,
     pub(crate) target_name: String,
+    #[allow(dead_code)] // consumed by COPY-time extraction in step 3
     pub(crate) target_kind: ColumnKind,
     /// User-provided PG type alias (e.g. "text", "bigint"). Kept verbatim so
     /// it can be echoed back through the column-metadata pipeline alongside
@@ -40,7 +47,6 @@ pub(crate) struct ExtractSpec {
 /// Validate and parse the `json_extract` JSONB blob into a list of specs.
 /// Errors are emitted via `pgrx::error!` so they surface as PG ERRORs from
 /// `deltax_enable_compression`.
-#[allow(dead_code)] // Wired up incrementally across the json-extract feature.
 pub(crate) fn parse_extract_specs(value: &serde_json::Value) -> Vec<ExtractSpec> {
     let arr = value.as_array().unwrap_or_else(|| {
         pgrx::error!(
@@ -510,7 +516,14 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     }
 
     // 3. Get column metadata
-    let columns = get_column_metadata(client, &schema, &part_table, &ht.segment_by, &ht.time_column);
+    let columns = get_column_metadata(
+        client,
+        &schema,
+        &part_table,
+        &ht.segment_by,
+        &ht.time_column,
+        ht.json_extract.as_ref(),
+    );
     if columns.is_empty() {
         pgrx::error!("pg_deltax: no columns found for {}.{}", schema, part_table);
     }
@@ -837,6 +850,20 @@ pub(crate) fn init_typed_columns(columns: &[ColumnMeta], kinds: &[ColumnKind]) -
 
 /// Extract one SPI row into typed column accumulators using native datum access.
 /// Segment_by columns are skipped (their TypedColumn slots remain empty).
+/// Push a NULL into any TypedColumn variant.
+fn push_typed_null(col: &mut TypedColumn) {
+    match col {
+        TypedColumn::Int16(v) => v.push(None),
+        TypedColumn::Int32(v) => v.push(None),
+        TypedColumn::Int64(v) => v.push(None),
+        TypedColumn::Float32(v) => v.push(None),
+        TypedColumn::Float64(v) => v.push(None),
+        TypedColumn::Bool(v) => v.push(None),
+        TypedColumn::Text(v) => v.push(None),
+        TypedColumn::Bytes(v) => v.push(None),
+    }
+}
+
 fn append_row_to_columns(
     row: &pgrx::spi::SpiHeapTupleData,
     columns: &[ColumnMeta],
@@ -845,6 +872,14 @@ fn append_row_to_columns(
 ) {
     for (i, (col, kind)) in columns.iter().zip(kinds.iter()).enumerate() {
         if col.is_segment_by {
+            continue;
+        }
+        // Synthetic extracted columns have no SPI ordinal — they must be
+        // populated from the source jsonb in their own pass. Until that's
+        // wired up for the SPI-fetch (post-INSERT) compression path, push
+        // NULL placeholders so per-segment row counts stay aligned.
+        if col.extracted.is_some() {
+            push_typed_null(&mut typed_cols[i]);
             continue;
         }
         let ordinal = i + 1; // SPI ordinals are 1-based
@@ -2505,6 +2540,7 @@ pub(crate) fn get_column_metadata(
     table: &str,
     segment_by: &[String],
     time_column: &str,
+    json_extract: Option<&serde_json::Value>,
 ) -> Vec<ColumnMeta> {
     let result = client
         .select(
@@ -2528,8 +2564,30 @@ pub(crate) fn get_column_metadata(
             data_type,
             is_segment_by: is_segment,
             is_time_column: is_time,
+            extracted: None,
         });
     }
+
+    // Append synthetic columns from json_extract. The `_col_idx` slots in
+    // companion tables are assigned in iteration order over non-segment-by
+    // columns, so extracted columns naturally land after physical columns
+    // without disturbing existing partitions.
+    if let Some(jx) = json_extract {
+        let mode = crate::get_json_extract_mode();
+        if mode != crate::JsonExtractMode::None {
+            let specs = parse_extract_specs(jx);
+            for spec in specs {
+                columns.push(ColumnMeta {
+                    name: spec.target_name.clone(),
+                    data_type: spec.target_type.clone(),
+                    is_segment_by: false,
+                    is_time_column: false,
+                    extracted: Some(spec),
+                });
+            }
+        }
+    }
+
     columns
 }
 
@@ -2578,7 +2636,17 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         .unwrap();
 
     // 2. Get column metadata (from the parent table, since partition is truncated)
-    let columns = get_column_metadata(client, &ht.schema_name, &ht.table_name, &ht.segment_by, &ht.time_column);
+    // Decompression repopulates the parent table's physical columns only —
+    // the synthetic json_extract columns live solely in the companion blobs
+    // and don't need to be reconstructed.
+    let columns = get_column_metadata(
+        client,
+        &ht.schema_name,
+        &ht.table_name,
+        &ht.segment_by,
+        &ht.time_column,
+        None,
+    );
 
     let companion_schema = "_deltax_compressed";
     let meta_fqn = format!("\"{}\".\"{}_meta\"", companion_schema, part_table);
@@ -3236,7 +3304,17 @@ pub(crate) fn analyze_partition_impl_split(
         }
     };
 
-    let columns = get_column_metadata(client, &schema, &part_table, &ht.segment_by, &ht.time_column);
+    // ANALYZE writes to pg_statistic, which is keyed on pg_attribute attnos —
+    // synthetic extracted columns have no pg_attribute entry, so they're
+    // omitted here.
+    let columns = get_column_metadata(
+        client,
+        &schema,
+        &part_table,
+        &ht.segment_by,
+        &ht.time_column,
+        None,
+    );
     let part_fqn = crate::partition::fqn(&schema, &part_table);
     let ddl = build_companion_ddl(&part_table, &columns);
 

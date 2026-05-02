@@ -638,8 +638,16 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_
             pgrx::error!("pg_deltax: no partitions found for {}.{}", schema, table);
         }
 
-        // Get column metadata from the parent table
-        let columns = get_column_metadata(client, &schema, &table, &ht.segment_by, &ht.time_column);
+        // Get column metadata from the parent table, with any json_extract
+        // synthetic columns appended at the end.
+        let columns = get_column_metadata(
+            client,
+            &schema,
+            &table,
+            &ht.segment_by,
+            &ht.time_column,
+            ht.json_extract.as_ref(),
+        );
         if columns.is_empty() {
             pgrx::error!("pg_deltax: no columns found for {}.{}", schema, table);
         }
