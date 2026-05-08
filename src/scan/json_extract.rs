@@ -224,7 +224,11 @@ unsafe fn pgrx_text_const_to_string(c: *mut pg_sys::Const) -> Option<String> {
         }
         let detoasted = pg_sys::pg_detoast_datum(varlena);
         let len = pgrx::varsize_any_exhdr(detoasted);
-        let data = pgrx::vardata_any(detoasted);
+        // `vardata_any` returns `*const c_char`, whose signedness depends on
+        // platform/ABI (i8 on x86_64 PG 18, u8 on aarch64). Cast through
+        // `*const u8` so this compiles in both worlds.
+        #[allow(clippy::unnecessary_cast)]
+        let data = pgrx::vardata_any(detoasted) as *const u8;
         let bytes = std::slice::from_raw_parts(data, len);
         std::str::from_utf8(bytes).ok().map(|s| s.to_string())
     }
@@ -270,9 +274,7 @@ pub(crate) unsafe fn rewrite_chains_in_node(
     phys: &PhysicalCols,
     physical_natts: i16,
 ) -> *mut pg_sys::Node {
-    unsafe {
-        rewrite_walker(node, rti, specs, phys, physical_natts)
-    }
+    unsafe { rewrite_walker(node, rti, specs, phys, physical_natts) }
 }
 
 /// Same as `rewrite_chains_in_node` but for a list of expressions; returns a
@@ -348,9 +350,9 @@ unsafe fn rewrite_walker(
                 pg_sys::INDEX_VAR,
                 physical_natts + spec_idx as i16 + 1,
                 kind_to_type_oid(spec.target_kind),
-                -1,                  // typmod
-                pg_sys::InvalidOid,  // collation
-                0,                   // varlevelsup
+                -1,                 // typmod
+                pg_sys::InvalidOid, // collation
+                0,                  // varlevelsup
             );
             return var as *mut pg_sys::Node;
         }
@@ -371,15 +373,23 @@ unsafe fn rewrite_walker(
             }
             pg_sys::NodeTag::T_CoerceViaIO => {
                 let c = node as *mut pg_sys::CoerceViaIO;
-                (*c).arg =
-                    rewrite_walker((*c).arg as *mut pg_sys::Node, rti, specs, phys, physical_natts)
-                        as *mut pg_sys::Expr;
+                (*c).arg = rewrite_walker(
+                    (*c).arg as *mut pg_sys::Node,
+                    rti,
+                    specs,
+                    phys,
+                    physical_natts,
+                ) as *mut pg_sys::Expr;
             }
             pg_sys::NodeTag::T_RelabelType => {
                 let r = node as *mut pg_sys::RelabelType;
-                (*r).arg =
-                    rewrite_walker((*r).arg as *mut pg_sys::Node, rti, specs, phys, physical_natts)
-                        as *mut pg_sys::Expr;
+                (*r).arg = rewrite_walker(
+                    (*r).arg as *mut pg_sys::Node,
+                    rti,
+                    specs,
+                    phys,
+                    physical_natts,
+                ) as *mut pg_sys::Expr;
             }
             pg_sys::NodeTag::T_NullTest => {
                 let n = node as *mut pg_sys::NullTest;
@@ -478,12 +488,8 @@ pub(crate) unsafe fn build_custom_scan_tlist(
             );
             // resname is informational; copy from pg_attribute for nicer EXPLAIN.
             let resname = pg_sys::pstrdup((*att).attname.data.as_ptr());
-            let tle = pg_sys::makeTargetEntry(
-                var as *mut pg_sys::Expr,
-                (i + 1) as i16,
-                resname,
-                false,
-            );
+            let tle =
+                pg_sys::makeTargetEntry(var as *mut pg_sys::Expr, (i + 1) as i16, resname, false);
             tlist = pg_sys::lappend(tlist, tle as *mut _);
         }
 
@@ -685,16 +691,13 @@ pub(crate) type SubplanTlist = Vec<SubplanColumn>;
 ///
 /// Gated on `pg_deltax.json_extract_mode`. With `none`, the walker is a
 /// complete no-op (queries fall through to the slow path and return
-/// correct results). With `fields`, the walker rewrites — but the
-/// executor-side population of synthetic slot positions must also be
-/// wired up (Step 5) for results to be correct. With this commit alone,
-/// `mode = fields` causes synthetic slot positions to read NULL.
-pub(crate) unsafe fn rewrite_plan_tree(
-    plan: *mut pg_sys::Plan,
-    rtable: *mut pg_sys::List,
-) {
+/// correct results). With `fields`, the walker rewrites.
+pub(crate) unsafe fn rewrite_plan_tree(plan: *mut pg_sys::Plan, rtable: *mut pg_sys::List) {
     unsafe {
-        if !matches!(crate::get_json_extract_mode(), crate::JsonExtractMode::Fields) {
+        if !matches!(
+            crate::get_json_extract_mode(),
+            crate::JsonExtractMode::Fields
+        ) {
             return;
         }
         let _ = rewrite_plan_subtree(plan, rtable);
@@ -703,10 +706,7 @@ pub(crate) unsafe fn rewrite_plan_tree(
 
 /// Walk a plan subtree. Returns the `SubplanTlist` describing what each
 /// position of THIS plan's targetlist provides to the parent.
-unsafe fn rewrite_plan_subtree(
-    plan: *mut pg_sys::Plan,
-    rtable: *mut pg_sys::List,
-) -> SubplanTlist {
+unsafe fn rewrite_plan_subtree(plan: *mut pg_sys::Plan, rtable: *mut pg_sys::List) -> SubplanTlist {
     unsafe {
         if plan.is_null() {
             return Vec::new();
@@ -715,8 +715,7 @@ unsafe fn rewrite_plan_subtree(
         // Leaf cases first.
         if (*plan).type_ == pg_sys::NodeTag::T_CustomScan {
             let cscan = plan as *mut pg_sys::CustomScan;
-            return subplan_tlist_from_deltax_decompress(cscan, rtable)
-                .unwrap_or_default();
+            return subplan_tlist_from_deltax_decompress(cscan, rtable).unwrap_or_default();
         }
 
         // Recursive case: collect children's SubplanTlists.
@@ -733,7 +732,8 @@ unsafe fn rewrite_plan_subtree(
 }
 
 fn has_any_synthetic(stl: &SubplanTlist) -> bool {
-    stl.iter().any(|c| matches!(c, SubplanColumn::Synthetic { .. }))
+    stl.iter()
+        .any(|c| matches!(c, SubplanColumn::Synthetic { .. }))
 }
 
 /// Walk the plan node's expression-bearing fields (`targetlist`, `qual`,
@@ -776,8 +776,7 @@ unsafe fn substitute_chains_in_tlist(
             if tle.is_null() || (*tle).expr.is_null() {
                 continue;
             }
-            let new_expr =
-                substitute_in_expr_node((*tle).expr as *mut pg_sys::Node, child_stl);
+            let new_expr = substitute_in_expr_node((*tle).expr as *mut pg_sys::Node, child_stl);
             (*tle).expr = new_expr as *mut pg_sys::Expr;
         }
         tlist
@@ -852,19 +851,17 @@ unsafe fn substitute_in_expr_node(
                 let c = node as *mut pg_sys::CaseExpr;
                 (*c).args = substitute_chains_in_list((*c).args, child_stl);
                 if !(*c).defresult.is_null() {
-                    (*c).defresult = substitute_in_expr_node(
-                        (*c).defresult as *mut pg_sys::Node,
-                        child_stl,
-                    ) as *mut pg_sys::Expr;
+                    (*c).defresult =
+                        substitute_in_expr_node((*c).defresult as *mut pg_sys::Node, child_stl)
+                            as *mut pg_sys::Expr;
                 }
             }
             pg_sys::NodeTag::T_CaseWhen => {
                 let c = node as *mut pg_sys::CaseWhen;
                 (*c).expr = substitute_in_expr_node((*c).expr as *mut pg_sys::Node, child_stl)
                     as *mut pg_sys::Expr;
-                (*c).result =
-                    substitute_in_expr_node((*c).result as *mut pg_sys::Node, child_stl)
-                        as *mut pg_sys::Expr;
+                (*c).result = substitute_in_expr_node((*c).result as *mut pg_sys::Node, child_stl)
+                    as *mut pg_sys::Expr;
             }
             pg_sys::NodeTag::T_Aggref => {
                 let a = node as *mut pg_sys::Aggref;
@@ -981,11 +978,16 @@ unsafe fn match_chain_against_child_stl(
     }
 }
 
-/// Inspect a `CustomScan` and, if it's a `DeltaXDecompress` carrying
-/// json_extract specs in its `custom_private`, return a `SubplanTlist` that
-/// describes its `custom_scan_tlist` shape (physical Vars + synthetic
-/// extracts). Returns `None` for any other CustomScan or when no specs are
-/// configured.
+/// Inspect a `CustomScan` and, if it's a `DeltaXDecompress` or `DeltaXAppend`
+/// carrying json_extract specs in its `custom_private`, return a
+/// `SubplanTlist` describing its `custom_scan_tlist` shape (physical Vars
+/// followed by synthetic extracts). Returns `None` for any other CustomScan
+/// or when no specs are configured.
+///
+/// `DeltaXAppend` is the parallel-aware parent-baserel custom scan (one node
+/// for the whole partitioned table); `DeltaXDecompress` is the per-partition
+/// scan PG's planner picks for direct-partition queries. Both flavors expose
+/// the same companion-blob shape, so the rebuild + forwarder logic is shared.
 unsafe fn subplan_tlist_from_deltax_decompress(
     cscan: *mut pg_sys::CustomScan,
     rtable: *mut pg_sys::List,
@@ -1004,7 +1006,7 @@ unsafe fn subplan_tlist_from_deltax_decompress(
             return None;
         }
         let name = std::ffi::CStr::from_ptr(name_ptr);
-        if name != crate::scan::CUSTOM_NAME {
+        if name != crate::scan::CUSTOM_NAME && name != crate::scan::DELTAX_APPEND_NAME {
             return None;
         }
 
@@ -1040,6 +1042,19 @@ unsafe fn subplan_tlist_from_deltax_decompress(
         // Vars, synthetic entries are chain Exprs. Position k (0-indexed)
         // in cstlist == col_idx k in `col_names`.
         append_synthetic_col_indices_to_custom_private(cscan, cstlist);
+
+        // Drop the original Section::Cols (the col_idx values between -1 and
+        // -2/-3 that `plan_custom_path` populated). They were computed before
+        // the walker ran and reflect the pre-rewrite needs (e.g. raw `data`
+        // for chain Exprs that have since been rewritten to synthetic Vars).
+        // Keeping them forces the executor to decompress columns nothing
+        // references — defeats the whole point of json_extract.
+        //
+        // For json_extract paths that cover all upper-plan references to a
+        // physical column, dropping Section::Cols entirely is safe. JSONBench
+        // queries fit this profile; queries that reference raw `data`
+        // alongside chain Exprs would need a ref-count to be correct (TODO).
+        prune_section_cols_in_custom_private(cscan);
 
         // Build SubplanTlist by walking scan.plan.targetlist, NOT
         // custom_scan_tlist. Upper plans' OUTER_VAR refs index into
@@ -1099,6 +1114,50 @@ unsafe fn build_subplan_tlist_from_scan_targetlist(
             stl.push(classify_custom_scan_tlist_entry(cs_expr, (*tle).resno));
         }
         stl
+    }
+}
+
+/// Strip Section::Cols (the col_idx values between sentinels `-1` and
+/// `-2`/`-3`) from `cscan->custom_private`. Preserves companion OIDs (before
+/// `-1`), Top-N info (after `-2`), and synthetic col_idx values (after `-3`).
+/// Leaves the `-1` sentinel in place.
+unsafe fn prune_section_cols_in_custom_private(cscan: *mut pg_sys::CustomScan) {
+    unsafe {
+        let cp = (*cscan).custom_private;
+        if cp.is_null() {
+            return;
+        }
+        let n = (*cp).length;
+        let mut new_list: *mut pg_sys::List = std::ptr::null_mut();
+        #[derive(PartialEq)]
+        enum Phase {
+            BeforeMinus1,
+            InCols,
+            After,
+        }
+        let mut phase = Phase::BeforeMinus1;
+        for i in 0..n {
+            let v = pg_sys::list_nth_int(cp, i);
+            match phase {
+                Phase::BeforeMinus1 => {
+                    new_list = pg_sys::lappend_int(new_list, v);
+                    if v == -1 {
+                        phase = Phase::InCols;
+                    }
+                }
+                Phase::InCols => {
+                    if v == -2 || v == -3 {
+                        new_list = pg_sys::lappend_int(new_list, v);
+                        phase = Phase::After;
+                    }
+                    // else: drop (was a Section::Cols col_idx)
+                }
+                Phase::After => {
+                    new_list = pg_sys::lappend_int(new_list, v);
+                }
+            }
+        }
+        (*cscan).custom_private = new_list;
     }
 }
 
@@ -1374,8 +1433,7 @@ unsafe fn rebuild_custom_scan_tlist_from_catalog(
         if rti_zero_indexed < 0 || rti_zero_indexed >= (*rtable).length {
             return None;
         }
-        let rte =
-            pg_sys::list_nth(rtable, rti_zero_indexed) as *mut pg_sys::RangeTblEntry;
+        let rte = pg_sys::list_nth(rtable, rti_zero_indexed) as *mut pg_sys::RangeTblEntry;
         if rte.is_null() {
             return None;
         }
