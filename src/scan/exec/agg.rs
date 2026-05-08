@@ -8478,6 +8478,13 @@ unsafe fn compact_finalize(
 // Packed Integer Keys (Phase 2)
 // ============================================================================
 
+/// Phase C.2.f — public re-export for `path.rs::add_agg_path`. Diverging the
+/// path-level and exec-level eligibility checks would silently mismatch
+/// leader and worker, so add_agg_path calls into the canonical predicate.
+pub(crate) fn can_use_compact_keys_path(group_specs: &[GroupByColSpec]) -> bool {
+    can_use_compact_keys(group_specs)
+}
+
 /// Check if all GROUP BY columns produce integer values and can be packed into u128.
 fn can_use_compact_keys(group_specs: &[GroupByColSpec]) -> bool {
     if group_specs.is_empty() || group_specs.len() > 2 {

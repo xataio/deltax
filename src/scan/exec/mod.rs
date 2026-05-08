@@ -21,6 +21,12 @@ pub(crate) use agg::AggScanState;
 pub(crate) use agg::{AggType, AggExpr, GroupByExpr, GroupByColSpec, HavingOp, HavingFilter,
     CaseWhenSpec, CaseWhenClause, CaseWhenCondition, CaseWhenOp, CaseWhenValue};
 
+// Re-export for cost.rs (parallel-agg worker recommendation needs the slot cap).
+pub(crate) use agg::MAX_AGG_WORKER_SLOTS;
+
+// Re-export for path.rs's parallel-eligibility check (C.2.f).
+pub(crate) use agg::can_use_compact_keys_path;
+
 // Re-exports for path.rs (create_*_state callbacks referenced in CustomScanMethods)
 pub(crate) use decompress::{create_custom_scan_state, create_deltax_append_state};
 pub(crate) use count_minmax::{create_count_scan_state, create_minmax_scan_state};

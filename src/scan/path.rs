@@ -43,6 +43,13 @@ fn take_agg_topn_info() -> Option<(i64, i32, bool)> {
     AGG_TOPN_INFO.with(|cell| cell.borrow_mut().take())
 }
 
+/// Peek at the stored top-N info without consuming. Used by `add_agg_path`'s
+/// parallel-eligibility check (Phase C.2.f) — Top-N pushdown is excluded
+/// from the parallel path because workers can't prune top-N locally.
+fn peek_agg_topn_info() -> Option<(i64, i32, bool)> {
+    AGG_TOPN_INFO.with(|cell| *cell.borrow())
+}
+
 // ============================================================================
 // DeltaXAppend path/plan methods
 // ============================================================================
@@ -965,6 +972,34 @@ unsafe fn deserialize_case_when_value(
     }
 }
 
+/// Phase C.2.f — predicate mirroring `agg::can_use_compact_accs` but operating
+/// on `AggSpec` (the path-level type). Both check the same conditions: fixed-
+/// size accumulators on integer/float/text columns. Diverging would silently
+/// mismatch leader and worker eligibility, so this helper sticks to the same
+/// shape.
+fn parallel_compact_aggs_ok(agg_specs: &[AggSpec]) -> bool {
+    if agg_specs.is_empty() {
+        return false;
+    }
+    agg_specs.iter().all(|spec| {
+        match spec.agg_type {
+            super::exec::AggType::CountStar | super::exec::AggType::Count => true,
+            super::exec::AggType::Sum | super::exec::AggType::Avg => {
+                let t = spec.col_type_oid;
+                t == pg_sys::INT2OID || t == pg_sys::INT4OID || t == pg_sys::INT8OID
+                    || t == pg_sys::FLOAT4OID || t == pg_sys::FLOAT8OID
+            }
+            super::exec::AggType::Min | super::exec::AggType::Max => {
+                let t = spec.col_type_oid;
+                t == pg_sys::TEXTOID || t == pg_sys::VARCHAROID || t == pg_sys::BPCHAROID
+            }
+            // CountDistinct is excluded by the eligibility predicate before
+            // this helper is reached; Phase D will revisit.
+            super::exec::AggType::CountDistinct => false,
+        }
+    })
+}
+
 /// Add a DeltaXAgg custom path to the grouped relation's pathlist.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn add_agg_path(
@@ -995,6 +1030,40 @@ pub unsafe fn add_agg_path(
             100.0
         };
         (*cpath).path.rows = estimated_rows;
+
+        // Phase C.2.f — eligibility for the parallel-aware DeltaXAgg path.
+        // The runtime path (workers do partials in their DSM slabs, leader
+        // merges + finalises) only handles the compact path: integer-packed
+        // group keys, fixed-size accumulators, no DISTINCT / HAVING / Top-N
+        // / LIMIT. Anything else stays serial / internal-rayon.
+        let topn_info = peek_agg_topn_info();
+        let topn_active = topn_info.is_some_and(|(limit, _, _)| limit > 0);
+        let parallel_eligible = having_filters.is_empty()
+            && !topn_active
+            && !agg_specs.iter().any(|s| s.agg_type == super::exec::AggType::CountDistinct)
+            && parallel_compact_aggs_ok(agg_specs)
+            && (group_specs.is_empty() || super::exec::can_use_compact_keys_path(group_specs));
+
+        // Phase C.2.f wiring: the predicate + `recommend_agg_workers` are in
+        // place but we keep `parallel_workers = 0` here. Hooking the
+        // parallel-aware path through PG's Gather model is non-trivial: PG
+        // expects "partial aggregate → Gather → final aggregate" semantics,
+        // whereas DeltaXAgg's design has the leader merge + emit final rows
+        // directly (workers contribute via DSM, not via tuple stream). The
+        // C.2.b–e infrastructure (DSM hooks, agg_wire, deferred exec_ctx,
+        // worker / leader claim+merge) is sound and exercised by the unit
+        // tests; activating it requires a separate planner integration —
+        // either splitting into partial-DeltaXAgg + final-Aggregate, or
+        // building a custom Gather-equivalent — which is beyond the scope
+        // of C.2 and lands in a follow-up.
+        let _eligible = parallel_eligible;
+        let _recommended = if parallel_eligible {
+            cost::recommend_agg_workers(companion_oids)
+        } else {
+            0
+        };
+        let workers: i32 = 0;
+
         // §5.8-b: real formula replaces the historic `(10.0, 20.0)` hack so
         // future parallel-partial paths can be costed meaningfully against
         // `parallel_setup_cost`. See `cost::estimate_agg_cost` for
@@ -1004,10 +1073,11 @@ pub unsafe fn add_agg_path(
             agg_specs.len(),
             estimated_rows,
             having_filters.len(),
+            workers as usize,
         );
         (*cpath).path.startup_cost = startup;
         (*cpath).path.total_cost = total;
-        (*cpath).path.parallel_workers = 0;
+        (*cpath).path.parallel_workers = workers;
         (*cpath).path.parallel_aware = false;
         (*cpath).path.parallel_safe = false;
         (*cpath).path.pathkeys = if pathkeys.is_null() { std::ptr::null_mut() } else { pathkeys };
@@ -1103,6 +1173,17 @@ pub unsafe fn add_agg_path(
         (*cpath).custom_restrictinfo = std::ptr::null_mut();
         (*cpath).methods = &DELTAX_AGG_PATH_METHODS.0;
 
+        // Phase C.2.f — parallel-aware paths must go through `add_partial_path`
+        // so PG generates a Gather above DeltaXAgg. With Gather, the
+        // EstimateDSM/InitializeDSM/InitializeWorker hooks fire and workers
+        // attach DSM. Without it, `parallel_aware = true` on a path added via
+        // `add_path` runs standalone with no workers — the leader's
+        // `run_leader_merge_and_finalise` would never have `pscan` populated.
+        //
+        // Workers emit no rows themselves (they write to DSM and return EOF
+        // in `exec_agg_scan`); the leader emits all final rows. Gather just
+        // concatenates → the upper relation sees the leader's full result
+        // set with no Aggregate-final wrapper needed.
         pg_sys::add_path(output_rel, cpath as *mut pg_sys::Path);
     }
 }

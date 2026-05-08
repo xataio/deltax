@@ -166,6 +166,7 @@ pub(super) fn estimate_agg_cost(
     num_agg_exprs: usize,
     estimated_groups: f64,
     num_having_filters: usize,
+    workers: usize,
 ) -> (f64, f64) {
     // Calibrated against RTABench suite (Apr 2026). Adjusting any of these
     // risks regressing planner selection on a subset of queries; re-run
@@ -184,15 +185,48 @@ pub(super) fn estimate_agg_cost(
     let num_aggs = num_agg_exprs.max(1) as f64;
     let groups = estimated_groups.max(1.0);
 
-    let scan_work = num_partitions * PER_PARTITION + total_rows * PER_ROW;
-    let agg_work = total_rows * num_aggs * PER_AGG_EXPR;
+    let mut scan_work = num_partitions * PER_PARTITION + total_rows * PER_ROW;
+    let mut agg_work = total_rows * num_aggs * PER_AGG_EXPR;
     let having_work = groups * num_having_filters as f64 * PER_HAVING;
     let group_emit = groups * PER_GROUP;
+
+    // Phase C.2.f — when workers > 0, the parallel-aware DeltaXAgg path
+    // splits scan + per-row aggregate work across leader + workers via
+    // `next_segment.fetch_add`; group emit and HAVING stay leader-side.
+    if workers > 0 {
+        let div = parallel_divisor(workers);
+        scan_work /= div;
+        agg_work /= div;
+    }
 
     let startup = 10.0 + scan_work + agg_work + having_work;
     let total = startup + group_emit;
 
     (startup, total)
+}
+
+/// Phase C.2.f — recommend a worker count for the parallel-aware DeltaXAgg
+/// path. Returns 0 when the table is too small to amortise parallel setup.
+///
+/// Heuristic: workers ≈ total_segments / 8 (mirrors DeltaXAppend's
+/// MIN_SEGS_PER_WORKER), clamped to PG's `max_parallel_workers_per_gather`
+/// and to `MAX_AGG_WORKER_SLOTS - 1` (DSM region accounts for one leader +
+/// N workers). Below 16 segments we keep the path serial — overhead of
+/// DSM setup + worker fork dominates.
+pub(super) fn recommend_agg_workers(companion_oids: &[pg_sys::Oid]) -> i32 {
+    let total_segments: i64 = companion_oids
+        .iter()
+        .map(|&oid| get_segment_count(oid))
+        .sum();
+    if total_segments < 16 {
+        return 0;
+    }
+    const MIN_SEGS_PER_WORKER: i64 = 8;
+    const MAX_AGG_WORKER_SLOTS_MINUS_ONE: i32 =
+        (super::exec::MAX_AGG_WORKER_SLOTS as i32) - 1;
+    let seg_floor = (total_segments / MIN_SEGS_PER_WORKER) as i32;
+    let pg_cap = unsafe { pg_sys::max_parallel_workers_per_gather };
+    seg_floor.min(pg_cap).clamp(0, MAX_AGG_WORKER_SLOTS_MINUS_ONE)
 }
 
 /// Get the estimated segment count for a companion OID (0 if unknown).
