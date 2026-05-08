@@ -6862,21 +6862,21 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
 /// String arena: all group key strings packed into one Vec<u8>.
 /// One deallocation instead of 275K individual String deallocations.
-struct StringArena {
-    buf: Vec<u8>,
+pub(super) struct StringArena {
+    pub(super) buf: Vec<u8>,
 }
 
 impl StringArena {
     fn new() -> Self { Self { buf: Vec::new() } }
 
-    fn alloc(&mut self, s: &str) -> (u32, u32) {
+    pub(super) fn alloc(&mut self, s: &str) -> (u32, u32) {
         let off = self.buf.len() as u32;
         let len = s.len() as u32;
         self.buf.extend_from_slice(s.as_bytes());
         (off, len)
     }
 
-    fn get(&self, off: u32, len: u32) -> &str {
+    pub(super) fn get(&self, off: u32, len: u32) -> &str {
         std::str::from_utf8(&self.buf[off as usize..off as usize + len as usize]).unwrap_or("")
     }
 }
@@ -7242,7 +7242,7 @@ pub(super) unsafe extern "C-unwind" fn rescan_agg_scan(
 
 /// Kind of accumulator slot in compact storage.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum CompactAccKind {
+pub(super) enum CompactAccKind {
     Count,              // 8 bytes: i64
     SumInt,             // 24 bytes: i128 sum (16) + i64 count (8) — for INT8 columns
     SumIntNarrow,       // 16 bytes: i64 sum (8) + i64 count (8) — for INT2/INT4 columns
@@ -7254,6 +7254,22 @@ enum CompactAccKind {
 }
 
 impl CompactAccKind {
+    /// 8-bit on-wire tag. Stable across versions because parallel-agg DSM wire
+    /// format depends on it.
+    #[allow(dead_code)] // wired by C.2.d/e via agg_wire
+    pub(super) fn wire_tag(self) -> u8 {
+        match self {
+            CompactAccKind::Count => 0,
+            CompactAccKind::SumInt => 1,
+            CompactAccKind::SumIntNarrow => 2,
+            CompactAccKind::SumFloat => 3,
+            CompactAccKind::MinStr => 4,
+            CompactAccKind::MaxStr => 5,
+            CompactAccKind::CountDistinctInt => 6,
+            CompactAccKind::CountDistinctStr => 7,
+        }
+    }
+
     fn byte_size(self) -> usize {
         match self {
             CompactAccKind::Count
@@ -7280,15 +7296,15 @@ impl CompactAccKind {
 }
 
 /// Layout of compact accumulator slots for one group.
-struct CompactAccLayout {
+pub(super) struct CompactAccLayout {
     /// (byte_offset, kind) per aggregate
-    slots: Vec<(usize, CompactAccKind)>,
+    pub(super) slots: Vec<(usize, CompactAccKind)>,
     /// Total bytes per group (aligned to 16)
-    group_stride: usize,
+    pub(super) group_stride: usize,
 }
 
 impl CompactAccLayout {
-    fn new(specs: &[AggExecSpec]) -> Self {
+    pub(super) fn new(specs: &[AggExecSpec]) -> Self {
         let mut offset: usize = 0;
 
         // Sort by alignment (descending) to minimize padding.
@@ -7363,7 +7379,7 @@ fn compact_acc_kind(spec: &AggExecSpec) -> CompactAccKind {
 /// Side-car storage for COUNT(DISTINCT) accumulators.
 /// Each CountDistinct agg spec gets a Vec of HashSets indexed by group_idx.
 /// Int columns store raw i64 values; text columns store 128-bit hash digests.
-struct CountDistinctSideCar {
+pub(super) struct CountDistinctSideCar {
     /// (agg_spec_index, is_str, sets_int, sets_str) per CountDistinct spec.
     /// Only one of sets_int/sets_str is populated based on is_str.
     entries: Vec<CdEntry>,
@@ -7377,7 +7393,7 @@ struct CdEntry {
 }
 
 impl CountDistinctSideCar {
-    fn new(agg_specs: &[AggExecSpec]) -> Self {
+    pub(super) fn new(agg_specs: &[AggExecSpec]) -> Self {
         let mut entries = Vec::new();
         for (i, spec) in agg_specs.iter().enumerate() {
             if spec.agg_type == AggType::CountDistinct {
@@ -7394,7 +7410,7 @@ impl CountDistinctSideCar {
         CountDistinctSideCar { entries }
     }
 
-    fn alloc_group(&mut self) {
+    pub(super) fn alloc_group(&mut self) {
         for e in &mut self.entries {
             if e.is_str {
                 e.sets_str.push(hashbrown::HashSet::with_hasher(BuildHasherDefault::default()));
@@ -7471,18 +7487,30 @@ impl CountDistinctSideCar {
 }
 
 /// Flat byte buffer holding compact accumulators for all groups.
-struct CompactAccStorage {
-    buf: Vec<u8>,
-    layout: CompactAccLayout,
-    str_arena: StringArena,
+pub(super) struct CompactAccStorage {
+    pub(super) buf: Vec<u8>,
+    pub(super) layout: CompactAccLayout,
+    pub(super) str_arena: StringArena,
 }
 
 impl CompactAccStorage {
-    fn new(layout: CompactAccLayout) -> Self {
+    pub(super) fn new(layout: CompactAccLayout) -> Self {
         CompactAccStorage {
             buf: Vec::new(),
             layout,
             str_arena: StringArena::new(),
+        }
+    }
+
+    /// Reconstruct from a layout + raw `buf` bytes + raw string arena bytes.
+    /// Used by parallel-agg DSM deserialise path; keeps byte interpretation
+    /// behind a single constructor so tests cover a stable contract.
+    #[allow(dead_code)] // wired by C.2.b's deserialiser
+    pub(super) fn from_parts(layout: CompactAccLayout, buf: Vec<u8>, str_arena_buf: Vec<u8>) -> Self {
+        CompactAccStorage {
+            buf,
+            layout,
+            str_arena: StringArena { buf: str_arena_buf },
         }
     }
 
@@ -7492,7 +7520,7 @@ impl CompactAccStorage {
     /// Growth strategy: below 1GB, let Vec double normally. Above 1GB,
     /// grow by 2GB increments to cap peak waste at ~2GB instead of 100%.
     #[inline]
-    fn alloc_group(&mut self) -> u32 {
+    pub(super) fn alloc_group(&mut self) -> u32 {
         let new_len = self.buf.len() + self.layout.group_stride;
         if new_len > self.buf.capacity() {
             const GB: usize = 1 << 30;
@@ -7517,7 +7545,7 @@ impl CompactAccStorage {
 
     /// Get a mutable i64 reference (for Count).
     #[inline]
-    unsafe fn count_mut(&mut self, group_idx: u32, slot: usize) -> &mut i64 {
+    pub(super) unsafe fn count_mut(&mut self, group_idx: u32, slot: usize) -> &mut i64 {
         unsafe {
             let (offset, _) = self.layout.slots[slot];
             let ptr = self.buf.as_mut_ptr()
@@ -7567,7 +7595,7 @@ impl CompactAccStorage {
 
     /// Read count value for finalization.
     #[inline]
-    unsafe fn read_count(&self, group_idx: u32, slot: usize) -> i64 {
+    pub(super) unsafe fn read_count(&self, group_idx: u32, slot: usize) -> i64 {
         unsafe {
             let (offset, _) = self.layout.slots[slot];
             let ptr = self.buf.as_ptr()
@@ -7617,7 +7645,7 @@ impl CompactAccStorage {
 
     /// Read MinStr/MaxStr: returns (arena_offset, length). Sentinel is (u32::MAX, 0) = no value.
     #[inline]
-    unsafe fn read_min_max_str(&self, group_idx: u32, slot: usize) -> (u32, u32) {
+    pub(super) unsafe fn read_min_max_str(&self, group_idx: u32, slot: usize) -> (u32, u32) {
         unsafe {
             let (offset, _) = self.layout.slots[slot];
             let base = self.buf.as_ptr()
@@ -7630,7 +7658,7 @@ impl CompactAccStorage {
 
     /// Write MinStr/MaxStr arena offset and length.
     #[inline]
-    unsafe fn write_min_max_str(&mut self, group_idx: u32, slot: usize, off: u32, len: u32) {
+    pub(super) unsafe fn write_min_max_str(&mut self, group_idx: u32, slot: usize, off: u32, len: u32) {
         unsafe {
             let (offset, _) = self.layout.slots[slot];
             let base = self.buf.as_mut_ptr()
@@ -7895,7 +7923,7 @@ fn unpack_int_keys(packed: u128, num_keys: usize) -> [i64; 2] {
 }
 
 /// Type alias for compact group map with u128 keys.
-type CompactGroupMap = hashbrown::HashMap<u128, u32, BuildHasherDefault<ahash::AHasher>>;
+pub(super) type CompactGroupMap = hashbrown::HashMap<u128, u32, BuildHasherDefault<ahash::AHasher>>;
 
 // ============================================================================
 // Parallel Compact Aggregation
@@ -8196,16 +8224,33 @@ struct ParallelCompactConfig<'a> {
 }
 
 /// Result of parallel compact aggregation from one worker thread.
-struct ParallelCompactResult {
-    compact_map: CompactGroupMap,
-    compact_storage: CompactAccStorage,
-    cd_sidecar: CountDistinctSideCar,
-    segments_processed: u64,
-    rows_processed: u64,
-    decompress_us: u64,
+pub(super) struct ParallelCompactResult {
+    pub(super) compact_map: CompactGroupMap,
+    pub(super) compact_storage: CompactAccStorage,
+    pub(super) cd_sidecar: CountDistinctSideCar,
+    pub(super) segments_processed: u64,
+    pub(super) rows_processed: u64,
+    pub(super) decompress_us: u64,
     /// Pre-computed top-K candidates: (keys, floor_value).
     /// Present when `config.topn_spec` is set.
-    topk: Option<(Vec<u128>, i64)>,
+    pub(super) topk: Option<(Vec<u128>, i64)>,
+}
+
+impl ParallelCompactResult {
+    /// Construct an empty result for the given agg specs. Used by parallel
+    /// workers as the per-process accumulator before serialising to DSM.
+    #[allow(dead_code)] // wired by C.2.d
+    pub(super) fn empty(agg_specs: &[AggExecSpec]) -> Self {
+        Self {
+            compact_map: CompactGroupMap::with_hasher(BuildHasherDefault::default()),
+            compact_storage: CompactAccStorage::new(CompactAccLayout::new(agg_specs)),
+            cd_sidecar: CountDistinctSideCar::new(agg_specs),
+            segments_processed: 0,
+            rows_processed: 0,
+            decompress_us: 0,
+            topk: None,
+        }
+    }
 }
 
 /// Process a chunk of segments on a worker thread using the compact path.
