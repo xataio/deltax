@@ -3127,11 +3127,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         }
 
                         for e in &spec_cd_sidecar.entries {
-                            let count = if e.is_str {
-                                e.sets_str[global_idx as usize].len() as i64
-                            } else {
-                                e.sets_int[global_idx as usize].len() as i64
-                            };
+                            let count = e.count(global_idx);
                             *storage.count_mut(global_idx, e.spec_idx) = count;
                         }
 
@@ -3293,11 +3289,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
                     // Write CountDistinct counts for this group
                     for e in &bare_cd_sidecar.entries {
-                        let count = if e.is_str {
-                            e.sets_str[global_idx as usize].len() as i64
-                        } else {
-                            e.sets_int[global_idx as usize].len() as i64
-                        };
+                        let count = e.count(global_idx);
                         *storage.count_mut(global_idx, e.spec_idx) = count;
                     }
 
@@ -4009,6 +4001,15 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 None
             };
 
+            // Phase D leader pre-pass: build per-spec dict-distinct remaps
+            // for every eligible CountDistinct(text) spec. Workers consult
+            // these through `ParallelMixedConfig::dict_distinct_remaps` to
+            // set bits in per-(spec, group) bitsets instead of hashing
+            // strings into HashSet<u128>. Specs not in the map fall back to
+            // the existing HashSet path. Sequential today — see
+            // `build_dict_distinct_remaps` for the cost/threshold logic.
+            let dict_distinct_remaps = build_dict_distinct_remaps(&all_segments, &agg_specs);
+
             let config = ParallelMixedConfig {
                 agg_specs: &agg_specs,
                 group_specs: &group_specs,
@@ -4026,6 +4027,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 rust_regex_infos: &rust_regex_infos,
                 sidecar_only_cols: &sidecar_only_cols,
                 preselected_keys: preselected_keys.as_ref(),
+                dict_distinct_remaps: &dict_distinct_remaps,
             };
 
             let mut pipeline_detoast_us: u64 = 0;
@@ -4045,9 +4047,13 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
                     std::thread::scope(|s| {
                         let chunk_size = current_batch.len().div_ceil(n_workers);
-                        let handles: Vec<_> = current_batch.chunks(chunk_size).map(|chunk| {
+                        let handles: Vec<_> = current_batch.chunks(chunk_size).enumerate().map(|(ci, chunk)| {
                             let cfg = &config;
-                            s.spawn(move || process_segments_mixed(chunk, cfg))
+                            // Phase D: chunk_offset is the seg_idx of chunk[0]
+                            // in the leader's all_segments view, used to index
+                            // dict_distinct_remaps.per_segment.
+                            let chunk_offset = batch_start + ci * chunk_size;
+                            s.spawn(move || process_segments_mixed(chunk, chunk_offset, cfg))
                         }).collect();
 
                         if batch_end < total_segs {
@@ -4069,9 +4075,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             } else {
                 let chunk_size = all_segments.len().div_ceil(n_workers);
                 std::thread::scope(|s| {
-                    let handles: Vec<_> = all_segments.chunks(chunk_size).map(|chunk| {
+                    let handles: Vec<_> = all_segments.chunks(chunk_size).enumerate().map(|(ci, chunk)| {
                         let cfg = &config;
-                        s.spawn(move || process_segments_mixed(chunk, cfg))
+                        let chunk_offset = ci * chunk_size;
+                        s.spawn(move || process_segments_mixed(chunk, chunk_offset, cfg))
                     }).collect();
                     handles.into_iter().map(|h| h.join().unwrap()).collect()
                 })
@@ -4246,11 +4253,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
                         // Write CountDistinct counts for this group
                         for e in &spec_cd_sidecar.entries {
-                            let count = if e.is_str {
-                                e.sets_str[global_idx as usize].len() as i64
-                            } else {
-                                e.sets_int[global_idx as usize].len() as i64
-                            };
+                            let count = e.count(global_idx);
                             *storage.count_mut(global_idx, e.spec_idx) = count;
                         }
 
@@ -4425,11 +4428,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         }
 
                         for e in &spec_cd_sidecar.entries {
-                            let count = if e.is_str {
-                                e.sets_str[global_idx as usize].len() as i64
-                            } else {
-                                e.sets_int[global_idx as usize].len() as i64
-                            };
+                            let count = e.count(global_idx);
                             *storage.count_mut(global_idx, e.spec_idx) = count;
                         }
 
@@ -4631,11 +4630,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     for i in 0..target_keys.len() {
                         let group_idx = i as u32;
                         for e in &final_cd_sidecar.entries {
-                            let count = if e.is_str {
-                                e.sets_str[group_idx as usize].len() as i64
-                            } else {
-                                e.sets_int[group_idx as usize].len() as i64
-                            };
+                            let count = e.count(group_idx);
                             *final_storage.count_mut(group_idx, e.spec_idx) = count;
                         }
                     }
@@ -8151,34 +8146,308 @@ fn compact_acc_kind(spec: &AggExecSpec) -> CompactAccKind {
     }
 }
 
+/// Phase D bitset: a bare `Vec<u64>` with set/or/popcount. Used for
+/// COUNT(DISTINCT text) when the column is dictionary-encoded across every
+/// participating segment — workers set bits indexed by leader-precomputed
+/// global string IDs, the merge step OR's two bitsets, and finalisation
+/// returns `count_ones`. Avoids a `bitvec` dep — `count_ones` on `u64`
+/// lowers to POPCNT on x86_64 and CNT on aarch64.
+#[derive(Clone)]
+pub(super) struct Bitset {
+    words: Vec<u64>,
+    nbits: u32,
+}
+
+impl Bitset {
+    pub(super) fn with_size(nbits: u32) -> Self {
+        let nwords = nbits.div_ceil(64) as usize;
+        Bitset { words: vec![0u64; nwords], nbits }
+    }
+    #[inline]
+    pub(super) fn set(&mut self, idx: u32) {
+        debug_assert!(idx < self.nbits, "Bitset::set out of range");
+        let w = (idx >> 6) as usize;
+        let b = idx & 63;
+        self.words[w] |= 1u64 << b;
+    }
+    #[inline]
+    pub(super) fn or_with(&mut self, other: &Bitset) {
+        debug_assert_eq!(self.words.len(), other.words.len());
+        for (a, b) in self.words.iter_mut().zip(other.words.iter()) {
+            *a |= *b;
+        }
+    }
+    pub(super) fn count_ones(&self) -> u64 {
+        self.words.iter().map(|w| w.count_ones() as u64).sum()
+    }
+}
+
+/// Phase D dict-eligible CountDistinct(text) global remap. Built once at the
+/// leader after segments are loaded — see `build_dict_distinct_remaps`.
+///
+/// `per_segment[seg_idx][local_dict_id] = global_id`. `seg_idx` is the
+/// position in the leader's `all_segments` Vec; `local_dict_id` is the entry
+/// position in that segment's per-column dictionary; `global_id` is a unique
+/// integer in `[0, global_count)` shared across every segment. Workers set
+/// bit `global_id` in their per-(spec,group) `Bitset` instead of hashing the
+/// raw string.
+pub(super) struct DictDistinctRemap {
+    pub(super) global_count: u32,
+    pub(super) per_segment: Vec<Vec<u32>>,
+}
+
+/// Skip Phase D's bitset path when the per-column global string count
+/// exceeds this. Two reasons:
+///
+///   1. **Memory**: bitset size is `global_count` bits per (spec, group,
+///      worker). At 250K bits × 16 groups × 16 workers ≈ 8 MB total — fine.
+///      Higher cardinalities push past 50 MB and start contending with the
+///      OS page cache that's holding hot blob data.
+///   2. **Pre-pass cost**: the sequential leader pre-pass scales with
+///      total dict entries across all segments; for high-cardinality cols
+///      (e.g. JSONBench's `did` synthetic at 3.6M unique) the interner
+///      build alone exceeds the savings on the worker hot-path.
+///
+/// Tuned so common JSONBench / RTABench shapes (collection, terminal,
+/// status) fall under the threshold and get the bitset speedup while pure
+/// user-id-style columns fall back to today's `HashSet<u128>`.
+pub(super) const PHASE_D_MAX_GLOBAL_FOR_BITSET: u32 = 250_000;
+
+/// Phase D leader pre-pass: walk each `CountDistinct(text)` spec's
+/// per-segment dictionary blob, build a global string-ID interner, and
+/// emit per-segment local→global remap tables. Returns one
+/// `DictDistinctRemap` per eligible spec (keyed by its index in
+/// `agg_specs`). Specs whose columns aren't dict-encoded across every
+/// segment, or whose global cardinality exceeds
+/// `PHASE_D_MAX_GLOBAL_FOR_BITSET`, are absent from the result and stay
+/// on the `HashSet<u128>` path.
+///
+/// Sequential today — the cost is dominated by hash-map probes on the
+/// shared global interner, not segment I/O. If a benchmark surfaces a
+/// case where this is the bottleneck, splitting into per-thread local
+/// interners + sequential merge is the next step.
+pub(super) fn build_dict_distinct_remaps(
+    all_segments: &[super::segments::SegmentData],
+    agg_specs: &[AggExecSpec],
+) -> std::collections::HashMap<usize, DictDistinctRemap> {
+    use crate::compression::{CompressedColumnRef, CompressionType, dictionary};
+
+    let mut remaps = std::collections::HashMap::new();
+
+    for (spec_idx, spec) in agg_specs.iter().enumerate() {
+        if spec.agg_type != AggType::CountDistinct {
+            continue;
+        }
+        if !matches!(
+            spec.col_type_oid,
+            pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID
+        ) {
+            continue;
+        }
+        if spec.col_idx < 0 {
+            continue;
+        }
+        let col_idx = spec.col_idx as usize;
+
+        // Eligibility: every segment whose blob is non-empty must be
+        // dict-encoded for this column AND the **sum of per-segment dict
+        // sizes** must fit under PHASE_D_MAX_GLOBAL_FOR_BITSET. The sum is
+        // an upper bound on global cardinality (after dedup it can only
+        // shrink), so it's a cheap filter: dict_size lives in the first 4
+        // bytes of `cc_ref.data` for both `Dictionary` and `DictionaryLz4`,
+        // so we read it WITHOUT decompressing the LZ4 entry blob. This
+        // matters because for high-cardinality columns (e.g. JSONBench's
+        // `did`, ~3.6M unique) full LZ4 decompression per seg dominates the
+        // pre-pass budget even when the eventual interner build would bail.
+        // Segment-by columns store values outside `compressed_blobs` (in
+        // `segment_values`); for those the blob is absent and the spec
+        // stays on the HashSet path even if every other segment is
+        // dict-encoded — too narrow to bother with a separate code path.
+        let mut eligible = true;
+        let mut dict_size_sum: u64 = 0;
+        for seg in all_segments {
+            if col_idx >= seg.compressed_blobs.len() {
+                eligible = false;
+                break;
+            }
+            let blob = &seg.compressed_blobs[col_idx];
+            if blob.is_empty() {
+                continue;
+            }
+            let comp = CompressionType::from_u8(blob[0]);
+            if !matches!(
+                comp,
+                CompressionType::Dictionary | CompressionType::DictionaryLz4
+            ) {
+                eligible = false;
+                break;
+            }
+            // Peek dict_size from header (first 4 bytes of cc_ref.data).
+            let cc_ref = CompressedColumnRef::from_bytes(blob);
+            if cc_ref.data.len() < 4 {
+                eligible = false;
+                break;
+            }
+            let dict_size =
+                u32::from_le_bytes(cc_ref.data[0..4].try_into().unwrap()) as u64;
+            dict_size_sum = dict_size_sum.saturating_add(dict_size);
+            if dict_size_sum > PHASE_D_MAX_GLOBAL_FOR_BITSET as u64 {
+                eligible = false;
+                break;
+            }
+        }
+        if !eligible {
+            continue;
+        }
+
+        // Sequential interner build. Hashbrown + ahash for the lookup hot
+        // loop. Owned `String` keys so the entries outlive `header.dict`'s
+        // borrow into the per-segment normalised buffer. The dict_size_sum
+        // gate above guarantees `global_interner.len() <
+        // PHASE_D_MAX_GLOBAL_FOR_BITSET`, so no runtime cap needed.
+        let mut global_interner: hashbrown::HashMap<
+            String,
+            u32,
+            BuildHasherDefault<ahash::AHasher>,
+        > = hashbrown::HashMap::with_hasher(BuildHasherDefault::default());
+        let mut per_segment: Vec<Vec<u32>> = Vec::with_capacity(all_segments.len());
+
+        for seg in all_segments {
+            let blob = &seg.compressed_blobs[col_idx];
+            if blob.is_empty() {
+                per_segment.push(Vec::new());
+                continue;
+            }
+            let cc_ref = CompressedColumnRef::from_bytes(blob);
+            let norm_buf;
+            let dict_data: &[u8] = if cc_ref.type_tag == CompressionType::DictionaryLz4 {
+                norm_buf = dictionary::normalize_lz4(cc_ref.data);
+                &norm_buf[..]
+            } else {
+                cc_ref.data
+            };
+            let header = dictionary::parse_header(dict_data);
+            let mut local_remap: Vec<u32> = Vec::with_capacity(header.dict.len());
+            for &entry in &header.dict {
+                let global_id = match global_interner.get(entry) {
+                    Some(&id) => id,
+                    None => {
+                        let id = global_interner.len() as u32;
+                        global_interner.insert(entry.to_string(), id);
+                        id
+                    }
+                };
+                local_remap.push(global_id);
+            }
+            per_segment.push(local_remap);
+        }
+
+        let global_count = global_interner.len() as u32;
+        if global_count == 0 {
+            // No distinct strings observed — the bitset is degenerate.
+            // HashSet path handles this trivially; skip.
+            continue;
+        }
+        remaps.insert(
+            spec_idx,
+            DictDistinctRemap {
+                global_count,
+                per_segment,
+            },
+        );
+    }
+
+    remaps
+}
+
 /// Side-car storage for COUNT(DISTINCT) accumulators.
 /// Each CountDistinct agg spec gets a Vec of HashSets indexed by group_idx.
 /// Int columns store raw i64 values; text columns store 128-bit hash digests.
+/// Dict-eligible text columns (Phase D) use per-group `Bitset` indexed by
+/// leader-precomputed global string IDs.
 pub(super) struct CountDistinctSideCar {
-    /// (agg_spec_index, is_str, sets_int, sets_str) per CountDistinct spec.
-    /// Only one of sets_int/sets_str is populated based on is_str.
     entries: Vec<CdEntry>,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub(super) enum CdKind {
+    Int,
+    Str,
+    /// Dict-encoded text with leader pre-pass: per-group `Bitset` of size
+    /// `global_count` (the bitset_size below). Merge is bit-OR; finalise is
+    /// `count_ones`. Eligibility checked in `build_dict_distinct_remaps`.
+    DictBitset,
 }
 
 struct CdEntry {
     spec_idx: usize,
-    is_str: bool,
+    kind: CdKind,
+    /// `bitset_size` for `DictBitset`; otherwise unused.
+    bitset_size: u32,
     sets_int: Vec<hashbrown::HashSet<i64, BuildHasherDefault<ahash::AHasher>>>,
     sets_str: Vec<hashbrown::HashSet<u128, BuildHasherDefault<ahash::AHasher>>>,
+    bitsets: Vec<Bitset>,
+}
+
+impl CdEntry {
+    /// Count of distinct values seen for `group_idx`. The output of every
+    /// CountDistinct accumulator finalisation, regardless of representation.
+    #[inline]
+    fn count(&self, group_idx: u32) -> i64 {
+        let i = group_idx as usize;
+        match self.kind {
+            CdKind::Str => self.sets_str[i].len() as i64,
+            CdKind::Int => self.sets_int[i].len() as i64,
+            CdKind::DictBitset => self.bitsets[i].count_ones() as i64,
+        }
+    }
 }
 
 impl CountDistinctSideCar {
+    /// Default constructor: every text CountDistinct uses the HashSet<u128>
+    /// path. Phase D's bitset path is opted in via `new_with_dict_remaps`,
+    /// which classifies eligible text specs as `DictBitset` instead.
     pub(super) fn new(agg_specs: &[AggExecSpec]) -> Self {
+        Self::new_inner(agg_specs, &Default::default())
+    }
+
+    /// Phase D entry point. `dict_remap_sizes` maps spec_idx → bitset size
+    /// (the global string-ID count) for every CountDistinct(text) spec the
+    /// leader has confirmed is dict-encoded across all relevant segments.
+    /// Specs absent from the map keep the HashSet<u128> behaviour.
+    pub(super) fn new_with_dict_remaps(
+        agg_specs: &[AggExecSpec],
+        dict_remap_sizes: &std::collections::HashMap<usize, u32>,
+    ) -> Self {
+        Self::new_inner(agg_specs, dict_remap_sizes)
+    }
+
+    fn new_inner(
+        agg_specs: &[AggExecSpec],
+        dict_remap_sizes: &std::collections::HashMap<usize, u32>,
+    ) -> Self {
         let mut entries = Vec::new();
         for (i, spec) in agg_specs.iter().enumerate() {
             if spec.agg_type == AggType::CountDistinct {
                 let is_str = matches!(spec.col_type_oid,
                     pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID);
+                let bitset_size = if is_str {
+                    dict_remap_sizes.get(&i).copied().unwrap_or(0)
+                } else { 0 };
+                let kind = if is_str && bitset_size > 0 {
+                    CdKind::DictBitset
+                } else if is_str {
+                    CdKind::Str
+                } else {
+                    CdKind::Int
+                };
                 entries.push(CdEntry {
                     spec_idx: i,
-                    is_str,
+                    kind,
+                    bitset_size,
                     sets_int: Vec::new(),
                     sets_str: Vec::new(),
+                    bitsets: Vec::new(),
                 });
             }
         }
@@ -8187,10 +8456,12 @@ impl CountDistinctSideCar {
 
     pub(super) fn alloc_group(&mut self) {
         for e in &mut self.entries {
-            if e.is_str {
-                e.sets_str.push(hashbrown::HashSet::with_hasher(BuildHasherDefault::default()));
-            } else {
-                e.sets_int.push(hashbrown::HashSet::with_hasher(BuildHasherDefault::default()));
+            match e.kind {
+                CdKind::Str => e.sets_str.push(
+                    hashbrown::HashSet::with_hasher(BuildHasherDefault::default())),
+                CdKind::Int => e.sets_int.push(
+                    hashbrown::HashSet::with_hasher(BuildHasherDefault::default())),
+                CdKind::DictBitset => e.bitsets.push(Bitset::with_size(e.bitset_size)),
             }
         }
     }
@@ -8213,14 +8484,26 @@ impl CountDistinctSideCar {
         }
     }
 
+    /// Phase D: set the bit for `global_id` in the per-group bitset of the
+    /// (dict-eligible) CountDistinct(text) spec at `spec_idx`. `global_id`
+    /// must be `< bitset_size` (`< DictDistinctRemap::global_count`).
+    fn insert_dict_global(&mut self, spec_idx: usize, group_idx: u32, global_id: u32) {
+        for e in &mut self.entries {
+            if e.spec_idx == spec_idx {
+                e.bitsets[group_idx as usize].set(global_id);
+                return;
+            }
+        }
+    }
+
     #[allow(dead_code)]
     fn len(&self, spec_idx: usize, group_idx: u32) -> i64 {
         for e in &self.entries {
             if e.spec_idx == spec_idx {
-                return if e.is_str {
-                    e.sets_str[group_idx as usize].len() as i64
-                } else {
-                    e.sets_int[group_idx as usize].len() as i64
+                return match e.kind {
+                    CdKind::Str => e.sets_str[group_idx as usize].len() as i64,
+                    CdKind::Int => e.sets_int[group_idx as usize].len() as i64,
+                    CdKind::DictBitset => e.bitsets[group_idx as usize].count_ones() as i64,
                 };
             }
         }
@@ -8230,12 +8513,19 @@ impl CountDistinctSideCar {
     fn union_from(&mut self, spec_idx: usize, dst_group: u32, other: &Self, src_group: u32) {
         for (e, oe) in self.entries.iter_mut().zip(other.entries.iter()) {
             if e.spec_idx == spec_idx {
-                if e.is_str {
-                    let src = &oe.sets_str[src_group as usize];
-                    e.sets_str[dst_group as usize].extend(src.iter().copied());
-                } else {
-                    let src = &oe.sets_int[src_group as usize];
-                    e.sets_int[dst_group as usize].extend(src.iter().copied());
+                match e.kind {
+                    CdKind::Str => {
+                        let src = &oe.sets_str[src_group as usize];
+                        e.sets_str[dst_group as usize].extend(src.iter().copied());
+                    }
+                    CdKind::Int => {
+                        let src = &oe.sets_int[src_group as usize];
+                        e.sets_int[dst_group as usize].extend(src.iter().copied());
+                    }
+                    CdKind::DictBitset => {
+                        let src = &oe.bitsets[src_group as usize];
+                        e.bitsets[dst_group as usize].or_with(src);
+                    }
                 }
                 return;
             }
@@ -8246,10 +8536,10 @@ impl CountDistinctSideCar {
     fn write_counts_to_storage(&self, storage: &mut CompactAccStorage, map: &CompactGroupMap) {
         for e in &self.entries {
             for (_, &gidx) in map.iter() {
-                let count = if e.is_str {
-                    e.sets_str[gidx as usize].len() as i64
-                } else {
-                    e.sets_int[gidx as usize].len() as i64
+                let count = match e.kind {
+                    CdKind::Str => e.sets_str[gidx as usize].len() as i64,
+                    CdKind::Int => e.sets_int[gidx as usize].len() as i64,
+                    CdKind::DictBitset => e.bitsets[gidx as usize].count_ones() as i64,
                 };
                 unsafe { *storage.count_mut(gidx, e.spec_idx) = count; }
             }
@@ -9899,6 +10189,16 @@ struct ParallelMixedConfig<'a> {
     /// (no ORDER BY, no HAVING, no WHERE) and the Phase-0 probe
     /// succeeded in finding `bare_limit` distinct keys.
     preselected_keys: Option<&'a hashbrown::HashSet<u128>>,
+    /// Phase D: leader-precomputed dict-distinct remaps. Keyed by spec_idx
+    /// for every CountDistinct(text) spec where every segment is dict-encoded
+    /// for the col AND the global-string count is below the bitset threshold.
+    /// Workers consult this to set bits in per-(spec, group) `Bitset`s
+    /// (`CdKind::DictBitset`) instead of hashing strings into `HashSet<u128>`.
+    /// Specs absent from the map keep the existing HashSet path. The
+    /// chunk-offset arg to `process_segments_mixed` indexes into
+    /// `per_segment` so each worker resolves `(seg_idx, local_dict_id)` →
+    /// `global_id` without further coordination.
+    dict_distinct_remaps: &'a std::collections::HashMap<usize, DictDistinctRemap>,
 }
 
 // TextQualInfo is now in text_col.rs
@@ -10206,13 +10506,26 @@ fn try_build_preselected(
 
 fn process_segments_mixed(
     segments: &[SegmentData],
+    chunk_offset: usize,
     config: &ParallelMixedConfig,
 ) -> ParallelMixedResult {
     let mut compact_map = CompactGroupMap::with_hasher(BuildHasherDefault::default());
     let mut compact_storage = CompactAccStorage::new(CompactAccLayout::new(config.agg_specs));
     let num_group_keys = config.group_specs.len();
     let mut mixed_keys = MixedKeyStorage::new(num_group_keys);
-    let mut cd_sidecar = CountDistinctSideCar::new(config.agg_specs);
+    // Phase D: classify each CountDistinct(text) spec as DictBitset when the
+    // leader pre-pass produced a remap for it. Bitset size = global string
+    // count for the column. Sized lookup map kept on the stack — at most a
+    // handful of CountDistinct specs per query.
+    let dict_remap_sizes: std::collections::HashMap<usize, u32> = config
+        .dict_distinct_remaps
+        .iter()
+        .map(|(&spec_idx, remap)| (spec_idx, remap.global_count))
+        .collect();
+    let mut cd_sidecar = CountDistinctSideCar::new_with_dict_remaps(
+        config.agg_specs,
+        &dict_remap_sizes,
+    );
     let mut segments_processed: u64 = 0;
     let mut rows_processed: u64 = 0;
     let mut decompress_us: u64 = 0;
@@ -10221,7 +10534,13 @@ fn process_segments_mixed(
     let n_int_keys = config.group_specs.iter().filter(|gs| !is_text_group_col(gs)).count();
     let n_str_keys = config.group_specs.iter().filter(|gs| is_text_group_col(gs)).count();
 
-    for seg in segments {
+    for (rel_idx, seg) in segments.iter().enumerate() {
+        // Phase D: absolute seg_idx into all_segments (and into each
+        // dict_distinct_remaps.per_segment). The chunk-mode `for seg in segments`
+        // doesn't expose this; we shadow it via `(rel_idx, seg)` so the bitset
+        // lookup at the per-row insert site can resolve `(spec_idx, seg_idx,
+        // local_id) → global_id` without further coordination.
+        let seg_idx_in_all = chunk_offset + rel_idx;
         if seg.row_count == 0 {
             continue;
         }
@@ -10591,8 +10910,21 @@ fn process_segments_mixed(
                     }
                     CompactAccKind::CountDistinctStr => {
                         let col_idx = spec.col_idx as usize;
-                        if let Some(ref seg_col) = text_seg_cols[col_idx]
-                            && let Some(s) = seg_col.get_str(row) {
+                        let Some(ref seg_col) = text_seg_cols[col_idx] else { continue };
+                        if let Some(remap) = config.dict_distinct_remaps.get(&spec_idx) {
+                            // Phase D bitset path: per-row work is local
+                            // dict_id → global_id → set bit. No hashing or
+                            // string materialisation. Eligibility is gated
+                            // at the leader pre-pass — this branch only
+                            // fires when every segment is dict-encoded for
+                            // `col_idx` and the column's global cardinality
+                            // fit under PHASE_D_MAX_GLOBAL_FOR_BITSET.
+                            if let Some(local_id) = seg_col.dict_local_id(row) {
+                                let seg_remap = &remap.per_segment[seg_idx_in_all];
+                                let global_id = seg_remap[local_id as usize];
+                                cd_sidecar.insert_dict_global(spec_idx, group_idx, global_id);
+                            }
+                        } else if let Some(s) = seg_col.get_str(row) {
                             cd_sidecar.insert_str(spec_idx, group_idx, hash128_str(s.as_bytes()));
                         }
                     }

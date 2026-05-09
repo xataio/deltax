@@ -59,6 +59,21 @@ impl SegTextColumn {
         }
     }
 
+    /// Phase D bitset path: return the local dict ID at `row` if this column
+    /// is `Dict`-encoded and the row is non-null. Returns `None` for nulls,
+    /// non-Dict variants (Lz4/Lengths/SegBy don't have a per-row dict
+    /// reference). Callers pair this with a leader-precomputed
+    /// local→global remap table to set bits in a per-group bitset.
+    pub(super) fn dict_local_id(&self, row: usize) -> Option<u32> {
+        match self {
+            SegTextColumn::Dict { row_to_entry, .. } => {
+                let idx = row_to_entry[row];
+                if idx == u32::MAX { None } else { Some(idx) }
+            }
+            _ => None,
+        }
+    }
+
     /// Get the character length of the value at a given row, or None if null.
     /// All variants support this — Dict/Lz4/SegBy compute from the string body,
     /// Lengths reads directly from the stored array.

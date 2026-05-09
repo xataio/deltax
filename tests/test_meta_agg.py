@@ -245,3 +245,195 @@ def test_aggregate_with_segment_by_correctness(db, func):
     _run_with_fastpath(db, False)
     ref = db.execute(sql).fetchone()[0]
     assert fast == ref, f"{func}(val): fast={fast} ref={ref}"
+
+
+def _seed_low_card_text(db, n_partitions=3, rows_per_partition=30_000, n_kinds=5):
+    """Helper for Phase D tests. Builds a table with low-cardinality
+    `kind` (5 values) and `tag` (12 values) — both dictionary-encoded —
+    plus a high-cardinality `user_id` text column (~rows_per_partition
+    distinct) that should force the HashSet fallback. Multi-partition so
+    Phase D's leader pre-pass actually walks several segment dicts and
+    builds the global remap."""
+    from datetime import datetime, timedelta, timezone
+
+    db.execute(
+        "CREATE TABLE events_d ("
+        "  ts TIMESTAMPTZ NOT NULL,"
+        "  kind TEXT,"
+        "  tag TEXT,"
+        "  user_id TEXT"
+        ")"
+    )
+    db.execute(
+        "SELECT deltax_create_table('events_d', 'ts', '1 day', %s)",
+        (n_partitions - 1,),
+    )
+    db.execute(
+        "SELECT deltax_enable_compression('events_d', "
+        "  order_by => ARRAY['ts'])"
+    )
+    db.commit()
+
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    window_us = 22 * 3600 * 1_000_000
+    spacing_us = max(1, window_us // max(1, rows_per_partition - 1))
+
+    for p in range(n_partitions):
+        part_start = today - timedelta(days=1) + timedelta(days=p) + timedelta(hours=1)
+        db.execute(
+            "INSERT INTO events_d (ts, kind, tag, user_id) "
+            "SELECT %s::timestamptz + (i::bigint * %s::bigint * interval '1 microsecond'), "
+            "       CASE i %% %s "
+            "         WHEN 0 THEN 'A' WHEN 1 THEN 'B' WHEN 2 THEN 'C' "
+            "         WHEN 3 THEN 'D' ELSE 'E' END, "
+            "       'tag_' || ((i %% 12)::text), "
+            "       'u_' || (i + %s * 100000)::text "
+            "FROM generate_series(0, %s) i",
+            (part_start, spacing_us, n_kinds, p, rows_per_partition - 1),
+        )
+    db.commit()
+
+    for (name,) in db.execute(
+        "SELECT partition_name FROM deltax_partition_info('events_d') "
+        "ORDER BY range_start"
+    ).fetchall():
+        cnt = db.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]
+        if cnt > 0:
+            db.execute("SELECT deltax_compress_partition(%s)", (name,))
+    db.commit()
+    db.rollback()
+    db.autocommit = True
+    db.execute("ANALYZE events_d")
+    db.autocommit = False
+
+
+def test_phase_d_count_distinct_low_card_text(db):
+    """Phase D bitset path: GROUP BY low-card text + COUNT(DISTINCT
+    low-card text). Both `kind` (5 vals) and `tag` (12 vals) are
+    dictionary-encoded and well under the bitset threshold, so workers
+    use Bitset + global string IDs. Result must match the reference path."""
+    _seed_low_card_text(db)
+    sql = (
+        "SELECT kind, COUNT(*), COUNT(DISTINCT tag) AS u "
+        "FROM events_d GROUP BY kind ORDER BY kind"
+    )
+    fast = db.execute(sql).fetchall()
+    # Force the serial CountDistinct path (HashSet<u128>, no Phase D
+    # bitset) by disabling internal worker parallelism. The serial path
+    # is the orthogonal reference for correctness — same query, same
+    # data, different distinct-set representation.
+    db.execute("SET pg_deltax.parallel_workers = 1")
+    try:
+        ref = db.execute(sql).fetchall()
+    finally:
+        db.execute("RESET pg_deltax.parallel_workers")
+    assert fast == ref, f"Phase D CountDistinct: fast={fast} ref={ref}"
+
+
+def test_phase_d_count_distinct_high_card_falls_back(db):
+    """High-card text column (`user_id`, ~rows_per_partition unique)
+    blows past PHASE_D_MAX_GLOBAL_FOR_BITSET. Phase D should bail at the
+    eligibility check and the query should use the existing HashSet<u128>
+    path. Correctness gate: result still matches reference."""
+    _seed_low_card_text(db)
+    sql = (
+        "SELECT kind, COUNT(DISTINCT user_id) AS u "
+        "FROM events_d GROUP BY kind ORDER BY kind"
+    )
+    fast = db.execute(sql).fetchall()
+    # Force the serial CountDistinct path (HashSet<u128>, no Phase D
+    # bitset) by disabling internal worker parallelism. The serial path
+    # is the orthogonal reference for correctness — same query, same
+    # data, different distinct-set representation.
+    db.execute("SET pg_deltax.parallel_workers = 1")
+    try:
+        ref = db.execute(sql).fetchall()
+    finally:
+        db.execute("RESET pg_deltax.parallel_workers")
+    assert fast == ref, f"high-card CountDistinct: fast={fast} ref={ref}"
+
+
+def test_phase_d_count_distinct_with_where(db):
+    """Phase D with a WHERE filter that selects ~half the rows — must
+    still produce the correct distinct count per group, exercising the
+    interaction between batch_quals row-skipping and the per-row bitset
+    insert."""
+    _seed_low_card_text(db)
+    sql = (
+        "SELECT kind, COUNT(DISTINCT tag) AS u "
+        "FROM events_d WHERE kind IN ('A', 'B') "
+        "GROUP BY kind ORDER BY kind"
+    )
+    fast = db.execute(sql).fetchall()
+    # Force the serial CountDistinct path (HashSet<u128>, no Phase D
+    # bitset) by disabling internal worker parallelism. The serial path
+    # is the orthogonal reference for correctness — same query, same
+    # data, different distinct-set representation.
+    db.execute("SET pg_deltax.parallel_workers = 1")
+    try:
+        ref = db.execute(sql).fetchall()
+    finally:
+        db.execute("RESET pg_deltax.parallel_workers")
+    assert fast == ref, f"Phase D + WHERE: fast={fast} ref={ref}"
+
+
+def test_phase_d_null_count_distinct(db):
+    """COUNT(DISTINCT col) excludes NULLs by SQL semantics. Phase D's
+    bitset path must observe this — the dict NULL sentinel maps to
+    `local_id == u32::MAX` and is filtered before bit-set insertion.
+    Build a fresh table where every row with `kind='B'` has `tag=NULL`,
+    so the Phase D bitset path exercises both null and non-null inputs."""
+    from datetime import datetime, timedelta, timezone
+
+    db.execute(
+        "CREATE TABLE events_dn ("
+        "  ts TIMESTAMPTZ NOT NULL,"
+        "  kind TEXT,"
+        "  tag TEXT"
+        ")"
+    )
+    db.execute("SELECT deltax_create_table('events_dn', 'ts', '1 day', 2)")
+    db.execute("SELECT deltax_enable_compression('events_dn', order_by => ARRAY['ts'])")
+    db.commit()
+
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    rows_per_partition = 30_000
+    window_us = 22 * 3600 * 1_000_000
+    spacing_us = max(1, window_us // (rows_per_partition - 1))
+    for p in range(3):
+        part_start = today - timedelta(days=1) + timedelta(days=p) + timedelta(hours=1)
+        db.execute(
+            "INSERT INTO events_dn (ts, kind, tag) "
+            "SELECT %s::timestamptz + (i::bigint * %s::bigint * interval '1 microsecond'), "
+            "       CASE i %% 5 WHEN 0 THEN 'A' WHEN 1 THEN 'B' WHEN 2 THEN 'C' "
+            "                   WHEN 3 THEN 'D' ELSE 'E' END, "
+            # tag = NULL whenever kind='B' (i%5==1) — exercise the dict
+            # NULL sentinel inside Phase D's per-row insert.
+            "       CASE WHEN i %% 5 = 1 THEN NULL "
+            "            ELSE 'tag_' || ((i %% 12)::text) END "
+            "FROM generate_series(0, %s) i",
+            (part_start, spacing_us, rows_per_partition - 1),
+        )
+    db.commit()
+    for (name,) in db.execute(
+        "SELECT partition_name FROM deltax_partition_info('events_dn') ORDER BY range_start"
+    ).fetchall():
+        cnt = db.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]
+        if cnt > 0:
+            db.execute("SELECT deltax_compress_partition(%s)", (name,))
+    db.commit()
+
+    sql = (
+        "SELECT kind, COUNT(DISTINCT tag) AS u "
+        "FROM events_dn GROUP BY kind ORDER BY kind"
+    )
+    fast = db.execute(sql).fetchall()
+    db.execute("SET pg_deltax.parallel_workers = 1")
+    try:
+        ref = db.execute(sql).fetchall()
+    finally:
+        db.execute("RESET pg_deltax.parallel_workers")
+    assert fast == ref, f"Phase D NULL: fast={fast} ref={ref}"
+    # Spot-check: kind='B' has all-NULL tags → COUNT(DISTINCT tag) == 0.
+    by_kind = {k: u for (k, u) in fast}
+    assert by_kind["B"] == 0, by_kind
