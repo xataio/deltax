@@ -8196,22 +8196,30 @@ pub(super) struct DictDistinctRemap {
     pub(super) per_segment: Vec<Vec<u32>>,
 }
 
-/// Skip Phase D's bitset path when the per-column global string count
-/// exceeds this. Two reasons:
+/// Skip Phase D's bitset path when the per-column **post-dedup global
+/// string count** exceeds this. Bitset size is `global_count` bits per
+/// (spec, group, worker); at 10M × 16 groups × 16 workers ≈ 320 MB —
+/// tolerable on bench-class boxes (m6i.8xlarge has 128 GB) but starts
+/// mattering on small ones. Tighten if real workloads push past this.
 ///
-///   1. **Memory**: bitset size is `global_count` bits per (spec, group,
-///      worker). At 250K bits × 16 groups × 16 workers ≈ 8 MB total — fine.
-///      Higher cardinalities push past 50 MB and start contending with the
-///      OS page cache that's holding hot blob data.
-///   2. **Pre-pass cost**: the sequential leader pre-pass scales with
-///      total dict entries across all segments; for high-cardinality cols
-///      (e.g. JSONBench's `did` synthetic at 3.6M unique) the interner
-///      build alone exceeds the savings on the worker hot-path.
+/// Checked AFTER the parallel pre-pass — at that point we know the
+/// actual deduplicated count, not the looser per-segment-dict-size sum.
+pub(super) const PHASE_D_MAX_GLOBAL_FOR_BITSET: u32 = 10_000_000;
+
+/// Skip Phase D entirely when the **sum of per-segment dict sizes**
+/// exceeds this. Sum is a loose upper bound on global cardinality
+/// (post-dedup `global_count` ≤ sum). A high sum implies expensive
+/// pre-pass: LZ4-decompressing dicts, hashing entries, allocating
+/// per-thread String keys. JSONBench Q1's `x_did` (~10K entries per
+/// segment × 2700 segs ≈ 27M sum, ~3.6M unique post-dedup) sits in the
+/// sweet spot — well under this gate, comfortably under
+/// `PHASE_D_MAX_GLOBAL_FOR_BITSET` after dedup. UUID-style columns
+/// where every row is unique blow past the sum gate without the
+/// pre-pass even running.
 ///
-/// Tuned so common JSONBench / RTABench shapes (collection, terminal,
-/// status) fall under the threshold and get the bitset speedup while pure
-/// user-id-style columns fall back to today's `HashSet<u128>`.
-pub(super) const PHASE_D_MAX_GLOBAL_FOR_BITSET: u32 = 250_000;
+/// Tuned 4× looser than the global cap to leave room for typical 4-10×
+/// dedup ratios while still bounding worst-case pre-pass memory.
+pub(super) const PHASE_D_MAX_DICT_SIZE_SUM: u64 = 50_000_000;
 
 /// Phase D leader pre-pass: walk each `CountDistinct(text)` spec's
 /// per-segment dictionary blob, build a global string-ID interner, and
@@ -8222,10 +8230,24 @@ pub(super) const PHASE_D_MAX_GLOBAL_FOR_BITSET: u32 = 250_000;
 /// `PHASE_D_MAX_GLOBAL_FOR_BITSET`, are absent from the result and stay
 /// on the `HashSet<u128>` path.
 ///
-/// Sequential today — the cost is dominated by hash-map probes on the
-/// shared global interner, not segment I/O. If a benchmark surfaces a
-/// case where this is the bottleneck, splitting into per-thread local
-/// interners + sequential merge is the next step.
+/// Parallelised via `std::thread::scope`:
+///
+///   1. **Phase 1 (parallel)** — each worker takes a chunk of segments,
+///      parses every dict (LZ4-decompressing as needed), and builds two
+///      things: a per-thread `local_entries: Vec<String>` recording
+///      strings in insertion order, and `seg_local_remaps: Vec<Vec<u32>>`
+///      mapping `(seg_in_chunk, local_dict_id) → local_thread_id` (the
+///      string's index in `local_entries`).
+///   2. **Phase 2 (sequential)** — merge each thread's `local_entries`
+///      into the global interner. For each thread `t` we end up with
+///      `thread_to_global[t][local_thread_id] = global_id`. This is the
+///      only sequential bottleneck and is dominated by HashMap probes
+///      against the global interner; LZ4 decompression and per-string
+///      hashing already happened in parallel.
+///   3. **Phase 3 (parallel)** — each worker rewrites its
+///      `seg_local_remaps` into the final `per_segment[seg_idx][local_dict_id]
+///      = global_id` slabs by indexing into `thread_to_global[my_thread]`.
+///      Pure array lookup; runs in well under 100ms even on Q1-scale data.
 pub(super) fn build_dict_distinct_remaps(
     all_segments: &[super::segments::SegmentData],
     agg_specs: &[AggExecSpec],
@@ -8233,6 +8255,7 @@ pub(super) fn build_dict_distinct_remaps(
     use crate::compression::{CompressedColumnRef, CompressionType, dictionary};
 
     let mut remaps = std::collections::HashMap::new();
+    let n_workers = crate::get_parallel_workers().max(1);
 
     for (spec_idx, spec) in agg_specs.iter().enumerate() {
         if spec.agg_type != AggType::CountDistinct {
@@ -8250,18 +8273,13 @@ pub(super) fn build_dict_distinct_remaps(
         let col_idx = spec.col_idx as usize;
 
         // Eligibility: every segment whose blob is non-empty must be
-        // dict-encoded for this column AND the **sum of per-segment dict
-        // sizes** must fit under PHASE_D_MAX_GLOBAL_FOR_BITSET. The sum is
+        // dict-encoded for this column AND the sum of per-segment dict
+        // sizes must fit under PHASE_D_MAX_GLOBAL_FOR_BITSET. The sum is
         // an upper bound on global cardinality (after dedup it can only
-        // shrink), so it's a cheap filter: dict_size lives in the first 4
-        // bytes of `cc_ref.data` for both `Dictionary` and `DictionaryLz4`,
-        // so we read it WITHOUT decompressing the LZ4 entry blob. This
-        // matters because for high-cardinality columns (e.g. JSONBench's
-        // `did`, ~3.6M unique) full LZ4 decompression per seg dominates the
-        // pre-pass budget even when the eventual interner build would bail.
-        // Segment-by columns store values outside `compressed_blobs` (in
-        // `segment_values`); for those the blob is absent and the spec
-        // stays on the HashSet path even if every other segment is
+        // shrink) and lives in the first 4 bytes of `cc_ref.data` — no
+        // LZ4 decompression on bail. Segment-by columns store values in
+        // `segment_values` (outside `compressed_blobs`); for those the
+        // spec stays on the HashSet path even if every other segment is
         // dict-encoded — too narrow to bother with a separate code path.
         let mut eligible = true;
         let mut dict_size_sum: u64 = 0;
@@ -8282,7 +8300,6 @@ pub(super) fn build_dict_distinct_remaps(
                 eligible = false;
                 break;
             }
-            // Peek dict_size from header (first 4 bytes of cc_ref.data).
             let cc_ref = CompressedColumnRef::from_bytes(blob);
             if cc_ref.data.len() < 4 {
                 eligible = false;
@@ -8291,7 +8308,7 @@ pub(super) fn build_dict_distinct_remaps(
             let dict_size =
                 u32::from_le_bytes(cc_ref.data[0..4].try_into().unwrap()) as u64;
             dict_size_sum = dict_size_sum.saturating_add(dict_size);
-            if dict_size_sum > PHASE_D_MAX_GLOBAL_FOR_BITSET as u64 {
+            if dict_size_sum > PHASE_D_MAX_DICT_SIZE_SUM {
                 eligible = false;
                 break;
             }
@@ -8300,54 +8317,144 @@ pub(super) fn build_dict_distinct_remaps(
             continue;
         }
 
-        // Sequential interner build. Hashbrown + ahash for the lookup hot
-        // loop. Owned `String` keys so the entries outlive `header.dict`'s
-        // borrow into the per-segment normalised buffer. The dict_size_sum
-        // gate above guarantees `global_interner.len() <
-        // PHASE_D_MAX_GLOBAL_FOR_BITSET`, so no runtime cap needed.
+        // ---------- Phase 1 (parallel): per-thread local interners ----------
+        struct LocalPrePass {
+            /// `local_entries[local_thread_id]` = entry string. Insertion
+            /// order — preserved so Phase 2's sequential merge is a clean
+            /// linear walk and `thread_to_global[t]` is indexable directly
+            /// by `local_thread_id`.
+            local_entries: Vec<String>,
+            /// `seg_local_remaps[seg_in_chunk][local_dict_id] = local_thread_id`.
+            seg_local_remaps: Vec<Vec<u32>>,
+        }
+
+        let chunk_size = all_segments.len().div_ceil(n_workers).max(1);
+        let local_results: Vec<LocalPrePass> = std::thread::scope(|s| {
+            all_segments
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(move || {
+                        let mut lookup: hashbrown::HashMap<
+                            String,
+                            u32,
+                            BuildHasherDefault<ahash::AHasher>,
+                        > = hashbrown::HashMap::with_hasher(BuildHasherDefault::default());
+                        let mut local_entries: Vec<String> = Vec::new();
+                        let mut seg_local_remaps: Vec<Vec<u32>> =
+                            Vec::with_capacity(chunk.len());
+                        for seg in chunk {
+                            let blob = &seg.compressed_blobs[col_idx];
+                            if blob.is_empty() {
+                                seg_local_remaps.push(Vec::new());
+                                continue;
+                            }
+                            let cc_ref = CompressedColumnRef::from_bytes(blob);
+                            let norm_buf;
+                            let dict_data: &[u8] = if cc_ref.type_tag
+                                == CompressionType::DictionaryLz4
+                            {
+                                norm_buf = dictionary::normalize_lz4(cc_ref.data);
+                                &norm_buf[..]
+                            } else {
+                                cc_ref.data
+                            };
+                            let header = dictionary::parse_header(dict_data);
+                            let mut seg_remap: Vec<u32> =
+                                Vec::with_capacity(header.dict.len());
+                            for &entry in &header.dict {
+                                let local_id = match lookup.get(entry) {
+                                    Some(&id) => id,
+                                    None => {
+                                        let id = local_entries.len() as u32;
+                                        local_entries.push(entry.to_string());
+                                        lookup.insert(entry.to_string(), id);
+                                        id
+                                    }
+                                };
+                                seg_remap.push(local_id);
+                            }
+                            seg_local_remaps.push(seg_remap);
+                        }
+                        LocalPrePass { local_entries, seg_local_remaps }
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        // ---------- Phase 2 (sequential): merge into global interner -------
+        // `thread_to_global[t][local_thread_id] = global_id`.
         let mut global_interner: hashbrown::HashMap<
             String,
             u32,
             BuildHasherDefault<ahash::AHasher>,
         > = hashbrown::HashMap::with_hasher(BuildHasherDefault::default());
-        let mut per_segment: Vec<Vec<u32>> = Vec::with_capacity(all_segments.len());
-
-        for seg in all_segments {
-            let blob = &seg.compressed_blobs[col_idx];
-            if blob.is_empty() {
-                per_segment.push(Vec::new());
-                continue;
-            }
-            let cc_ref = CompressedColumnRef::from_bytes(blob);
-            let norm_buf;
-            let dict_data: &[u8] = if cc_ref.type_tag == CompressionType::DictionaryLz4 {
-                norm_buf = dictionary::normalize_lz4(cc_ref.data);
-                &norm_buf[..]
-            } else {
-                cc_ref.data
-            };
-            let header = dictionary::parse_header(dict_data);
-            let mut local_remap: Vec<u32> = Vec::with_capacity(header.dict.len());
-            for &entry in &header.dict {
+        let mut thread_to_global: Vec<Vec<u32>> =
+            Vec::with_capacity(local_results.len());
+        for local in &local_results {
+            let mut t_remap: Vec<u32> = Vec::with_capacity(local.local_entries.len());
+            for entry in &local.local_entries {
                 let global_id = match global_interner.get(entry) {
                     Some(&id) => id,
                     None => {
                         let id = global_interner.len() as u32;
-                        global_interner.insert(entry.to_string(), id);
+                        global_interner.insert(entry.clone(), id);
                         id
                     }
                 };
-                local_remap.push(global_id);
+                t_remap.push(global_id);
             }
-            per_segment.push(local_remap);
+            thread_to_global.push(t_remap);
         }
 
         let global_count = global_interner.len() as u32;
         if global_count == 0 {
-            // No distinct strings observed — the bitset is degenerate.
-            // HashSet path handles this trivially; skip.
             continue;
         }
+        if global_count > PHASE_D_MAX_GLOBAL_FOR_BITSET {
+            // Post-dedup the column has more unique strings than the
+            // bitset memory budget allows. Drop the pre-pass work and let
+            // workers fall back to HashSet<u128>. Pre-pass effort wasted
+            // for this query, but the sum gate above keeps the wasted
+            // work bounded; in practice this branch only fires on truly
+            // pathological cardinality (>10M unique).
+            continue;
+        }
+
+        // ---------- Phase 3 (parallel): rewrite local IDs to global IDs ----
+        // Each worker takes its slice of `local_results` + its slot in
+        // `thread_to_global`, rewrites `seg_local_remaps` in place. The
+        // resulting `Vec<Vec<u32>>` per chunk is concatenated below into
+        // `per_segment` in the original `all_segments` order — chunks were
+        // contiguous slices in Phase 1, so the order is preserved.
+        let global_chunks: Vec<Vec<Vec<u32>>> = std::thread::scope(|s| {
+            local_results
+                .into_iter()
+                .zip(thread_to_global.iter())
+                .map(|(mut local, t_remap)| {
+                    s.spawn(move || {
+                        for seg_remap in &mut local.seg_local_remaps {
+                            for slot in seg_remap.iter_mut() {
+                                *slot = t_remap[*slot as usize];
+                            }
+                        }
+                        local.seg_local_remaps
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        let mut per_segment: Vec<Vec<u32>> = Vec::with_capacity(all_segments.len());
+        for chunk in global_chunks {
+            per_segment.extend(chunk);
+        }
+        debug_assert_eq!(per_segment.len(), all_segments.len());
+
         remaps.insert(
             spec_idx,
             DictDistinctRemap {

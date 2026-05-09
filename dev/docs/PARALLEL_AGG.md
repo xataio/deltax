@@ -53,7 +53,7 @@ The DSM-merge model from C.2.b–e turned out to be a poor fit for PG's `Gather`
   - [ ] **C.3**: extend `evaluate_batch_quals` (`batch_qual.rs:495`) to return tri-state `BatchEval { AllPass, AllReject, Selective(Bitmap) }`; add `enum SegmentEval { FullMetadata, PerSegmentByGroup, PerRow }` so per-segment metadata (`col_minmax / col_sums / row_count`) can short-circuit decompression for full-segment cases.
   - [ ] **C.4**: gate `add_agg_path` for parallel (`parallel_safe = true, parallel_workers = recommend_agg_workers(...)`). Update `cost::estimate_agg_cost` so the planner picks the parallel variant on large inputs. Add `tests/test_aggregate_pushdown.py` (parametrize over `max_parallel_workers_per_gather ∈ {0, 2, 4, 8}`) for correctness, and an EXPLAIN assertion that DeltaXAgg picks `parallel_workers > 0` on Q3/Q4-shaped queries.
 - [x] **JSON-extract chain eligibility for DeltaXAgg path** (out-of-band — not in the original plan). Without this, the upper-paths classifier rejected JSONB chain Exprs in agg args, GROUP BY, tlist projections, and WHERE quals, so DeltaXAgg never got a path for any json_extract query. Q1 went from 49s (PG `Gather Merge → external sort → GroupAggregate`) to 2.1s warm (`Custom Scan (DeltaXAgg)` direct, internal rayon). Q0 1.1s → 285ms. Phase D is no longer load-bearing for Q1 — see "JSON-extract chain eligibility" section below.
-- [~] Phase D — parallel `COUNT(DISTINCT)` for dictionary-encoded text columns. **Infrastructure landed; high-card extension deferred.** `Bitset`, `DictDistinctRemap`, `build_dict_distinct_remaps`, `CdKind::DictBitset`, and the `process_segments_mixed` insert/merge/finalise switch are all in place + tested. Sequential leader pre-pass with a 250K-string ceiling keeps it dormant on JSONBench Q1 (`x_did` has 3.6M unique values — bypasses the bitset by design); follow-up parallelises the pre-pass + raises the ceiling to actually deliver the Q1 → ~1.6s win. See "Phase D" section below for details.
+- [~] Phase D — parallel `COUNT(DISTINCT)` for dictionary-encoded text columns. **Infrastructure landed (parallel pre-pass shipped); doesn't move JSONBench Q1.** `Bitset`, `DictDistinctRemap`, `build_dict_distinct_remaps` (parallel via two `std::thread::scope` calls + sequential merge), `CdKind::DictBitset`, and the `process_segments_mixed` insert/merge/finalise switch are all in place + tested. **Phase D fundamentally cannot help Q1** — `x_did` has ~25-30K unique values per 30K-row segment, fails the dict-encoder's `cardinality <= rows/2` heuristic, gets stored as `Lz4Blocked` instead of `Dictionary`. Phase D's bitset path requires every relevant segment to be dict-encoded for the column; Q1's eligibility check correctly bails on the first Lz4Blocked segment and falls back to the existing `HashSet<u128>` path. See "Phase D" section below for details.
 - [ ] Phase E — HAVING in the parallel path.
 - [ ] Phase F — EXPLAIN, GUCs, hardening.
 
@@ -157,27 +157,27 @@ Leader's `exec_agg_scan` first call: deserialise all partial states from DSM, ru
 
 **Expected JSONBench impact**: Q3 3.2s → ~0.8s, Q4 3.6s → ~0.8s. Q0/Q2 unaffected.
 
-### Phase D — Parallel COUNT(DISTINCT) for dict-encoded text ✅ INFRASTRUCTURE DONE (sequential pre-pass; high-card extension deferred)
+### Phase D — Parallel COUNT(DISTINCT) for dict-encoded text ✅ INFRASTRUCTURE DONE (doesn't help JSONBench Q1)
 
 **Shipped**:
 - `agg.rs::Bitset` — `Vec<u64>` with `set / or_with / count_ones`. `count_ones` lowers to POPCNT/CNT.
 - `agg.rs::DictDistinctRemap` — leader-built `(global_count, per_segment[seg_idx][local_id] = global_id)` per dict-eligible CountDistinct(text) spec.
-- `agg.rs::build_dict_distinct_remaps` — sequential leader pre-pass. Eligibility gate uses `dict_size_sum > PHASE_D_MAX_GLOBAL_FOR_BITSET (250K)` as a fast upper bound on global cardinality, so high-cardinality columns bail without LZ4-decompressing dict entries.
+- `agg.rs::build_dict_distinct_remaps` — **parallel** leader pre-pass via two `std::thread::scope` calls. Phase 1 (parallel) builds per-thread local interners + per-seg local remaps. Phase 2 (sequential) merges local interners into a global one and produces a `thread_to_global[t][local_thread_id] = global_id` translation table. Phase 3 (parallel) rewrites per-seg remaps to global IDs. Two-stage eligibility: `dict_size_sum > PHASE_D_MAX_DICT_SIZE_SUM (50M)` peeks the 4-byte dict-size header from each blob without LZ4-decompressing — bails fast on UUID-style cols; `global_count > PHASE_D_MAX_GLOBAL_FOR_BITSET (10M)` is checked AFTER the pre-pass to bound bitset memory.
 - `CdEntry { kind: CdKind, ..., bitsets: Vec<Bitset> }` — third variant alongside `Int / Str`. `count(group_idx)` helper dispatches; `union_from` handles bit-OR; `write_counts_to_storage` handles `count_ones`.
 - `text_col.rs::SegTextColumn::dict_local_id(row)` — returns the local dict ID for `Dict`-encoded columns; workers use it (instead of `get_str + hash128_str`) to look up `global_id` and set the bit.
 - `process_segments_mixed` — accepts `chunk_offset`; classifies CountDistinctStr inserts via `config.dict_distinct_remaps.get(&spec_idx)`; falls back to `insert_str` when the spec wasn't pre-built.
 - 4 new tests in `test_meta_agg.py`: low-card text (bitset path), high-card user_id (HashSet fallback), WHERE-filter interaction, NULL-aware semantics. All 220 tests pass.
 
-**JSONBench impact**: zero change. Q1's `x_did` has 3.6M unique values — well past the 250K threshold — so the bitset path is correctly skipped and Q1 stays on the existing HashSet<u128> path at 2.1s warm. ClickBench / RTABench within run-to-run noise. The infrastructure is in place; lifting it onto Q1 needs the high-card extension below.
+**JSONBench impact: zero**. Q1 was the design target, but `x_did` is **Lz4Blocked-encoded**, not dict-encoded — confirmed via the eligibility check on EC2 (comp_byte=6 = Lz4Blocked at segment 0). Per-segment cardinality of `did` is ~25K-30K unique out of 30K rows, which fails the compressor's `cardinality <= rows/2` heuristic at ingest time. Phase D's bitset path requires every relevant segment to be dict-encoded for the column; Q1's eligibility check correctly bails on the first non-dict segment and the path falls back to the existing `HashSet<u128>` route at 2.1s warm.
 
-**Deferred — high-cardinality bitset path**:
+**Where Phase D would actually fire**: any GROUP BY + COUNT(DISTINCT) shape where the DISTINCT column is dict-encoded. `should_use_dictionary` requires per-seg cardinality < 65536 AND ≤ rows/2, so columns with high redundancy (status flags, terminal IDs, product categories, low-cardinality enums). Tested via `test_phase_d_count_distinct_low_card_text`.
 
-The bitset itself works fine for ~3.6M unique strings (~450 KB per group, ~115 MB across 16 groups × 16 workers). The blocker is the **leader pre-pass cost**: walking 27M dict entries through a global `HashMap<String, u32>` is ~1s sequential — a wash with the savings on Q1's 885ms agg+merge. Two follow-up steps to make this useful for Q1:
+**What Q1 actually needs**: the `did` column's count-distinct cost is dominated by Lz4Blocked decompression + per-row hashing, neither of which Phase D addresses. Options for a follow-up that *would* help Q1:
+- **Pre-hash dict-equivalent at compress time**: store a side-table of `Vec<u128>` hashes per Lz4Blocked text column, populated at compression. Per-row work becomes `seg.text_hashes[row]` instead of `hash128_str(get_str(row).as_bytes())`. Saves the hashing step but not the decompression.
+- **Different storage encoding for high-cardinality count-distinct columns**: e.g. compress `did` as a stable hash representation (xxhash3 / fingerprint) rather than the raw string. Per-row work becomes integer compare. Bigger architectural shift; needs a column-level opt-in via `deltax_enable_compression`.
+- **Approximate count-distinct** (HLL): O(1)-state per group; matches ClickHouse's default behaviour but loses exactness.
 
-1. **Parallelise the pre-pass**. Each worker builds a per-thread local `HashMap<String, u32>` over its segment chunk, then a sequential merge step assigns global IDs and rewrites per-segment local→thread-local IDs to global. Mirrors `process_segments_mixed`'s chunking. Estimated: parallel phase ~50ms, sequential merge ~250ms, parallel remap rebuild ~50ms — ~350ms total. With Q1 currently at 885ms agg+merge, switching to bitset (workers ~30ms, merge OR ~15ms) plus the parallel pre-pass nets to ~400ms total → Q1 → ~1.6s.
-2. **Raise `PHASE_D_MAX_GLOBAL_FOR_BITSET`** from 250K to ~10M once the parallel pre-pass lands. The cap-on-eligibility logic stays the same; only the threshold value changes.
-
-(The current 250K threshold is a deliberate "ship infrastructure first" choice — it keeps the sequential pre-pass cost bounded. Tests cover the bitset path on low-card columns; the same code paths fire when the threshold is raised.)
+None of these are "Phase D" any more — call them Phase G if/when prioritised.
 
 Original Phase D plan (archived for reference):
 
