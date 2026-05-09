@@ -1478,6 +1478,8 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     col_type_oid: pg_sys::InvalidOid,
                     expr_kind: AggExpr::Column,
                     const_offset: 0,
+                    is_partial: false,
+                    transtype_oid: pg_sys::InvalidOid,
                 });
                 all_minmax = false;
                 has_non_minmax = true;
@@ -1647,6 +1649,8 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         col_type_oid: effective_col_type_oid,
                         expr_kind,
                         const_offset: agg_const_offset,
+                        is_partial: false,
+                        transtype_oid: pg_sys::InvalidOid,
                     });
                     all_minmax = false;
                     has_non_minmax = true;
@@ -1662,6 +1666,8 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         col_type_oid: effective_col_type_oid,
                         expr_kind,
                         const_offset: agg_const_offset,
+                        is_partial: false,
+                        transtype_oid: pg_sys::InvalidOid,
                     });
                     all_minmax = false;
                     has_non_minmax = true;
@@ -1676,6 +1682,8 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             col_type_oid: effective_col_type_oid,
                             expr_kind,
                             const_offset: agg_const_offset,
+                            is_partial: false,
+                            transtype_oid: pg_sys::InvalidOid,
                         });
                         all_meta_answerable = false;
                     } else {
@@ -1686,6 +1694,8 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             col_type_oid: effective_col_type_oid,
                             expr_kind,
                             const_offset: agg_const_offset,
+                            is_partial: false,
+                            transtype_oid: pg_sys::InvalidOid,
                         });
                         if !count_meta_ok {
                             all_meta_answerable = false;
@@ -1702,6 +1712,8 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         col_type_oid: effective_col_type_oid,
                         expr_kind,
                         const_offset: agg_const_offset,
+                        is_partial: false,
+                        transtype_oid: pg_sys::InvalidOid,
                     });
                     if has_non_minmax {
                         // Mixed MIN/MAX with SUM/COUNT/AVG → falls through to general AggScan
@@ -1722,6 +1734,8 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         col_type_oid: effective_col_type_oid,
                         expr_kind,
                         const_offset: agg_const_offset,
+                        is_partial: false,
+                        transtype_oid: pg_sys::InvalidOid,
                     });
                     if has_non_minmax {
                         all_minmax = false;

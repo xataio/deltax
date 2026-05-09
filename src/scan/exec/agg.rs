@@ -179,6 +179,20 @@ pub(crate) struct AggExecSpec {
     pub(crate) col_type_oid: pg_sys::Oid,  // source column type
     pub(crate) expr_kind: AggExpr,         // Column, LengthOf, or AddConst
     pub(crate) const_offset: i64,          // Only used when expr_kind == AddConst
+    /// Phase C.2 activation: when true, exec emits PG's partial-aggregate
+    /// transition state (see `transtype_oid`) instead of the final value;
+    /// a Final Aggregate node above DeltaXAgg combines partials via the
+    /// aggregate's combinefn. Wired by C.2.f's planner construction.
+    /// Default false → existing complete-aggregate behaviour.
+    #[allow(dead_code)] // wired by C.2 activation in path.rs
+    pub(crate) is_partial: bool,
+    /// Aggregate's `aggtranstype` from `pg_aggregate.dat` — only meaningful
+    /// when `is_partial = true`. For COUNT/SUM(int4) this is INT8;
+    /// for SUM(int8) / AVG it's INTERNAL (serialized via aggserialfn);
+    /// for MIN/MAX it's the column type. `InvalidOid` when `is_partial =
+    /// false`.
+    #[allow(dead_code)] // wired by C.2 activation in path.rs
+    pub(crate) transtype_oid: pg_sys::Oid,
 }
 
 // SAFETY: AggExecSpec contains only value types (i32, i64, Oid=u32, enums).
@@ -1063,6 +1077,8 @@ unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan 
                 col_type_oid: pg_sys::Oid::from(col_type_oid),
                 expr_kind,
                 const_offset,
+                is_partial: false,
+                transtype_oid: pg_sys::InvalidOid,
             });
         }
     }
@@ -10806,6 +10822,8 @@ mod tests {
             col_type_oid: pg_sys::Oid::from(col_type_oid),
             expr_kind: AggExpr::Column,
             const_offset: 0,
+            is_partial: false,
+            transtype_oid: pg_sys::InvalidOid,
         }
     }
 

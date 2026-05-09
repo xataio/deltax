@@ -920,6 +920,16 @@ pub struct AggSpec {
     pub col_type_oid: pg_sys::Oid,  // source column type OID
     pub expr_kind: super::exec::AggExpr,  // Column, LengthOf, or AddConst
     pub const_offset: i64,          // Only used when expr_kind == AddConst
+    /// Phase C.2 activation: when true, the partial CustomPath is being
+    /// built and this spec emits per-PG `aggtranstype` partial state values
+    /// (combined upstream by a Final Aggregate node). Default false →
+    /// existing complete-aggregate path.
+    #[allow(dead_code)] // wired by C.2 activation in path.rs
+    pub is_partial: bool,
+    /// Aggregate's `aggtranstype` from `pg_aggregate.dat`. Only meaningful
+    /// when `is_partial = true`.
+    #[allow(dead_code)] // wired by C.2 activation in path.rs
+    pub transtype_oid: pg_sys::Oid,
 }
 
 /// Serialize a CaseWhenValue into the integer list.

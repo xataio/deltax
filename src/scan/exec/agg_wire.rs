@@ -480,6 +480,8 @@ mod tests {
             col_type_oid: pg_sys::INT8OID,
             expr_kind: AggExpr::Column,
             const_offset: 0,
+            is_partial: false,
+            transtype_oid: pg_sys::InvalidOid,
         }]
     }
 
@@ -491,6 +493,8 @@ mod tests {
                 col_type_oid: pg_sys::INT4OID,
                 expr_kind: AggExpr::Column,
                 const_offset: 0,
+                is_partial: false,
+                transtype_oid: pg_sys::InvalidOid,
             },
             AggExecSpec {
                 agg_type: AggType::CountStar,
@@ -498,6 +502,8 @@ mod tests {
                 col_type_oid: pg_sys::INT8OID,
                 expr_kind: AggExpr::Column,
                 const_offset: 0,
+                is_partial: false,
+                transtype_oid: pg_sys::InvalidOid,
             },
         ]
     }
@@ -509,6 +515,8 @@ mod tests {
             col_type_oid: pg_sys::TEXTOID,
             expr_kind: AggExpr::Column,
             const_offset: 0,
+            is_partial: false,
+            transtype_oid: pg_sys::InvalidOid,
         }]
     }
 
