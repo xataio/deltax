@@ -83,6 +83,8 @@ pub(crate) struct DecompressState {
     topn_limit: usize,
     /// Sort ascending (true) or descending (false) for Top-N.
     topn_ascending: bool,
+    /// Whether NULL sort keys come before normal values.
+    topn_nulls_first: bool,
     /// Whether ORDER BY has multiple columns (first is time, rest handled by PG Sort).
     topn_multi_col_sort: bool,
     /// Sort column index (0-based into col_names) for Top-N.
@@ -331,6 +333,7 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
         let mut found_sentinel = false;
         let mut topn_limit: i64 = 0;
         let mut topn_ascending: bool = true;
+        let mut topn_nulls_first: bool = false;
         let mut topn_multi_col_sort: bool = false;
         let mut topn_sort_col_attno: i32 = 0;
         for i in 1..list_len {
@@ -340,7 +343,8 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
                 continue;
             }
             if val == -2 && found_sentinel {
-                // Top-N sentinel: next values are effective_limit, sort_ascending, multi_col_sort, sort_col_attno
+                // Top-N sentinel: next values are effective_limit, sort_ascending,
+                // multi_col_sort, sort_col_attno, nulls_first
                 if i + 2 < list_len {
                     topn_limit = pg_sys::list_nth_int(custom_private, i + 1) as i64;
                     topn_ascending = pg_sys::list_nth_int(custom_private, i + 2) != 0;
@@ -350,6 +354,9 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
                 }
                 if i + 4 < list_len {
                     topn_sort_col_attno = pg_sys::list_nth_int(custom_private, i + 4);
+                }
+                if i + 5 < list_len {
+                    topn_nulls_first = pg_sys::list_nth_int(custom_private, i + 5) != 0;
                 }
                 break;
             }
@@ -385,6 +392,7 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
         // Set Top-N fields
         state.topn_limit = if topn_limit > 0 { topn_limit as usize } else { 0 };
         state.topn_ascending = topn_ascending;
+        state.topn_nulls_first = topn_nulls_first;
         state.topn_multi_col_sort = topn_multi_col_sort;
         state.timing.topn_limit = if topn_limit > 0 { topn_limit as u64 } else { 0 };
         if topn_limit > 0 && topn_sort_col_attno > 0 {
@@ -494,6 +502,7 @@ fn make_worker_stub_state() -> DecompressState {
         selection_vector: Vec::new(),
         topn_limit: 0,
         topn_ascending: true,
+        topn_nulls_first: false,
         topn_multi_col_sort: false,
         topn_sort_col: None,
         topn_buffer: Vec::new(),
@@ -540,6 +549,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         let mut found_sentinel = false;
         let mut topn_limit: i64 = 0;
         let mut topn_ascending: bool = true;
+        let mut topn_nulls_first: bool = false;
         let mut topn_multi_col_sort: bool = false;
         let mut topn_sort_col_attno: i32 = 0;
         for i in 0..list_len {
@@ -549,7 +559,8 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
                 continue;
             }
             if val == -2 && found_sentinel {
-                // Top-N sentinel: next values are effective_limit, sort_ascending, multi_col_sort, sort_col_attno
+                // Top-N sentinel: next values are effective_limit, sort_ascending,
+                // multi_col_sort, sort_col_attno, nulls_first
                 if i + 2 < list_len {
                     topn_limit = pg_sys::list_nth_int(custom_private, i + 1) as i64;
                     topn_ascending = pg_sys::list_nth_int(custom_private, i + 2) != 0;
@@ -559,6 +570,9 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
                 }
                 if i + 4 < list_len {
                     topn_sort_col_attno = pg_sys::list_nth_int(custom_private, i + 4);
+                }
+                if i + 5 < list_len {
+                    topn_nulls_first = pg_sys::list_nth_int(custom_private, i + 5) != 0;
                 }
                 break;
             }
@@ -760,6 +774,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             selection_vector: Vec::new(),
             topn_limit: if topn_limit > 0 { topn_limit as usize } else { 0 },
             topn_ascending,
+            topn_nulls_first,
             topn_multi_col_sort,
             topn_sort_col,
             topn_buffer: Vec::new(),
@@ -931,6 +946,7 @@ fn load_decompress_state(
         selection_vector: Vec::new(),
         topn_limit: 0,
         topn_ascending: true,
+        topn_nulls_first: false,
         topn_multi_col_sort: false,
         topn_sort_col: None,
         topn_buffer: Vec::new(),
@@ -975,9 +991,52 @@ struct TopNCandidate {
     segment_idx: usize,
     row_idx: usize,
     sort_key: i64,
+    sort_is_null: bool,
     /// Datums for Phase 1 columns (filter + sort), keyed by col_idx.
     /// Stored so Phase 2 can skip re-decompressing these columns.
     phase1_datums: Vec<(usize, pg_sys::Datum, bool)>,
+}
+
+fn cmp_topn_key(
+    a_key: i64,
+    a_is_null: bool,
+    b_key: i64,
+    b_is_null: bool,
+    ascending: bool,
+    nulls_first: bool,
+) -> std::cmp::Ordering {
+    match (a_is_null, b_is_null) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => {
+            if nulls_first { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater }
+        }
+        (false, true) => {
+            if nulls_first { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less }
+        }
+        (false, false) => {
+            if ascending {
+                a_key.cmp(&b_key)
+            } else {
+                b_key.cmp(&a_key)
+            }
+        }
+    }
+}
+
+fn cmp_topn_candidate(
+    a: &TopNCandidate,
+    b: &TopNCandidate,
+    ascending: bool,
+    nulls_first: bool,
+) -> std::cmp::Ordering {
+    cmp_topn_key(
+        a.sort_key,
+        a.sort_is_null,
+        b.sort_key,
+        b.sort_is_null,
+        ascending,
+        nulls_first,
+    )
 }
 
 /// Execute the two-pass Top-N optimization.
@@ -1444,19 +1503,16 @@ unsafe fn exec_topn_two_pass(
                     continue;
                 }
                 let (datum, is_null) = sort_datums[row_idx];
-                if is_null {
-                    continue;
-                }
-                let sort_key = datum.value() as i64;
+                let sort_key = if is_null { 0 } else { datum.value() as i64 };
 
                 // Row-level early exit (ASC only): rows are ascending, so once
                 // we see a row beyond the threshold, all subsequent rows are too.
-                if can_row_early_exit && sort_key > row_threshold {
+                if !is_null && can_row_early_exit && sort_key > row_threshold {
                     break;
                 }
                 // Row-level skip (DESC): skip rows below threshold (they can't
                 // be in the top-N), but don't break — later rows may be above.
-                if can_row_skip_desc && sort_key < row_threshold {
+                if !is_null && can_row_skip_desc && sort_key < row_threshold {
                     continue;
                 }
 
@@ -1490,6 +1546,7 @@ unsafe fn exec_topn_two_pass(
                     segment_idx: seg_idx,
                     row_idx,
                     sort_key,
+                    sort_is_null: is_null,
                     phase1_datums: p1_datums,
                 });
             }
@@ -1498,13 +1555,10 @@ unsafe fn exec_topn_two_pass(
             if candidates.len() >= effective_limit {
                 // Partial sort to find the N-th element (0-indexed: effective_limit - 1)
                 let n = effective_limit - 1;
-                if state.topn_ascending {
-                    candidates.select_nth_unstable_by_key(n, |c| c.sort_key);
-                    topn_threshold = Some(candidates[n].sort_key);
-                } else {
-                    candidates.select_nth_unstable_by_key(n, |c| std::cmp::Reverse(c.sort_key));
-                    topn_threshold = Some(candidates[n].sort_key);
-                }
+                candidates.select_nth_unstable_by(n, |a, b| {
+                    cmp_topn_candidate(a, b, state.topn_ascending, state.topn_nulls_first)
+                });
+                topn_threshold = Some(candidates[n].sort_key);
                 // Note: we intentionally do NOT truncate candidates here.
                 // select_nth_unstable_by_key partitions but doesn't fully sort,
                 // and truncating could drop valid tie candidates needed later.
@@ -1526,11 +1580,9 @@ unsafe fn exec_topn_two_pass(
         }
 
         // === Sort and truncate to top-N ===
-        if state.topn_ascending {
-            candidates.sort_by_key(|c| c.sort_key);
-        } else {
-            candidates.sort_by_key(|c| std::cmp::Reverse(c.sort_key));
-        }
+        candidates.sort_by(|a, b| {
+            cmp_topn_candidate(a, b, state.topn_ascending, state.topn_nulls_first)
+        });
         if state.topn_multi_col_sort {
             // Multi-column ORDER BY: keep all candidates whose time key could appear
             // in the final top-N. Find the threshold at position effective_limit-1,
@@ -1538,11 +1590,17 @@ unsafe fn exec_topn_two_pass(
             // since ties on the time column need secondary sort by PG's Sort node.
             let threshold_idx = std::cmp::min(effective_limit - 1, candidates.len() - 1);
             let threshold_key = candidates[threshold_idx].sort_key;
-            if state.topn_ascending {
-                candidates.retain(|c| c.sort_key <= threshold_key);
-            } else {
-                candidates.retain(|c| c.sort_key >= threshold_key);
-            }
+            let threshold_is_null = candidates[threshold_idx].sort_is_null;
+            candidates.retain(|c| {
+                cmp_topn_key(
+                    c.sort_key,
+                    c.sort_is_null,
+                    threshold_key,
+                    threshold_is_null,
+                    state.topn_ascending,
+                    state.topn_nulls_first,
+                ) != std::cmp::Ordering::Greater
+            });
         } else {
             candidates.truncate(effective_limit);
         }
@@ -1561,6 +1619,7 @@ unsafe fn exec_topn_two_pass(
 
         struct RowData {
             sort_key: i64,
+            sort_is_null: bool,
             datums: Vec<(pg_sys::Datum, bool)>,
         }
         let mut result_rows: Vec<RowData> = Vec::with_capacity(effective_limit);
@@ -1686,17 +1745,26 @@ unsafe fn exec_topn_two_pass(
                     row_datums[ci] = (d, isnull);
                 }
 
-                result_rows.push(RowData { sort_key: candidate.sort_key, datums: row_datums });
+                result_rows.push(RowData {
+                    sort_key: candidate.sort_key,
+                    sort_is_null: candidate.sort_is_null,
+                    datums: row_datums,
+                });
             }
         }
 
         // Sort result_rows by sort key (skip for multi-column: PG's Sort handles it)
         if !state.topn_multi_col_sort {
-            if state.topn_ascending {
-                result_rows.sort_by_key(|r| r.sort_key);
-            } else {
-                result_rows.sort_by_key(|r| std::cmp::Reverse(r.sort_key));
-            }
+            result_rows.sort_by(|a, b| {
+                cmp_topn_key(
+                    a.sort_key,
+                    a.sort_is_null,
+                    b.sort_key,
+                    b.sort_is_null,
+                    state.topn_ascending,
+                    state.topn_nulls_first,
+                )
+            });
         }
 
         // Store in topn_buffer

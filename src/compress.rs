@@ -2048,31 +2048,46 @@ pub(crate) fn compress_typed_column(data: &TypedColumn, data_type: &str) -> Vec<
     }
 }
 
-/// Encode f64 to i64 in an order-preserving way.
-/// Positive floats map to positive i64s, negatives to negative i64s, preserving order.
+/// Encode f64 to i64 in a way that preserves numeric order under signed i64
+/// comparison. This is used by colstats min/max pruning.
 pub(crate) fn encode_f64_to_i64(v: f64) -> i64 {
-    let bits = v.to_bits() as i64;
-    if bits >= 0 { bits ^ i64::MIN } else { !bits }
+    const SIGN: u64 = 1u64 << 63;
+    let bits = v.to_bits();
+    let unsigned_key = if bits & SIGN != 0 { !bits } else { bits ^ SIGN };
+    (unsigned_key ^ SIGN) as i64
 }
 
 /// Decode order-preserving i64 back to f64.
 pub(crate) fn decode_i64_to_f64(enc: i64) -> f64 {
-    let bits = if enc >= 0 { !enc } else { enc ^ i64::MIN };
-    f64::from_bits(bits as u64)
+    const SIGN: u64 = 1u64 << 63;
+    let unsigned_key = (enc as u64) ^ SIGN;
+    let bits = if unsigned_key & SIGN != 0 {
+        unsigned_key ^ SIGN
+    } else {
+        !unsigned_key
+    };
+    f64::from_bits(bits)
 }
 
-/// Encode f32 to i64 in an order-preserving way (via 32-bit transform, then sign-extend).
+/// Encode f32 to i64 in a way that preserves numeric order under signed i64
+/// comparison (via 32-bit transform, then sign-extend).
 pub(crate) fn encode_f32_to_i64(v: f32) -> i64 {
-    let bits = v.to_bits() as i32;
-    let i32_enc = if bits >= 0 { bits ^ i32::MIN } else { !bits };
-    i32_enc as i64
+    const SIGN: u32 = 1u32 << 31;
+    let bits = v.to_bits();
+    let unsigned_key = if bits & SIGN != 0 { !bits } else { bits ^ SIGN };
+    ((unsigned_key ^ SIGN) as i32) as i64
 }
 
 /// Decode order-preserving i64 back to f32.
 pub(crate) fn decode_i64_to_f32(enc: i64) -> f32 {
-    let i32_enc = enc as i32;
-    let bits = if i32_enc >= 0 { !i32_enc } else { i32_enc ^ i32::MIN };
-    f32::from_bits(bits as u32)
+    const SIGN: u32 = 1u32 << 31;
+    let unsigned_key = ((enc as i32) as u32) ^ SIGN;
+    let bits = if unsigned_key & SIGN != 0 {
+        unsigned_key ^ SIGN
+    } else {
+        !unsigned_key
+    };
+    f32::from_bits(bits)
 }
 
 /// Compute min/max encoded as order-preserving i64, for use in normalized colstats table.
@@ -3195,5 +3210,55 @@ mod tests {
         let tail = i16_col.split_off(1);
         assert_eq!(i16_col, TypedColumn::Int16(vec![Some(1)]));
         assert_eq!(tail, TypedColumn::Int16(vec![Some(2)]));
+    }
+
+    #[test]
+    fn test_float64_minmax_encoding_preserves_signed_order() {
+        let values = [
+            f64::NEG_INFINITY,
+            -100.0,
+            -2.5,
+            -0.0,
+            0.0,
+            3.25,
+            100.0,
+            f64::INFINITY,
+        ];
+        for pair in values.windows(2) {
+            assert!(
+                encode_f64_to_i64(pair[0]) < encode_f64_to_i64(pair[1]),
+                "{} should encode below {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for value in values {
+            assert_eq!(decode_i64_to_f64(encode_f64_to_i64(value)).to_bits(), value.to_bits());
+        }
+    }
+
+    #[test]
+    fn test_float32_minmax_encoding_preserves_signed_order() {
+        let values = [
+            f32::NEG_INFINITY,
+            -100.0,
+            -2.5,
+            -0.0,
+            0.0,
+            3.25,
+            100.0,
+            f32::INFINITY,
+        ];
+        for pair in values.windows(2) {
+            assert!(
+                encode_f32_to_i64(pair[0]) < encode_f32_to_i64(pair[1]),
+                "{} should encode below {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        for value in values {
+            assert_eq!(decode_i64_to_f32(encode_f32_to_i64(value)).to_bits(), value.to_bits());
+        }
     }
 }
