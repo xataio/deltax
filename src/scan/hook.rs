@@ -2149,7 +2149,11 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         }
                     }
                     pg_sys::NodeTag::T_ScalarArrayOpExpr => {
-                        // col IN (...) / col = ANY(ARRAY[...])
+                        // col IN (...) / col = ANY(ARRAY[...]). Accepts plain
+                        // Var or json_extract chain on the LHS; runtime
+                        // (`extract_batch_quals` + per-segment text dispatch
+                        // in `decompress.rs`) handles both numeric and text
+                        // IN lists, so the planner gate matches.
                         let saop = qn as *const pg_sys::ScalarArrayOpExpr;
                         if !(*saop).useOr {
                             return; // ALL semantics not supported
@@ -2164,9 +2168,6 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             return;
                         }
                         let sa_a0 = unwrap_relabel(sa_arg0);
-                        if (*sa_a0).type_ != pg_sys::NodeTag::T_Var {
-                            return;
-                        }
                         if (*sa_arg1).type_ != pg_sys::NodeTag::T_Const {
                             return;
                         }
@@ -2174,14 +2175,25 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         if (*sa_const).constisnull {
                             return;
                         }
-                        let sa_var = sa_a0 as *const pg_sys::Var;
-                        let sa_type_oid = (*sa_var).vartype;
+                        if json_extract_ctx.is_none() {
+                            json_extract_ctx = Some(super::json_extract::AggChainCtx::from_root(root));
+                        }
+                        let sa_type_oid = if (*sa_a0).type_ == pg_sys::NodeTag::T_Var {
+                            (*(sa_a0 as *const pg_sys::Var)).vartype
+                        } else if let Some(Some(ctx)) = json_extract_ctx.as_ref()
+                            && let Some((_idx, ty)) = ctx.match_to_synthetic(sa_a0)
+                        {
+                            ty
+                        } else {
+                            return;
+                        };
                         if !matches!(
                             sa_type_oid,
                             pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
                             | pg_sys::DATEOID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID
+                            | pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID
                         ) {
-                            return; // only numeric/date/timestamp IN lists
+                            return;
                         }
                     }
                     _ => {

@@ -883,6 +883,163 @@ pub(super) unsafe fn decompress_text_blob_with_eq_filter(
     }
 }
 
+/// Decompress a text column blob with `IN (...)` filtering pushed into decompression.
+///
+/// Same shape as `decompress_text_blob_with_eq_filter` but matches against a
+/// set of constant strings (PG `Var = ANY (ARRAY[...])` / `Var IN (...)`).
+/// For dictionary-compressed data, the set probe runs once per dict entry,
+/// not per row — O(dict_size) hashes vs O(row_count).
+///
+/// `is_not_in = true` flips to `NOT IN (...)`. Empty `const_strs` returns
+/// the all-false (or all-true if `is_not_in`) selection without decompressing.
+pub(super) unsafe fn decompress_text_blob_with_in_filter(
+    blob: &[u8],
+    type_oid: pg_sys::Oid,
+    typmod: i32,
+    const_strs: &[String],
+    is_not_in: bool,
+    max_rows: Option<usize>,
+) -> (Vec<(pg_sys::Datum, bool)>, Vec<bool>) {
+    if blob.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let cc = CompressedColumnRef::from_bytes(blob);
+    let total_count = match max_rows {
+        Some(mr) => mr.min(cc.row_count as usize),
+        None => cc.row_count as usize,
+    };
+    let non_null_count = count_non_null(cc.null_bitmap, total_count);
+
+    let const_set: std::collections::HashSet<&str> =
+        const_strs.iter().map(|s| s.as_str()).collect();
+    let matches_in = |text: &str| -> bool {
+        let hit = const_set.contains(text);
+        if is_not_in { !hit } else { hit }
+    };
+
+    let (nn_datums, nn_sel): (Vec<pg_sys::Datum>, Vec<bool>) = match cc.type_tag {
+        CompressionType::Dictionary | CompressionType::DictionaryLz4 => {
+            let norm_buf;
+            let dict_data = if cc.type_tag == CompressionType::DictionaryLz4 {
+                norm_buf = compression::dictionary::normalize_lz4(cc.data);
+                &norm_buf
+            } else {
+                cc.data
+            };
+            let hdr = compression::dictionary::parse_header(dict_data);
+
+            let dict_matches: Vec<bool> = hdr.dict.iter().map(|s| matches_in(s)).collect();
+
+            let mut indices = Vec::with_capacity(non_null_count);
+            for i in 0..non_null_count {
+                indices.push(compression::dictionary::read_index(
+                    dict_data,
+                    hdr.indices_start,
+                    hdr.index_width,
+                    i,
+                ));
+            }
+
+            let sel: Vec<bool> = indices.iter().map(|&idx| dict_matches[idx as usize]).collect();
+            let matched_slices: Vec<&str> = indices
+                .iter()
+                .zip(sel.iter())
+                .filter(|&(_, &pass)| pass)
+                .map(|(&idx, _)| hdr.dict[idx as usize])
+                .collect();
+            let matched_datums = unsafe {
+                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
+            };
+
+            let mut datums = Vec::with_capacity(non_null_count);
+            let mut match_idx = 0;
+            for &pass in &sel {
+                if pass {
+                    datums.push(matched_datums[match_idx]);
+                    match_idx += 1;
+                } else {
+                    datums.push(pg_sys::Datum::from(0));
+                }
+            }
+            (datums, sel)
+        }
+        CompressionType::Lz4 | CompressionType::Lz4Blocked => {
+            let (buf, ranges) = if cc.type_tag == CompressionType::Lz4 {
+                compression::lz4::decode_to_ranges(cc.data, non_null_count)
+            } else {
+                compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None)
+            };
+
+            let slices: Vec<&str> = ranges
+                .iter()
+                .map(|&(off, len)| {
+                    std::str::from_utf8(&buf[off..off + len])
+                        .expect("invalid UTF-8 in LZ4 data")
+                })
+                .collect();
+            let sel: Vec<bool> = slices.iter().map(|s| matches_in(s)).collect();
+
+            let matched_slices: Vec<&str> = slices
+                .iter()
+                .zip(sel.iter())
+                .filter(|&(_, &pass)| pass)
+                .map(|(&s, _)| s)
+                .collect();
+            let matched_datums = unsafe {
+                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
+            };
+
+            let mut datums = Vec::with_capacity(non_null_count);
+            let mut match_idx = 0;
+            for &pass in &sel {
+                if pass {
+                    datums.push(matched_datums[match_idx]);
+                    match_idx += 1;
+                } else {
+                    datums.push(pg_sys::Datum::from(0));
+                }
+            }
+            (datums, sel)
+        }
+        _ => {
+            return {
+                let full = unsafe { decompress_blob_to_datums(
+                    blob,
+                    &pg_type_name(type_oid),
+                    type_oid,
+                    typmod,
+                ) };
+                let sel = vec![true; full.len()];
+                (full, sel)
+            };
+        }
+    };
+
+    let null_bitmap = cc.null_bitmap;
+    if null_bitmap.is_empty() {
+        let datums: Vec<(pg_sys::Datum, bool)> =
+            nn_datums.into_iter().map(|d| (d, false)).collect();
+        (datums, nn_sel)
+    } else {
+        let mut datums = Vec::with_capacity(total_count);
+        let mut sel = Vec::with_capacity(total_count);
+        let mut val_idx = 0;
+        for i in 0..total_count {
+            let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            if is_null {
+                datums.push((pg_sys::Datum::from(0), true));
+                sel.push(false);
+            } else {
+                datums.push((nn_datums[val_idx], false));
+                sel.push(nn_sel[val_idx]);
+                val_idx += 1;
+            }
+        }
+        (datums, sel)
+    }
+}
+
 /// Decompress a text column blob to int4 lengths without varlena allocation.
 ///
 /// For Dictionary: compute length of each dict entry once, map indices to lengths.

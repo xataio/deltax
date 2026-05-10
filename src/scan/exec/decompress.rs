@@ -12,6 +12,7 @@ use super::batch_qual::{BatchQual, BatchCompareOp, evaluate_batch_quals, extract
 use super::datum_utils::{
     decompress_blob_to_datums, decompress_blob_to_datums_truncated,
     decompress_text_blob_with_like_filter, decompress_text_blob_with_eq_filter,
+    decompress_text_blob_with_in_filter,
     decompress_text_blob_with_selection, decompress_jsonb_blob_with_selection,
     string_to_datum, pg_type_name,
     exec_project, exec_qual,
@@ -1317,6 +1318,11 @@ unsafe fn exec_topn_two_pass(
                             && bq.text_const.is_some()
                             && matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne)
                     });
+                    let text_in_qual = state.batch_quals.iter().find(|bq| {
+                        bq.col_idx == col_idx
+                            && bq.in_list_text.is_some()
+                            && bq.op == BatchCompareOp::InList
+                    });
                     let has_any_batch_qual = state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
 
                     if let Some(bq) = like_qual {
@@ -1344,6 +1350,19 @@ unsafe fn exec_topn_two_pass(
                         } else {
                             for (ps, es) in pre_selection.iter_mut().zip(eq_sel.iter()) {
                                 *ps = *ps && *es;
+                            }
+                        }
+                    } else if let Some(bq) = text_in_qual {
+                        let strs = bq.in_list_text.as_ref().unwrap();
+                        let (datums, in_sel) = decompress_text_blob_with_in_filter(
+                            blob, type_oid, typmod, strs, /* is_not_in */ false, cutoff_row,
+                        );
+                        decompressed.push(datums);
+                        if pre_selection.is_empty() {
+                            pre_selection = in_sel;
+                        } else {
+                            for (ps, is_) in pre_selection.iter_mut().zip(in_sel.iter()) {
+                                *ps = *ps && *is_;
                             }
                         }
                     } else if has_any_batch_qual {
@@ -2456,6 +2475,11 @@ unsafe fn exec_topn_text_sequential(
                             && bq.text_const.is_some()
                             && matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne)
                     });
+                    let text_in_qual = state.batch_quals.iter().find(|bq| {
+                        bq.col_idx == col_idx
+                            && bq.in_list_text.is_some()
+                            && bq.op == BatchCompareOp::InList
+                    });
                     let has_any_batch_qual = state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
 
                     if let Some(bq) = like_qual {
@@ -2483,6 +2507,19 @@ unsafe fn exec_topn_text_sequential(
                         } else {
                             for (ps, es) in pre_selection.iter_mut().zip(eq_sel.iter()) {
                                 *ps = *ps && *es;
+                            }
+                        }
+                    } else if let Some(bq) = text_in_qual {
+                        let strs = bq.in_list_text.as_ref().unwrap();
+                        let (datums, in_sel) = decompress_text_blob_with_in_filter(
+                            blob, type_oid, typmod, strs, /* is_not_in */ false, None,
+                        );
+                        decompressed.push(datums);
+                        if pre_selection.is_empty() {
+                            pre_selection = in_sel;
+                        } else {
+                            for (ps, is_) in pre_selection.iter_mut().zip(in_sel.iter()) {
+                                *ps = *ps && *is_;
                             }
                         }
                     } else if has_any_batch_qual || col_idx == sort_col {
@@ -3156,6 +3193,11 @@ unsafe fn load_next_segment(
                             && bq.text_const.is_some()
                             && matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne)
                     });
+                    let text_in_qual = state.batch_quals.iter().find(|bq| {
+                        bq.col_idx == col_idx
+                            && bq.in_list_text.is_some()
+                            && bq.op == BatchCompareOp::InList
+                    });
                     let has_any_batch_qual = state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
 
                     if let Some(bq) = like_qual {
@@ -3184,6 +3226,19 @@ unsafe fn load_next_segment(
                         } else {
                             for (ps, es) in pre_selection.iter_mut().zip(eq_sel.iter()) {
                                 *ps = *ps && *es;
+                            }
+                        }
+                    } else if let Some(bq) = text_in_qual {
+                        let strs = bq.in_list_text.as_ref().unwrap();
+                        let (datums, in_sel) = decompress_text_blob_with_in_filter(
+                            blob, type_oid, typmod, strs, /* is_not_in */ false, None,
+                        );
+                        decompressed.push(datums);
+                        if pre_selection.is_empty() {
+                            pre_selection = in_sel;
+                        } else {
+                            for (ps, is_) in pre_selection.iter_mut().zip(in_sel.iter()) {
+                                *ps = *ps && *is_;
                             }
                         }
                     } else if has_any_batch_qual {

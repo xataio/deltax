@@ -20,7 +20,8 @@ use super::batch_qual::{BatchCompareOp, BatchQual,
 use super::datum_utils::{
     decompress_blob_to_datums, decompress_text_blob_to_raw_strings,
     decompress_text_blob_to_lengths, decompress_text_blob_with_like_filter,
-    decompress_text_blob_with_eq_filter, string_to_datum, pg_type_name,
+    decompress_text_blob_with_eq_filter, decompress_text_blob_with_in_filter,
+    string_to_datum, pg_type_name,
     count_non_null, collation_strcmp,
 };
 use super::segments::{
@@ -6261,6 +6262,11 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                 && bq.text_const.is_some()
                                 && matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne)
                         });
+                        let text_in_qual = batch_quals.iter().find(|bq| {
+                            bq.col_idx == col_idx
+                                && bq.in_list_text.is_some()
+                                && bq.op == BatchCompareOp::InList
+                        });
 
                         if let Some(bq) = like_qual {
                             let strat = bq.like_strategy.as_ref().unwrap();
@@ -6287,6 +6293,19 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                             } else {
                                 for (ps, es) in pre_selection.iter_mut().zip(eq_sel.iter()) {
                                     *ps = *ps && *es;
+                                }
+                            }
+                        } else if let Some(bq) = text_in_qual {
+                            let strs = bq.in_list_text.as_ref().unwrap();
+                            let (datums, in_sel) = decompress_text_blob_with_in_filter(
+                                blob, type_oid, typmod, strs, /* is_not_in */ false, None,
+                            );
+                            decompressed.push(datums);
+                            if pre_selection.is_empty() {
+                                pre_selection = in_sel;
+                            } else {
+                                for (ps, is_) in pre_selection.iter_mut().zip(in_sel.iter()) {
+                                    *ps = *ps && *is_;
                                 }
                             }
                         } else {

@@ -1860,7 +1860,27 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
                     }).unwrap_or(0) as i32;
                     output_map.push((1, group_idx));
                 } else if (*expr).type_ == pg_sys::NodeTag::T_OpExpr {
-                    // OpExpr in target list (e.g. col - 1) — find matching GROUP BY AddConst spec
+                    // OpExpr in target list. Three cases handled below:
+                    //   1. JSONB chain (`data->>'k'`) — match to a synthetic
+                    //      column GROUP BY entry via AggChainCtx.
+                    //   2. `Var ± Const` — match to AddConst GROUP BY.
+                    //   3. fall through to a default that points at group_specs[0].
+                    // Try chain first because chain Exprs are also OpExpr nodes;
+                    // without this, a `data->>'k'` target falls through to the
+                    // AddConst path, finds no Const arg, and emits a bogus
+                    // `Group(0)` mapping that crashes finalization when there
+                    // are multiple GROUP BY columns.
+                    let chain_match = super::json_extract::AggChainCtx::from_root(root)
+                        .and_then(|ctx| ctx.match_to_synthetic(expr))
+                        .map(|(synth_col_idx, _)| synth_col_idx);
+                    if let Some(synth_col_idx) = chain_match {
+                        let group_idx = parsed_groups.iter().position(|g| {
+                            g.col_idx == synth_col_idx
+                                && matches!(g.expr, ParsedGroupExpr::Column)
+                        }).unwrap_or(0) as i32;
+                        output_map.push((1, group_idx));
+                        continue;
+                    }
                     let opexpr = expr as *const pg_sys::OpExpr;
                     let op_oid = u32::from((*opexpr).opno);
                     let op_args = (*opexpr).args;

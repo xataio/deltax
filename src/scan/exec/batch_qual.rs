@@ -31,6 +31,7 @@ pub(super) struct BatchQual {
     pub(super) like_strategy: Option<LikeStrategy>, // pre-compiled LIKE pattern
     pub(super) text_const: Option<String>,          // text constant for Eq/Ne pushdown
     pub(super) in_list_i64: Option<Vec<i64>>,       // constant values for IN list (stored as i64)
+    pub(super) in_list_text: Option<Vec<String>>,   // constant values for text IN list
 }
 
 // SAFETY: BatchQual is shared across threads only via immutable references
@@ -531,6 +532,7 @@ pub(super) unsafe fn extract_batch_quals(
                             like_strategy: None,
                             text_const: None,
                             in_list_i64: None,
+                            in_list_text: None,
                         });
                     }
                 }
@@ -558,6 +560,7 @@ pub(super) unsafe fn extract_batch_quals(
                                         like_strategy: None,
                                         text_const: None,
                                         in_list_i64: None,
+                                        in_list_text: None,
                                     });
                                 }
                             }
@@ -608,8 +611,7 @@ pub(super) unsafe fn extract_batch_quals(
                 }
                 let sa_col_idx = (sa_varattno - 1) as usize;
                 let sa_type_oid = col_types[sa_col_idx];
-                // Only support numeric/date/timestamp types for IN list
-                if !matches!(
+                let is_numeric_in = matches!(
                     sa_type_oid,
                     pg_sys::INT2OID
                         | pg_sys::INT4OID
@@ -617,7 +619,12 @@ pub(super) unsafe fn extract_batch_quals(
                         | pg_sys::DATEOID
                         | pg_sys::TIMESTAMPOID
                         | pg_sys::TIMESTAMPTZOID
-                ) {
+                );
+                let is_text_in = matches!(
+                    sa_type_oid,
+                    pg_sys::TEXTOID | pg_sys::VARCHAROID | pg_sys::BPCHAROID
+                );
+                if !is_numeric_in && !is_text_in {
                     continue;
                 }
                 // Deconstruct the array constant to extract element values
@@ -654,15 +661,32 @@ pub(super) unsafe fn extract_batch_quals(
                 if sa_nelems <= 0 || sa_elems.is_null() {
                     continue;
                 }
-                // Collect values as i64, skip if any element is null
-                let mut in_values: Vec<i64> = Vec::with_capacity(sa_nelems as usize);
+                // Collect values: i64 for numeric types, owned String for text.
                 let mut sa_has_null = false;
+                let mut in_values_i64: Vec<i64> = Vec::new();
+                let mut in_values_text: Vec<String> = Vec::new();
                 for ei in 0..sa_nelems as usize {
                     if !sa_nulls.is_null() && *sa_nulls.add(ei) {
                         sa_has_null = true;
                         break;
                     }
-                    in_values.push((*sa_elems.add(ei)).value() as i64);
+                    let datum = *sa_elems.add(ei);
+                    if is_text_in {
+                        let varlena_ptr = datum.cast_mut_ptr::<pg_sys::varlena>();
+                        let len = pgrx::varsize_any_exhdr(varlena_ptr);
+                        let data = pgrx::vardata_any(varlena_ptr);
+                        #[allow(clippy::unnecessary_cast)]
+                        let bytes = std::slice::from_raw_parts(data as *const u8, len);
+                        match std::str::from_utf8(bytes) {
+                            Ok(s) => in_values_text.push(s.to_string()),
+                            Err(_) => {
+                                sa_has_null = true; // bail rather than guess
+                                break;
+                            }
+                        }
+                    } else {
+                        in_values_i64.push(datum.value() as i64);
+                    }
                 }
                 if sa_has_null {
                     continue;
@@ -674,7 +698,8 @@ pub(super) unsafe fn extract_batch_quals(
                     type_oid: sa_type_oid,
                     like_strategy: None,
                     text_const: None,
-                    in_list_i64: Some(in_values),
+                    in_list_i64: if is_numeric_in { Some(in_values_i64) } else { None },
+                    in_list_text: if is_text_in { Some(in_values_text) } else { None },
                 });
                 continue;
             }
@@ -795,6 +820,7 @@ pub(super) unsafe fn extract_batch_quals(
                     like_strategy: Some(strategy),
                     text_const: None,
                     in_list_i64: None,
+                    in_list_text: None,
                 });
             } else if matches!(type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID)
                 && matches!(cmp_op, BatchCompareOp::Eq | BatchCompareOp::Ne)
@@ -822,6 +848,7 @@ pub(super) unsafe fn extract_batch_quals(
                     like_strategy: None,
                     text_const: Some(const_str),
                     in_list_i64: None,
+                    in_list_text: None,
                 });
             } else {
                 if !is_batch_comparable_type(type_oid) {
@@ -842,6 +869,7 @@ pub(super) unsafe fn extract_batch_quals(
                     like_strategy: None,
                     text_const: None,
                     in_list_i64: None,
+                    in_list_text: None,
                 });
             }
 
