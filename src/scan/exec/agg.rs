@@ -4107,7 +4107,20 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             // Use fewer batches than the compact path (2 vs n_workers*2) because
             // the mixed path processes text columns which have high per-segment
             // cost. Fewer batches = fewer thread scope synchronization points.
-            let use_pipeline = use_lazy && all_segments.len() >= n_workers * 16;
+            //
+            // Gate on `!batch_quals.is_empty()`: pipeline overlap only pays off
+            // when workers spend non-trivial time per segment (filter eval, more
+            // complex aggregation) so the leader can usefully detoast the next
+            // batch in parallel. Unfiltered text-grouping queries
+            // (e.g. ClickBench Q18) have workers blast through segments
+            // faster than detoast can keep up — the per-iteration thread::scope
+            // synchronization is then pure overhead. Empirically on ClickBench:
+            // pipeline gives ~+0.8s on Q22-class (heavy filter), ~-2.3s on
+            // Q18-class (no filter). Net positive on filtered, net negative on
+            // unfiltered.
+            let use_pipeline = use_lazy
+                && all_segments.len() >= n_workers * 16
+                && !batch_quals.is_empty();
             // Pipeline uses 2 batches: workers run on current batch while leader
             // detoasts the next. Pre-detoast must cover the *entire* first batch
             // before workers spawn, otherwise workers on un-detoasted segments
