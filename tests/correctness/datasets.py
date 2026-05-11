@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import csv
+import datetime as dt
 import io
+import json
 
 
 MOCK_NOW = "2025-01-15 12:00:00+00"
 BASE_TS = "2025-01-15 00:00:00+00"
+RTABENCH_BASE_TS = dt.datetime(2024, 5, 1, 0, 0, 0, tzinfo=dt.timezone.utc)
+RTABENCH_MOCK_NOW = "2024-05-01 00:00:00+00"
 
 PARTITION_SEGMENT_EDGE_ROWS = (
     ("2025-01-13 23:58:00+00", 100, 0, "default_old", -100, 1.00, "before-start-a"),
@@ -175,6 +179,17 @@ CODEC_MATRIX_COLUMNS = (
     "nullable_text",
 )
 
+RTABENCH_EVENT_COLUMNS = (
+    "order_id",
+    "counter",
+    "event_created",
+    "event_type",
+    "satisfaction",
+    "processor",
+    "backup_processor",
+    "event_payload",
+)
+
 
 def _compress_non_default_partitions(conn, table_name: str) -> None:
     partitions = conn.execute(
@@ -336,6 +351,237 @@ def _copy_codec_matrix_rows_deltax(
         copy_sql = f"COPY {table_name} FROM STDIN WITH ({copy_options})"
     else:
         raise ValueError(f"unsupported direct backfill format: {copy_format}")
+
+    with conn.cursor() as cur:
+        with cur.copy(copy_sql) as copy:
+            copy.write(buf.getvalue().encode())
+
+
+def _rtabench_rows() -> tuple[tuple[tuple, ...], ...]:
+    countries = ("US", "DE", "FR", "UK", "IT", "CA")
+    states = ("CA", "BE", "IDF", "LND", "RM", "ON")
+    categories = ("electronics", "books", "clothing", "toys", "home")
+    event_types = ("Created", "Packed", "Departed", "Delivered", "Returned", "Cancelled")
+    processors = ("proc-a", "proc-b", "proc-c", "proc-d")
+    terminals = ("Berlin", "Hamburg", "Munich", "Frankfurt", "Cologne")
+    statuses = ("Created", "Delayed", "Priority", "Delivered", "Returned", "Cancelled")
+
+    customers = tuple(
+        (
+            customer_id,
+            f"cust-{customer_id:03d}",
+            countries[customer_id % len(countries)],
+            states[customer_id % len(states)],
+        )
+        for customer_id in range(1, 25)
+    )
+    products = tuple(
+        (
+            product_id,
+            f"prod-{product_id:03d}",
+            categories[product_id % len(categories)],
+            round(7.50 + ((product_id * 37) % 250) + (product_id % 4) * 0.25, 2),
+            0 if product_id % 13 == 0 else 20 + ((product_id * 17) % 480),
+        )
+        for product_id in range(1, 41)
+    )
+
+    orders = []
+    order_items = []
+    events = []
+    counter = 0
+    for order_id in range(1, 181):
+        customer_id = ((order_id * 7) % len(customers)) + 1
+        created_at = RTABENCH_BASE_TS + dt.timedelta(
+            days=order_id % 12,
+            hours=(order_id * 5) % 24,
+            minutes=(order_id * 11) % 60,
+        )
+        orders.append((order_id, customer_id, created_at))
+
+        for item_idx in range(1, (order_id % 4) + 2):
+            product_id = ((order_id * 3 + item_idx * 5) % len(products)) + 1
+            amount = ((order_id + item_idx * 2) % 7) + 1
+            order_items.append((order_id, product_id, amount))
+
+        event_count = (order_id % 6) + 2
+        for event_idx in range(event_count):
+            counter += 1
+            event_created = created_at + dt.timedelta(
+                hours=event_idx * 6 + (order_id % 5),
+                minutes=(order_id * 13 + event_idx * 17) % 60,
+            )
+            max_ts = RTABENCH_BASE_TS + dt.timedelta(days=15) - dt.timedelta(seconds=1)
+            if event_created > max_ts:
+                event_created = max_ts - dt.timedelta(minutes=event_idx)
+
+            event_type = event_types[(order_id + event_idx) % len(event_types)]
+            payload = {
+                "terminal": terminals[(order_id + event_idx) % len(terminals)],
+                "status": [
+                    statuses[(order_id + event_idx) % len(statuses)],
+                    "Priority" if order_id % 9 == 0 else "Normal",
+                ],
+                "lane": (order_id + event_idx) % 8 + 1,
+            }
+            events.append(
+                (
+                    order_id,
+                    counter if counter % 17 else None,
+                    event_created,
+                    event_type,
+                    round(1.0 + ((order_id * 11 + event_idx * 7) % 400) / 100.0, 2),
+                    processors[(order_id + event_idx) % len(processors)],
+                    None if (order_id + event_idx) % 5 == 0 else processors[
+                        (order_id + event_idx + 1) % len(processors)
+                    ],
+                    json.dumps(payload, sort_keys=True),
+                )
+            )
+
+    return (
+        customers,
+        products,
+        tuple(orders),
+        tuple(order_items),
+        tuple(events),
+    )
+
+
+def _create_rtabench_synthetic_schema(conn, deltax_table: str, plain_table: str) -> None:
+    conn.execute(
+        """
+        CREATE TABLE customers (
+            customer_id integer PRIMARY KEY,
+            name text NOT NULL,
+            country text NOT NULL,
+            state text NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE products (
+            product_id integer PRIMARY KEY,
+            name text NOT NULL,
+            category text NOT NULL,
+            price numeric(10,2) NOT NULL,
+            stock integer NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE orders (
+            order_id integer PRIMARY KEY,
+            customer_id integer NOT NULL,
+            created_at timestamptz NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE order_items (
+            order_id integer NOT NULL,
+            product_id integer NOT NULL,
+            amount integer NOT NULL,
+            PRIMARY KEY (order_id, product_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE processor_dim (
+            processor text,
+            region text NOT NULL,
+            active boolean NOT NULL
+        )
+        """
+    )
+    for table_name in (plain_table, deltax_table):
+        conn.execute(
+            f"""
+            CREATE TABLE {table_name} (
+                order_id integer NOT NULL,
+                counter integer,
+                event_created timestamptz NOT NULL,
+                event_type text NOT NULL,
+                satisfaction real NOT NULL,
+                processor text NOT NULL,
+                backup_processor text,
+                event_payload jsonb
+            )
+            """
+        )
+
+
+def _copy_rows_text(conn, table_name: str, rows: tuple[tuple, ...]) -> None:
+    buf = io.StringIO()
+    for row in rows:
+        fields = []
+        for value in row:
+            if value is None:
+                fields.append(r"\N")
+            elif isinstance(value, dt.datetime):
+                fields.append(value.isoformat())
+            else:
+                fields.append(str(value).replace("\\", "\\\\").replace("\t", r"\t"))
+        buf.write("\t".join(fields))
+        buf.write("\n")
+
+    with conn.cursor() as cur:
+        with cur.copy(f"COPY {table_name} FROM STDIN") as copy:
+            copy.write(buf.getvalue().encode())
+
+
+def _insert_rtabench_events(conn, table_name: str, events: tuple[tuple, ...]) -> None:
+    for event in events:
+        conn.execute(
+            f"""
+            INSERT INTO {table_name} (
+                order_id,
+                counter,
+                event_created,
+                event_type,
+                satisfaction,
+                processor,
+                backup_processor,
+                event_payload
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            """,
+            event,
+        )
+
+
+def _copy_rtabench_events_deltax(
+    conn,
+    table_name: str,
+    events: tuple[tuple, ...],
+    *,
+    copy_format: str,
+) -> None:
+    buf = io.StringIO()
+    if copy_format == "deltax_compress_csv":
+        writer = csv.writer(buf)
+        for row in events:
+            writer.writerow(r"\N" if value is None else value for value in row)
+        copy_sql = f"COPY {table_name} FROM STDIN WITH (FORMAT deltax_compress_csv, NULL '\\N')"
+    elif copy_format == "deltax_compress":
+        for row in events:
+            fields = []
+            for value in row:
+                if value is None:
+                    fields.append(r"\N")
+                elif isinstance(value, dt.datetime):
+                    fields.append(value.isoformat())
+                else:
+                    fields.append(str(value).replace("\\", "\\\\").replace("\t", r"\t"))
+            buf.write("\t".join(fields))
+            buf.write("\n")
+        copy_sql = f"COPY {table_name} FROM STDIN WITH (FORMAT deltax_compress)"
+    else:
+        raise ValueError(f"unsupported rtabench load path: {copy_format}")
 
     with conn.cursor() as cur:
         with cur.copy(copy_sql) as copy:
@@ -775,5 +1021,96 @@ def create_codec_matrix_pair(
         raise ValueError(f"unsupported codec matrix load path: {load_path}")
 
     _analyze_tables(conn, plain_table, deltax_table)
+
+    return plain_table, deltax_table
+
+
+def create_rtabench_synthetic_pair(
+    conn,
+    *,
+    deltax_table: str = "order_events",
+    load_path: str = "copy_text",
+    segment_size: int = 25,
+    mixed_uncompressed_tail: bool = False,
+) -> tuple[str, str]:
+    """Create an RTABench-shaped dimensional dataset and compressed fact table."""
+    plain_table = f"{deltax_table}_plain"
+
+    conn.execute(f"SET pg_deltax.mock_now = '{RTABENCH_MOCK_NOW}'")
+    _create_rtabench_synthetic_schema(conn, deltax_table, plain_table)
+    conn.execute(
+        f"SELECT deltax_create_table('{deltax_table}', 'event_created', '1 day'::interval, 16)"
+    )
+    conn.execute(
+        "SELECT deltax_enable_compression("
+        f"'{deltax_table}', segment_by => ARRAY[]::text[], "
+        "order_by => ARRAY['order_id', 'event_created'], segment_size => %s)",
+        (segment_size,),
+    )
+    conn.commit()
+
+    customers, products, orders, order_items, events = _rtabench_rows()
+    _copy_rows_text(conn, "customers", customers)
+    _copy_rows_text(conn, "products", products)
+    _copy_rows_text(conn, "orders", orders)
+    _copy_rows_text(conn, "order_items", order_items)
+    _copy_rows_text(
+        conn,
+        "processor_dim",
+        (
+            ("proc-a", "eu-central", True),
+            ("proc-b", "us-east", True),
+            ("proc-c", "ap-south", False),
+            ("proc-d", "eu-west", True),
+            (None, "missing-backup", False),
+        ),
+    )
+    _copy_rows_text(conn, plain_table, events)
+
+    direct_events = events
+    tail_events: tuple[tuple, ...] = ()
+    if mixed_uncompressed_tail:
+        direct_events = events[:-19]
+        tail_events = events[-19:]
+
+    if load_path == "copy_text":
+        _copy_rtabench_events_deltax(
+            conn,
+            deltax_table,
+            direct_events,
+            copy_format="deltax_compress",
+        )
+    elif load_path == "copy_csv":
+        _copy_rtabench_events_deltax(
+            conn,
+            deltax_table,
+            direct_events,
+            copy_format="deltax_compress_csv",
+        )
+    elif load_path == "regular":
+        _copy_rows_text(conn, deltax_table, events)
+        conn.commit()
+        _compress_non_default_partitions(conn, deltax_table)
+    else:
+        raise ValueError(f"unsupported rtabench load path: {load_path}")
+
+    if tail_events:
+        _insert_rtabench_events(conn, deltax_table, tail_events)
+    conn.commit()
+
+    default_rows = conn.execute(f"SELECT count(*) FROM {deltax_table}_default").fetchone()[0]
+    if default_rows:
+        raise AssertionError(f"{default_rows} RTABench rows landed in the default partition")
+
+    _analyze_tables(
+        conn,
+        "customers",
+        "products",
+        "processor_dim",
+        "orders",
+        "order_items",
+        plain_table,
+        deltax_table,
+    )
 
     return plain_table, deltax_table

@@ -313,6 +313,8 @@ Purpose:
 
 ### Session 8: Joins and RTABench Shapes
 
+Status: done.
+
 Dataset:
 
 - Expand the current RTABench synthetic fixture into a reusable correctness

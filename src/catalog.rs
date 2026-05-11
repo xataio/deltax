@@ -455,6 +455,56 @@ pub fn mark_partition_decompressed(
     Ok(())
 }
 
+/// Install the DML rejection trigger on a compressed leaf partition.
+///
+/// Parent-table INSERTs are routed to the leaf after ExecutorStart, so the
+/// result-relation hook cannot reliably catch them. A row trigger on the leaf
+/// fires after tuple routing and blocks both direct and routed DML.
+pub fn install_compressed_dml_trigger(
+    client: &mut SpiClient,
+    schema: &str,
+    table: &str,
+) -> spi::SpiResult<()> {
+    let partition_fqn = crate::partition::fqn(schema, table);
+    client.update(
+        &format!(
+            "DROP TRIGGER IF EXISTS deltax_reject_compressed_dml ON {}",
+            partition_fqn
+        ),
+        None,
+        &[],
+    )?;
+    client.update(
+        &format!(
+            "CREATE TRIGGER deltax_reject_compressed_dml
+             BEFORE INSERT OR UPDATE OR DELETE ON {}
+             FOR EACH ROW EXECUTE FUNCTION deltax_reject_compressed_partition_dml()",
+            partition_fqn
+        ),
+        None,
+        &[],
+    )?;
+    Ok(())
+}
+
+/// Remove the compressed-partition DML trigger before decompression restores
+/// rows into the partition heap.
+pub fn drop_compressed_dml_trigger(
+    client: &mut SpiClient,
+    schema: &str,
+    table: &str,
+) -> spi::SpiResult<()> {
+    client.update(
+        &format!(
+            "DROP TRIGGER IF EXISTS deltax_reject_compressed_dml ON {}",
+            crate::partition::fqn(schema, table)
+        ),
+        None,
+        &[],
+    )?;
+    Ok(())
+}
+
 /// Look up a partition by schema + table name.
 pub fn get_partition_by_name(
     client: &SpiClient,

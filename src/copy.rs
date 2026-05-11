@@ -483,6 +483,7 @@ const META_BATCH_SIZE: usize = 50;
 /// Per-partition buffer for accumulating rows during direct backfill.
 struct PartitionBuffer {
     partition_id: i32,
+    partition_schema: String,
     partition_table: String,
     typed_cols: Vec<TypedColumn>,
     row_count: usize,
@@ -683,6 +684,7 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_
         range_ends.push(end_usec);
         part_buffers.push(PartitionBuffer {
             partition_id: p.id,
+            partition_schema: p.schema_name.clone(),
             partition_table: p.table_name.clone(),
             typed_cols: init_typed_columns(&columns, &kinds),
             row_count: 0,
@@ -2683,6 +2685,12 @@ fn finalize_partition(
             total_rows,
         )
         .expect("failed to update partition catalog");
+        catalog::install_compressed_dml_trigger(
+            client,
+            &buf.partition_schema,
+            &buf.partition_table,
+        )
+        .expect("failed to install compressed partition DML trigger");
         catalog::update_partition_column_ndistinct(
             client,
             partition_id,
@@ -3347,4 +3355,3 @@ fn route_rows_to_partitions(
         }
     }
 }
-

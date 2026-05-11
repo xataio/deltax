@@ -1221,6 +1221,531 @@ def codec_matrix_cases() -> Iterable[QueryCase]:
     )
 
 
+def rtabench_synthetic_cases() -> Iterable[QueryCase]:
+    yield QueryCase(
+        "fact_projection_ordered",
+        """
+        SELECT order_id, counter, event_created, event_type, satisfaction, processor, backup_processor
+        FROM {table}
+        WHERE event_created >= '2024-05-03 00:00:00+00'
+          AND event_created < '2024-05-07 00:00:00+00'
+        ORDER BY order_id, event_created, counter NULLS LAST
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "dimension_join_fact_inner",
+        """
+        SELECT oe.order_id, c.customer_id, c.country, oe.event_type, oe.event_created
+        FROM orders o
+        JOIN customers c ON c.customer_id = o.customer_id
+        JOIN {table} oe ON oe.order_id = o.order_id
+        WHERE c.country IN ('US', 'DE', 'FR')
+          AND oe.event_type IN ('Delivered', 'Returned')
+        ORDER BY c.country, oe.order_id, oe.event_created, oe.counter NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "fact_outer_side_dimension_join",
+        """
+        SELECT oe.order_id, oe.event_type, o.customer_id, c.state
+        FROM {table} oe
+        JOIN orders o ON o.order_id = oe.order_id
+        JOIN customers c ON c.customer_id = o.customer_id
+        WHERE oe.order_id BETWEEN 20 AND 45
+          AND oe.processor IN ('proc-a', 'proc-c')
+        ORDER BY oe.order_id, oe.event_created, oe.counter NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "fact_left_join_product_rollup",
+        """
+        SELECT
+            oe.order_id,
+            oe.event_type,
+            count(oi.product_id) AS item_count,
+            coalesce(sum(oi.amount * p.price), 0)::numeric(20,2) AS order_value
+        FROM {table} oe
+        LEFT JOIN order_items oi ON oi.order_id = oe.order_id
+        LEFT JOIN products p ON p.product_id = oi.product_id
+        WHERE oe.event_type IN ('Created', 'Delivered')
+          AND oe.order_id <= 30
+        GROUP BY oe.order_id, oe.event_created, oe.counter, oe.event_type
+        ORDER BY oe.order_id, oe.event_created, oe.counter NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "exists_delivered_orders",
+        """
+        SELECT o.order_id, o.customer_id, o.created_at
+        FROM orders o
+        WHERE EXISTS (
+            SELECT 1
+            FROM {table} oe
+            WHERE oe.order_id = o.order_id
+              AND oe.event_type = 'Delivered'
+        )
+        ORDER BY o.order_id
+        """,
+    )
+    yield QueryCase(
+        "not_exists_cancelled_orders",
+        """
+        SELECT o.order_id, o.customer_id
+        FROM orders o
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM {table} oe
+            WHERE oe.order_id = o.order_id
+              AND oe.event_type = 'Cancelled'
+        )
+        ORDER BY o.order_id
+        """,
+    )
+    yield QueryCase(
+        "in_delivered_order_ids",
+        """
+        SELECT o.order_id, o.customer_id
+        FROM orders o
+        WHERE o.order_id IN (
+            SELECT oe.order_id
+            FROM {table} oe
+            WHERE oe.event_type = 'Delivered'
+              AND oe.event_created < '2024-05-10 00:00:00+00'
+        )
+        ORDER BY o.order_id
+        """,
+    )
+    yield QueryCase(
+        "not_in_returned_order_ids",
+        """
+        SELECT o.order_id, o.customer_id
+        FROM orders o
+        WHERE o.order_id NOT IN (
+            SELECT oe.order_id
+            FROM {table} oe
+            WHERE oe.event_type = 'Returned'
+        )
+        ORDER BY o.order_id
+        """,
+    )
+    yield QueryCase(
+        "distinct_on_latest_per_order",
+        """
+        SELECT DISTINCT ON (oe.order_id)
+            oe.order_id, oe.event_created, oe.event_type, oe.processor
+        FROM {table} oe
+        WHERE oe.order_id IN (5, 17, 42, 88, 123, 177)
+        ORDER BY oe.order_id, oe.event_created DESC, oe.counter DESC NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "window_last_event_per_order",
+        """
+        SELECT order_id, event_created, event_type, processor
+        FROM (
+            SELECT
+                oe.order_id,
+                oe.event_created,
+                oe.event_type,
+                oe.processor,
+                row_number() OVER (
+                    PARTITION BY oe.order_id
+                    ORDER BY oe.event_created DESC, oe.counter DESC NULLS LAST
+                ) AS rn
+            FROM {table} oe
+            WHERE oe.order_id BETWEEN 40 AND 70
+        ) ranked
+        WHERE rn = 1
+        ORDER BY order_id
+        """,
+    )
+    yield QueryCase(
+        "customer_revenue_from_delivered_events",
+        """
+        SELECT
+            c.customer_id,
+            c.country,
+            sum(oi.amount * p.price)::numeric(20,2) AS revenue,
+            count(DISTINCT o.order_id) AS orders
+        FROM customers c
+        JOIN orders o ON o.customer_id = c.customer_id
+        JOIN order_items oi ON oi.order_id = o.order_id
+        JOIN products p ON p.product_id = oi.product_id
+        JOIN (
+            SELECT DISTINCT order_id
+            FROM {table}
+            WHERE event_type = 'Delivered'
+        ) delivered ON delivered.order_id = o.order_id
+        WHERE o.created_at >= '2024-05-01 00:00:00+00'
+          AND o.created_at < '2024-05-12 00:00:00+00'
+        GROUP BY c.customer_id, c.country
+        HAVING sum(oi.amount * p.price) > 1000
+        ORDER BY revenue DESC, c.customer_id
+        """,
+    )
+    yield QueryCase(
+        "category_performance_join",
+        """
+        SELECT
+            p.category,
+            oe.event_type,
+            count(*) AS event_item_rows,
+            count(DISTINCT oe.order_id) AS orders,
+            sum(oi.amount * p.price)::numeric(20,2) AS value
+        FROM {table} oe
+        JOIN order_items oi ON oi.order_id = oe.order_id
+        JOIN products p ON p.product_id = oi.product_id
+        WHERE oe.event_type IN ('Delivered', 'Returned')
+          AND oe.event_created >= '2024-05-03 00:00:00+00'
+          AND oe.event_created < '2024-05-13 00:00:00+00'
+        GROUP BY p.category, oe.event_type
+        ORDER BY p.category, oe.event_type
+        """,
+    )
+    yield QueryCase(
+        "semi_join_products_with_events",
+        """
+        SELECT p.product_id, p.category, p.price
+        FROM products p
+        WHERE EXISTS (
+            SELECT 1
+            FROM order_items oi
+            JOIN {table} oe ON oe.order_id = oi.order_id
+            WHERE oi.product_id = p.product_id
+              AND oe.event_type = 'Delivered'
+              AND oe.processor = 'proc-a'
+        )
+        ORDER BY p.category, p.product_id
+        """,
+    )
+    yield QueryCase(
+        "anti_join_products_without_returns",
+        """
+        SELECT p.product_id, p.category
+        FROM products p
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM order_items oi
+            JOIN {table} oe ON oe.order_id = oi.order_id
+            WHERE oi.product_id = p.product_id
+              AND oe.event_type = 'Returned'
+        )
+        ORDER BY p.product_id
+        """,
+    )
+    yield QueryCase(
+        "event_transition_self_join",
+        """
+        SELECT
+            first_ev.order_id,
+            first_ev.event_type AS first_type,
+            later_ev.event_type AS later_type,
+            later_ev.event_created
+        FROM {table} first_ev
+        JOIN {table} later_ev
+          ON later_ev.order_id = first_ev.order_id
+         AND later_ev.event_created > first_ev.event_created
+        WHERE first_ev.event_type = 'Created'
+          AND later_ev.event_type IN ('Delivered', 'Returned')
+          AND first_ev.order_id BETWEEN 1 AND 50
+        ORDER BY first_ev.order_id, later_ev.event_created, later_ev.counter NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "lateral_latest_event_per_customer_order",
+        """
+        SELECT c.customer_id, o.order_id, latest.event_created, latest.event_type
+        FROM customers c
+        JOIN orders o ON o.customer_id = c.customer_id
+        CROSS JOIN LATERAL (
+            SELECT oe.event_created, oe.event_type
+            FROM {table} oe
+            WHERE oe.order_id = o.order_id
+            ORDER BY oe.event_created DESC, oe.counter DESC NULLS LAST
+            LIMIT 1
+        ) latest
+        WHERE c.customer_id IN (1, 7, 13, 19)
+        ORDER BY c.customer_id, o.order_id
+        """,
+    )
+    yield QueryCase(
+        "processor_backup_coalesce_grouping",
+        """
+        SELECT
+            processor,
+            coalesce(backup_processor, 'none') AS backup,
+            count(*) AS events,
+            round(avg(satisfaction)::numeric, 4) AS avg_satisfaction
+        FROM {table}
+        WHERE event_created >= '2024-05-01 00:00:00+00'
+          AND event_created < '2024-05-15 00:00:00+00'
+        GROUP BY processor, coalesce(backup_processor, 'none')
+        ORDER BY processor, backup
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "union_all_inner_outer_roles",
+        """
+        SELECT order_id, source
+        FROM (
+            SELECT oe.order_id, 'fact_filtered' AS source
+            FROM {table} oe
+            WHERE oe.order_id <= 8
+              AND oe.event_type = 'Created'
+            UNION ALL
+            SELECT o.order_id, 'dimension_filtered' AS source
+            FROM orders o
+            JOIN {table} oe ON oe.order_id = o.order_id
+            WHERE o.customer_id = 3
+              AND oe.event_type = 'Delivered'
+        ) unioned
+        ORDER BY source, order_id
+        """,
+    )
+    yield QueryCase(
+        "right_join_fact_null_extension",
+        """
+        SELECT p.processor, oe.order_id, oe.event_type
+        FROM {table} oe
+        RIGHT JOIN processor_dim p ON p.processor = oe.processor
+                              AND oe.event_type = 'Delivered'
+                              AND oe.order_id BETWEEN 1 AND 60
+        ORDER BY p.processor NULLS LAST, oe.order_id NULLS LAST, oe.event_created NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "full_outer_join_product_event_coverage",
+        """
+        SELECT
+            coalesce(oi.product_id, -1) AS product_id,
+            coalesce(oe.event_type, 'no-event') AS event_type,
+            count(*) AS rows
+        FROM (
+            SELECT order_id, product_id
+            FROM order_items
+            WHERE product_id BETWEEN 1 AND 12
+        ) oi
+        FULL OUTER JOIN (
+            SELECT order_id, event_type
+            FROM {table}
+            WHERE order_id BETWEEN 150 AND 168
+              AND event_type IN ('Delivered', 'Returned')
+        ) oe ON oe.order_id = oi.order_id
+        GROUP BY coalesce(oi.product_id, -1), coalesce(oe.event_type, 'no-event')
+        ORDER BY product_id, event_type
+        """,
+    )
+    yield QueryCase(
+        "nullable_backup_plain_equality_join",
+        """
+        SELECT oe.order_id, oe.event_type, oe.backup_processor, p.region
+        FROM {table} oe
+        JOIN processor_dim p ON p.processor = oe.backup_processor
+        WHERE oe.order_id BETWEEN 12 AND 40
+        ORDER BY oe.order_id, oe.event_created, oe.counter NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "nullable_backup_is_not_distinct_join",
+        """
+        SELECT oe.order_id, oe.event_type, oe.backup_processor, p.region
+        FROM {table} oe
+        JOIN processor_dim p
+          ON p.processor IS NOT DISTINCT FROM oe.backup_processor
+        WHERE oe.order_id BETWEEN 12 AND 40
+        ORDER BY oe.order_id, oe.event_created, oe.counter NULLS LAST, p.region
+        """,
+    )
+    yield QueryCase(
+        "left_join_nullable_backup_dimension",
+        """
+        SELECT
+            oe.order_id,
+            oe.event_type,
+            coalesce(p.region, 'unmatched') AS backup_region,
+            count(*) AS events
+        FROM {table} oe
+        LEFT JOIN processor_dim p ON p.processor = oe.backup_processor
+        WHERE oe.order_id BETWEEN 80 AND 98
+        GROUP BY oe.order_id, oe.event_type, coalesce(p.region, 'unmatched')
+        ORDER BY oe.order_id, oe.event_type, backup_region
+        """,
+    )
+    yield QueryCase(
+        "multi_column_latest_event_join",
+        """
+        SELECT oe.order_id, oe.event_created, oe.event_type, oe.processor
+        FROM {table} oe
+        JOIN (
+            SELECT order_id, max(event_created) AS latest_created
+            FROM {table}
+            WHERE order_id BETWEEN 30 AND 55
+            GROUP BY order_id
+        ) latest
+          ON latest.order_id = oe.order_id
+         AND latest.latest_created = oe.event_created
+        ORDER BY oe.order_id, oe.counter NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "multi_column_event_type_counter_join",
+        """
+        SELECT oe.order_id, oe.counter, oe.event_type, marker.marker
+        FROM {table} oe
+        JOIN (
+            VALUES
+                (10, 'Packed'::text),
+                (11, 'Departed'::text),
+                (12, 'Delivered'::text),
+                (13, 'Returned'::text),
+                (14, 'Cancelled'::text),
+                (15, 'Created'::text)
+        ) AS marker(order_id, marker)
+          ON marker.order_id = oe.order_id
+         AND marker.marker = oe.event_type
+        ORDER BY oe.order_id, oe.event_created, oe.counter NULLS LAST
+        """,
+    )
+    yield QueryCase(
+        "range_join_events_after_order_created",
+        """
+        SELECT o.order_id, count(*) AS events_after_created
+        FROM orders o
+        JOIN {table} oe
+          ON oe.order_id = o.order_id
+         AND oe.event_created >= o.created_at
+         AND oe.event_created < o.created_at + interval '30 hours'
+        WHERE o.order_id BETWEEN 45 AND 75
+        GROUP BY o.order_id
+        ORDER BY o.order_id
+        """,
+    )
+    yield QueryCase(
+        "bounded_self_range_join",
+        """
+        SELECT
+            base.order_id,
+            base.event_type AS base_type,
+            follow.event_type AS follow_type,
+            count(*) AS transitions
+        FROM {table} base
+        JOIN {table} follow
+          ON follow.order_id = base.order_id
+         AND follow.event_created > base.event_created
+         AND follow.event_created <= base.event_created + interval '18 hours'
+        WHERE base.order_id BETWEEN 60 AND 85
+        GROUP BY base.order_id, base.event_type, follow.event_type
+        ORDER BY base.order_id, base_type, follow_type
+        """,
+    )
+    yield QueryCase(
+        "correlated_event_count_per_order",
+        """
+        SELECT
+            o.order_id,
+            o.customer_id,
+            (
+                SELECT count(*)
+                FROM {table} oe
+                WHERE oe.order_id = o.order_id
+                  AND oe.event_type <> 'Created'
+            ) AS non_created_events
+        FROM orders o
+        WHERE o.order_id BETWEEN 1 AND 35
+        ORDER BY o.order_id
+        """,
+    )
+    yield QueryCase(
+        "correlated_max_event_timestamp",
+        """
+        SELECT
+            o.order_id,
+            (
+                SELECT max(oe.event_created)
+                FROM {table} oe
+                WHERE oe.order_id = o.order_id
+            ) AS max_event_created
+        FROM orders o
+        WHERE o.customer_id IN (2, 8, 14, 20)
+        ORDER BY o.order_id
+        """,
+    )
+    yield QueryCase(
+        "correlated_avg_satisfaction_by_customer",
+        """
+        SELECT
+            c.customer_id,
+            round((
+                SELECT avg(oe.satisfaction)::numeric
+                FROM orders o
+                JOIN {table} oe ON oe.order_id = o.order_id
+                WHERE o.customer_id = c.customer_id
+            ), 4) AS avg_satisfaction
+        FROM customers c
+        WHERE c.customer_id BETWEEN 1 AND 12
+        ORDER BY c.customer_id
+        """,
+        comparator="float_tolerant",
+    )
+    yield QueryCase(
+        "rtabench_q0004_customer_order_events",
+        """
+        SELECT
+            c.country,
+            date_trunc('day', oe.event_created) AS day,
+            count(DISTINCT o.order_id) AS orders,
+            count(*) AS events
+        FROM customers c
+        JOIN orders o ON o.customer_id = c.customer_id
+        JOIN {table} oe ON oe.order_id = o.order_id
+        WHERE oe.event_created >= '2024-05-04 00:00:00+00'
+          AND oe.event_created < '2024-05-11 00:00:00+00'
+        GROUP BY c.country, date_trunc('day', oe.event_created)
+        ORDER BY c.country, day
+        """,
+    )
+    yield QueryCase(
+        "rtabench_q0012_product_category_funnel",
+        """
+        SELECT
+            p.category,
+            count(*) FILTER (WHERE oe.event_type = 'Created') AS created_events,
+            count(*) FILTER (WHERE oe.event_type = 'Delivered') AS delivered_events,
+            count(*) FILTER (WHERE oe.event_type = 'Returned') AS returned_events
+        FROM {table} oe
+        JOIN order_items oi ON oi.order_id = oe.order_id
+        JOIN products p ON p.product_id = oi.product_id
+        WHERE oe.event_created >= '2024-05-01 00:00:00+00'
+          AND oe.event_created < '2024-05-15 00:00:00+00'
+        GROUP BY p.category
+        ORDER BY p.category
+        """,
+    )
+    yield QueryCase(
+        "rtabench_q0017_processor_latency_rollup",
+        """
+        SELECT
+            first_ev.processor,
+            first_ev.event_type AS from_type,
+            later_ev.event_type AS to_type,
+            count(*) AS transitions,
+            round(avg(extract(epoch FROM later_ev.event_created - first_ev.event_created))::numeric, 2)
+                AS avg_seconds
+        FROM {table} first_ev
+        JOIN {table} later_ev
+          ON later_ev.order_id = first_ev.order_id
+         AND later_ev.event_created > first_ev.event_created
+        WHERE first_ev.event_type IN ('Created', 'Packed')
+          AND later_ev.event_type IN ('Delivered', 'Returned', 'Cancelled')
+        GROUP BY first_ev.processor, first_ev.event_type, later_ev.event_type
+        ORDER BY first_ev.processor, from_type, to_type
+        """,
+        comparator="float_tolerant",
+    )
+
+
 def partition_segment_plan_shape_cases() -> Iterable[QueryCase]:
     yield QueryCase(
         "or_ranges_across_pruning_boundaries",

@@ -100,6 +100,19 @@ CREATE TABLE IF NOT EXISTS deltax_partition (
 );
 
 ALTER TABLE deltax_partition ADD COLUMN IF NOT EXISTS column_valmap JSONB;
+
+CREATE OR REPLACE FUNCTION deltax_reject_compressed_partition_dml()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'cannot % compressed partition "%.%", decompress it first',
+        TG_OP,
+        TG_TABLE_SCHEMA,
+        TG_TABLE_NAME
+        USING ERRCODE = 'object_not_in_prerequisite_state';
+END;
+$$;
 "#,
     name = "create_catalog_tables",
 );

@@ -359,6 +359,8 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         row_count,
     )
     .expect("failed to update catalog");
+    catalog::install_compressed_dml_trigger(client, &schema, &part_table)
+        .expect("failed to install compressed partition DML trigger");
 
     // Persist per-column ndistinct from the partition-level HLL merge
     // (strictly more accurate than the old MAX-over-segments approach,
@@ -2363,6 +2365,8 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
     let text_lengths_fqn = format!("\"{}\".\"{}_text_lengths\"", companion_schema, part_table);
     let valbitmap_fqn = format!("\"{}\".\"{}_valbitmap\"", companion_schema, part_table);
     let part_fqn = crate::partition::fqn(&schema, &part_table);
+    catalog::drop_compressed_dml_trigger(client, &schema, &part_table)
+        .expect("failed to drop compressed partition DML trigger");
 
     // 3. Read compressed segments from meta + blobs tables
 
