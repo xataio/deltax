@@ -2493,7 +2493,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         let sidecar_only_cols: Vec<bool> = if sidecar_candidate.iter().any(|&s| s)
             && crate::get_parallel_workers() > 1
             && estimated_rows >= SIDECAR_MIN_ROWS
-            && can_parallel_mixed(&group_specs, &needed_cols, &meta.col_types, &batch_quals, &agg_specs)
+            && can_parallel_mixed(&group_specs, &needed_cols, &meta.col_types, &meta.col_not_null, &batch_quals, &agg_specs)
         {
             sidecar_candidate
         } else {
@@ -4035,7 +4035,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             && n_workers > 1
             && all_segments.len() > 1
             && all_regexp_compiled
-            && can_parallel_mixed(&group_specs, &needed_cols, &meta.col_types, &batch_quals, &agg_specs);
+            && can_parallel_mixed(&group_specs, &needed_cols, &meta.col_types, &meta.col_not_null, &batch_quals, &agg_specs);
 
         if can_parallel_mixed_flag {
             let t2 = Instant::now();
@@ -11021,6 +11021,7 @@ fn can_parallel_mixed(
     group_specs: &[GroupByColSpec],
     needed_cols: &[bool],
     col_types: &[pg_sys::Oid],
+    col_not_null: &[bool],
     batch_quals: &[BatchQual],
     agg_specs: &[AggExecSpec],
 ) -> bool {
@@ -11051,7 +11052,12 @@ fn can_parallel_mixed(
         if is_text_group_col(gs) {
             continue; // text column (or RegexpReplace with Rust regex) — OK
         }
-        // Must be an integer-producing expression
+        // Must be an integer-producing expression.
+        // The mixed per-row loop bails on NULL int keys (see has_null check
+        // in process_segments_mixed): hash_mixed_key / MixedKeyStorage have
+        // no NULL slot for the int side, so NULL groups would collapse into
+        // Int(0). Require attnotnull for any numeric column we'd read, same
+        // gate as can_use_compact_keys.
         match &gs.expr {
             GroupByExpr::Column => {
                 let t = gs.type_oid;
@@ -11060,8 +11066,15 @@ fn can_parallel_mixed(
                 {
                     return false;
                 }
+                if !col_not_null.get(gs.col_idx as usize).copied().unwrap_or(false) {
+                    return false;
+                }
             }
-            GroupByExpr::DateTrunc { .. } | GroupByExpr::Extract { .. } | GroupByExpr::AddConst { .. } => {}
+            GroupByExpr::DateTrunc { .. } | GroupByExpr::Extract { .. } | GroupByExpr::AddConst { .. } => {
+                if !col_not_null.get(gs.col_idx as usize).copied().unwrap_or(false) {
+                    return false;
+                }
+            }
             GroupByExpr::RegexpReplace { .. } | GroupByExpr::CaseWhen(_) => return false, // non-text RegexpReplace/CaseWhen not supported
         }
     }
