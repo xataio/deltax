@@ -191,7 +191,7 @@ integration-test: $(VENV)/.stamp
 	@for v in $(PG_VERSIONS); do \
 		echo "=== Integration tests: PG $$v ==="; \
 		$(MAKE) image PG_MAJOR=$$v; \
-		PG_DELTAX_IMAGE=pg_deltax:pg$$v $(VENV)/bin/pytest tests/ -v; \
+		PG_DELTAX_IMAGE=pg_deltax:pg$$v $(VENV)/bin/pytest tests/ -v --ignore=tests/correctness; \
 	done
 
 correctness-smoke: $(VENV)/.stamp correctness-image
