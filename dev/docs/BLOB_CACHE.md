@@ -1,74 +1,78 @@
 # Blob cache — shared-memory cache for detoasted compressed blobs
 
-> **Status: DSA approach hit a dead end; needs replacement (2026-05-13).**
-> Full storage infrastructure (shmem hooks, ctl block, inline LWLocks,
-> sharded hashmap framework, pin counting, three detoast call sites,
-> `pg_deltax_blob_cache_stats()` SRF) is in place and `get_pinned`
-> traverses correctly on misses. Both DSA approaches we tried crash
-> on first allocation — see [DSA findings](#dsa-findings) below.
-> The recommended next step is a hand-rolled allocator that pre-carves
-> the shmem region into fixed-size slots; that bypasses DSA's
-> process-local-area machinery, which doesn't play nicely with our
-> postmaster-creates / backend-attaches pattern on Docker for Mac
-> aarch64.
+> **Status: DSA approach working end-to-end (2026-05-13).**
+> Postmaster creates the in-place DSA, backends attach lazily, three
+> scans round-trip cleanly with hits incrementing. Two bugs that
+> previously made this look like a dead end are documented in
+> [DSA: what bit us, and the fix](#dsa-what-bit-us-and-the-fix) below
+> for future readers; both are gotchas in how PG 17's DSA contract
+> interacts with extension shmem hooks, not bugs in pgrx or PG.
 
-## DSA findings
+## DSA: what bit us, and the fix
 
-Two approaches were investigated end-to-end and both fail; the gdb
-investigation pinpointed the root cause.
+The earlier write-up of this section called for abandoning DSA and
+hand-rolling a size-class allocator. That was wrong. Two distinct
+bugs in our DSA setup looked like one fatal "DSA can't work here"
+problem; once both were named they were one-line fixes each. We're
+keeping DSA.
 
-**Approach A: `dsa_create_in_place_ext` in postmaster + `dsa_attach_in_place` in backend.**
-Postmaster reserves the full `blob_cache_mb` of named shmem, creates
-the in-place DSA, and `dsa_pin`s it. The backend later calls
-`dsa_attach_in_place(dsa_chunk, NULL)` and gets back a non-null
-`*dsa_area`. But `area->control` (the first field) points into the
-backend's malloc heap, not at `place`. When `dsa_allocate_extended`
-then does `area->control->lwlock`, the lock address is garbage and
-`LWLockAcquire` segfaults.
+**Bug 1 — `dsa_create_in_place_ext(place, size, tranche, NULL, 0, 0)`
+violates the DSA contract.** PG 17 exposes only the 6-arg `_ext`
+form; the 4-arg `dsa_create_in_place` is a macro (`dsa.h:122-125`)
+that fills in `DSA_DEFAULT_INIT_SEGMENT_SIZE` (1 MB) and
+`DSA_MAX_SEGMENT_SIZE` for the segment-size knobs. `create_internal`
+asserts `init_segment_size >= DSA_MIN_SEGMENT_SIZE` (`dsa.c:1233`),
+but in a release build the assertion is stripped — `create_internal`
+silently writes `control->init_segment_size = 0;
+control->max_segment_size = 0;` into shmem (`dsa.c:1268-1269`), and a
+subsequent `dsa_allocate_extended` walks into garbage when
+`make_new_segment` multiplies through those zeros (`dsa.c:2125-2127`).
+The gdb dump where `area->control` appeared to point into the backend
+heap was the post-corruption state, not a binding mismatch — the
+binding is fine.
 
-Diagnostic dump from a crashed backend (gdb on the core):
+Fix: pass the documented defaults explicitly and cap actual usage
+with `dsa_set_size_limit` after create, the way `pgstat_shmem.c`
+(`pgstat_shmem.c:163-196`) does it. Specifically: in
+`shmem_startup_hook`, after `dsa_create_in_place_ext(..., DSA_DEFAULT_INIT_SEGMENT_SIZE,
+DSA_MAX_SEGMENT_SIZE)`, call `dsa_pin` → `dsa_set_size_limit(area,
+dsa_size)` → `dsa_detach(area)`. The pin keeps the in-shmem control
+block alive across all-backends-detached; the limit caps total
+allocations to the in-place chunk so the DSA never tries to allocate
+a fresh DSM segment (which is exactly what blew up the "lazy
+create-from-first-backend" attempt under Docker Desktop tmpfs); the
+detach releases the postmaster-local `dsa_area*` since backends build
+their own via `dsa_attach_in_place`.
 
-```
-block      = 0xffff6ec0d800  (PG main shmem region, in /dev/zero mapping)
-dsa_chunk  = 0xffff6ec33850  (block + sizeof(BlobCacheCtl) — still in shmem)
-area       = 0xaaaaeca97f90  (backend's process-local dsa_area handle)
-area[0..8] = 0xaaaaec4726b0  (area->control — points to backend HEAP, not shmem!)
-```
+**Bug 2 — `dsa_attach_in_place` palloc's the backend-local
+`dsa_area*` in `CurrentMemoryContext`.** Our backend `attach()` ran
+lazily from inside `get_pinned`/`insert`, i.e. inside whatever
+memory context the executor had active (typically a per-portal or
+per-transaction context). End-of-transaction destroys that context,
+freeing the `dsa_area` struct underneath us. The next query's
+`get_pinned` reads the stale `dsa_area*` from our process-local
+`OnceLock`, dereferences a freed `area->control`, and segfaults. This
+is the bug that masqueraded as "second-scan crash" even with the
+size-knob fix in place.
 
-So `dsa_attach_in_place` is *not* setting `area->control = place`. The
-internal pointers it stores reference backend heap, and the DSA's
-control lock ends up at `0x8c900001650` (unmapped), so the dereference
-in `LWLockAcquire` segfaults. This may be a pgrx binding mismatch with
-PG 17 (the `_in_place_ext` 6-arg signature) or a subtle initialization
-step we're missing — multiple attempts to align the layout, switch
-between named and inline LWLock tranches, and resize the DSA chunk
-did not change the outcome.
+Fix: switch to `TopMemoryContext` around the `dsa_attach_in_place` +
+`dsa_pin_mapping` pair, again mirroring `pgstat_shmem.c:225-234`.
+`dsa_pin_mapping` makes the *segment mappings* survive resource-owner
+release, but the `dsa_area` struct itself lives in whatever context
+was current when `palloc` ran — so the context switch is the missing
+half.
 
-**Approach B: lazy `dsa_create_ext` from the first backend.**
-Skips the postmaster-side creation entirely; the first backend that
-calls `get_pinned`/`insert` CAS-races to call `dsa_create_ext` and
-stores the handle for others to `dsa_attach` to. This avoids the
-in-place machinery, but hits a Docker-on-Mac quirk:
-`ERROR: could not resize shared memory segment "/PostgreSQL.NNN" to 0
-bytes: Invalid argument`. The DSM segment that `dsa_create` allocates
-fails to release cleanly under Docker Desktop's tmpfs.
+Together those changes fit in `src/blob_cache/storage.rs`:
 
-**Conclusion: drop DSA, hand-roll an allocator.** The cache's
-allocation patterns are simple — fixed-size header (`Entry`) plus
-variable-size payload (bytes). We can pre-carve the named shmem block
-into:
-
-- The control struct + shards (already done).
-- A fixed array of `Entry` slots (size: `n_entries_max` × `sizeof(Entry)`).
-- A pool of payload chunks in a few power-of-two size classes, each
-  with an atomic free-list head.
-
-This bypasses DSA entirely while keeping cross-backend sharing through
-named shmem. Allocation/free become simple atomic pops/pushes on the
-size-class free-lists. Size classes 16K / 32K / 64K / 128K / 256K /
-512K / 1M (as the design doc already proposes) cover the JSONBench
-blob distribution; oversize blobs (>1M) just fail the cache. This is
-~1 day of work and avoids the DSA portability surface entirely.
+- Add module-local constants `DSA_DEFAULT_INIT_SEGMENT_SIZE = 1 <<
+  20` and `DSA_MAX_SEGMENT_SIZE = 1usize << 40` (pgrx doesn't bind
+  `#define` macros).
+- In `dsa_create_in_place_compat`, pass those constants instead of
+  `0, 0`.
+- In `my_shmem_startup_hook`, after a successful create: `dsa_pin` →
+  `dsa_set_size_limit(area, dsa_size)` → `dsa_detach(area)`.
+- In `attach()`, wrap `dsa_attach_in_place` + `dsa_pin_mapping` with
+  `MemoryContextSwitchTo(TopMemoryContext)` / back.
 
 ## Implementation status
 
@@ -95,32 +99,32 @@ blob distribution; oversize blobs (>1M) just fail the cache. This is
   `std::thread::scope` dispatch).
 - Build green on PG 17 (default). `make clippy` clean on new code.
   All 382 pgrx unit tests still pass.
+- DSA create + attach working end-to-end (2026-05-13). Smoke test
+  (`SELECT count(*), sum(length(body))` twice over a 5K-row table of
+  32 KB rows compressed by `deltax_compress_partition`) shows
+  `misses_total=1`, `hits_total=1` after the second scan, no
+  crashes. Root causes were the two DSA gotchas documented in [DSA:
+  what bit us, and the fix](#dsa-what-bit-us-and-the-fix).
 
 ### Remaining
 
-1. **Debug the backend attach failure.** `register_hooks` and
-   `shmem_startup_hook` confirmed firing (postmaster log). Backend
-   `get_pinned` reaches `attach()` but it returns false on every
-   call. Next step: re-enable diagnostic logs in `attach()` and
-   identify whether `dsa_attach_in_place`, `ShmemInitStruct`, or
-   `GetNamedLWLockTranche` is the culprit.
-2. **Eviction.** Currently `insert` drops the new entry when
+1. **Eviction.** Currently `insert` drops the new entry when
    `total_bytes + new > max_bytes` (bumping `insert_failures_total`).
    First iteration acceptable for JSONBench (1GB > working set).
    Production needs LRU with neighbour-shard fallback and pin-skip.
-3. **`dshash` substitute already in place.** pgrx 0.17 doesn't
+2. **`dshash` substitute already in place.** pgrx 0.17 doesn't
    expose `dshash_*` so the implementation uses a custom per-shard
    fixed-bucket hashmap (`BUCKETS_PER_SHARD = 256`, separate chaining
    through `Entry::bucket_next`). Acceptable for the working set
    sizes we have; reconsider if buckets get long under churn.
-4. **ScanTiming/AggScanState wiring.** `DetoastLazyStats` returned
+3. **ScanTiming/AggScanState wiring.** `DetoastLazyStats` returned
    by the lazy-detoast helpers; call sites currently discard. Fold
    into per-state timing and aggregate across workers via
    `ScanTimingShmem`.
-5. **Tests.** `tests/test_blob_cache.py` for parity, eviction, and
+4. **Tests.** `tests/test_blob_cache.py` for parity, eviction, and
    concurrent-insert races; parametrise `tests/test_parallel_scan.py`
    over `blob_cache_mb`.
-6. **Bench validation** on JSONBench + ClickBench EC2.
+5. **Bench validation** on JSONBench + ClickBench EC2.
 
 ### Codebase findings that simplify the original plan
 

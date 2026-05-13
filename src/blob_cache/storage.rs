@@ -70,6 +70,11 @@ const BUCKETS_PER_SHARD: u32 = 256;
 /// Shmem block name (also used as the LWLock tranche name).
 const SHMEM_NAME: &std::ffi::CStr = c"pg_deltax_blob_cache";
 
+// From PG 17 dsa.h (#defines, not bound by pgrx). Mirror pgstat_shmem.c's
+// usage: passing 0,0 violates the contract Assert'd at dsa.c:1233.
+const DSA_DEFAULT_INIT_SEGMENT_SIZE: usize = 1 * 1024 * 1024;
+const DSA_MAX_SEGMENT_SIZE: usize = 1usize << 40;
+
 // ---------------------------------------------------------------------------
 // On-shmem data structures (all #[repr(C)])
 // ---------------------------------------------------------------------------
@@ -548,7 +553,15 @@ unsafe extern "C-unwind" fn my_shmem_startup_hook() {
                 tranche_id,
             );
             if !area.is_null() {
+                // Mirror pgstat_shmem.c: pin so the area survives
+                // all-backends-detached, cap actual size so the DSA
+                // never tries to allocate a fresh DSM segment (which
+                // is what blew up Approach B under Docker-for-Mac
+                // tmpfs), then detach the postmaster-local handle —
+                // each backend builds its own via dsa_attach_in_place.
                 pg_sys::dsa_pin(area);
+                pg_sys::dsa_set_size_limit(area, dsa_size);
+                pg_sys::dsa_detach(area);
                 (*ctl).dsa_ready.store(1, Ordering::Release);
             }
             (*ctl).initialized.store(1, Ordering::Release);
@@ -601,14 +614,24 @@ fn attach() -> bool {
             }
             let block = *CTL_PTR.get().unwrap() as *mut u8;
             let dsa_chunk = block.add(std::mem::size_of::<BlobCacheCtl>());
+            // `dsa_attach_in_place` palloc's the backend-local `dsa_area`
+            // struct in CurrentMemoryContext. We call this from inside a
+            // query, so that context is typically an executor/portal
+            // context that gets freed at end-of-transaction — leaving
+            // DSA_AREA_PTR dangling for the next query. Pin the struct
+            // to TopMemoryContext, mirroring pgstat_shmem.c:225-234.
+            let prev_ctx = pg_sys::MemoryContextSwitchTo(pg_sys::TopMemoryContext);
             let area = pg_sys::dsa_attach_in_place(
                 dsa_chunk as *mut std::ffi::c_void,
                 std::ptr::null_mut(),
             );
+            if !area.is_null() {
+                pg_sys::dsa_pin_mapping(area);
+            }
+            pg_sys::MemoryContextSwitchTo(prev_ctx);
             if area.is_null() {
                 return false;
             }
-            pg_sys::dsa_pin_mapping(area);
             let _ = DSA_AREA_PTR.set(area as usize);
         }
     }
@@ -640,11 +663,13 @@ fn reservation_total_bytes(_n_shards: usize) -> usize {
     std::mem::size_of::<BlobCacheCtl>() + RESERVATION_BYTES.load(Ordering::Relaxed) as usize
 }
 
-/// Cross-version wrapper for `dsa_create_in_place`. PG 17+ renamed it
-/// to `dsa_create_in_place_ext` and added init/max segment size knobs.
-/// Since we size the in-place chunk to the full cache and don't want
-/// growth, we pass `0,0` so PG uses sensible defaults if it ever does
-/// fall back to growth.
+/// Cross-version wrapper for `dsa_create_in_place`. PG 17+ exposes only
+/// the 6-arg `_ext`; the 4-arg form is a macro that fills in the
+/// `init_segment_size` / `max_segment_size` defaults. Passing `0,0`
+/// (as we did initially) violates the contract Assert'd at dsa.c:1233
+/// and silently corrupts the control block in release builds. We
+/// follow pgstat_shmem.c's pattern: pass the defaults, then cap actual
+/// usage with `dsa_set_size_limit` after create.
 unsafe fn dsa_create_in_place_compat(
     place: *mut std::ffi::c_void,
     size: usize,
@@ -658,8 +683,8 @@ unsafe fn dsa_create_in_place_compat(
                 size,
                 tranche_id,
                 std::ptr::null_mut(),
-                0,
-                0,
+                DSA_DEFAULT_INIT_SEGMENT_SIZE,
+                DSA_MAX_SEGMENT_SIZE,
             )
         }
         #[cfg(not(any(feature = "pg17", feature = "pg18")))]
