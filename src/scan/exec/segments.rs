@@ -2367,22 +2367,32 @@ pub(super) unsafe fn load_segments_heap(
                                 );
                                 segments[seg_idx].toast_pointers[blob_slot] = ptr_copy;
                             } else {
-                                // Eager: detoast immediately
-                                let varlena_ptr: *mut pg_sys::varlena = blob_values[2].cast_mut_ptr();
-                                let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
-                                let len = pgrx::varsize_any_exhdr(detoasted);
-                                let data = pgrx::vardata_any(detoasted);
-                                #[allow(clippy::unnecessary_cast)]
-                                let bytes = std::slice::from_raw_parts(
-                                    data as *const u8,
-                                    len,
-                                )
-                                .to_vec();
-                                let was_toasted = detoasted != varlena_ptr;
-                                if was_toasted {
-                                    pg_sys::pfree(detoasted as *mut _);
+                                // Eager path: try the cache, fall back to detoast.
+                                let cache_key = crate::blob_cache::BlobCacheKey::new(
+                                    meta_oid, seg_id, blob_slot,
+                                );
+                                if let Some(pin) = crate::blob_cache::get_pinned(&cache_key) {
+                                    segments[seg_idx].compressed_blobs[blob_slot] =
+                                        pin.as_slice().to_vec();
+                                    segments[seg_idx].cached_blob_pins.push(pin);
+                                } else {
+                                    let varlena_ptr: *mut pg_sys::varlena = blob_values[2].cast_mut_ptr();
+                                    let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                                    let len = pgrx::varsize_any_exhdr(detoasted);
+                                    let data = pgrx::vardata_any(detoasted);
+                                    #[allow(clippy::unnecessary_cast)]
+                                    let bytes = std::slice::from_raw_parts(
+                                        data as *const u8,
+                                        len,
+                                    )
+                                    .to_vec();
+                                    let was_toasted = detoasted != varlena_ptr;
+                                    if was_toasted {
+                                        pg_sys::pfree(detoasted as *mut _);
+                                    }
+                                    crate::blob_cache::insert(&cache_key, &bytes);
+                                    segments[seg_idx].compressed_blobs[blob_slot] = bytes;
                                 }
-                                segments[seg_idx].compressed_blobs[blob_slot] = bytes;
                             }
                         }
 
@@ -2438,14 +2448,24 @@ pub(super) unsafe fn load_segments_heap(
                             std::ptr::copy_nonoverlapping(varlena_ptr as *const u8, ptr_copy.as_mut_ptr(), ptr_size);
                             segments[seg_idx].toast_pointers[blob_slot] = ptr_copy;
                         } else {
-                            let varlena_ptr: *mut pg_sys::varlena = bv[2].cast_mut_ptr();
-                            let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
-                            let len = pgrx::varsize_any_exhdr(detoasted);
-                            let data = pgrx::vardata_any(detoasted);
-                            #[allow(clippy::unnecessary_cast)]
-                            let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
-                            if detoasted != varlena_ptr { pg_sys::pfree(detoasted as *mut _); }
-                            segments[seg_idx].compressed_blobs[blob_slot] = bytes;
+                            let cache_key = crate::blob_cache::BlobCacheKey::new(
+                                meta_oid, seg_id, blob_slot,
+                            );
+                            if let Some(pin) = crate::blob_cache::get_pinned(&cache_key) {
+                                segments[seg_idx].compressed_blobs[blob_slot] =
+                                    pin.as_slice().to_vec();
+                                segments[seg_idx].cached_blob_pins.push(pin);
+                            } else {
+                                let varlena_ptr: *mut pg_sys::varlena = bv[2].cast_mut_ptr();
+                                let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                                let len = pgrx::varsize_any_exhdr(detoasted);
+                                let data = pgrx::vardata_any(detoasted);
+                                #[allow(clippy::unnecessary_cast)]
+                                let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
+                                if detoasted != varlena_ptr { pg_sys::pfree(detoasted as *mut _); }
+                                crate::blob_cache::insert(&cache_key, &bytes);
+                                segments[seg_idx].compressed_blobs[blob_slot] = bytes;
+                            }
                         }
                     }
 
@@ -2749,6 +2769,18 @@ pub(super) unsafe fn fetch_segment_blobs(
                 continue; // already fetched
             }
 
+            // Cache fast path: skip the index lookup + heap I/O + detoast
+            // entirely if this (companion, segment, col) blob is already
+            // in the shared blob cache. The pin keeps the DSA bytes alive
+            // for the lifetime of the segment.
+            let cache_key =
+                crate::blob_cache::BlobCacheKey::new(companion_oid, segment_id, blob_slot);
+            if let Some(pin) = crate::blob_cache::get_pinned(&cache_key) {
+                seg.compressed_blobs[blob_slot] = pin.as_slice().to_vec();
+                seg.cached_blob_pins.push(pin);
+                continue;
+            }
+
             // Two-column PK scankey: (_col_idx = ci, _segment_id = seg_id).
             let mut skeys = [pg_sys::ScanKeyData::default(); 2];
             pg_sys::ScanKeyInit(
@@ -2790,6 +2822,7 @@ pub(super) unsafe fn fetch_segment_blobs(
                     if detoasted != varlena_ptr {
                         pg_sys::pfree(detoasted as *mut _);
                     }
+                    crate::blob_cache::insert(&cache_key, &bytes);
                     seg.compressed_blobs[blob_slot] = bytes;
                 }
             }

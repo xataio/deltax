@@ -1,12 +1,14 @@
 # Blob cache — shared-memory cache for detoasted compressed blobs
 
-> **Status: Phase 1 scaffolding landed (2026-05-13).** Module structure,
-> public API, GUCs, integration point in `detoast_lazy_blobs`, and pin
-> lifetime are all in place; the storage backend
-> (`src/blob_cache/storage.rs`) is a stub that always misses. The actual
-> shmem-backed implementation (DSA + dshash + sharded LWLocks + LRU +
-> eviction) is the remaining ~1–1.5 weeks of focused work. See
-> [Implementation status](#implementation-status) below.
+> **Status: storage backend wired up, runtime debug pending (2026-05-13).**
+> Module structure, public API, GUCs, shmem registration, DSA creation,
+> sharded hashmap, pin counting, integration in three detoast sites,
+> and the `pg_deltax_blob_cache_stats()` SRF are all in place. Hooks
+> verified firing in postmaster (`register_hooks` + `shmem_startup_hook`
+> log at startup). Backend-side `attach()` currently fails for reasons
+> TBD — likely an issue with `dsa_attach_in_place` or a missed setup
+> step in the forked backend; needs a debug session with diagnostic
+> logs re-enabled. No eviction yet (insert drops when full).
 
 ## Implementation status
 
@@ -36,30 +38,29 @@
 
 ### Remaining
 
-1. **Storage backend in `src/blob_cache/storage.rs`** — the hard part.
-   - `shmem_request_hook` (PG 15+) / `RequestAddinShmemSpace` (PG 14)
-     in `_PG_init` reserving the control struct and an LWLock tranche
-     named `pg_deltax_blob_cache`.
-   - `shmem_startup_hook` that runs once: `ShmemInitStruct` the control
-     block, `dsa_create_in_place` the area (initial size
-     `min(blob_cache_mb, 256 MiB)`), `dshash_create` with a custom
-     hash over `BlobCacheKey`.
-   - Sharded LRU intrusive list whose `prev`/`next` pointers are
-     `dsa_pointer`s (since list nodes live in DSA memory).
-   - Size-class rounding (16/32/64/128/256/512KB, 1MB).
-   - Pin counting on `AtomicU16` inside each `BlobCacheEntry`.
-   - Eviction with neighbour-shard fallback when the local shard's tail
-     is fully pinned.
-2. **ScanTiming/AggScanState wiring.** `DetoastLazyStats` is already
-   returned by the lazy-detoast helpers; call sites currently discard.
-   Fold into the per-state timing struct and aggregate across parallel
-   workers via the existing `ScanTimingShmem` path.
-3. **`pg_deltax_blob_cache_stats()` SRF.** Small once `stats()` returns
-   real data.
-4. **Tests.** `tests/test_blob_cache.py` for parity, eviction, and
+1. **Debug the backend attach failure.** `register_hooks` and
+   `shmem_startup_hook` confirmed firing (postmaster log). Backend
+   `get_pinned` reaches `attach()` but it returns false on every
+   call. Next step: re-enable diagnostic logs in `attach()` and
+   identify whether `dsa_attach_in_place`, `ShmemInitStruct`, or
+   `GetNamedLWLockTranche` is the culprit.
+2. **Eviction.** Currently `insert` drops the new entry when
+   `total_bytes + new > max_bytes` (bumping `insert_failures_total`).
+   First iteration acceptable for JSONBench (1GB > working set).
+   Production needs LRU with neighbour-shard fallback and pin-skip.
+3. **`dshash` substitute already in place.** pgrx 0.17 doesn't
+   expose `dshash_*` so the implementation uses a custom per-shard
+   fixed-bucket hashmap (`BUCKETS_PER_SHARD = 256`, separate chaining
+   through `Entry::bucket_next`). Acceptable for the working set
+   sizes we have; reconsider if buckets get long under churn.
+4. **ScanTiming/AggScanState wiring.** `DetoastLazyStats` returned
+   by the lazy-detoast helpers; call sites currently discard. Fold
+   into per-state timing and aggregate across workers via
+   `ScanTimingShmem`.
+5. **Tests.** `tests/test_blob_cache.py` for parity, eviction, and
    concurrent-insert races; parametrise `tests/test_parallel_scan.py`
    over `blob_cache_mb`.
-5. **Bench validation** on JSONBench + ClickBench EC2.
+6. **Bench validation** on JSONBench + ClickBench EC2.
 
 ### Codebase findings that simplify the original plan
 

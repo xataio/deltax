@@ -31,6 +31,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use pgrx::iter::TableIterator;
+use pgrx::name;
+use pgrx::prelude::*;
+
 mod storage;
 
 /// Cache key: 12 bytes, trivially hashable. The companion OID changes on
@@ -82,7 +86,6 @@ impl Drop for BlobCachePin {
 
 /// Global counters for the `pg_deltax_blob_cache_stats()` SRF.
 #[derive(Copy, Clone, Default, Debug)]
-#[allow(dead_code)] // Surfaced via SRF; lands with the storage backend.
 pub(crate) struct BlobCacheStats {
     pub(crate) entries: u64,
     pub(crate) bytes_used: u64,
@@ -119,7 +122,6 @@ pub(crate) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
 }
 
 /// Snapshot of global stats. Used by the SRF and tests.
-#[allow(dead_code)] // Surfaced via SRF; lands with the storage backend.
 pub(crate) fn stats() -> BlobCacheStats {
     storage::stats()
 }
@@ -142,9 +144,38 @@ pub(crate) fn configured_bytes() -> usize {
 }
 
 /// Returns the configured shard count, rounded up to the next power of two.
-#[allow(dead_code)] // Used by the storage layer once it lands.
 pub(crate) fn configured_shards() -> usize {
     let s = crate::BLOB_CACHE_SHARDS.get();
     let raw = s.max(1) as usize;
     raw.next_power_of_two().min(1024)
+}
+
+/// SRF that exposes the current global blob cache counters. One row.
+///
+/// All counters are returned as `bigint` (PG has no unsigned types).
+/// Negative values are not possible — internal counters are `u64` and
+/// will saturate before overflowing `i64::MAX` (~9 EiB / hits ~9 quintillion).
+#[pg_extern]
+fn pg_deltax_blob_cache_stats() -> TableIterator<
+    'static,
+    (
+        name!(entries, i64),
+        name!(bytes_used, i64),
+        name!(bytes_max, i64),
+        name!(hits_total, i64),
+        name!(misses_total, i64),
+        name!(evictions_total, i64),
+        name!(insert_failures_total, i64),
+    ),
+> {
+    let s = stats();
+    TableIterator::once((
+        s.entries as i64,
+        s.bytes_used as i64,
+        s.bytes_max as i64,
+        s.hits_total as i64,
+        s.misses_total as i64,
+        s.evictions_total as i64,
+        s.insert_failures_total as i64,
+    ))
 }
