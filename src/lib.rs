@@ -70,9 +70,12 @@ pub(crate) static JSON_EXTRACT_MODE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"none"));
 
 /// Size of the process-shared blob cache, in MiB. `0` disables the cache.
-/// Default `1024` enables ~1 GiB by default; operators can lower for small
-/// instances or raise on memory-rich systems. See `dev/docs/BLOB_CACHE.md`.
-pub(crate) static BLOB_CACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(1024);
+/// Default `4096` covers the JSONBench working set fully and most of the
+/// ClickBench working set out of the box. Memory-constrained boxes
+/// (e.g. Docker Desktop default VM, small CI runners) should lower it;
+/// multi-column heavy OLAP workloads (ClickBench at scale) benefit from
+/// bumping to 8192. See `dev/docs/BLOB_CACHE.md#sizing`.
+pub(crate) static BLOB_CACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(4096);
 
 /// Number of shards (power of two) in the blob cache. More shards reduce
 /// LWLock contention; fewer save shmem overhead. Default `64` is a good

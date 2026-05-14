@@ -507,14 +507,23 @@ workload.
 
 | GUC | Type | Default | Range | Meaning |
 |---|---|---|---|---|
-| `pg_deltax.blob_cache_mb` | int | `1024` | `0..32768` | Cache size in MiB. `0` = disabled. Postmaster context. |
+| `pg_deltax.blob_cache_mb` | int | `4096` | `0..32768` | Cache size in MiB. `0` = disabled. Postmaster context. |
 | `pg_deltax.blob_cache_shards` | int | `64` | `1..1024` | Shard count. Powers of two recommended. Postmaster context. |
 
-The current `1024` default is a conservative starting point that fits
-in shmem on a small box without forcing huge-pages tuning. On
-production analytical workloads where the per-column working set
-exceeds 1 GB (most of them), users should bump this — see
-[Sizing](#sizing).
+The `4096` default is the largest value that:
+
+- Fully covers JSONBench's working set (2.3 GB measured) with
+  headroom.
+- Covers ~75-80% of ClickBench's working set (~5.5 GB extrapolated),
+  enough that most warm queries hit cache; for full coverage bump to
+  `8192`.
+- Fits on memory-constrained dev boxes (Docker Desktop default 4 GB
+  VM has it tight — drop to `1024` if PG fails to start with
+  "could not map anonymous shared memory").
+
+Users on big production servers (32+ GB RAM) running heavy
+multi-column OLAP workloads (ClickBench-scale) should override to
+`8192` or more. See [Sizing](#sizing) for the operational story.
 
 ## Sizing
 
