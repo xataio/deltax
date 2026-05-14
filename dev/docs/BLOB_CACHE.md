@@ -161,6 +161,22 @@ Together those changes fit in `src/blob_cache/storage.rs`:
   cap. Warm-run wins: Q4 2.30s → 1.52s (−34%), Q5 2.45s → 1.77s
   (−28%). Q1/Q2 marginal because they were already detoast-light.
   See [Sizing](#sizing) for the operational story.
+- **Auto-sized default (2026-05-14).** `pg_deltax.blob_cache_mb = -1`
+  (the new default) reads `MemTotal` from `/proc/meminfo` at
+  postmaster start and resolves to `clamp(MemTotal / 4, 256 MiB,
+  4096 MiB)`. Falls back to the floor on non-Linux hosts. Resolved
+  value is observable via `pg_deltax_blob_cache_stats().bytes_max`.
+- **Integration tests (2026-05-14).** `tests/test_blob_cache.py` —
+  6 tests covering: (1) the auto-sized default resolves to a
+  non-zero cap, (2) cold scans populate misses + entries, (3) warm
+  scans produce hits dominantly, (4) two scans return bytewise-
+  identical results (validates the `BlobBytes::Cached` borrow
+  path), (5) no entries are pinned between queries (`pin_count == 0`
+  across all shards after a scan), (6) `EXPLAIN ANALYZE` surfaces
+  the `DeltaX Blob Cache: hits=…` line. Skips cache-on-vs-off parity
+  because `blob_cache_mb` is Postmaster-context — manual EC2
+  validation covered that already (37/43 ClickBench queries
+  hash-identical; 6 differ only in tie-breaking).
 
 ### Remaining
 
@@ -168,20 +184,18 @@ Together those changes fit in `src/blob_cache/storage.rs`:
    64 shards and a hash-distributed key, a target shard can be empty
    when eviction is needed; `insert` then bumps
    `insert_failures_total` (~38 out of 50 attempts in a stress test
-   on 4 MB / 64 shards). In practice, large caches with thousands of
-   entries per shard rarely hit this. When the rate justifies it,
-   try shards `±1, ±2, ...` with `LWLockConditionalAcquire` (avoids
-   deadlock without strict lock ordering).
+   on 4 MB / 64 shards). In practice this only matters when the
+   cache is significantly smaller than the working set; the
+   auto-sized default + the 4 GiB cap make it a corner case. If a
+   workload ever hits it, try shards `±1, ±2, ...` with
+   `LWLockConditionalAcquire` (avoids deadlock without strict lock
+   ordering).
 2. **`dshash` substitute already in place.** pgrx 0.17 doesn't
    expose `dshash_*` so the implementation uses a custom per-shard
    fixed-bucket hashmap (`BUCKETS_PER_SHARD = 256`, separate chaining
    through `Entry::bucket_next`). Acceptable for the working set
-   sizes we have; reconsider if buckets get long under churn.
-3. **Tests.** `tests/test_blob_cache.py` for parity, eviction, and
-   concurrent-insert races; parametrise `tests/test_parallel_scan.py`
-   over `blob_cache_mb`. Needs a separate-container fixture since
-   `blob_cache_mb` is Postmaster-context.
-4. **Bench validation** on JSONBench + ClickBench EC2.
+   sizes we have; reconsider if buckets get long under churn. (Not
+   a remaining task — kept here as a note for future readers.)
 
 ### Codebase findings that simplify the original plan
 
