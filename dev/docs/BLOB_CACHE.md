@@ -146,6 +146,21 @@ Together those changes fit in `src/blob_cache/storage.rs`:
   needed no changes. Measured warm-scan detoast cost on a ~1.2 MB
   blob dropped from 0.082 ms → 0.006 ms (~13×); MB-scale blobs on
   JSONBench / RTABench will save proportionally more.
+- **Per-shard diagnostic SRF (2026-05-14).**
+  `pg_deltax_blob_cache_shard_stats()` walks every shard's LRU list
+  under shared lock and returns `(shard_id, n_entries, bytes_used,
+  lru_walk_count, pinned_count, unpinned_count, lru_head_dp,
+  lru_tail_dp)`. Added to debug a stuck-cache scenario where the
+  bench showed `evictions_total=0` alongside 895k insert failures;
+  the SRF immediately confirmed LRU invariants were intact and
+  redirected the investigation to sizing instead.
+- **Cache sizing validated (2026-05-14).** Running JSONBench on
+  m6i.8xlarge with `pg_deltax.blob_cache_mb` bumped from 1024 to
+  8192: hit ratio jumped from 52% → 91%, evictions and
+  insert_failures both went to 0, working set fit at 2.3 GB / 8 GB
+  cap. Warm-run wins: Q4 2.30s → 1.52s (−34%), Q5 2.45s → 1.77s
+  (−28%). Q1/Q2 marginal because they were already detoast-light.
+  See [Sizing](#sizing) for the operational story.
 
 ### Remaining
 
@@ -492,12 +507,70 @@ workload.
 
 | GUC | Type | Default | Range | Meaning |
 |---|---|---|---|---|
-| `pg_deltax.blob_cache_mb` | int | `0` | `0..32768` | Cache size in MiB. `0` = disabled. |
-| `pg_deltax.blob_cache_shards` | int | `64` | `1..1024` | Shard count. Powers of 2 only. Restart required. |
+| `pg_deltax.blob_cache_mb` | int | `1024` | `0..32768` | Cache size in MiB. `0` = disabled. Postmaster context. |
+| `pg_deltax.blob_cache_shards` | int | `64` | `1..1024` | Shard count. Powers of two recommended. Postmaster context. |
 
-Start with `default=0` so the cache is opt-in until measured on real
-workloads. Once we've validated benefits and absence of regressions
-(JSONBench, ClickBench, RTABench), flip the default to ~`1024`.
+The current `1024` default is a conservative starting point that fits
+in shmem on a small box without forcing huge-pages tuning. On
+production analytical workloads where the per-column working set
+exceeds 1 GB (most of them), users should bump this — see
+[Sizing](#sizing).
+
+## Sizing
+
+The cache is sized for the *working set* of detoasted compressed
+column blobs across the queries you actually run, not the whole
+column-store. Each compressed segment-column is one cache entry; a
+typical ClickBench blob is 30–80 KB, JSONBench's single `data` jsonb
+column is ~MB-scale. The cache only helps for blobs that get touched
+again, so the relevant capacity is "how much hot column data does my
+workload re-read."
+
+**Rough heuristics**, in priority order:
+
+1. **Empirical**: run the workload at the current default, query
+   `pg_deltax_blob_cache_stats()`, and watch `insert_failures_total`.
+   If it stays near zero, the cache fits. If it climbs into the
+   thousands or millions, double the cache and re-test.
+2. **By column**: `(rows_touched_per_query) × (avg_compressed_bytes_per_row)
+   × (num_hot_columns)`. For JSONBench's single jsonb column on
+   100 M rows ≈ 2.3 GB compressed; an 8 GB cache covers it with
+   headroom for variation.
+3. **By RAM budget**: `min(workload_estimate, 25% of physical RAM)`.
+   Leave plenty for `shared_buffers`, `work_mem × parallel_workers`,
+   and OS file cache. On a 128 GB box, 8–16 GB blob cache is
+   comfortable.
+
+**When the cache is too small** — symptom: `insert_failures_total >>
+evictions_total`. The cache fills, then a workload-pattern issue
+prevents eviction from firing reliably: a query that pins many entries
+(via cache hits) during its scan can't evict any of them within the
+same query, so subsequent misses in that query fall through without
+caching. Between queries, pins release and the cache recovers, but
+during a single multi-column heavy query the cache is effectively
+read-only. **The right fix is always "size up"** — once the working
+set fits, evictions never need to fire at all (they don't on JSONBench
+at 8 GB). The neighbour-shard eviction fallback under
+[Remaining](#remaining) would only chip at the margin of this
+behaviour, not solve it.
+
+**Future work — auto-sizing.** A `pg_deltax.blob_cache_mb = 0` (or
+`auto`) mode that picks a value from physical RAM would be a UX win.
+The candidate heuristic: `min(8192, 25% × MemTotal)` MiB. Implementation
+needs a portable way to read physical RAM at postmaster start (`sysconf
+(_SC_PHYS_PAGES) × _SC_PAGE_SIZE` on Linux; the `sysinfo` crate would
+abstract this) and a clear "I overrode the default" signal in the
+extension's startup log. Mirrors `pg_deltax.parallel_workers = 0`
+which already auto-resolves via `num_cpus::get().min(16)`.
+Open questions before implementing:
+
+- Should auto-size honour `huge_pages = try`/`on`? Picking 25% of RAM
+  on a box without huge pages configured may surface as a startup
+  failure instead of a working cache.
+- How should it interact with `shared_buffers`? If both auto-size to
+  25% of RAM, the box is at 50%+ shmem before `work_mem` runs.
+- How loud should the log line be? Users should be able to find the
+  number without grepping for it.
 
 ## Testing matrix
 
