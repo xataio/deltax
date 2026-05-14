@@ -535,7 +535,7 @@ pub(super) fn segment_skippable_by_dict(
     batch_quals: &[BatchQual],
     col_names: &[String],
     segment_by: &[String],
-    compressed_blobs: &[Vec<u8>],
+    compressed_blobs: &[BlobBytes],
 ) -> bool {
     for bq in batch_quals {
         // Determine which operation we're checking
@@ -612,6 +612,50 @@ pub(super) fn segment_skippable_by_dict(
     false
 }
 
+/// One per-column compressed blob stored in `SegmentData`. Lets cache
+/// hits skip the `to_vec()` copy: instead of materialising the cached
+/// bytes into a backend-heap `Vec<u8>`, `Cached` keeps a raw pointer into
+/// the DSA-backed `BlobCachePin` allocation. The corresponding pin lives
+/// in `SegmentData::cached_blob_pins`, which is declared AFTER
+/// `compressed_blobs` so Rust drops `compressed_blobs` first — the raw
+/// pointers go out of scope before the pins release the entry.
+///
+/// `Deref<Target = [u8]>` so existing consumer code that takes `&[u8]`
+/// keeps working without changes.
+pub(crate) enum BlobBytes {
+    Owned(Vec<u8>),
+    /// Borrowed bytes from the blob cache. Valid for the lifetime of
+    /// the surrounding `SegmentData` (i.e. until the matching pin in
+    /// `cached_blob_pins` drops).
+    Cached { data: *const u8, len: u32 },
+}
+
+impl Default for BlobBytes {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
+impl std::ops::Deref for BlobBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            BlobBytes::Owned(v) => v.as_slice(),
+            BlobBytes::Cached { data, len } => unsafe {
+                std::slice::from_raw_parts(*data, *len as usize)
+            },
+        }
+    }
+}
+
+// SAFETY: Cached's raw pointer references DSA shared memory whose
+// lifetime is guaranteed by the matching `BlobCachePin` in the same
+// `SegmentData`. The pin uses atomic pin_count to keep the entry
+// resident across all readers and prevents eviction. The bytes are
+// only ever read, never written.
+unsafe impl Send for BlobBytes {}
+unsafe impl Sync for BlobBytes {}
+
 pub(super) struct SegmentData {
     /// Source companion-table OID. Populated by the caller after
     /// `load_segments_heap` returns; used by `fetch_segment_blobs` to re-open
@@ -621,7 +665,7 @@ pub(super) struct SegmentData {
     /// the main load).
     pub(super) segment_id: i32,
     pub(super) segment_values: Vec<Option<String>>,
-    pub(super) compressed_blobs: Vec<Vec<u8>>,
+    pub(super) compressed_blobs: Vec<BlobBytes>,
     /// Per-text-column length sidecar blobs (parallel to compressed_blobs).
     /// Non-empty when the planner has marked a text column as sidecar-only;
     /// holds the compressed u32-per-row length array instead of the main blob.
@@ -638,6 +682,12 @@ pub(super) struct SegmentData {
     /// detoast_lazy_blobs() to materialize". Empty means already detoasted or
     /// not needed.
     pub(super) toast_pointers: Vec<Vec<u8>>,
+    /// Pins for blobs served from the shared blob cache. Holding these pins
+    /// guarantees the underlying DSA-backed bytes outlive every read of
+    /// `compressed_blobs` (including parallel-worker reads, since detoast
+    /// runs on the leader before worker dispatch and segments are owned by
+    /// the leader's `DecompressState`). Released automatically on drop.
+    pub(super) cached_blob_pins: Vec<crate::blob_cache::BlobCachePin>,
 }
 
 // SAFETY: SegmentData is shared across threads only via immutable references
@@ -1266,8 +1316,10 @@ pub(super) unsafe fn load_segments_heap(
                 });
             }
 
-            // Pre-allocate empty blob slots — will be filled in Phase 2
-            let compressed_blobs: Vec<Vec<u8>> = vec![Vec::new(); num_blob_cols];
+            // Pre-allocate empty blob slots — will be filled in Phase 2.
+            // resize_with avoids requiring BlobBytes: Clone (it isn't).
+            let mut compressed_blobs: Vec<BlobBytes> = Vec::with_capacity(num_blob_cols);
+            compressed_blobs.resize_with(num_blob_cols, BlobBytes::default);
             let text_length_blobs: Vec<Vec<u8>> = vec![Vec::new(); num_blob_cols];
             let toast_pointers: Vec<Vec<u8>> = vec![Vec::new(); num_blob_cols];
 
@@ -1284,6 +1336,7 @@ pub(super) unsafe fn load_segments_heap(
                 col_minmax,
                 col_sums,
                 toast_pointers,
+                cached_blob_pins: Vec::new(),
             });
         }
 
@@ -2360,22 +2413,33 @@ pub(super) unsafe fn load_segments_heap(
                                 );
                                 segments[seg_idx].toast_pointers[blob_slot] = ptr_copy;
                             } else {
-                                // Eager: detoast immediately
-                                let varlena_ptr: *mut pg_sys::varlena = blob_values[2].cast_mut_ptr();
-                                let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
-                                let len = pgrx::varsize_any_exhdr(detoasted);
-                                let data = pgrx::vardata_any(detoasted);
-                                #[allow(clippy::unnecessary_cast)]
-                                let bytes = std::slice::from_raw_parts(
-                                    data as *const u8,
-                                    len,
-                                )
-                                .to_vec();
-                                let was_toasted = detoasted != varlena_ptr;
-                                if was_toasted {
-                                    pg_sys::pfree(detoasted as *mut _);
+                                // Eager path: try the cache, fall back to detoast.
+                                let cache_key = crate::blob_cache::BlobCacheKey::new(
+                                    meta_oid, seg_id, blob_slot,
+                                );
+                                if let Some(pin) = crate::blob_cache::get_pinned(&cache_key) {
+                                    let s = pin.as_slice();
+                                    segments[seg_idx].compressed_blobs[blob_slot] =
+                                        BlobBytes::Cached { data: s.as_ptr(), len: s.len() as u32 };
+                                    segments[seg_idx].cached_blob_pins.push(pin);
+                                } else {
+                                    let varlena_ptr: *mut pg_sys::varlena = blob_values[2].cast_mut_ptr();
+                                    let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                                    let len = pgrx::varsize_any_exhdr(detoasted);
+                                    let data = pgrx::vardata_any(detoasted);
+                                    #[allow(clippy::unnecessary_cast)]
+                                    let bytes = std::slice::from_raw_parts(
+                                        data as *const u8,
+                                        len,
+                                    )
+                                    .to_vec();
+                                    let was_toasted = detoasted != varlena_ptr;
+                                    if was_toasted {
+                                        pg_sys::pfree(detoasted as *mut _);
+                                    }
+                                    crate::blob_cache::insert(&cache_key, &bytes);
+                                    segments[seg_idx].compressed_blobs[blob_slot] = BlobBytes::Owned(bytes);
                                 }
-                                segments[seg_idx].compressed_blobs[blob_slot] = bytes;
                             }
                         }
 
@@ -2431,14 +2495,25 @@ pub(super) unsafe fn load_segments_heap(
                             std::ptr::copy_nonoverlapping(varlena_ptr as *const u8, ptr_copy.as_mut_ptr(), ptr_size);
                             segments[seg_idx].toast_pointers[blob_slot] = ptr_copy;
                         } else {
-                            let varlena_ptr: *mut pg_sys::varlena = bv[2].cast_mut_ptr();
-                            let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
-                            let len = pgrx::varsize_any_exhdr(detoasted);
-                            let data = pgrx::vardata_any(detoasted);
-                            #[allow(clippy::unnecessary_cast)]
-                            let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
-                            if detoasted != varlena_ptr { pg_sys::pfree(detoasted as *mut _); }
-                            segments[seg_idx].compressed_blobs[blob_slot] = bytes;
+                            let cache_key = crate::blob_cache::BlobCacheKey::new(
+                                meta_oid, seg_id, blob_slot,
+                            );
+                            if let Some(pin) = crate::blob_cache::get_pinned(&cache_key) {
+                                let s = pin.as_slice();
+                                segments[seg_idx].compressed_blobs[blob_slot] =
+                                    BlobBytes::Cached { data: s.as_ptr(), len: s.len() as u32 };
+                                segments[seg_idx].cached_blob_pins.push(pin);
+                            } else {
+                                let varlena_ptr: *mut pg_sys::varlena = bv[2].cast_mut_ptr();
+                                let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                                let len = pgrx::varsize_any_exhdr(detoasted);
+                                let data = pgrx::vardata_any(detoasted);
+                                #[allow(clippy::unnecessary_cast)]
+                                let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
+                                if detoasted != varlena_ptr { pg_sys::pfree(detoasted as *mut _); }
+                                crate::blob_cache::insert(&cache_key, &bytes);
+                                segments[seg_idx].compressed_blobs[blob_slot] = BlobBytes::Owned(bytes);
+                            }
                         }
                     }
 
@@ -2661,7 +2736,8 @@ pub(super) unsafe fn fetch_segment_blobs(
             .filter(|n| !segment_by.contains(*n))
             .count();
         if seg.compressed_blobs.is_empty() {
-            seg.compressed_blobs = vec![Vec::new(); num_blob_cols];
+            seg.compressed_blobs = Vec::with_capacity(num_blob_cols);
+            seg.compressed_blobs.resize_with(num_blob_cols, BlobBytes::default);
         }
 
         // Derive `{partition}_blobs` OID from meta OID.
@@ -2742,6 +2818,20 @@ pub(super) unsafe fn fetch_segment_blobs(
                 continue; // already fetched
             }
 
+            // Cache fast path: skip the index lookup + heap I/O + detoast
+            // entirely if this (companion, segment, col) blob is already
+            // in the shared blob cache. The pin keeps the DSA bytes alive
+            // for the lifetime of the segment.
+            let cache_key =
+                crate::blob_cache::BlobCacheKey::new(companion_oid, segment_id, blob_slot);
+            if let Some(pin) = crate::blob_cache::get_pinned(&cache_key) {
+                let s = pin.as_slice();
+                seg.compressed_blobs[blob_slot] =
+                    BlobBytes::Cached { data: s.as_ptr(), len: s.len() as u32 };
+                seg.cached_blob_pins.push(pin);
+                continue;
+            }
+
             // Two-column PK scankey: (_col_idx = ci, _segment_id = seg_id).
             let mut skeys = [pg_sys::ScanKeyData::default(); 2];
             pg_sys::ScanKeyInit(
@@ -2783,7 +2873,8 @@ pub(super) unsafe fn fetch_segment_blobs(
                     if detoasted != varlena_ptr {
                         pg_sys::pfree(detoasted as *mut _);
                     }
-                    seg.compressed_blobs[blob_slot] = bytes;
+                    crate::blob_cache::insert(&cache_key, &bytes);
+                    seg.compressed_blobs[blob_slot] = BlobBytes::Owned(bytes);
                 }
             }
 
@@ -2797,30 +2888,75 @@ pub(super) unsafe fn fetch_segment_blobs(
     t_start.elapsed().as_micros() as u64
 }
 
+/// Materialize a single blob slot from the cache (on hit) or via
+/// `pg_detoast_datum` (on miss). On miss, the freshly-detoasted bytes
+/// are also inserted into the cache best-effort.
+///
+/// Returns `(bytes_served_from_cache, hit)`. `hit` is true when the
+/// blob came from the cache; the caller can use this to bump per-query
+/// stats counters.
+unsafe fn detoast_blob_slot(seg: &mut SegmentData, bi: usize) -> (u64, bool) {
+    unsafe {
+        let key = crate::blob_cache::BlobCacheKey::new(
+            seg.companion_oid,
+            seg.segment_id,
+            bi,
+        );
+        if let Some(pin) = crate::blob_cache::get_pinned(&key) {
+            let slice = pin.as_slice();
+            let len = slice.len() as u64;
+            // Borrow directly from the pin — no memcpy. The pin lives
+            // in cached_blob_pins until SegmentData drops, and
+            // compressed_blobs is declared before cached_blob_pins so
+            // the BlobBytes::Cached pointers drop first.
+            seg.compressed_blobs[bi] =
+                BlobBytes::Cached { data: slice.as_ptr(), len: slice.len() as u32 };
+            seg.toast_pointers[bi].clear();
+            seg.cached_blob_pins.push(pin);
+            return (len, true);
+        }
+
+        let ptr = seg.toast_pointers[bi].as_ptr() as *mut pg_sys::varlena;
+        let detoasted = pg_sys::pg_detoast_datum(ptr);
+        let len = pgrx::varsize_any_exhdr(detoasted);
+        let data = pgrx::vardata_any(detoasted);
+        #[allow(clippy::unnecessary_cast)]
+        let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
+        if detoasted != ptr {
+            pg_sys::pfree(detoasted as *mut _);
+        }
+        crate::blob_cache::insert(&key, &bytes);
+        seg.compressed_blobs[bi] = BlobBytes::Owned(bytes);
+        seg.toast_pointers[bi].clear();
+        (0, false)
+    }
+}
+
 /// Materialize deferred TOAST pointers for a segment.
 ///
 /// For each blob index that has a non-empty toast_pointer, calls pg_detoast_datum
 /// on the stored pointer copy and replaces the empty compressed_blob with the
 /// detoasted data. Clears the toast_pointer after detoasting.
-pub(super) unsafe fn detoast_lazy_blobs(seg: &mut SegmentData) {
+///
+/// Returns the [`DetoastLazyStats`] aggregated over all blobs that were
+/// materialised on this call.
+pub(super) unsafe fn detoast_lazy_blobs(seg: &mut SegmentData) -> DetoastLazyStats {
+    let mut stats = DetoastLazyStats::default();
     unsafe {
         for bi in 0..seg.toast_pointers.len() {
             if seg.toast_pointers[bi].is_empty() {
                 continue;
             }
-            let ptr = seg.toast_pointers[bi].as_ptr() as *mut pg_sys::varlena;
-            let detoasted = pg_sys::pg_detoast_datum(ptr);
-            let len = pgrx::varsize_any_exhdr(detoasted);
-            let data = pgrx::vardata_any(detoasted);
-            #[allow(clippy::unnecessary_cast)]
-            let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
-            if detoasted != ptr {
-                pg_sys::pfree(detoasted as *mut _);
+            let (bytes_from_cache, hit) = detoast_blob_slot(seg, bi);
+            if hit {
+                stats.cache_hits += 1;
+                stats.cache_bytes_served += bytes_from_cache;
+            } else {
+                stats.cache_misses += 1;
             }
-            seg.compressed_blobs[bi] = bytes;
-            seg.toast_pointers[bi].clear();
         }
     }
+    stats
 }
 
 /// Materialize deferred TOAST pointers for specific blob indices only.
@@ -2828,25 +2964,35 @@ pub(super) unsafe fn detoast_lazy_blobs(seg: &mut SegmentData) {
 /// Like `detoast_lazy_blobs` but only processes the given blob indices,
 /// leaving other blobs lazy. Used in top-N Phase 1 to detoast only
 /// filter + sort column blobs while deferring Phase 2 columns.
-pub(super) unsafe fn detoast_lazy_blobs_selective(seg: &mut SegmentData, blob_indices: &[usize]) {
+pub(super) unsafe fn detoast_lazy_blobs_selective(
+    seg: &mut SegmentData,
+    blob_indices: &[usize],
+) -> DetoastLazyStats {
+    let mut stats = DetoastLazyStats::default();
     unsafe {
         for &bi in blob_indices {
             if bi >= seg.toast_pointers.len() || seg.toast_pointers[bi].is_empty() {
                 continue;
             }
-            let ptr = seg.toast_pointers[bi].as_ptr() as *mut pg_sys::varlena;
-            let detoasted = pg_sys::pg_detoast_datum(ptr);
-            let len = pgrx::varsize_any_exhdr(detoasted);
-            let data = pgrx::vardata_any(detoasted);
-            #[allow(clippy::unnecessary_cast)]
-            let bytes = std::slice::from_raw_parts(data as *const u8, len).to_vec();
-            if detoasted != ptr {
-                pg_sys::pfree(detoasted as *mut _);
+            let (bytes_from_cache, hit) = detoast_blob_slot(seg, bi);
+            if hit {
+                stats.cache_hits += 1;
+                stats.cache_bytes_served += bytes_from_cache;
+            } else {
+                stats.cache_misses += 1;
             }
-            seg.compressed_blobs[bi] = bytes;
-            seg.toast_pointers[bi].clear();
         }
     }
+    stats
+}
+
+/// Per-call counters returned by the lazy-detoast helpers. Callers fold
+/// these into their `ScanTiming` so the totals show up in EXPLAIN.
+#[derive(Copy, Clone, Default, Debug)]
+pub(crate) struct DetoastLazyStats {
+    pub(crate) cache_hits: u64,
+    pub(crate) cache_misses: u64,
+    pub(crate) cache_bytes_served: u64,
 }
 
 /// Extract segment pruning filters from the plan qual (raw expression tree).

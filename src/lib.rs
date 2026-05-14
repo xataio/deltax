@@ -9,6 +9,7 @@ use pgrx::prelude::*;
 #[cfg(test)]
 extern crate pg_deltax_test_stubs as _;
 
+mod blob_cache;
 mod bloom;
 mod catalog;
 mod compress;
@@ -67,6 +68,17 @@ pub(crate) static DISABLE_PARALLEL_AGG: GucSetting<bool> =
 /// Default is `none` until Step 5 (executor synthetic slot population) lands.
 pub(crate) static JSON_EXTRACT_MODE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"none"));
+
+/// Size of the process-shared blob cache, in MiB. `0` disables the cache.
+/// Default `-1` means auto: 25% of physical RAM, clamped to
+/// [256, 4096] MiB. Explicit positive values override; `0` disables
+/// the cache entirely. See `dev/docs/BLOB_CACHE.md#sizing`.
+pub(crate) static BLOB_CACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(-1);
+
+/// Number of shards (power of two) in the blob cache. More shards reduce
+/// LWLock contention; fewer save shmem overhead. Default `64` is a good
+/// fit for typical OLAP workloads. Restart required to change.
+pub(crate) static BLOB_CACHE_SHARDS: GucSetting<i32> = GucSetting::<i32>::new(64);
 
 /// Resolve the effective number of parallel workers.
 /// 0 = auto (num_cpus, capped at 16), 1 = single-threaded, 2..=64 = explicit.
@@ -245,6 +257,27 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Userset,
         GucFlags::default(),
     );
+    GucRegistry::define_int_guc(
+        c"pg_deltax.blob_cache_mb",
+        c"Size of the process-shared blob cache, in MiB. -1 = auto (25% of physical RAM, clamped to [256, 4096]); 0 = disabled; N > 0 = explicit MiB.",
+        c"The blob cache stores detoasted compressed segment blobs keyed by (companion_oid, segment_id, col_idx). Repeated queries against the same segments skip the pg_detoast_datum path. -1 (default) auto-sizes at postmaster start from /proc/meminfo, falling back to the 256 MB floor if it can't be read. Explicit values override the auto heuristic. See dev/docs/BLOB_CACHE.md. Restart required — the shmem reservation is captured at postmaster start.",
+        &BLOB_CACHE_MB,
+        -1,
+        32768,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"pg_deltax.blob_cache_shards",
+        c"Number of shards (power of two) in the blob cache. Restart required.",
+        c"Each shard owns an LWLock and an LRU list. More shards reduce contention under high concurrency; fewer save shmem overhead. Must be a power of two between 1 and 1024.",
+        &BLOB_CACHE_SHARDS,
+        1,
+        1024,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+    blob_cache::register_hooks();
     worker::register_bgworker();
     unsafe { scan::register_hook(); }
     unsafe { scan::register_executor_start_hook(); }

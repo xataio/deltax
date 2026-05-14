@@ -273,6 +273,21 @@ pub unsafe extern "C-unwind" fn explain_agg_scan(
                     );
                 }
 
+                if state.blob_cache_hits + state.blob_cache_misses > 0 {
+                    let cache_str = std::ffi::CString::new(format!(
+                        "hits={} misses={} bytes_served={}",
+                        state.blob_cache_hits,
+                        state.blob_cache_misses,
+                        state.blob_cache_bytes_served,
+                    ))
+                    .unwrap();
+                    pg_sys::ExplainPropertyText(
+                        c"DeltaX Blob Cache".as_ptr(),
+                        cache_str.as_ptr(),
+                        es,
+                    );
+                }
+
                 if (*es).buffers {
                     let b = &state.buf_stats;
                     let buffers_str = std::ffi::CString::new(format!(
@@ -323,6 +338,9 @@ unsafe fn explain_timing(
                 let mut rows_filtered = t.rows_filtered;
                 let mut rows_batch_filtered = t.rows_batch_filtered;
                 let mut compressed_bytes = t.compressed_bytes;
+                let mut blob_cache_hits = t.blob_cache_hits;
+                let mut blob_cache_misses = t.blob_cache_misses;
+                let mut blob_cache_bytes_served = t.blob_cache_bytes_served;
                 // Slot 0 is the leader; its counters are already in `t`.
                 // Skip it during aggregation to avoid double-counting.
                 for (slot_idx, s) in state.cached_worker_timings.iter().enumerate() {
@@ -342,6 +360,9 @@ unsafe fn explain_timing(
                     rows_filtered += s.rows_filtered;
                     rows_batch_filtered += s.rows_batch_filtered;
                     compressed_bytes += s.compressed_bytes;
+                    blob_cache_hits += s.blob_cache_hits;
+                    blob_cache_misses += s.blob_cache_misses;
+                    blob_cache_bytes_served += s.blob_cache_bytes_served;
                 }
 
                 let total_ms = (metadata_us + heap_scan_us + decompress_us + batch_eval_us + emit_us)
@@ -388,6 +409,19 @@ unsafe fn explain_timing(
                     stats_str.as_ptr(),
                     es,
                 );
+
+                if blob_cache_hits + blob_cache_misses > 0 {
+                    let cache_str = std::ffi::CString::new(format!(
+                        "hits={} misses={} bytes_served={}",
+                        blob_cache_hits, blob_cache_misses, blob_cache_bytes_served,
+                    ))
+                    .unwrap();
+                    pg_sys::ExplainPropertyText(
+                        c"DeltaX Blob Cache".as_ptr(),
+                        cache_str.as_ptr(),
+                        es,
+                    );
+                }
 
                 // If this was a parallel partial scan, surface per-process
                 // segment counts + decompress timing for visibility into
