@@ -359,6 +359,32 @@ pub(crate) fn eval_extract(value: i64, divisor: i64, unit: &str) -> i64 {
     }
 }
 
+/// If segment min/max prove an EXTRACT() group key is constant across the
+/// segment, return that key. This lets the hot mixed-aggregate path avoid
+/// decompressing a time column just to recompute the same bucket for every row.
+fn constant_extract_key_for_segment(
+    cm: &super::segments::ColMinMax,
+    divisor: i64,
+    unit: &str,
+) -> Option<i64> {
+    if cm.min_null || cm.max_null {
+        return None;
+    }
+    let min_value = if divisor > 0 {
+        cm.min_encoded
+    } else {
+        decode_encoded_to_pg_i64(cm.min_encoded, cm.type_oid)
+    };
+    let max_value = if divisor > 0 {
+        cm.max_encoded
+    } else {
+        decode_encoded_to_pg_i64(cm.max_encoded, cm.type_oid)
+    };
+    let min_key = eval_extract(min_value, divisor, unit);
+    let max_key = eval_extract(max_value, divisor, unit);
+    (min_key == max_key).then_some(min_key)
+}
+
 /// Extract a sub-day field from a BIGINT column whose value, when divided
 /// by `divisor`, yields seconds since the unix epoch (1970-01-01). Used for
 /// the `extract(unit FROM to_timestamp(bigint_col / divisor))` shape — the
@@ -2509,6 +2535,17 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             }
         }
 
+        let mut needed_minmax_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for gs in &group_specs {
+            if matches!(gs.expr, GroupByExpr::Extract { .. })
+                && gs.col_idx >= 0
+                && (gs.col_idx as usize) < meta.col_names.len()
+            {
+                needed_minmax_set.insert(meta.col_names[gs.col_idx as usize].clone());
+            }
+        }
+        let needed_minmax_cols: Vec<String> = needed_minmax_set.into_iter().collect();
+
         // Load segments from all companion tables (with lazy pruning)
         let n_workers = crate::get_parallel_workers();
         let use_lazy = n_workers > 1;
@@ -2518,11 +2555,11 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         for &oid in &companion_oids {
             let (mut segs, _, _, _, _, dt_us) = load_segments_heap(
                 oid, &meta.col_names, &meta.segment_by, &needed_cols_main,
-                &meta.time_column, false, &seg_filters, time_min, time_max,
+                &meta.time_column, !needed_minmax_cols.is_empty(), &seg_filters, time_min, time_max,
                 if use_lazy { Some(&lazy_cols) } else { None },
-                &batch_quals, &[],
+                &batch_quals, &needed_minmax_cols,
                 &meta.col_types,
-                &[],
+                &needed_minmax_cols,
                 false,
             );
             // Load text-length sidecars for the columns in sidecar-only mode.
@@ -4030,12 +4067,32 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         }
         let all_regexp_compiled = !has_regexp_group || !rust_regex_infos.is_empty();
 
+        let mut mixed_col_not_null = meta.col_not_null.clone();
+        mixed_col_not_null.resize(meta.col_names.len(), false);
+        for gs in &group_specs {
+            if !matches!(gs.expr, GroupByExpr::Extract { .. })
+                || gs.col_idx < 0
+                || (gs.col_idx as usize) >= meta.col_names.len()
+            {
+                continue;
+            }
+            let col_idx = gs.col_idx as usize;
+            let col_name = &meta.col_names[col_idx];
+            if all_segments.iter().all(|seg| {
+                seg.col_sums
+                    .get(col_name)
+                    .is_some_and(|cs| cs.nonnull_count == seg.row_count as i64)
+            }) {
+                mixed_col_not_null[col_idx] = true;
+            }
+        }
+
         let can_parallel_mixed_flag = !can_parallel
             && has_group_by
             && n_workers > 1
             && all_segments.len() > 1
             && all_regexp_compiled
-            && can_parallel_mixed(&group_specs, &needed_cols, &meta.col_types, &meta.col_not_null, &batch_quals, &agg_specs);
+            && can_parallel_mixed(&group_specs, &needed_cols, &meta.col_types, &mixed_col_not_null, &batch_quals, &agg_specs);
 
         if can_parallel_mixed_flag {
             let t2 = Instant::now();
@@ -6357,6 +6414,36 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
             total_segments += 1;
 
+            let mut const_group_keys: Vec<Option<i64>> = vec![None; group_specs.len()];
+            for (gi, gs) in group_specs.iter().enumerate() {
+                if is_text_group_col(gs) {
+                    continue;
+                }
+                let GroupByExpr::Extract { unit, divisor, .. } = &gs.expr else {
+                    continue;
+                };
+                let col_idx = gs.col_idx as usize;
+                let Some(col_name) = meta.col_names.get(col_idx) else {
+                    continue;
+                };
+                let Some(cm) = seg.col_minmax.get(col_name) else {
+                    continue;
+                };
+                const_group_keys[gi] = constant_extract_key_for_segment(cm, *divisor, unit);
+            }
+
+            let skip_numeric_decompress: Vec<bool> = (0..meta.col_names.len())
+                .map(|col_idx| {
+                    numeric_col_used_only_by_constant_group_keys(
+                        col_idx,
+                        &group_specs,
+                        &const_group_keys,
+                        &batch_quals,
+                        &agg_specs,
+                    )
+                })
+                .collect();
+
             // Decompress needed columns
             let t_dec = Instant::now();
             pg_sys::MemoryContextReset(segment_mcxt);
@@ -6397,6 +6484,13 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 } else {
                     let blob = &seg.compressed_blobs[blob_idx];
                     let typmod = meta.col_typmods[col_idx];
+
+                    if skip_numeric_decompress[col_idx] {
+                        decompressed.push(Vec::new());
+                        raw_strings.push(None);
+                        blob_idx += 1;
+                        continue;
+                    }
 
                     // Fast path: COUNT(DISTINCT) on text without GROUP BY or
                     // row-level WHERE — hash directly from compressed data,
@@ -7178,6 +7272,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                             } else {
                                 key_ref.push(GroupKeyRef::Null);
                             }
+                            continue;
+                        }
+                        if let Some(v) = const_group_keys[gi] {
+                            key_ref.push(GroupKeyRef::Int(v));
                             continue;
                         }
                         let col = &decompressed[gs.col_idx as usize];
@@ -10732,6 +10830,46 @@ fn is_text_group_col(gs: &GroupByColSpec) -> bool {
     }
 }
 
+fn case_when_references_col(spec: &CaseWhenSpec, col_idx: usize) -> bool {
+    spec.clauses.iter().any(|clause| {
+        clause.conditions.iter().any(|cond| cond.col_idx == col_idx)
+            || matches!(&clause.result, CaseWhenValue::ColumnRef(ci) if *ci == col_idx)
+    }) || matches!(&spec.default, CaseWhenValue::ColumnRef(ci) if *ci == col_idx)
+}
+
+fn numeric_col_used_only_by_constant_group_keys(
+    col_idx: usize,
+    group_specs: &[GroupByColSpec],
+    const_group_keys: &[Option<i64>],
+    batch_quals: &[BatchQual],
+    agg_specs: &[AggExecSpec],
+) -> bool {
+    if batch_quals.iter().any(|bq| bq.col_idx == col_idx) {
+        return false;
+    }
+    if agg_specs.iter().any(|spec| spec.col_idx >= 0 && spec.col_idx as usize == col_idx) {
+        return false;
+    }
+
+    let mut saw_const_group_ref = false;
+    for (gi, gs) in group_specs.iter().enumerate() {
+        if gs.col_idx >= 0 && gs.col_idx as usize == col_idx {
+            if const_group_keys.get(gi).and_then(|v| *v).is_some() {
+                saw_const_group_ref = true;
+            } else {
+                return false;
+            }
+        }
+        if let GroupByExpr::CaseWhen(ref spec) = gs.expr
+            && case_when_references_col(spec, col_idx)
+        {
+            return false;
+        }
+    }
+
+    saw_const_group_ref
+}
+
 /// Check if pattern contains POSIX character classes like [:alpha:] inside bracket expressions.
 fn has_posix_classes(pattern: &str) -> bool {
     let bytes = pattern.as_bytes();
@@ -11402,6 +11540,36 @@ fn process_segments_mixed(
 
         segments_processed += 1;
 
+        let mut const_group_keys: Vec<Option<i64>> = vec![None; config.group_specs.len()];
+        for (gi, gs) in config.group_specs.iter().enumerate() {
+            if is_text_group_col(gs) {
+                continue;
+            }
+            let GroupByExpr::Extract { unit, divisor, .. } = &gs.expr else {
+                continue;
+            };
+            let col_idx = gs.col_idx as usize;
+            let Some(col_name) = config.col_names.get(col_idx) else {
+                continue;
+            };
+            let Some(cm) = seg.col_minmax.get(col_name) else {
+                continue;
+            };
+            const_group_keys[gi] = constant_extract_key_for_segment(cm, *divisor, unit);
+        }
+
+        let skip_numeric_decompress: Vec<bool> = (0..config.col_names.len())
+            .map(|col_idx| {
+                numeric_col_used_only_by_constant_group_keys(
+                    col_idx,
+                    config.group_specs,
+                    &const_group_keys,
+                    config.batch_quals,
+                    config.agg_specs,
+                )
+            })
+            .collect();
+
         // Decompress needed columns
         let t_dec = Instant::now();
         let mut numeric_cols: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
@@ -11455,6 +11623,9 @@ fn process_segments_mixed(
                     // Text GROUP BY column — decompress to SegTextColumn
                     text_seg_cols.push(decompress_text_to_seg_col(blob));
                     numeric_cols.push(Vec::new());
+                } else if skip_numeric_decompress[col_idx] {
+                    numeric_cols.push(Vec::new());
+                    text_seg_cols.push(None);
                 } else if is_numeric_type(type_oid) {
                     // Numeric column
                     numeric_cols.push(decompress_numeric_blob(blob, type_oid));
@@ -11578,27 +11749,31 @@ fn process_segments_mixed(
                     }
                     str_idx += 1;
                 } else {
-                    let col = &numeric_cols[gs.col_idx as usize];
-                    if col.is_empty() || col[row].1 {
-                        has_null = true;
-                        break;
+                    if let Some(v) = const_group_keys[gi] {
+                        int_keys[int_idx] = v;
+                    } else {
+                        let col = &numeric_cols[gs.col_idx as usize];
+                        if col.is_empty() || col[row].1 {
+                            has_null = true;
+                            break;
+                        }
+                        int_keys[int_idx] = match &gs.expr {
+                            GroupByExpr::DateTrunc { unit_usecs, .. } => {
+                                let pg_usec = col[row].0.value() as i64;
+                                pg_usec.div_euclid(*unit_usecs) * *unit_usecs
+                            }
+                            GroupByExpr::Extract { unit, divisor, .. } => {
+                                eval_extract(col[row].0.value() as i64, *divisor, unit)
+                            }
+                            GroupByExpr::AddConst { offset, .. } => {
+                                col[row].0.value() as i64 + offset
+                            }
+                            GroupByExpr::Column => {
+                                col[row].0.value() as i64
+                            }
+                            _ => unreachable!(),
+                        };
                     }
-                    int_keys[int_idx] = match &gs.expr {
-                        GroupByExpr::DateTrunc { unit_usecs, .. } => {
-                            let pg_usec = col[row].0.value() as i64;
-                            pg_usec.div_euclid(*unit_usecs) * *unit_usecs
-                        }
-                        GroupByExpr::Extract { unit, divisor, .. } => {
-                            eval_extract(col[row].0.value() as i64, *divisor, unit)
-                        }
-                        GroupByExpr::AddConst { offset, .. } => {
-                            col[row].0.value() as i64 + offset
-                        }
-                        GroupByExpr::Column => {
-                            col[row].0.value() as i64
-                        }
-                        _ => unreachable!(),
-                    };
                     int_idx += 1;
                 }
             }
@@ -12100,6 +12275,36 @@ mod tests {
         assert_eq!(
             extract_subday_from_bigint_scaled(pre_epoch, 1_000_000, "hour"),
             23,
+        );
+    }
+
+    #[test]
+    fn test_constant_extract_key_for_segment_same_hour() {
+        let cm = super::super::segments::ColMinMax {
+            min_encoded: 1_715_258_096_000_000,
+            max_encoded: 1_715_259_000_000_000,
+            min_null: false,
+            max_null: false,
+            type_oid: pg_sys::INT8OID,
+        };
+        assert_eq!(
+            constant_extract_key_for_segment(&cm, 1_000_000, "hour"),
+            Some(12),
+        );
+    }
+
+    #[test]
+    fn test_constant_extract_key_for_segment_crossing_hour() {
+        let cm = super::super::segments::ColMinMax {
+            min_encoded: 1_715_259_599_000_000,
+            max_encoded: 1_715_259_601_000_000,
+            min_null: false,
+            max_null: false,
+            type_oid: pg_sys::INT8OID,
+        };
+        assert_eq!(
+            constant_extract_key_for_segment(&cm, 1_000_000, "hour"),
+            None,
         );
     }
 
