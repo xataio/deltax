@@ -430,6 +430,11 @@ pub(crate) struct AggScanState {
     pub(crate) detoast_us: u64,
     pub(crate) decompress_us: u64,
     pub(crate) agg_us: u64,
+    /// Blob cache hits accumulated across all `detoast_lazy_blobs` calls
+    /// for this scan. Surfaced in EXPLAIN as `DeltaX Blob Cache`.
+    pub(crate) blob_cache_hits: u64,
+    pub(crate) blob_cache_misses: u64,
+    pub(crate) blob_cache_bytes_served: u64,
     pub(crate) total_segments: u64,
     pub(crate) total_rows_processed: u64,
     pub(crate) batch_quals_count: usize,
@@ -817,6 +822,9 @@ fn build_minimal_worker_state() -> AggScanState {
         metadata_us: 0,
         heap_scan_us: 0,
         detoast_us: 0,
+        blob_cache_hits: 0,
+        blob_cache_misses: 0,
+        blob_cache_bytes_served: 0,
         decompress_us: 0,
         agg_us: 0,
         total_segments: 0,
@@ -980,6 +988,9 @@ fn build_deferred_agg_state(ctx: AggExecContext, is_worker: bool) -> AggScanStat
         metadata_us: 0,
         heap_scan_us: 0,
         detoast_us: 0,
+        blob_cache_hits: 0,
+        blob_cache_misses: 0,
+        blob_cache_bytes_served: 0,
         decompress_us: 0,
         agg_us: 0,
         total_segments: 0,
@@ -1532,6 +1543,9 @@ fn try_catalog_shortcut(
         metadata_us,
         heap_scan_us: 0,
         detoast_us: 0,
+        blob_cache_hits: 0,
+        blob_cache_misses: 0,
+        blob_cache_bytes_served: 0,
         decompress_us: 0,
         agg_us: 0,
         total_segments: 0,
@@ -1821,6 +1835,9 @@ fn try_metadata_fast_path(
         metadata_us,
         heap_scan_us,
         detoast_us: 0,
+        blob_cache_hits: 0,
+        blob_cache_misses: 0,
+        blob_cache_bytes_served: 0,
         decompress_us: 0,
         agg_us,
         total_segments,
@@ -2515,6 +2532,12 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         let lazy_cols: Vec<bool> = needed_cols_main.clone();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         let mut total_detoast_us: u64 = 0;
+        // Blob-cache accumulators paired with `total_detoast_us` so call
+        // sites can fold the `DetoastLazyStats` returned by the lazy
+        // helpers. Surfaced in EXPLAIN as `DeltaX Blob Cache`.
+        let mut total_cache_hits: u64 = 0;
+        let mut total_cache_misses: u64 = 0;
+        let mut total_cache_bytes_served: u64 = 0;
         for &oid in &companion_oids {
             let (mut segs, _, _, _, _, dt_us) = load_segments_heap(
                 oid, &meta.col_names, &meta.segment_by, &needed_cols_main,
@@ -2731,12 +2754,18 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     let batch_size = all_segments.len().div_ceil(n_batches);
                     let first_end = batch_size.min(all_segments.len());
                     for seg in &mut all_segments[..first_end] {
-                        detoast_lazy_blobs(seg);
+                        let dl = detoast_lazy_blobs(seg);
+                        total_cache_hits += dl.cache_hits;
+                        total_cache_misses += dl.cache_misses;
+                        total_cache_bytes_served += dl.cache_bytes_served;
                     }
                 } else {
                     // Few segments — detoast all upfront, single scope below
                     for seg in &mut all_segments {
-                        detoast_lazy_blobs(seg);
+                        let dl = detoast_lazy_blobs(seg);
+                        total_cache_hits += dl.cache_hits;
+                        total_cache_misses += dl.cache_misses;
+                        total_cache_bytes_served += dl.cache_bytes_served;
                     }
                 }
                 total_detoast_us += t_detoast.elapsed().as_micros() as u64;
@@ -2768,7 +2797,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         if batch_end < total_segs {
                             let t_pd = Instant::now();
                             for seg in &mut pending[..next_end - batch_end] {
-                                detoast_lazy_blobs(seg);
+                                let dl = detoast_lazy_blobs(seg);
+                        total_cache_hits += dl.cache_hits;
+                        total_cache_misses += dl.cache_misses;
+                        total_cache_bytes_served += dl.cache_bytes_served;
                             }
                             pipeline_detoast_us += t_pd.elapsed().as_micros() as u64;
                         }
@@ -3155,6 +3187,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         metadata_us,
                         heap_scan_us,
                         detoast_us: total_detoast_us,
+                        blob_cache_hits: total_cache_hits,
+                        blob_cache_misses: total_cache_misses,
+                        blob_cache_bytes_served: total_cache_bytes_served,
                         decompress_us,
                         agg_us,
                         total_segments,
@@ -3325,6 +3360,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         metadata_us,
                         heap_scan_us,
                         detoast_us: total_detoast_us,
+                        blob_cache_hits: total_cache_hits,
+                        blob_cache_misses: total_cache_misses,
+                        blob_cache_bytes_served: total_cache_bytes_served,
                         decompress_us,
                         agg_us,
                         total_segments,
@@ -3493,6 +3531,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     metadata_us,
                     heap_scan_us,
                     detoast_us: total_detoast_us,
+                    blob_cache_hits: total_cache_hits,
+                    blob_cache_misses: total_cache_misses,
+                    blob_cache_bytes_served: total_cache_bytes_served,
                     decompress_us,
                     agg_us,
                     total_segments,
@@ -3826,6 +3867,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     metadata_us,
                     heap_scan_us,
                     detoast_us: total_detoast_us,
+                    blob_cache_hits: total_cache_hits,
+                    blob_cache_misses: total_cache_misses,
+                    blob_cache_bytes_served: total_cache_bytes_served,
                     decompress_us,
                     agg_us,
                     total_segments,
@@ -3977,6 +4021,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 metadata_us,
                 heap_scan_us,
                 detoast_us: total_detoast_us,
+                blob_cache_hits: total_cache_hits,
+                blob_cache_misses: total_cache_misses,
+                blob_cache_bytes_served: total_cache_bytes_served,
                 decompress_us,
                 agg_us,
                 total_segments,
@@ -4163,11 +4210,17 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     let batch_size = all_segments.len().div_ceil(n_batches);
                     let first_end = batch_size.min(all_segments.len());
                     for seg in &mut all_segments[..first_end] {
-                        detoast_lazy_blobs(seg);
+                        let dl = detoast_lazy_blobs(seg);
+                        total_cache_hits += dl.cache_hits;
+                        total_cache_misses += dl.cache_misses;
+                        total_cache_bytes_served += dl.cache_bytes_served;
                     }
                 } else {
                     for seg in &mut all_segments {
-                        detoast_lazy_blobs(seg);
+                        let dl = detoast_lazy_blobs(seg);
+                        total_cache_hits += dl.cache_hits;
+                        total_cache_misses += dl.cache_misses;
+                        total_cache_bytes_served += dl.cache_bytes_served;
                     }
                 }
                 total_detoast_us += t_detoast.elapsed().as_micros() as u64;
@@ -4263,7 +4316,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         if batch_end < total_segs {
                             let t_pd = Instant::now();
                             for seg in &mut pending[..next_end - batch_end] {
-                                detoast_lazy_blobs(seg);
+                                let dl = detoast_lazy_blobs(seg);
+                        total_cache_hits += dl.cache_hits;
+                        total_cache_misses += dl.cache_misses;
+                        total_cache_bytes_served += dl.cache_bytes_served;
                             }
                             pipeline_detoast_us += t_pd.elapsed().as_micros() as u64;
                         }
@@ -4527,6 +4583,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     metadata_us,
                     heap_scan_us,
                     detoast_us: total_detoast_us,
+                    blob_cache_hits: total_cache_hits,
+                    blob_cache_misses: total_cache_misses,
+                    blob_cache_bytes_served: total_cache_bytes_served,
                     decompress_us,
                     agg_us,
                     total_segments,
@@ -4788,6 +4847,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         metadata_us,
                         heap_scan_us,
                         detoast_us: total_detoast_us,
+                        blob_cache_hits: total_cache_hits,
+                        blob_cache_misses: total_cache_misses,
+                        blob_cache_bytes_served: total_cache_bytes_served,
                         decompress_us,
                         agg_us,
                         total_segments,
@@ -4969,6 +5031,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         metadata_us,
                         heap_scan_us,
                         detoast_us: total_detoast_us,
+                        blob_cache_hits: total_cache_hits,
+                        blob_cache_misses: total_cache_misses,
+                        blob_cache_bytes_served: total_cache_bytes_served,
                         decompress_us,
                         agg_us,
                         total_segments,
@@ -5182,6 +5247,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     metadata_us,
                     heap_scan_us,
                     detoast_us: total_detoast_us,
+                    blob_cache_hits: total_cache_hits,
+                    blob_cache_misses: total_cache_misses,
+                    blob_cache_bytes_served: total_cache_bytes_served,
                     decompress_us,
                     agg_us,
                     total_segments,
@@ -5557,6 +5625,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     metadata_us,
                     heap_scan_us,
                     detoast_us: total_detoast_us,
+                    blob_cache_hits: total_cache_hits,
+                    blob_cache_misses: total_cache_misses,
+                    blob_cache_bytes_served: total_cache_bytes_served,
                     decompress_us,
                     agg_us,
                     total_segments,
@@ -5862,6 +5933,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 metadata_us,
                 heap_scan_us,
                 detoast_us: total_detoast_us,
+                blob_cache_hits: total_cache_hits,
+                blob_cache_misses: total_cache_misses,
+                blob_cache_bytes_served: total_cache_bytes_served,
                 decompress_us,
                 agg_us,
                 total_segments,
@@ -6109,11 +6183,17 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     let batch_size = all_segments.len().div_ceil(n_batches);
                     let first_end = batch_size.min(all_segments.len());
                     for seg in &mut all_segments[..first_end] {
-                        detoast_lazy_blobs(seg);
+                        let dl = detoast_lazy_blobs(seg);
+                        total_cache_hits += dl.cache_hits;
+                        total_cache_misses += dl.cache_misses;
+                        total_cache_bytes_served += dl.cache_bytes_served;
                     }
                 } else {
                     for seg in &mut all_segments {
-                        detoast_lazy_blobs(seg);
+                        let dl = detoast_lazy_blobs(seg);
+                        total_cache_hits += dl.cache_hits;
+                        total_cache_misses += dl.cache_misses;
+                        total_cache_bytes_served += dl.cache_bytes_served;
                     }
                 }
                 total_detoast_us += t_detoast.elapsed().as_micros() as u64;
@@ -6145,7 +6225,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                         if batch_end < total_segs {
                             let t_pd = Instant::now();
                             for seg in &mut pending[..next_end - batch_end] {
-                                detoast_lazy_blobs(seg);
+                                let dl = detoast_lazy_blobs(seg);
+                        total_cache_hits += dl.cache_hits;
+                        total_cache_misses += dl.cache_misses;
+                        total_cache_bytes_served += dl.cache_bytes_served;
                             }
                             pipeline_detoast_us += t_pd.elapsed().as_micros() as u64;
                         }
@@ -6281,6 +6364,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 metadata_us,
                 heap_scan_us,
                 detoast_us: total_detoast_us + pipeline_detoast_us,
+                blob_cache_hits: total_cache_hits,
+                blob_cache_misses: total_cache_misses,
+                blob_cache_bytes_served: total_cache_bytes_served,
                 decompress_us: 0,
                 agg_us,
                 total_segments,
@@ -6316,7 +6402,10 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
         if use_lazy {
             let t_detoast = Instant::now();
             for seg in &mut all_segments {
-                detoast_lazy_blobs(seg);
+                let dl = detoast_lazy_blobs(seg);
+                total_cache_hits += dl.cache_hits;
+                total_cache_misses += dl.cache_misses;
+                total_cache_bytes_served += dl.cache_bytes_served;
             }
             total_detoast_us += t_detoast.elapsed().as_micros() as u64;
         }
@@ -7675,6 +7764,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
             metadata_us,
             heap_scan_us,
             detoast_us: total_detoast_us,
+            blob_cache_hits: total_cache_hits,
+            blob_cache_misses: total_cache_misses,
+            blob_cache_bytes_served: total_cache_bytes_served,
             decompress_us,
             agg_us,
             total_segments,
@@ -12355,6 +12447,7 @@ mod tests {
             col_minmax: HashMap::new(),
             col_sums: HashMap::new(),
             toast_pointers: Vec::new(),
+            cached_blob_pins: Vec::new(),
         }
     }
 

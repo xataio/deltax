@@ -556,6 +556,7 @@ mod tests {
             col_minmax: HashMap::new(),
             col_sums: HashMap::new(),
             toast_pointers: Vec::new(),
+            cached_blob_pins: Vec::new(),
         }
     }
 

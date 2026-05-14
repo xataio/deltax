@@ -182,6 +182,12 @@ pub(crate) struct ScanTiming {
     pub(crate) topn_candidates: u64,
     /// Top-N segments processed in Phase 2.
     pub(crate) topn_phase2_segments: u64,
+    /// Blob cache hits across this process's detoast calls.
+    pub(crate) blob_cache_hits: u64,
+    /// Blob cache misses across this process's detoast calls.
+    pub(crate) blob_cache_misses: u64,
+    /// Bytes served from the blob cache (sum across hits).
+    pub(crate) blob_cache_bytes_served: u64,
 }
 
 /// POD projection of `ScanTiming` for cross-process DSM aggregation.
@@ -212,6 +218,9 @@ pub(crate) struct ScanTimingShmem {
     pub(crate) segments_bloom_skipped: u64,
     pub(crate) segments_valbitmap_skipped: u64,
     pub(crate) phase2_skipped: u64,
+    pub(crate) blob_cache_hits: u64,
+    pub(crate) blob_cache_misses: u64,
+    pub(crate) blob_cache_bytes_served: u64,
 }
 
 /// Leader + up to 32 workers. PG typically uses much less; we hard-error
@@ -240,6 +249,16 @@ pub(crate) struct DeltaXAppendPState {
 
 /// Returns the DSM slot index for the current process.
 /// Leader (ParallelWorkerNumber == -1) → slot 0; worker K → slot K + 1.
+impl ScanTiming {
+    /// Fold a `DetoastLazyStats` (returned by `detoast_lazy_blobs` /
+    /// `detoast_lazy_blobs_selective`) into the per-process counters.
+    pub(crate) fn fold_detoast_stats(&mut self, s: super::segments::DetoastLazyStats) {
+        self.blob_cache_hits += s.cache_hits;
+        self.blob_cache_misses += s.cache_misses;
+        self.blob_cache_bytes_served += s.cache_bytes_served;
+    }
+}
+
 unsafe fn current_worker_slot() -> usize {
     let n = unsafe { pg_sys::ParallelWorkerNumber };
     if n < 0 {
@@ -285,6 +304,9 @@ unsafe fn flush_timing_to_shmem(state: &DecompressState) {
         slot.segments_bloom_skipped = t.segments_bloom_skipped;
         slot.segments_valbitmap_skipped = t.segments_valbitmap_skipped;
         slot.phase2_skipped = t.phase2_skipped;
+        slot.blob_cache_hits = t.blob_cache_hits;
+        slot.blob_cache_misses = t.blob_cache_misses;
+        slot.blob_cache_bytes_served = t.blob_cache_bytes_served;
         // populated must be written last so the leader can treat slots
         // missing this flag (e.g. a worker that crashed) as absent.
         slot.populated = 1;
@@ -504,6 +526,9 @@ fn make_worker_stub_state() -> DecompressState {
             topn_limit: 0,
             topn_candidates: 0,
             topn_phase2_segments: 0,
+            blob_cache_hits: 0,
+            blob_cache_misses: 0,
+            blob_cache_bytes_served: 0,
         },
         instrument: None,
         _time_column: String::new(),
@@ -776,6 +801,9 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
                 topn_limit: if topn_limit > 0 { topn_limit as u64 } else { 0 },
                 topn_candidates: 0,
                 topn_phase2_segments: 0,
+                blob_cache_hits: 0,
+                blob_cache_misses: 0,
+                blob_cache_bytes_served: 0,
             },
             instrument: None,
             _time_column: meta.time_column,
@@ -948,6 +976,9 @@ fn load_decompress_state(
             topn_limit: 0,
             topn_candidates: 0,
             topn_phase2_segments: 0,
+            blob_cache_hits: 0,
+            blob_cache_misses: 0,
+            blob_cache_bytes_served: 0,
         },
         instrument: None,
         _time_column: meta.time_column,
@@ -1183,7 +1214,8 @@ unsafe fn exec_topn_two_pass(
                 );
                 // Detoast lazy blobs since normal scan path needs them
                 for seg in state.segments_data.iter_mut() {
-                    detoast_lazy_blobs(seg);
+                    let dl = detoast_lazy_blobs(seg);
+                    state.timing.fold_detoast_stats(dl);
                 }
                 state.topn_limit = 0;
                 state.segment_index = 0;
@@ -1334,7 +1366,8 @@ unsafe fn exec_topn_two_pass(
             // so that skipped segments incur zero I/O on cold runs.
             // Phase 2 blobs remain lazy until Phase 2 (winning segments only).
             let t_detoast = if instrument { Some(Instant::now()) } else { None };
-            detoast_lazy_blobs_selective(&mut state.segments_data[seg_idx], &phase1_blob_indices);
+            let dl = detoast_lazy_blobs_selective(&mut state.segments_data[seg_idx], &phase1_blob_indices);
+            state.timing.fold_detoast_stats(dl);
             if let Some(t) = t_detoast {
                 state.timing.heap_scan_us += t.elapsed().as_micros() as u64;
             }
@@ -1698,7 +1731,8 @@ unsafe fn exec_topn_two_pass(
         if candidates.is_empty() || candidates.len() <= effective_limit {
             // Detoast all lazy blobs since normal path needs them
             for seg in state.segments_data.iter_mut() {
-                detoast_lazy_blobs(seg);
+                let dl = detoast_lazy_blobs(seg);
+                state.timing.fold_detoast_stats(dl);
             }
             state.topn_limit = 0;
             state.segment_index = 0;
@@ -1755,7 +1789,8 @@ unsafe fn exec_topn_two_pass(
         // Non-winning segments' pointers are never detoasted (saving I/O).
         let t_lazy = if instrument { Some(Instant::now()) } else { None };
         for &seg_idx in segment_topn_rows.keys() {
-            detoast_lazy_blobs(&mut state.segments_data[seg_idx]);
+            let dl = detoast_lazy_blobs(&mut state.segments_data[seg_idx]);
+            state.timing.fold_detoast_stats(dl);
         }
         if let Some(t) = t_lazy {
             state.timing.heap_scan_us += t.elapsed().as_micros() as u64;
@@ -2190,7 +2225,8 @@ unsafe fn exec_topn_text(
                     num_batch_quals,
                 );
                 for seg in state.segments_data.iter_mut() {
-                    detoast_lazy_blobs(seg);
+                    let dl = detoast_lazy_blobs(seg);
+                    state.timing.fold_detoast_stats(dl);
                 }
                 state.topn_limit = 0;
                 state.segment_index = 0;
@@ -2278,7 +2314,8 @@ unsafe fn exec_topn_text(
 
             // Detoast Phase 1 blobs (PG API — must be main thread)
             let t_detoast = if instrument { Some(Instant::now()) } else { None };
-            detoast_lazy_blobs_selective(&mut state.segments_data[seg_idx], &phase1_blob_indices);
+            let dl = detoast_lazy_blobs_selective(&mut state.segments_data[seg_idx], &phase1_blob_indices);
+            state.timing.fold_detoast_stats(dl);
             if let Some(t) = t_detoast {
                 state.timing.heap_scan_us += t.elapsed().as_micros() as u64;
             }
@@ -2395,7 +2432,8 @@ unsafe fn exec_topn_text(
 
             if all_candidates.is_empty() || all_candidates.len() <= effective_limit {
                 for seg in state.segments_data.iter_mut() {
-                    detoast_lazy_blobs(seg);
+                    let dl = detoast_lazy_blobs(seg);
+                    state.timing.fold_detoast_stats(dl);
                 }
                 state.topn_limit = 0;
                 state.segment_index = 0;
@@ -2452,7 +2490,8 @@ unsafe fn exec_topn_text(
             // Detoast lazy blobs for winning segments
             let t_lazy = if instrument { Some(Instant::now()) } else { None };
             for &seg_idx in segment_topn_rows.keys() {
-                detoast_lazy_blobs(&mut state.segments_data[seg_idx]);
+                let dl = detoast_lazy_blobs(&mut state.segments_data[seg_idx]);
+                state.timing.fold_detoast_stats(dl);
             }
             if let Some(t) = t_lazy {
                 state.timing.heap_scan_us += t.elapsed().as_micros() as u64;
@@ -2855,7 +2894,8 @@ unsafe fn exec_topn_text_sequential(
         // If no candidates or all fit in limit, fall back to normal path
         if candidates.is_empty() || candidates.len() <= effective_limit {
             for seg in state.segments_data.iter_mut() {
-                detoast_lazy_blobs(seg);
+                let dl = detoast_lazy_blobs(seg);
+                state.timing.fold_detoast_stats(dl);
             }
             state.topn_limit = 0;
             state.segment_index = 0;
@@ -2906,7 +2946,8 @@ unsafe fn exec_topn_text_sequential(
         // Detoast lazy blobs for winning segments only
         let t_lazy = if instrument { Some(Instant::now()) } else { None };
         for &seg_idx in segment_topn_rows.keys() {
-            detoast_lazy_blobs(&mut state.segments_data[seg_idx]);
+            let dl = detoast_lazy_blobs(&mut state.segments_data[seg_idx]);
+            state.timing.fold_detoast_stats(dl);
         }
         if let Some(t) = t_lazy {
             state.timing.heap_scan_us += t.elapsed().as_micros() as u64;
@@ -3817,11 +3858,13 @@ pub(super) unsafe extern "C-unwind" fn init_worker_deltax_append(
             let num_blob_cols = state.col_names.iter()
                 .filter(|n| !state.segment_by.contains(*n))
                 .count();
+            let mut compressed_blobs: Vec<super::segments::BlobBytes> = Vec::with_capacity(num_blob_cols);
+            compressed_blobs.resize_with(num_blob_cols, super::segments::BlobBytes::default);
             segments_data.push(SegmentData {
                 companion_oid: b.companion_oid,
                 segment_id: b.segment_id,
                 segment_values: b.segment_values,
-                compressed_blobs: vec![Vec::new(); num_blob_cols],
+                compressed_blobs,
                 text_length_blobs: vec![Vec::new(); num_blob_cols],
                 row_count: b.row_count,
                 min_time: b.min_time,
@@ -3829,6 +3872,7 @@ pub(super) unsafe extern "C-unwind" fn init_worker_deltax_append(
                 col_minmax: std::collections::HashMap::new(),
                 col_sums: std::collections::HashMap::new(),
                 toast_pointers: vec![Vec::new(); num_blob_cols],
+                cached_blob_pins: Vec::new(),
             });
         }
         state.segments_data = segments_data;
