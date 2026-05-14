@@ -171,7 +171,13 @@ fn resolve_configured_bytes() -> usize {
 /// 25% of physical RAM, clamped to `[AUTO_FLOOR_MB, AUTO_CAP_MB]`.
 /// Returns `AUTO_FLOOR_MB` when /proc/meminfo isn't readable.
 fn auto_size_mb() -> i32 {
-    let phys_mb = read_phys_mem_mb().unwrap_or(0);
+    clamp_auto_mb(read_phys_mem_mb().unwrap_or(0))
+}
+
+/// Pure clamp logic factored out for unit testing. `phys_mb <= 0`
+/// (couldn't read system RAM) falls back to the floor; otherwise
+/// `25% × phys_mb` clamped to `[AUTO_FLOOR_MB, AUTO_CAP_MB]`.
+fn clamp_auto_mb(phys_mb: i32) -> i32 {
     if phys_mb <= 0 {
         return AUTO_FLOOR_MB;
     }
@@ -248,4 +254,59 @@ fn pg_deltax_blob_cache_shard_stats() -> TableIterator<
     ),
 > {
     TableIterator::new(storage::shard_diag())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_auto_unreadable_phys_returns_floor() {
+        // /proc/meminfo not readable → read_phys_mem_mb() returns None
+        // → auto_size_mb() passes 0 to the clamp.
+        assert_eq!(clamp_auto_mb(0), AUTO_FLOOR_MB);
+        assert_eq!(clamp_auto_mb(-1), AUTO_FLOOR_MB);
+    }
+
+    #[test]
+    fn clamp_auto_tiny_phys_hits_floor() {
+        // Boxes with < 1 GiB compute 25% below the floor and clamp up.
+        assert_eq!(clamp_auto_mb(512), AUTO_FLOOR_MB); // 128 < 256
+        assert_eq!(clamp_auto_mb(1023), AUTO_FLOOR_MB); // 255 < 256
+    }
+
+    #[test]
+    fn clamp_auto_floor_exact() {
+        // 1 GiB / 4 = 256 MiB = floor exactly.
+        assert_eq!(clamp_auto_mb(1024), 256);
+    }
+
+    #[test]
+    fn clamp_auto_quarter_in_range() {
+        // 4 GiB → 1 GiB, 8 GiB → 2 GiB, 12 GiB → 3 GiB.
+        assert_eq!(clamp_auto_mb(4 * 1024), 1024);
+        assert_eq!(clamp_auto_mb(8 * 1024), 2048);
+        assert_eq!(clamp_auto_mb(12 * 1024), 3072);
+    }
+
+    #[test]
+    fn clamp_auto_cap_exact() {
+        // 16 GiB / 4 = 4 GiB = cap exactly.
+        assert_eq!(clamp_auto_mb(16 * 1024), AUTO_CAP_MB);
+    }
+
+    #[test]
+    fn clamp_auto_large_phys_hits_cap() {
+        // Big production boxes get capped at AUTO_CAP_MB, not 25% of RAM.
+        assert_eq!(clamp_auto_mb(32 * 1024), AUTO_CAP_MB); // 8 GiB → cap 4 GiB
+        assert_eq!(clamp_auto_mb(128 * 1024), AUTO_CAP_MB); // 32 GiB → cap 4 GiB
+        assert_eq!(clamp_auto_mb(1024 * 1024), AUTO_CAP_MB); // 256 GiB → cap 4 GiB
+    }
+
+    #[test]
+    fn clamp_auto_overflow_guard() {
+        // i32::MAX as MB ≈ 2 PiB. The /4 keeps us comfortably in i32,
+        // and the cap clamps anyway.
+        assert_eq!(clamp_auto_mb(i32::MAX), AUTO_CAP_MB);
+    }
 }
