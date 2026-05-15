@@ -50,6 +50,7 @@ LIMIT_TIE_QUERIES = {
     "Q38": 1,  # PageViews (OFFSET 1000)
     "Q39": 5,  # PageViews (OFFSET 1000)
     "Q40": 2,  # PageViews (OFFSET 100)
+    "Q41": 2,  # PageViews (OFFSET 10000 — all-ties tail at full scale)
 }
 
 QUERIES = [
