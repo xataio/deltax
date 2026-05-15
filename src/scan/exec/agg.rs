@@ -4136,7 +4136,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
 
         let can_parallel_mixed_flag = !can_parallel
             && has_group_by
-            && n_workers > 1
+            && (n_workers > 1 || derived_minmax_topn.is_some())
             && all_segments.len() > 1
             && all_regexp_compiled
             && can_parallel_mixed(&group_specs, &needed_cols, &meta.col_types, &mixed_col_not_null, &batch_quals, &agg_specs);
@@ -4429,64 +4429,123 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 let limit = topn_limit as usize;
                 let ascending = topn_ascending;
 
-                // Step 1: single pass to combine per-worker partial
-                // MAX/MIN into per-key global (max, min).
-                let mut per_key: hashbrown::HashMap<
-                    u128,
-                    (i64, i64, bool),
-                    BuildHasherDefault<ahash::AHasher>,
-                > = hashbrown::HashMap::with_capacity_and_hasher(
-                    partial_results
-                        .iter()
-                        .map(|r| r.compact_map.len())
-                        .max()
-                        .unwrap_or(0),
-                    Default::default(),
-                );
-                for result in &partial_results {
+                // Step 1+2: partition worker-local groups by hash, merge
+                // each partition's MAX/MIN in parallel, and keep only local
+                // top-K candidates. The old implementation built one large
+                // leader HashMap and then scanned it; Q4 spends hundreds of
+                // milliseconds there with ~1.35M distinct users.
+                let n_partitions = n_workers.max(1);
+                let mut buckets: Vec<Vec<(usize, u128, u32)>> =
+                    (0..n_partitions).map(|_| Vec::new()).collect();
+                for (wi, result) in partial_results.iter().enumerate() {
                     for (&hash_key, &wgidx) in &result.compact_map {
-                        let (max_val, max_has) = result
-                            .compact_storage
-                            .read_min_max_int(wgidx, max_slot);
-                        let (min_val, min_has) = result
-                            .compact_storage
-                            .read_min_max_int(wgidx, min_slot);
-                        let entry = per_key
-                            .entry(hash_key)
-                            .or_insert((i64::MIN, i64::MAX, false));
-                        if max_has && (!entry.2 || max_val > entry.0) {
-                            entry.0 = max_val;
-                            entry.2 = true;
-                        }
-                        if min_has && (entry.1 == i64::MAX || min_val < entry.1) {
-                            entry.1 = min_val;
-                        }
+                        let p = (((hash_key as u64) ^ ((hash_key >> 64) as u64)) as usize)
+                            % n_partitions;
+                        buckets[p].push((wi, hash_key, wgidx));
                     }
                 }
 
-                // Step 2: top-K heap on `max - min`. Use i128 to avoid
-                // overflow on far-apart times. Skip keys whose either
-                // accumulator never saw a value (max_has=false ⇒ NULL).
-                let mut heap: std::collections::BinaryHeap<
-                    Reverse<(i128, u128)>,
-                > = std::collections::BinaryHeap::with_capacity(limit + 1);
+                let partition_results: Vec<(usize, Vec<(i128, u128)>)> =
+                    std::thread::scope(|s| {
+                        let workers = &partial_results;
+                        let handles: Vec<_> = buckets
+                            .into_iter()
+                            .map(|bucket| {
+                                s.spawn(move || {
+                                    let mut per_key: hashbrown::HashMap<
+                                        u128,
+                                        (i64, i64, bool),
+                                        BuildHasherDefault<ahash::AHasher>,
+                                    > = hashbrown::HashMap::with_capacity_and_hasher(
+                                        bucket.len(),
+                                        Default::default(),
+                                    );
+
+                                    for (wi, hash_key, wgidx) in bucket {
+                                        let worker = &workers[wi];
+                                        let (max_val, max_has) = worker
+                                            .compact_storage
+                                            .read_min_max_int(wgidx, max_slot);
+                                        let (min_val, min_has) = worker
+                                            .compact_storage
+                                            .read_min_max_int(wgidx, min_slot);
+                                        let entry = per_key
+                                            .entry(hash_key)
+                                            .or_insert((i64::MIN, i64::MAX, false));
+                                        if max_has && (!entry.2 || max_val > entry.0) {
+                                            entry.0 = max_val;
+                                            entry.2 = true;
+                                        }
+                                        if min_has && (entry.1 == i64::MAX || min_val < entry.1) {
+                                            entry.1 = min_val;
+                                        }
+                                    }
+
+                                    let unique_count = per_key.len();
+                                    if ascending {
+                                        let mut heap: std::collections::BinaryHeap<(i128, u128)> =
+                                            std::collections::BinaryHeap::with_capacity(limit + 1);
+                                        for (&hash_key, &(max_val, min_val, seen)) in &per_key {
+                                            if !seen {
+                                                continue;
+                                            }
+                                            let derived =
+                                                (max_val as i128).saturating_sub(min_val as i128);
+                                            heap.push((derived, hash_key));
+                                            if heap.len() > limit {
+                                                heap.pop();
+                                            }
+                                        }
+                                        (unique_count, heap.into_vec())
+                                    } else {
+                                        let mut heap: std::collections::BinaryHeap<
+                                            Reverse<(i128, u128)>,
+                                        > = std::collections::BinaryHeap::with_capacity(limit + 1);
+                                        for (&hash_key, &(max_val, min_val, seen)) in &per_key {
+                                            if !seen {
+                                                continue;
+                                            }
+                                            let derived =
+                                                (max_val as i128).saturating_sub(min_val as i128);
+                                            heap.push(Reverse((derived, hash_key)));
+                                            if heap.len() > limit {
+                                                heap.pop();
+                                            }
+                                        }
+                                        (
+                                            unique_count,
+                                            heap.into_iter()
+                                                .map(|Reverse(candidate)| candidate)
+                                                .collect(),
+                                        )
+                                    }
+                                })
+                            })
+                            .collect();
+
+                        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    });
+
+                let pre_topn_groups: usize = partition_results
+                    .iter()
+                    .map(|(unique_count, _)| *unique_count)
+                    .sum();
+                let mut heap: std::collections::BinaryHeap<Reverse<(i128, u128)>> =
+                    std::collections::BinaryHeap::with_capacity(limit + 1);
                 let mut asc_heap: std::collections::BinaryHeap<(i128, u128)> =
                     std::collections::BinaryHeap::with_capacity(limit + 1);
-                let pre_topn_groups = per_key.len();
-                for (&hash_key, &(max_val, min_val, seen)) in &per_key {
-                    if !seen {
-                        continue;
-                    }
-                    let derived = (max_val as i128).saturating_sub(min_val as i128);
-                    if ascending {
-                        asc_heap.push((derived, hash_key));
-                        if asc_heap.len() > limit {
-                            asc_heap.pop();
-                        }
-                    } else {
-                        heap.push(Reverse((derived, hash_key)));
-                        if heap.len() > limit {
-                            heap.pop();
+                for (_, candidates) in partition_results {
+                    for (derived, hash_key) in candidates {
+                        if ascending {
+                            asc_heap.push((derived, hash_key));
+                            if asc_heap.len() > limit {
+                                asc_heap.pop();
+                            }
+                        } else {
+                            heap.push(Reverse((derived, hash_key)));
+                            if heap.len() > limit {
+                                heap.pop();
+                            }
                         }
                     }
                 }
