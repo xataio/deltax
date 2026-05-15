@@ -382,7 +382,29 @@ fn constant_extract_key_for_segment(
     };
     let min_key = eval_extract(min_value, divisor, unit);
     let max_key = eval_extract(max_value, divisor, unit);
-    (min_key == max_key).then_some(min_key)
+    if min_key != max_key {
+        return None;
+    }
+
+    let bucket_width = match unit {
+        "second" | "seconds" => 1_000_000,
+        "minute" | "minutes" => 60_000_000,
+        "hour" | "hours" => 3_600_000_000,
+        _ => return None,
+    };
+    let (min_bucket, max_bucket) = if divisor > 0 {
+        let width = (bucket_width / 1_000_000_i64).saturating_mul(divisor);
+        if width <= 0 {
+            return None;
+        }
+        (min_value.div_euclid(width), max_value.div_euclid(width))
+    } else {
+        (
+            min_value.div_euclid(bucket_width),
+            max_value.div_euclid(bucket_width),
+        )
+    };
+    (min_bucket == max_bucket).then_some(min_key)
 }
 
 /// Extract a sub-day field from a BIGINT column whose value, when divided
@@ -2901,6 +2923,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     match sort_kind {
                         CompactAccKind::Count => storage.read_count(group_idx, sort_slot),
                         CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(group_idx, sort_slot).0,
+                        CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+                            storage.read_min_max_int(group_idx, sort_slot).0
+                        }
                         _ => storage.read_count(group_idx, sort_slot),
                     }
                 };
@@ -3742,6 +3767,9 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                                     match sort_kind {
                                         CompactAccKind::Count => storage.read_count(gidx, sort_slot),
                                         CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(gidx, sort_slot).0,
+                                        CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+                                            storage.read_min_max_int(gidx, sort_slot).0
+                                        }
                                         _ => storage.read_count(gidx, sort_slot),
                                     }
                                 }
@@ -9749,6 +9777,9 @@ unsafe fn compact_topn_select(
                 match kind {
                     CompactAccKind::Count => storage.read_count(group_idx, sort_slot),
                     CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(group_idx, sort_slot).0,
+                    CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+                        storage.read_min_max_int(group_idx, sort_slot).0
+                    }
                     _ => storage.read_count(group_idx, sort_slot),
                 }
             }
@@ -10698,6 +10729,9 @@ fn process_segments_compact(
                 match sort_kind {
                     CompactAccKind::Count => compact_storage.read_count(gidx, sort_slot),
                     CompactAccKind::SumIntNarrow => compact_storage.read_sum_int_narrow(gidx, sort_slot).0,
+                    CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+                        compact_storage.read_min_max_int(gidx, sort_slot).0
+                    }
                     _ => compact_storage.read_count(gidx, sort_slot),
                 }
             }
@@ -12455,6 +12489,36 @@ mod tests {
         };
         assert_eq!(
             constant_extract_key_for_segment(&cm, 1_000_000, "hour"),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_constant_extract_key_for_segment_same_minute() {
+        let cm = super::super::segments::ColMinMax {
+            min_encoded: 10 * 60_000_000 + 20_000_000,
+            max_encoded: 10 * 60_000_000 + 40_000_000,
+            min_null: false,
+            max_null: false,
+            type_oid: pg_sys::INT8OID,
+        };
+        assert_eq!(
+            constant_extract_key_for_segment(&cm, 0, "minute"),
+            Some(10),
+        );
+    }
+
+    #[test]
+    fn test_constant_extract_key_for_segment_same_minute_value_across_hour() {
+        let cm = super::super::segments::ColMinMax {
+            min_encoded: 27 * 60_000_000,
+            max_encoded: 87 * 60_000_000,
+            min_null: false,
+            max_null: false,
+            type_oid: pg_sys::INT8OID,
+        };
+        assert_eq!(
+            constant_extract_key_for_segment(&cm, 0, "minute"),
             None,
         );
     }
