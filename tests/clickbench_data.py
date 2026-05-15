@@ -311,45 +311,6 @@ def query_results_to_dict(results: dict) -> dict:
     return out
 
 
-def validate_nondet_query(qid, u_rows, c_rows, sort_info):
-    """Validate a non-deterministic query beyond row-count equality.
-
-    Checks that both result sets respect the ORDER BY contract:
-    - Sort key column is correctly ordered in both results.
-    - The extreme sort key value (first row) matches between the two
-      result sets, catching data-level bugs.  Skipped for OFFSET queries
-      where the boundary value can legitimately differ due to ties.
-
-    Returns (ok, detail_str).
-    """
-    if sort_info is None:
-        return True, f"{len(c_rows)} rows, non-deterministic (no ORDER BY)"
-
-    col_idx, direction, has_offset = sort_info
-
-    def _is_sorted(rows):
-        keys = [r[col_idx] for r in rows]
-        if direction == "DESC":
-            return all(a >= b for a, b in zip(keys, keys[1:]))
-        return all(a <= b for a, b in zip(keys, keys[1:]))
-
-    if not _is_sorted(c_rows):
-        return False, "compressed results not sorted correctly"
-    if not _is_sorted(u_rows):
-        # Shouldn't happen, but report it
-        return False, "uncompressed results not sorted correctly"
-
-    if not has_offset and len(u_rows) > 0 and len(c_rows) > 0:
-        u_top = u_rows[0][col_idx]
-        c_top = c_rows[0][col_idx]
-        if u_top != c_top:
-            return False, (
-                f"top sort-key differs: uncompr={u_top}, compr={c_top}"
-            )
-
-    return True, f"{len(c_rows)} rows, sort order verified"
-
-
 def run_queries(conn, queries, label=""):
     """Run each query with warmup + timed runs.
 

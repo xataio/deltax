@@ -28,9 +28,8 @@ from clickbench_data import (
     query_results_to_dict,
     run_queries,
     save_bench_results,
-    validate_nondet_query,
 )
-from clickbench_queries import NONDETERMINISTIC_QUERIES, NONDET_SORT_INFO, LIMIT_TIE_QUERIES, QUERIES
+from clickbench_queries import QUERIES, compare_results
 
 
 # ---------------------------------------------------------------------------
@@ -491,72 +490,14 @@ class TestClickBench:
                     print(f"  {qid}: SKIP (query errored)")
                     continue
 
-                if qid in NONDETERMINISTIC_QUERIES:
-                    if len(u_rows) != len(c_rows):
-                        mismatches.append(qid)
-                        print(f"  {qid}: MISMATCH (row count: uncompr={len(u_rows)}, compr={len(c_rows)})")
-                    else:
-                        ok, detail = validate_nondet_query(
-                            qid, u_rows, c_rows, NONDET_SORT_INFO.get(qid)
-                        )
-                        if ok:
-                            print(f"  {qid}: OK ({detail})")
-                        else:
-                            mismatches.append(qid)
-                            print(f"  {qid}: MISMATCH ({detail})")
-                elif qid in LIMIT_TIE_QUERIES:
-                    # Tie-tolerant: strip rows at the tail (and head for OFFSET
-                    # queries) that share a sort-key value with the boundary row,
-                    # then exact-match the stable interior.
-                    sk = LIMIT_TIE_QUERIES[qid]
-                    if len(u_rows) != len(c_rows):
-                        mismatches.append(qid)
-                        print(f"  {qid}: MISMATCH (row count: uncompr={len(u_rows)}, compr={len(c_rows)})")
-                    elif len(u_rows) == 0:
-                        print(f"  {qid}: OK (0 rows)")
-                    else:
-                        # Strip tail ties (LIMIT boundary)
-                        u_tail = u_rows[-1][sk]
-                        c_tail = c_rows[-1][sk]
-                        u_stable = [r for r in u_rows if r[sk] != u_tail]
-                        c_stable = [r for r in c_rows if r[sk] != c_tail]
-                        # Strip head ties too (OFFSET boundary)
-                        u_head = u_rows[0][sk]
-                        c_head = c_rows[0][sk]
-                        u_stable = sorted([r for r in u_stable if r[sk] != u_head])
-                        c_stable = sorted([r for r in c_stable if r[sk] != c_head])
-                        if u_stable == c_stable:
-                            n_tied = len(u_rows) - len(u_stable)
-                            print(f"  {qid}: OK ({len(u_stable)} exact + {n_tied} tied rows)")
-                        else:
-                            mismatches.append(qid)
-                            print(f"  {qid}: MISMATCH (non-tied rows differ)!")
-                            print(f"    uncompressed stable: {len(u_stable)} rows, first={u_stable[:2]}")
-                            print(f"    compressed stable:   {len(c_stable)} rows, first={c_stable[:2]}")
-                elif sorted(u_rows) == sorted(c_rows):
-                    print(f"  {qid}: OK ({len(u_rows)} rows match)")
+                outcome = compare_results(qid, u_rows, c_rows)
+                if outcome.ok:
+                    print(f"  {qid}: OK ({outcome.detail})")
                 else:
                     mismatches.append(qid)
-                    print(f"  {qid}: MISMATCH!")
-                    print(f"    uncompressed: {len(u_rows)} rows, first={u_rows[:2]}")
-                    print(f"    compressed:   {len(c_rows)} rows, first={c_rows[:2]}")
-                    # Detailed diff for debugging
-                    u_sorted = sorted(u_rows)
-                    c_sorted = sorted(c_rows)
-                    if len(u_sorted) == len(c_sorted):
-                        for i, (ur, cr) in enumerate(zip(u_sorted, c_sorted)):
-                            if ur != cr:
-                                print(f"    row {i} diff: uncompr={ur}")
-                                print(f"                  compr  ={cr}")
-                    else:
-                        u_set = set(map(tuple, u_sorted))
-                        c_set = set(map(tuple, c_sorted))
-                        only_u = u_set - c_set
-                        only_c = c_set - u_set
-                        if only_u:
-                            print(f"    only in uncompressed ({len(only_u)}): {list(only_u)[:5]}")
-                        if only_c:
-                            print(f"    only in compressed ({len(only_c)}): {list(only_c)[:5]}")
+                    print(f"  {qid}: MISMATCH ({outcome.detail})")
+                    for line in outcome.extra_lines:
+                        print(f"    {line}")
 
         # Phase 6: Print results
         print("\n\n" + "=" * 72)

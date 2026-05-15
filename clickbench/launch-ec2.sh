@@ -11,6 +11,7 @@ SG=sg-add473b4
 VOLUME_SIZE=500
 NAME=clickbench-pg-deltax
 TERMINATE_ONLY=false
+REFERENCE_MODE=false
 
 # Parse options
 while [[ $# -gt 0 ]]; do
@@ -19,9 +20,19 @@ while [[ $# -gt 0 ]]; do
       TERMINATE_ONLY=true
       shift
       ;;
+    --name)
+      NAME="$2"
+      shift 2
+      ;;
+    --reference)
+      # Adjust the suggested next-step message to point at the correctness
+      # reference flow rather than the bench flow.
+      REFERENCE_MODE=true
+      shift
+      ;;
     *)
       echo "Unknown option: $1" >&2
-      echo "Usage: $0 [--terminate-only]" >&2
+      echo "Usage: $0 [--terminate-only] [--name <tag-name>] [--reference]" >&2
       exit 1
       ;;
   esac
@@ -132,9 +143,14 @@ echo "Instance ready. Next steps:"
 echo ""
 echo "  export EC2=$IP"
 echo ""
-echo "  make setup EC2=$IP    # full setup: install deps, build, load data"
-echo "  make deploy EC2=$IP   # just recompile + restart"
-echo "  make bench EC2=$IP    # run benchmark"
+if $REFERENCE_MODE; then
+  echo "  make reference EC2=$IP            # vanilla PG, capture query results, commit JSON"
+  echo "  make destroy-reference-ec2        # tear down this instance when done"
+else
+  echo "  make setup EC2=$IP    # full setup: install deps, build, load data"
+  echo "  make deploy EC2=$IP   # just recompile + restart"
+  echo "  make bench EC2=$IP    # run benchmark"
+fi
 echo ""
 echo "Serial console (if SSH is down):"
 echo "  aws ec2-instance-connect send-serial-console-ssh-public-key --profile $PROFILE --instance-id $INSTANCE_ID --serial-port 0 --ssh-public-key file://~/.ssh/tsg.pub --region us-east-1"
