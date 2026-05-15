@@ -7,7 +7,14 @@ Query IDs are 0-indexed (Q0..Q42) to match the ClickBench reporting convention.
 
 Note: EventDate references are kept as-is (DATE type in schema).
 EventTime is TIMESTAMPTZ in our schema; queries referencing it work unchanged.
+
+This module also owns the per-query equality semantics (deterministic /
+non-deterministic / limit-tie) and the `compare_results()` helper that both
+`tests/bench_clickbench.py` Phase 5 and `clickbench/verify_results.py` call.
 """
+
+from dataclasses import dataclass, field
+
 
 # Queries with non-deterministic result ordering due to ties in ORDER BY
 # with LIMIT/OFFSET, or no ORDER BY at all.  Content comparison between
@@ -398,3 +405,131 @@ QUERIES = [
         "ORDER BY DATE_TRUNC('minute', EventTime) LIMIT 10 OFFSET 1000",
     ),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Result comparison
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CompareOutcome:
+    ok: bool
+    detail: str
+    extra_lines: list = field(default_factory=list)
+
+
+def validate_nondet_query(qid, expected_rows, actual_rows, sort_info):
+    """Validate a non-deterministic query beyond row-count equality.
+
+    Checks that both result sets respect the ORDER BY contract:
+    - Sort key column is correctly ordered in both results.
+    - The extreme sort key value (first row) matches between the two
+      result sets, catching data-level bugs.  Skipped for OFFSET queries
+      where the boundary value can legitimately differ due to ties.
+
+    Returns (ok, detail_str).
+    """
+    if sort_info is None:
+        return True, f"{len(actual_rows)} rows, non-deterministic (no ORDER BY)"
+
+    col_idx, direction, has_offset = sort_info
+
+    def _is_sorted(rows):
+        keys = [r[col_idx] for r in rows]
+        if direction == "DESC":
+            return all(a >= b for a, b in zip(keys, keys[1:]))
+        return all(a <= b for a, b in zip(keys, keys[1:]))
+
+    if not _is_sorted(actual_rows):
+        return False, "actual results not sorted correctly"
+    if not _is_sorted(expected_rows):
+        return False, "expected results not sorted correctly"
+
+    if not has_offset and expected_rows and actual_rows:
+        e_top = expected_rows[0][col_idx]
+        a_top = actual_rows[0][col_idx]
+        if e_top != a_top:
+            return False, f"top sort-key differs: expected={e_top}, actual={a_top}"
+
+    return True, f"{len(actual_rows)} rows, sort order verified"
+
+
+def compare_results(qid, expected_rows, actual_rows) -> CompareOutcome:
+    """Compare expected vs actual result rows for a given ClickBench query.
+
+    Applies the per-query semantics declared at the top of this module:
+    - NONDETERMINISTIC_QUERIES: row count match plus optional sort-order check.
+    - LIMIT_TIE_QUERIES: strip rows sharing the sort-key value with the
+      LIMIT/OFFSET boundary, then exact-match the stable interior.
+    - Everything else: sorted set equality.
+
+    Rows can be any sequence of cells; the caller decides representation
+    (psycopg tuples, lists of strings parsed from TSV, etc.).  Cells must
+    be hashable and comparable for the deterministic path.
+    """
+    if qid in NONDETERMINISTIC_QUERIES:
+        if len(expected_rows) != len(actual_rows):
+            return CompareOutcome(
+                False,
+                f"row count: expected={len(expected_rows)} actual={len(actual_rows)}",
+            )
+        ok, detail = validate_nondet_query(
+            qid, expected_rows, actual_rows, NONDET_SORT_INFO.get(qid)
+        )
+        return CompareOutcome(ok, detail)
+
+    if qid in LIMIT_TIE_QUERIES:
+        sk = LIMIT_TIE_QUERIES[qid]
+        if len(expected_rows) != len(actual_rows):
+            return CompareOutcome(
+                False,
+                f"row count: expected={len(expected_rows)} actual={len(actual_rows)}",
+            )
+        if not expected_rows:
+            return CompareOutcome(True, "0 rows")
+        e_tail = expected_rows[-1][sk]
+        a_tail = actual_rows[-1][sk]
+        e_stable = [r for r in expected_rows if r[sk] != e_tail]
+        a_stable = [r for r in actual_rows if r[sk] != a_tail]
+        e_head = expected_rows[0][sk]
+        a_head = actual_rows[0][sk]
+        e_stable = sorted(r for r in e_stable if r[sk] != e_head)
+        a_stable = sorted(r for r in a_stable if r[sk] != a_head)
+        if e_stable == a_stable:
+            n_tied = len(expected_rows) - len(e_stable)
+            return CompareOutcome(
+                True, f"{len(e_stable)} exact + {n_tied} tied rows"
+            )
+        return CompareOutcome(
+            False,
+            "non-tied rows differ",
+            [
+                f"expected stable: {len(e_stable)} rows, first={e_stable[:2]}",
+                f"actual stable:   {len(a_stable)} rows, first={a_stable[:2]}",
+            ],
+        )
+
+    e_sorted = sorted(expected_rows)
+    a_sorted = sorted(actual_rows)
+    if e_sorted == a_sorted:
+        return CompareOutcome(True, f"{len(expected_rows)} rows match")
+
+    extra = [
+        f"expected: {len(expected_rows)} rows, first={expected_rows[:2]}",
+        f"actual:   {len(actual_rows)} rows, first={actual_rows[:2]}",
+    ]
+    if len(e_sorted) == len(a_sorted):
+        for i, (er, ar) in enumerate(zip(e_sorted, a_sorted)):
+            if er != ar:
+                extra.append(f"row {i} diff: expected={er}")
+                extra.append(f"              actual  ={ar}")
+    else:
+        e_set = set(map(tuple, e_sorted))
+        a_set = set(map(tuple, a_sorted))
+        only_e = e_set - a_set
+        only_a = a_set - e_set
+        if only_e:
+            extra.append(f"only in expected ({len(only_e)}): {list(only_e)[:5]}")
+        if only_a:
+            extra.append(f"only in actual ({len(only_a)}): {list(only_a)[:5]}")
+    return CompareOutcome(False, "rows differ", extra)

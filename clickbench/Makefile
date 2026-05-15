@@ -11,6 +11,15 @@
 #   make bench EC2=<ip>          # run all 43 queries, download results
 #   make query EC2=<ip> Q=33     # EXPLAIN ANALYZE a single query
 #
+# Correctness verification (the bench harness only times queries — it does
+# not validate their output). The reference is generated once on a fresh
+# vanilla-PG EC2 (separate Name tag, doesn't clobber the bench EC2) and
+# committed; verify runs against the live bench EC2.
+#   make launch-reference-ec2          # launch the vanilla-PG instance
+#   make reference EC2=<vanilla-pg-ip> # one-time: vanilla PG + capture + rebuild JSON
+#   make destroy-reference-ec2         # tear down the vanilla-PG instance
+#   make verify    EC2=<bench-ip>      # diff current pg_deltax output vs committed JSON
+#
 # Ad-hoc:
 #   make sql EC2=<ip> SQL="SHOW work_mem"
 #   make psql EC2=<ip>
@@ -31,8 +40,9 @@ CLICKBENCH_DIR ?= $(CURDIR)/../../../ClickBench/pg-deltax
 
 AWS_PROFILE ?= management
 AWS_NAME = clickbench-pg-deltax
+REFERENCE_AWS_NAME = clickbench-pg-deltax-reference
 
-.PHONY: launch-ec2 destroy-ec2 ssh setup deploy bench query sql psql
+.PHONY: launch-ec2 destroy-ec2 launch-reference-ec2 destroy-reference-ec2 ssh setup deploy bench query sql psql reference verify
 
 # Launch a new EC2 instance (terminates any existing one with the same name)
 launch-ec2:
@@ -45,6 +55,26 @@ destroy-ec2:
 		--query 'Reservations[*].Instances[*].[InstanceId,PublicIpAddress]' --output text); \
 	if [ -z "$$EXISTING" ]; then \
 		echo "No running instance found with name $(AWS_NAME)"; \
+	else \
+		IDS=$$(echo "$$EXISTING" | awk '{print $$1}'); \
+		echo "Terminating: $$EXISTING"; \
+		aws ec2 terminate-instances --profile "$(AWS_PROFILE)" --instance-ids $$IDS --output text; \
+		aws ec2 wait instance-terminated --profile "$(AWS_PROFILE)" --instance-ids $$IDS; \
+		echo "Terminated."; \
+	fi
+
+# Launch a separate EC2 instance for the vanilla-PG correctness reference run.
+# Uses a different Name tag so it doesn't clobber the bench EC2.
+launch-reference-ec2:
+	@bash launch-ec2.sh --name $(REFERENCE_AWS_NAME) --reference
+
+# Terminate the reference EC2 instance.
+destroy-reference-ec2:
+	@EXISTING=$$(aws ec2 describe-instances --profile "$(AWS_PROFILE)" \
+		--filters "Name=tag:Name,Values=$(REFERENCE_AWS_NAME)" "Name=instance-state-name,Values=running,stopped,pending" \
+		--query 'Reservations[*].Instances[*].[InstanceId,PublicIpAddress]' --output text); \
+	if [ -z "$$EXISTING" ]; then \
+		echo "No running instance found with name $(REFERENCE_AWS_NAME)"; \
 	else \
 		IDS=$$(echo "$$EXISTING" | awk '{print $$1}'); \
 		echo "Terminating: $$EXISTING"; \
@@ -111,6 +141,51 @@ bench:
 		cd $(CLICKBENCH_DIR)/.. && ./generate-results.sh; \
 		open $(CLICKBENCH_DIR)/../index.html; \
 	fi
+
+# One-time: launch a SEPARATE vanilla-PG EC2 first, then run this to install PG,
+# load the data with plain COPY, capture each of the 43 queries' result sets,
+# pull the captured CSVs back, and (re)build clickbench/reference_results.json.
+# Commit the resulting JSON.
+reference:
+	@test -n "$(EC2)" || (echo "Usage: make $@ EC2=<vanilla-pg-ip>"; exit 1)
+	@echo "=== Syncing clickbench scripts ==="
+	rsync -az -e "ssh -i $(EC2_KEY) -o StrictHostKeyChecking=no" \
+		$(CURDIR)/ $(EC2_USER)@$(EC2):~/clickbench/
+	@echo "=== Bootstrapping vanilla PG + loading data (this takes a while) ==="
+	$(EC2_SSH) 'cd ~/clickbench && bash reference.sh'
+	@echo "=== Capturing query result sets ==="
+	$(EC2_SSH) 'cd ~/clickbench && DB=test bash capture_results.sh'
+	@echo "=== Downloading results ==="
+	rm -rf /tmp/clickbench_reference
+	$(EC2_SCP) $(EC2_USER)@$(EC2):/tmp/results.tar.gz /tmp/clickbench_reference.tar.gz
+	$(EC2_SCP) $(EC2_USER)@$(EC2):~/clickbench/reference_stats.env /tmp/clickbench_reference_stats.env
+	mkdir -p /tmp/clickbench_reference
+	tar -xzf /tmp/clickbench_reference.tar.gz -C /tmp/clickbench_reference --strip-components=1
+	@echo "=== Building reference_results.json ==="
+	python3 $(CURDIR)/verify_results.py build-reference /tmp/clickbench_reference \
+		--stats-env /tmp/clickbench_reference_stats.env \
+		-o $(CURDIR)/reference_results.json
+	@echo "=== Done. Commit $(CURDIR)/reference_results.json. ==="
+
+# Run the 43 ClickBench queries against the CURRENT pg_deltax DB on the bench EC2,
+# diff against the committed reference. Exits non-zero on mismatch.
+# Cheap: ~2 minutes of cold psql calls, no recompile, no data reload.
+verify:
+	@test -n "$(EC2)" || (echo "Usage: make $@ EC2=<bench-ip>"; exit 1)
+	@test -f $(CURDIR)/reference_results.json || (echo "Missing reference_results.json — run 'make reference' first or pull it from git"; exit 1)
+	@echo "=== Syncing capture script ==="
+	rsync -az -e "ssh -i $(EC2_KEY) -o StrictHostKeyChecking=no" \
+		$(CURDIR)/capture_results.sh $(CURDIR)/queries.sql $(EC2_USER)@$(EC2):~/clickbench/
+	@echo "=== Capturing query result sets from pg_deltax DB ==="
+	$(EC2_SSH) 'cd ~/clickbench && DB=test bash capture_results.sh'
+	@echo "=== Downloading results ==="
+	rm -rf /tmp/clickbench_verify
+	$(EC2_SCP) $(EC2_USER)@$(EC2):/tmp/results.tar.gz /tmp/clickbench_verify.tar.gz
+	mkdir -p /tmp/clickbench_verify
+	tar -xzf /tmp/clickbench_verify.tar.gz -C /tmp/clickbench_verify --strip-components=1
+	@echo "=== Comparing against $(CURDIR)/reference_results.json ==="
+	python3 $(CURDIR)/verify_results.py check /tmp/clickbench_verify \
+		--reference $(CURDIR)/reference_results.json
 
 # EXPLAIN ANALYZE a single query. Usage: make query EC2=<ip> Q=33 [SET="SET pg_deltax.parallel_workers=4"]
 query:
