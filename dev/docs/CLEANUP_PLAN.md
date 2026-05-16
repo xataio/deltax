@@ -293,7 +293,7 @@ Substantial but either smaller, less unsafe, or partially tested.
 | `src/scan/exec/segments.rs` | 3150 | 23 | 0 | Segment iteration core. Some `unsafe`, no tests. |
 | `src/compress.rs` | 3773 | 7 | 13 | Already tested for codec paths; needs a simplify pass and probably some splitting. Low `unsafe`. |
 | `src/blob_cache/storage.rs` | 1013 | 37 | 0 | Mmap-backed cache. Recent (just merged); add tests while the design is fresh. |
-| `src/scan/exec/agg.rs` | 13691 | 162 | 140 | Largest file. Lots of `unsafe`, but also lots of tests. Strongest candidate for *splitting* into submodules and shrinking each. Treat as a multi-session sub-project. |
+| `src/scan/exec/agg.rs` | 13691 | 162 | 140 | Largest file. Lots of `unsafe`, but also lots of tests. Strongest candidate for *splitting* into submodules and shrinking each. **Multi-session sub-project — playbook in [`AGG_SPLIT.md`](./AGG_SPLIT.md).** |
 | `src/scan/exec/batch_qual.rs` | 884 | 4 | 0 | Low `unsafe`; mostly needs tests. |
 | `src/scan/exec/count_minmax.rs` | 798 | 20 | 0 | Same shape: small enough to clean in one session. |
 | `src/scan/exec/append_wire.rs` | 649 | 17 | 0 | Wire format. Pure logic, should unit-test. |
