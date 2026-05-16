@@ -30,6 +30,64 @@ narration.
 
 ## Sessions
 
+### 2026-05-16 — `src/compress.rs` — TBD
+
+**Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
+`unsafe` audit deferred — the file only has 7 `unsafe` ops, all narrow PG
+FFI for `jsonb_text_to_binary`.
+**LOC:** 3773 → 3880 (non-test) / 4337 total with 9 new tests added.
+Non-test grew (+107) because rustfmt expanded many densely-packed
+single-line items; functional duplication dropped at every site.
+**`unsafe`:** 7 → 7 (no change — none of the cleanups touched FFI).
+**Tests:** 13 → 22.
+
+- Extracted `minmax_encoded_via<T>(values, encode)` to dedupe the 5
+  numeric branches of `compute_minmax_encoded_i64`. Each branch was 8–10
+  lines of identical "for v in flatten / map_or min / map_or max" logic;
+  now each is a one-line call passing in the type-specific `encode` fn.
+- Extracted `sum_int_column<T>(values)` and `sum_float_column<T>(values)`
+  for the 5 numeric branches of `compute_typed_sum`. The integer branches
+  (Int16/Int32/Int64) all widened to i128 and computed the same triple;
+  the float branches (Float32/Float64) likewise computed via f64 with
+  `{:.17e}` formatting. Now each branch is a one-liner; text and bool
+  branches remain inline because they have different semantics.
+- Extracted `minmax_ord<T: Ord>` and `minmax_float<T: PartialOrd>` for the
+  same reduction inside `compute_typed_minmax`. The integer branches now
+  share the reduction; only the post-processing (Date / timestamp string
+  formatting) differs and stays inline.
+- Added 9 `#[test]` cases:
+  - `compute_minmax_encoded_i64_handles_each_numeric_kind` — Int16/32/64,
+    Float32/64, all-null
+  - `compute_minmax_encoded_i64_returns_none_for_unsupported_types` —
+    text / bool / declared-mismatch types
+  - `compute_typed_sum_integer_branches` — i128 widening, all-null, count
+    vs nonzero distinction
+  - `compute_typed_sum_float_branches` — Float32 widens via f64
+  - `compute_typed_sum_text_returns_char_count_sum` — char count (not byte
+    count); the "héllo" case (é = 2 bytes, 1 char) locks in the semantic
+  - `compute_typed_sum_bool_and_bytes_have_no_sum`
+  - `supports_minmax_matrix`, `supports_sum_matrix`,
+    `is_text_data_type_matrix` — comprehensive type-name coverage
+  - `is_valid_identifier_accepts_legal_names` — happy + rejects
+    starts-with-digit, dashes, spaces, non-ASCII
+  - `is_recognized_extract_type_matrix` — every accepted spelling +
+    rejection of `jsonb`/`uuid`/`numeric`
+  - `classify_column_segment_by_is_text`, `classify_column_maps_pg_aliases`
+- Deferred: SAFETY: comment pass on the 7 `unsafe` blocks (all in
+  `jsonb_text_to_binary`).
+- **Benchmarks**:
+  - ClickBench EC2 (c6a.4xlarge, 100M-row full dataset): **62.82s vs
+    prior 62.13s** (+1.1% total, within noise). Q40 +10.3% (75ms query,
+    noise floor) and Q28 +5.3% are run-to-run variance — compress.rs is
+    only on the COPY/ingest path, and the EC2 data was loaded at setup
+    time, before any of these changes.
+  - JSONBench EC2 (m6i.8xlarge, 100M Bluesky events): **3.588s vs prior
+    3.582s** (+0.2% total). All queries within ±7%; Q3 -6.6%.
+- **Correctness:** `make correctness` 999 passed / 3 skipped / 6 xfailed
+  (matches baseline). Unit: 464 pass on PG17 and PG18 (was 451).
+  Integration: 234 pass on PG17 and PG18.
+- **Perf opportunities surfaced:** none.
+
 ### 2026-05-16 — `src/scan/exec/segments.rs` — fdeea74
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.

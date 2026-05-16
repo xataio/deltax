@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use cardinality_estimator::CardinalityEstimator;
 
 use crate::catalog;
-use crate::compression::{self, CompressionType, CompressedColumn};
+use crate::compression::{self, CompressedColumn, CompressionType};
 
 /// Microseconds between Unix epoch (1970-01-01) and PG epoch (2000-01-01).
 pub(crate) const PG_EPOCH_OFFSET_USEC: i64 = 946_684_800_000_000;
@@ -69,15 +69,21 @@ pub(crate) fn parse_extract_specs(value: &serde_json::Value) -> Vec<ExtractSpec>
             .get("src")
             .and_then(|v| v.as_str())
             .unwrap_or_else(|| {
-                pgrx::error!("pg_deltax: json_extract[{}].src must be a string column name", i)
+                pgrx::error!(
+                    "pg_deltax: json_extract[{}].src must be a string column name",
+                    i
+                )
             })
             .to_string();
 
-        let path_value = obj.get("path").unwrap_or_else(|| {
-            pgrx::error!("pg_deltax: json_extract[{}].path is required", i)
-        });
+        let path_value = obj
+            .get("path")
+            .unwrap_or_else(|| pgrx::error!("pg_deltax: json_extract[{}].path is required", i));
         let path_arr = path_value.as_array().unwrap_or_else(|| {
-            pgrx::error!("pg_deltax: json_extract[{}].path must be a JSON array of strings", i)
+            pgrx::error!(
+                "pg_deltax: json_extract[{}].path must be a JSON array of strings",
+                i
+            )
         });
         if path_arr.is_empty() {
             pgrx::error!("pg_deltax: json_extract[{}].path must not be empty", i);
@@ -100,14 +106,13 @@ pub(crate) fn parse_extract_specs(value: &serde_json::Value) -> Vec<ExtractSpec>
         let target_name = obj
             .get("name")
             .and_then(|v| v.as_str())
-            .unwrap_or_else(|| {
-                pgrx::error!("pg_deltax: json_extract[{}].name must be a string", i)
-            })
+            .unwrap_or_else(|| pgrx::error!("pg_deltax: json_extract[{}].name must be a string", i))
             .to_string();
         if !is_valid_identifier(&target_name) {
             pgrx::error!(
                 "pg_deltax: json_extract[{}].name {:?} is not a valid SQL identifier",
-                i, target_name
+                i,
+                target_name
             );
         }
         if !seen_names.insert(target_name.clone()) {
@@ -120,9 +125,7 @@ pub(crate) fn parse_extract_specs(value: &serde_json::Value) -> Vec<ExtractSpec>
         let target_type = obj
             .get("type")
             .and_then(|v| v.as_str())
-            .unwrap_or_else(|| {
-                pgrx::error!("pg_deltax: json_extract[{}].type must be a string", i)
-            })
+            .unwrap_or_else(|| pgrx::error!("pg_deltax: json_extract[{}].type must be a string", i))
             .to_string();
         let target_kind = classify_column(&target_type, false);
         if matches!(target_kind, ColumnKind::Jsonb) {
@@ -138,7 +141,8 @@ pub(crate) fn parse_extract_specs(value: &serde_json::Value) -> Vec<ExtractSpec>
         if !is_recognized_extract_type(&target_type) {
             pgrx::error!(
                 "pg_deltax: json_extract[{}].type {:?} is not recognized (expected one of: text, varchar, char, smallint, integer, bigint, real, double precision, boolean, timestamp, timestamp with time zone, date)",
-                i, target_type
+                i,
+                target_type
             );
         }
 
@@ -176,16 +180,24 @@ pub(crate) fn build_extract_targets_per_column(
         .position(|c| c.extracted.is_some())
         .unwrap_or(columns.len());
 
-    let mut per_col: Vec<Option<ColumnExtractTargets>> = (0..physical_count).map(|_| None).collect();
+    let mut per_col: Vec<Option<ColumnExtractTargets>> =
+        (0..physical_count).map(|_| None).collect();
 
     for (target_idx, col) in columns.iter().enumerate() {
-        let Some(spec) = col.extracted.as_ref() else { continue };
-        let src_idx = match columns.iter().take(physical_count).position(|c| c.name == spec.src_column) {
+        let Some(spec) = col.extracted.as_ref() else {
+            continue;
+        };
+        let src_idx = match columns
+            .iter()
+            .take(physical_count)
+            .position(|c| c.name == spec.src_column)
+        {
             Some(idx) => idx,
             None => {
                 pgrx::error!(
                     "pg_deltax: json_extract spec for {:?}: src column {:?} not found in physical columns",
-                    spec.target_name, spec.src_column
+                    spec.target_name,
+                    spec.src_column
                 )
             }
         };
@@ -320,19 +332,19 @@ fn push_extracted_leaf(
         (ColumnKind::Bool, TypedColumn::Bool(vec), serde_json::Value::Bool(b)) => {
             vec.push(Some(*b));
         }
-        (ColumnKind::Timestamp | ColumnKind::TimestampTz, TypedColumn::Int64(vec), serde_json::Value::String(s)) => {
+        (
+            ColumnKind::Timestamp | ColumnKind::TimestampTz,
+            TypedColumn::Int64(vec),
+            serde_json::Value::String(s),
+        ) => {
             // PG-format timestamp text. Best-effort parse; NULL on miss.
             // Wrap parse_timestamp_to_usec which currently doesn't return Result —
             // catch panics from malformed inputs and treat as NULL.
-            let parsed = std::panic::catch_unwind(|| {
-                crate::timeparse::parse_timestamp_to_usec(s)
-            });
+            let parsed = std::panic::catch_unwind(|| crate::timeparse::parse_timestamp_to_usec(s));
             vec.push(parsed.ok());
         }
         (ColumnKind::Date, TypedColumn::Int64(vec), serde_json::Value::String(s)) => {
-            let parsed = std::panic::catch_unwind(|| {
-                crate::timeparse::parse_timestamp_to_usec(s)
-            });
+            let parsed = std::panic::catch_unwind(|| crate::timeparse::parse_timestamp_to_usec(s));
             vec.push(parsed.ok());
         }
         // Anything else: type mismatch -> NULL.
@@ -413,7 +425,11 @@ fn deltax_enable_compression(
         let ht = catalog::get_deltatable(client, &schema, &table)
             .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
+                pgrx::error!(
+                    "pg_deltax: table {}.{} is not a deltax table",
+                    schema,
+                    table
+                )
             });
 
         // Validate segment_by columns exist
@@ -423,11 +439,20 @@ fn deltax_enable_compression(
                     "SELECT 1 FROM information_schema.columns
                      WHERE table_schema = $1 AND table_name = $2 AND column_name::text = $3",
                     None,
-                    &[schema.as_str().into(), table.as_str().into(), col.as_str().into()],
+                    &[
+                        schema.as_str().into(),
+                        table.as_str().into(),
+                        col.as_str().into(),
+                    ],
                 )
                 .expect("failed to check column");
             if exists.is_empty() {
-                pgrx::error!("pg_deltax: segment_by column '{}' not found in {}.{}", col, schema, table);
+                pgrx::error!(
+                    "pg_deltax: segment_by column '{}' not found in {}.{}",
+                    col,
+                    schema,
+                    table
+                );
             }
         }
 
@@ -438,7 +463,11 @@ fn deltax_enable_compression(
             order_by
         };
 
-        let effective_segment_size = if segment_size <= 0 { 30000 } else { segment_size };
+        let effective_segment_size = if segment_size <= 0 {
+            30000
+        } else {
+            segment_size
+        };
 
         // Validate json_extract specs (if any) before persisting. Each spec's
         // src column must exist in the parent table and be jsonb. The names
@@ -465,11 +494,14 @@ fn deltax_enable_compression(
                 match dt {
                     None => pgrx::error!(
                         "pg_deltax: json_extract src column '{}' not found in {}.{}",
-                        spec.src_column, schema, table
+                        spec.src_column,
+                        schema,
+                        table
                     ),
                     Some(t) if t.to_lowercase() != "jsonb" => pgrx::error!(
                         "pg_deltax: json_extract src column '{}' must be jsonb (is {})",
-                        spec.src_column, t
+                        spec.src_column,
+                        t
                     ),
                     Some(_) => {}
                 }
@@ -489,7 +521,9 @@ fn deltax_enable_compression(
                 if !collision.is_empty() {
                     pgrx::error!(
                         "pg_deltax: json_extract name '{}' collides with an existing column in {}.{}",
-                        spec.target_name, schema, table
+                        spec.target_name,
+                        schema,
+                        table
                     );
                 }
             }
@@ -517,16 +551,17 @@ fn deltax_enable_compression(
 
 /// Set the automatic compression policy for a deltatable.
 #[pg_extern]
-fn deltax_set_compression_policy(
-    relation: &str,
-    compress_after: pgrx::datum::Interval,
-) -> String {
+fn deltax_set_compression_policy(relation: &str, compress_after: pgrx::datum::Interval) -> String {
     Spi::connect_mut(|client| {
         let (schema, table) = crate::partition::resolve_relation(client, relation);
         let ht = catalog::get_deltatable(client, &schema, &table)
             .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
+                pgrx::error!(
+                    "pg_deltax: table {}.{} is not a deltax table",
+                    schema,
+                    table
+                )
             });
 
         if ht.segment_by.is_empty() && ht.order_by.is_empty() {
@@ -546,17 +581,13 @@ fn deltax_set_compression_policy(
 /// Compress a single partition.
 #[pg_extern]
 fn deltax_compress_partition(partition: &str) -> String {
-    Spi::connect_mut(|client| {
-        compress_partition_impl(client, partition)
-    })
+    Spi::connect_mut(|client| compress_partition_impl(client, partition))
 }
 
 /// Decompress a single partition.
 #[pg_extern]
 fn deltax_decompress_partition(partition: &str) -> String {
-    Spi::connect_mut(|client| {
-        decompress_partition_impl(client, partition)
-    })
+    Spi::connect_mut(|client| decompress_partition_impl(client, partition))
 }
 
 /// Refresh `pg_class.reltuples` and `pg_statistic` for a compressed
@@ -598,7 +629,11 @@ fn deltax_compression_stats(
         let ht = catalog::get_deltatable(client, &schema, &table)
             .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
+                pgrx::error!(
+                    "pg_deltax: table {}.{} is not a deltax table",
+                    schema,
+                    table
+                )
             });
 
         let result = client
@@ -614,8 +649,18 @@ fn deltax_compression_stats(
 
         let mut rows = Vec::new();
         for row in result {
-            let name: String = row.get_datum_by_ordinal(1).unwrap().value::<String>().unwrap().unwrap();
-            let compressed: bool = row.get_datum_by_ordinal(2).unwrap().value::<bool>().unwrap().unwrap_or(false);
+            let name: String = row
+                .get_datum_by_ordinal(1)
+                .unwrap()
+                .value::<String>()
+                .unwrap()
+                .unwrap();
+            let compressed: bool = row
+                .get_datum_by_ordinal(2)
+                .unwrap()
+                .value::<bool>()
+                .unwrap()
+                .unwrap_or(false);
             let raw: Option<i64> = row.get_datum_by_ordinal(3).unwrap().value::<i64>().unwrap();
             let comp: Option<i64> = row.get_datum_by_ordinal(4).unwrap().value::<i64>().unwrap();
             let count: Option<i64> = row.get_datum_by_ordinal(5).unwrap().value::<i64>().unwrap();
@@ -642,7 +687,11 @@ fn deltax_table_size(relation: &str) -> i64 {
         let ht = catalog::get_deltatable(client, &schema, &table)
             .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
+                pgrx::error!(
+                    "pg_deltax: table {}.{} is not a deltax table",
+                    schema,
+                    table
+                )
             });
 
         let result = client
@@ -658,8 +707,18 @@ fn deltax_table_size(relation: &str) -> i64 {
         let companion_schema = "_deltax_compressed";
         let mut total: i64 = 0;
         for row in result {
-            let part_name: String = row.get_datum_by_ordinal(1).unwrap().value::<String>().unwrap().unwrap();
-            let compressed: bool = row.get_datum_by_ordinal(2).unwrap().value::<bool>().unwrap().unwrap_or(false);
+            let part_name: String = row
+                .get_datum_by_ordinal(1)
+                .unwrap()
+                .value::<String>()
+                .unwrap()
+                .unwrap();
+            let compressed: bool = row
+                .get_datum_by_ordinal(2)
+                .unwrap()
+                .value::<bool>()
+                .unwrap()
+                .unwrap_or(false);
 
             if compressed {
                 // Measure live size of companion tables
@@ -686,7 +745,11 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     let part_info = catalog::get_partition_by_name(client, &schema, &part_table)
         .expect("failed to query partition")
         .unwrap_or_else(|| {
-            pgrx::error!("pg_deltax: partition {}.{} not found in catalog", schema, part_table)
+            pgrx::error!(
+                "pg_deltax: partition {}.{} not found in catalog",
+                schema,
+                part_table
+            )
         });
 
     if part_info.is_compressed {
@@ -699,8 +762,11 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         .unwrap();
 
     if ht.order_by.is_empty() && ht.segment_by.is_empty() {
-        pgrx::error!("pg_deltax: compression not enabled on {}.{}. Call deltax_enable_compression() first.",
-            ht.schema_name, ht.table_name);
+        pgrx::error!(
+            "pg_deltax: compression not enabled on {}.{}. Call deltax_enable_compression() first.",
+            ht.schema_name,
+            ht.table_name
+        );
     }
 
     // 3. Get column metadata
@@ -738,7 +804,10 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     // reltuples = 0 means PG knows the partition is empty (e.g. freshly created).
     // Skip compression — creating the companion table would confuse the scan hook.
     if reltuples == 0 {
-        return format!("Partition {}.{} has no rows to compress", schema, part_table);
+        return format!(
+            "Partition {}.{} has no rows to compress",
+            schema, part_table
+        );
     }
 
     // 5. Build companion table DDL: meta (thin) + colstats (wide) + blobs + blooms
@@ -769,21 +838,44 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
             .update(&format!("DROP TABLE IF EXISTS {}", ddl.meta_fqn), None, &[])
             .expect("failed to drop empty meta table");
         client
-            .update(&format!("DROP TABLE IF EXISTS {}", ddl.colstats_fqn), None, &[])
+            .update(
+                &format!("DROP TABLE IF EXISTS {}", ddl.colstats_fqn),
+                None,
+                &[],
+            )
             .expect("failed to drop empty colstats table");
         client
-            .update(&format!("DROP TABLE IF EXISTS {}", ddl.blobs_fqn), None, &[])
+            .update(
+                &format!("DROP TABLE IF EXISTS {}", ddl.blobs_fqn),
+                None,
+                &[],
+            )
             .expect("failed to drop empty blobs table");
         client
-            .update(&format!("DROP TABLE IF EXISTS {}", ddl.blooms_fqn), None, &[])
+            .update(
+                &format!("DROP TABLE IF EXISTS {}", ddl.blooms_fqn),
+                None,
+                &[],
+            )
             .expect("failed to drop empty blooms table");
         client
-            .update(&format!("DROP TABLE IF EXISTS {}", ddl.text_lengths_fqn), None, &[])
+            .update(
+                &format!("DROP TABLE IF EXISTS {}", ddl.text_lengths_fqn),
+                None,
+                &[],
+            )
             .expect("failed to drop empty text_lengths table");
         client
-            .update(&format!("DROP TABLE IF EXISTS {}", ddl.valbitmap_fqn), None, &[])
+            .update(
+                &format!("DROP TABLE IF EXISTS {}", ddl.valbitmap_fqn),
+                None,
+                &[],
+            )
             .expect("failed to drop empty valbitmap table");
-        return format!("Partition {}.{} has no rows to compress", schema, part_table);
+        return format!(
+            "Partition {}.{} has no rows to compress",
+            schema, part_table
+        );
     }
 
     // 8. Truncate original partition (stays attached to parent)
@@ -835,11 +927,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     // Failure here is WARNING, not fatal — the partition is still
     // queryable with pessimistic estimates.
     let part_rel_oid: pg_sys::Oid = client
-        .select(
-            &format!("SELECT '{}'::regclass::oid", part_fqn),
-            None,
-            &[],
-        )
+        .select(&format!("SELECT '{}'::regclass::oid", part_fqn), None, &[])
         .expect("failed to resolve partition oid")
         .first()
         .get_one::<pg_sys::Oid>()
@@ -848,13 +936,20 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         .unwrap_or(pg_sys::InvalidOid);
     if part_rel_oid != pg_sys::InvalidOid
         && let Err(e) = crate::stats::write_partition_stats(
-            client, part_rel_oid, &col_ndistinct, row_count, &ddl.colstats_fqn, &columns,
+            client,
+            part_rel_oid,
+            &col_ndistinct,
+            row_count,
+            &ddl.colstats_fqn,
+            &columns,
         )
     {
         pgrx::warning!(
             "pg_deltax: failed to update pg_statistic for {}: {}. \
              Run deltax_analyze_partition('{}') to retry.",
-            part_fqn, e, part_fqn,
+            part_fqn,
+            e,
+            part_fqn,
         );
     }
 
@@ -891,17 +986,17 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
 /// Classifies how to read a column from SPI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ColumnKind {
-    Text,         // text, varchar, char — read as String
-    Int16,        // smallint/int2
-    Int32,        // integer/int4
-    Int64,        // bigint/int8
-    Float32,      // real/float4
-    Float64,      // double precision/float8
-    Bool,         // boolean/bool
-    Timestamp,    // timestamp without time zone — read as pgrx::Timestamp → i64 usec
-    TimestampTz,  // timestamp with time zone — read as pgrx::TimestampWithTimeZone → i64 usec
-    Date,         // date — read as pgrx::Date → i64 usec
-    Jsonb,        // jsonb — stored as the binary varlena form produced by jsonb_in
+    Text,        // text, varchar, char — read as String
+    Int16,       // smallint/int2
+    Int32,       // integer/int4
+    Int64,       // bigint/int8
+    Float32,     // real/float4
+    Float64,     // double precision/float8
+    Bool,        // boolean/bool
+    Timestamp,   // timestamp without time zone — read as pgrx::Timestamp → i64 usec
+    TimestampTz, // timestamp with time zone — read as pgrx::TimestampWithTimeZone → i64 usec
+    Date,        // date — read as pgrx::Date → i64 usec
+    Jsonb,       // jsonb — stored as the binary varlena form produced by jsonb_in
 }
 
 /// Column data stored in native types.
@@ -1239,12 +1334,8 @@ pub(crate) unsafe fn jsonb_text_to_binary(text: &str) -> Vec<u8> {
         let mut typinput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
         let mut typioparam: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
         pgrx::pg_sys::getTypeInputInfo(pgrx::pg_sys::JSONBOID, &mut typinput, &mut typioparam);
-        let datum = pgrx::pg_sys::OidInputFunctionCall(
-            typinput,
-            c_text.as_ptr() as *mut _,
-            typioparam,
-            -1,
-        );
+        let datum =
+            pgrx::pg_sys::OidInputFunctionCall(typinput, c_text.as_ptr() as *mut _, typioparam, -1);
         let varlena = datum.cast_mut_ptr::<pgrx::pg_sys::varlena>();
         let detoasted = pgrx::pg_sys::pg_detoast_datum(varlena);
         let total_len = pgrx::varsize_any_exhdr(detoasted);
@@ -1261,7 +1352,11 @@ pub(crate) unsafe fn jsonb_text_to_binary(text: &str) -> Vec<u8> {
 
 /// Sort typed columns in-place by the given order_by column indices.
 /// Computes a permutation from the sort keys, then reorders all columns by that permutation.
-pub(crate) fn sort_typed_columns(typed_cols: &mut [TypedColumn], order_col_indices: &[usize], num_rows: usize) {
+pub(crate) fn sort_typed_columns(
+    typed_cols: &mut [TypedColumn],
+    order_col_indices: &[usize],
+    num_rows: usize,
+) {
     if order_col_indices.is_empty() || num_rows <= 1 {
         return;
     }
@@ -1322,7 +1417,7 @@ pub(crate) struct ColstatsRow {
     pub(crate) segment_id: i32,
     pub(crate) min_val: Option<i64>,
     pub(crate) max_val: Option<i64>,
-    pub(crate) sum_val: Option<String>,  // NUMERIC as string
+    pub(crate) sum_val: Option<String>, // NUMERIC as string
     pub(crate) nonnull_count: i32,
     pub(crate) nonzero_count: i32,
     pub(crate) ndistinct: i64,
@@ -1469,9 +1564,7 @@ pub(crate) fn flush_segment_metadata(
         let (min_enc, max_enc) = compute_minmax_encoded_i64(&typed_cols[i], &col.data_type);
 
         let (sum_val, nonnull, nonzero) = if supports_sum(&col.data_type) {
-            let (s, nn, nz) = col_sums.get(&col.name)
-                .cloned()
-                .unwrap_or((None, 0, 0));
+            let (s, nn, nz) = col_sums.get(&col.name).cloned().unwrap_or((None, 0, 0));
             (s, nn as i32, nz as i32)
         } else {
             (None, 0, 0)
@@ -1509,7 +1602,14 @@ pub(crate) fn flush_segment_metadata(
     // once the partition-level value→bit_idx map is finalized.
     let valbitmap_value_sets = compute_segment_valbitmap_values(typed_cols, columns);
 
-    (total_size, blobs, bloom_entries, cs_rows, text_length_blobs, valbitmap_value_sets)
+    (
+        total_size,
+        blobs,
+        bloom_entries,
+        cs_rows,
+        text_length_blobs,
+        valbitmap_value_sets,
+    )
 }
 
 /// Collect per-segment distinct text values for low-cardinality columns.
@@ -1595,14 +1695,46 @@ pub(crate) fn compute_segment_ndistinct(
         }
         let mut hll = CardinalityEstimator::<u64>::new();
         match &typed_cols[i] {
-            TypedColumn::Int16(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
-            TypedColumn::Int32(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
-            TypedColumn::Int64(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
-            TypedColumn::Float32(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(&x.to_bits())); } }
-            TypedColumn::Float64(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(&x.to_bits())); } }
-            TypedColumn::Bool(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
-            TypedColumn::Text(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
-            TypedColumn::Bytes(v) => { for x in v.iter().flatten() { hll.insert_hash(hash_for_hll(x)); } }
+            TypedColumn::Int16(v) => {
+                for x in v.iter().flatten() {
+                    hll.insert_hash(hash_for_hll(x));
+                }
+            }
+            TypedColumn::Int32(v) => {
+                for x in v.iter().flatten() {
+                    hll.insert_hash(hash_for_hll(x));
+                }
+            }
+            TypedColumn::Int64(v) => {
+                for x in v.iter().flatten() {
+                    hll.insert_hash(hash_for_hll(x));
+                }
+            }
+            TypedColumn::Float32(v) => {
+                for x in v.iter().flatten() {
+                    hll.insert_hash(hash_for_hll(&x.to_bits()));
+                }
+            }
+            TypedColumn::Float64(v) => {
+                for x in v.iter().flatten() {
+                    hll.insert_hash(hash_for_hll(&x.to_bits()));
+                }
+            }
+            TypedColumn::Bool(v) => {
+                for x in v.iter().flatten() {
+                    hll.insert_hash(hash_for_hll(x));
+                }
+            }
+            TypedColumn::Text(v) => {
+                for x in v.iter().flatten() {
+                    hll.insert_hash(hash_for_hll(x));
+                }
+            }
+            TypedColumn::Bytes(v) => {
+                for x in v.iter().flatten() {
+                    hll.insert_hash(hash_for_hll(x));
+                }
+            }
         }
         estimates.push(hll.estimate() as i64);
         sketches.push(hll);
@@ -1714,7 +1846,17 @@ pub(crate) fn flush_with_splitting(
                 dst.merge(src);
             }
             let (size, blobs, bloom_entries, cs_rows, length_blobs, vb_values) =
-                flush_segment_metadata(client, meta_fqn, colstats_fqn, columns, typed_cols, seg_values, &ndistinct, chunk_rows, seg_id);
+                flush_segment_metadata(
+                    client,
+                    meta_fqn,
+                    colstats_fqn,
+                    columns,
+                    typed_cols,
+                    seg_values,
+                    &ndistinct,
+                    chunk_rows,
+                    seg_id,
+                );
             total_size += size;
             for (col_idx, blob) in blobs {
                 blob_buffer.push((col_idx, seg_id, blob));
@@ -1739,7 +1881,17 @@ pub(crate) fn flush_with_splitting(
                 dst.merge(src);
             }
             let (size, blobs, bloom_entries, cs_rows, length_blobs, vb_values) =
-                flush_segment_metadata(client, meta_fqn, colstats_fqn, columns, &chunk_cols, seg_values, &ndistinct, chunk_rows, seg_id);
+                flush_segment_metadata(
+                    client,
+                    meta_fqn,
+                    colstats_fqn,
+                    columns,
+                    &chunk_cols,
+                    seg_values,
+                    &ndistinct,
+                    chunk_rows,
+                    seg_id,
+                );
             total_size += size;
             for (col_idx, blob) in blobs {
                 blob_buffer.push((col_idx, seg_id, blob));
@@ -1759,7 +1911,6 @@ pub(crate) fn flush_with_splitting(
     }
     total_size
 }
-
 
 /// DDL info for all companion tables of a compressed partition.
 pub(crate) struct CompanionDdl {
@@ -1782,10 +1933,7 @@ pub(crate) struct CompanionDdl {
 /// The meta table is thin: only segment_id, segment_by cols, time column min/max,
 /// and row_count. All other per-column stats (min/max for non-time columns,
 /// sum/count, ndistinct) go into the colstats table.
-pub(crate) fn build_companion_ddl(
-    part_table: &str,
-    columns: &[ColumnMeta],
-) -> CompanionDdl {
+pub(crate) fn build_companion_ddl(part_table: &str, columns: &[ColumnMeta]) -> CompanionDdl {
     let companion_schema = "_deltax_compressed";
     let meta_fqn = format!("\"{}\".\"{}_meta\"", companion_schema, part_table);
     let colstats_fqn = format!("\"{}\".\"{}_colstats\"", companion_schema, part_table);
@@ -1810,11 +1958,7 @@ pub(crate) fn build_companion_ddl(
     }
     meta_cols.push("_row_count INT".to_string());
 
-    let meta_ddl = format!(
-        "CREATE TABLE {} ({})",
-        meta_fqn,
-        meta_cols.join(", ")
-    );
+    let meta_ddl = format!("CREATE TABLE {} ({})", meta_fqn, meta_cols.join(", "));
 
     // Normalized colstats table: fixed 8-column schema
     let colstats_ddl = format!(
@@ -1987,8 +2131,9 @@ fn compress_partition_streaming(
     // gets merged in below; the final merged estimates feed the
     // `pg_statistic.stadistinct` write.
     let num_nonseg_cols = columns.iter().filter(|c| !c.is_segment_by).count();
-    let mut partition_hll: Vec<CardinalityEstimator<u64>> =
-        (0..num_nonseg_cols).map(|_| CardinalityEstimator::<u64>::new()).collect();
+    let mut partition_hll: Vec<CardinalityEstimator<u64>> = (0..num_nonseg_cols)
+        .map(|_| CardinalityEstimator::<u64>::new())
+        .collect();
 
     loop {
         let result = client
@@ -2022,8 +2167,12 @@ fn compress_partition_streaming(
                     // Segment boundary — flush accumulated data
                     if rows_in_segment > 0 {
                         if !tables_created {
-                            client.update(&ddl.meta_ddl, None, &[]).expect("failed to create meta table");
-                            client.update(&ddl.colstats_ddl, None, &[]).expect("failed to create colstats table");
+                            client
+                                .update(&ddl.meta_ddl, None, &[])
+                                .expect("failed to create meta table");
+                            client
+                                .update(&ddl.colstats_ddl, None, &[])
+                                .expect("failed to create colstats table");
                             tables_created = true;
                         }
                         total_compressed_size += flush_with_splitting(
@@ -2057,8 +2206,12 @@ fn compress_partition_streaming(
             // Check segment_size limit
             if rows_in_segment >= segment_size {
                 if !tables_created {
-                    client.update(&ddl.meta_ddl, None, &[]).expect("failed to create meta table");
-                    client.update(&ddl.colstats_ddl, None, &[]).expect("failed to create colstats table");
+                    client
+                        .update(&ddl.meta_ddl, None, &[])
+                        .expect("failed to create meta table");
+                    client
+                        .update(&ddl.colstats_ddl, None, &[])
+                        .expect("failed to create colstats table");
                     tables_created = true;
                 }
                 // Sort in Rust when no SQL ORDER BY (non-segment_by path)
@@ -2071,17 +2224,18 @@ fn compress_partition_streaming(
                 for (dst, src) in partition_hll.iter_mut().zip(sketches.iter()) {
                     dst.merge(src);
                 }
-                let (size, blobs, bloom_entries, cs_rows, length_blobs, vb_values) = flush_segment_metadata(
-                    client,
-                    &ddl.meta_fqn,
-                    &ddl.colstats_fqn,
-                    columns,
-                    &typed_cols,
-                    &current_seg_values,
-                    &ndistinct,
-                    rows_in_segment as u32,
-                    seg_id,
-                );
+                let (size, blobs, bloom_entries, cs_rows, length_blobs, vb_values) =
+                    flush_segment_metadata(
+                        client,
+                        &ddl.meta_fqn,
+                        &ddl.colstats_fqn,
+                        columns,
+                        &typed_cols,
+                        &current_seg_values,
+                        &ndistinct,
+                        rows_in_segment as u32,
+                        seg_id,
+                    );
                 total_compressed_size += size;
                 for (col_idx, blob) in blobs {
                     blob_buffer.push((col_idx, seg_id, blob));
@@ -2115,8 +2269,12 @@ fn compress_partition_streaming(
     // Flush remaining
     if rows_in_segment > 0 {
         if !tables_created {
-            client.update(&ddl.meta_ddl, None, &[]).expect("failed to create meta table");
-            client.update(&ddl.colstats_ddl, None, &[]).expect("failed to create colstats table");
+            client
+                .update(&ddl.meta_ddl, None, &[])
+                .expect("failed to create meta table");
+            client
+                .update(&ddl.colstats_ddl, None, &[])
+                .expect("failed to create colstats table");
         }
         if seg_col_indices.is_empty() {
             sort_typed_columns(&mut typed_cols, &order_col_indices, rows_in_segment);
@@ -2152,28 +2310,41 @@ fn compress_partition_streaming(
         // Batch insert for efficiency
         let batch_size = 100;
         for chunk in colstats_buffer.chunks(batch_size) {
-            let values: Vec<String> = chunk.iter().map(|r| {
-                let min_str = r.min_val.map_or("NULL".to_string(), |v| v.to_string());
-                let max_str = r.max_val.map_or("NULL".to_string(), |v| v.to_string());
-                let sum_str = r.sum_val.as_deref().unwrap_or("NULL");
-                format!(
-                    "({}, {}, {}, {}, {}, {}, {}, {})",
-                    r.col_idx, r.segment_id, min_str, max_str, sum_str,
-                    r.nonnull_count, r.nonzero_count, r.ndistinct
-                )
-            }).collect();
+            let values: Vec<String> = chunk
+                .iter()
+                .map(|r| {
+                    let min_str = r.min_val.map_or("NULL".to_string(), |v| v.to_string());
+                    let max_str = r.max_val.map_or("NULL".to_string(), |v| v.to_string());
+                    let sum_str = r.sum_val.as_deref().unwrap_or("NULL");
+                    format!(
+                        "({}, {}, {}, {}, {}, {}, {}, {})",
+                        r.col_idx,
+                        r.segment_id,
+                        min_str,
+                        max_str,
+                        sum_str,
+                        r.nonnull_count,
+                        r.nonzero_count,
+                        r.ndistinct
+                    )
+                })
+                .collect();
             let sql = format!(
                 "INSERT INTO {} (_col_idx, _segment_id, _min, _max, _sum, _nonnull_count, _nonzero_count, _ndistinct) VALUES {}",
                 ddl.colstats_fqn,
                 values.join(", ")
             );
-            client.update(&sql, None, &[]).expect("failed to insert colstats batch");
+            client
+                .update(&sql, None, &[])
+                .expect("failed to insert colstats batch");
         }
     }
 
     // Flush blobs column-major into the blobs table
     if !blob_buffer.is_empty() {
-        client.update(&ddl.blobs_ddl, None, &[]).expect("failed to create blobs table");
+        client
+            .update(&ddl.blobs_ddl, None, &[])
+            .expect("failed to create blobs table");
 
         // Sort by (col_idx, segment_id) for column-major insertion order
         blob_buffer.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
@@ -2196,7 +2367,9 @@ fn compress_partition_streaming(
 
         // Flush bloom filters into separate blooms table
         if !bloom_buffer.is_empty() {
-            client.update(&ddl.blooms_ddl, None, &[]).expect("failed to create blooms table");
+            client
+                .update(&ddl.blooms_ddl, None, &[])
+                .expect("failed to create blooms table");
 
             // Sort by (col_idx, segment_id) for column-major insertion order
             bloom_buffer.sort_by_key(|&(col_idx, seg_id, _, _)| (col_idx, seg_id));
@@ -2224,7 +2397,9 @@ fn compress_partition_streaming(
 
         // Flush text-length sidecars into the text_lengths table
         if !text_length_buffer.is_empty() {
-            client.update(&ddl.text_lengths_ddl, None, &[]).expect("failed to create text_lengths table");
+            client
+                .update(&ddl.text_lengths_ddl, None, &[])
+                .expect("failed to create text_lengths table");
 
             // Sort by (col_idx, segment_id) for column-major insertion order
             text_length_buffer.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
@@ -2285,14 +2460,15 @@ fn compress_partition_streaming(
     // encode each segment's bitmap against the finalized partition map and
     // bulk-insert into the valbitmap table. The partition map itself is
     // returned to the caller for catalog persistence.
-    let column_valmap = finalize_and_insert_valbitmaps(
-        client,
-        ddl,
-        columns,
-        valbitmap_value_buffer,
-    );
+    let column_valmap =
+        finalize_and_insert_valbitmaps(client, ddl, columns, valbitmap_value_buffer);
 
-    (total_compressed_size, total_rows, partition_hll, column_valmap)
+    (
+        total_compressed_size,
+        total_rows,
+        partition_hll,
+        column_valmap,
+    )
 }
 
 /// Build partition-level value→bit_idx maps from per-segment value sets,
@@ -2315,8 +2491,7 @@ fn finalize_and_insert_valbitmaps(
     // soon as it crosses VALBITMAP_MAX_DISTINCT (we'll drop the bitmap for
     // that column anyway).
     let mut union_by_col: HashMap<u16, BTreeSet<String>> = HashMap::new();
-    let mut overflow_cols: std::collections::HashSet<u16> =
-        std::collections::HashSet::new();
+    let mut overflow_cols: std::collections::HashSet<u16> = std::collections::HashSet::new();
     for (col_idx, _seg_id, vals) in &value_buffer {
         if overflow_cols.contains(col_idx) {
             continue;
@@ -2367,8 +2542,7 @@ fn finalize_and_insert_valbitmaps(
         .update(&ddl.valbitmap_ddl, None, &[])
         .expect("failed to create valbitmap table");
 
-    let mut entries: Vec<(u16, i32, Vec<u8>)> =
-        Vec::with_capacity(value_buffer.len());
+    let mut entries: Vec<(u16, i32, Vec<u8>)> = Vec::with_capacity(value_buffer.len());
     for (col_idx, seg_id, vals) in value_buffer {
         let Some((_, idx_map)) = finalized.get(&col_idx) else {
             // Column overflowed at partition level — skip.
@@ -2407,7 +2581,8 @@ fn finalize_and_insert_valbitmaps(
         .expect("failed to analyze valbitmap table");
 
     // Build the catalog payload: column name → sorted value list.
-    let mut by_name: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut by_name: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     for (col_idx, (vals, _)) in finalized {
         if let Some(name) = col_idx_to_name.get(&col_idx) {
             by_name.insert(name.clone(), vals);
@@ -2554,95 +2729,82 @@ pub(crate) fn decode_i64_to_f32(enc: i64) -> f32 {
     f32::from_bits(bits)
 }
 
+/// Reduce `values` to the `(min, max)` of `encode(v)` over non-null entries,
+/// producing the order-preserving i64 pair stored in the colstats table.
+fn minmax_encoded_via<T: Copy, F: Fn(T) -> i64>(
+    values: &[Option<T>],
+    encode: F,
+) -> (Option<i64>, Option<i64>) {
+    let mut min_v: Option<i64> = None;
+    let mut max_v: Option<i64> = None;
+    for v in values.iter().flatten() {
+        let e = encode(*v);
+        min_v = Some(min_v.map_or(e, |cur| cur.min(e)));
+        max_v = Some(max_v.map_or(e, |cur| cur.max(e)));
+    }
+    (min_v, max_v)
+}
+
 /// Compute min/max encoded as order-preserving i64, for use in normalized colstats table.
 /// Returns None for types without minmax support.
-pub(crate) fn compute_minmax_encoded_i64(data: &TypedColumn, data_type: &str) -> (Option<i64>, Option<i64>) {
+pub(crate) fn compute_minmax_encoded_i64(
+    data: &TypedColumn,
+    data_type: &str,
+) -> (Option<i64>, Option<i64>) {
     if !supports_minmax(data_type) {
         return (None, None);
     }
     match data {
-        TypedColumn::Int16(values) => {
-            let mut min_v: Option<i64> = None;
-            let mut max_v: Option<i64> = None;
-            for v in values.iter().flatten() {
-                let v64 = *v as i64;
-                min_v = Some(min_v.map_or(v64, |cur| cur.min(v64)));
-                max_v = Some(max_v.map_or(v64, |cur| cur.max(v64)));
-            }
-            (min_v, max_v)
-        }
-        TypedColumn::Int32(values) => {
-            let mut min_v: Option<i64> = None;
-            let mut max_v: Option<i64> = None;
-            for v in values.iter().flatten() {
-                let v64 = *v as i64;
-                min_v = Some(min_v.map_or(v64, |cur| cur.min(v64)));
-                max_v = Some(max_v.map_or(v64, |cur| cur.max(v64)));
-            }
-            (min_v, max_v)
-        }
-        TypedColumn::Int64(values) => {
-            // For int64, timestamp, timestamptz, date — identity (already i64)
-            let mut min_v: Option<i64> = None;
-            let mut max_v: Option<i64> = None;
-            for v in values.iter().flatten() {
-                min_v = Some(min_v.map_or(*v, |cur| cur.min(*v)));
-                max_v = Some(max_v.map_or(*v, |cur| cur.max(*v)));
-            }
-            (min_v, max_v)
-        }
-        TypedColumn::Float64(values) => {
-            let mut min_v: Option<i64> = None;
-            let mut max_v: Option<i64> = None;
-            for v in values.iter().flatten() {
-                let enc = encode_f64_to_i64(*v);
-                min_v = Some(min_v.map_or(enc, |cur| cur.min(enc)));
-                max_v = Some(max_v.map_or(enc, |cur| cur.max(enc)));
-            }
-            (min_v, max_v)
-        }
-        TypedColumn::Float32(values) => {
-            let mut min_v: Option<i64> = None;
-            let mut max_v: Option<i64> = None;
-            for v in values.iter().flatten() {
-                let enc = encode_f32_to_i64(*v);
-                min_v = Some(min_v.map_or(enc, |cur| cur.min(enc)));
-                max_v = Some(max_v.map_or(enc, |cur| cur.max(enc)));
-            }
-            (min_v, max_v)
-        }
+        TypedColumn::Int16(values) => minmax_encoded_via(values, |v| v as i64),
+        TypedColumn::Int32(values) => minmax_encoded_via(values, |v| v as i64),
+        // int64, timestamp, timestamptz, date — identity (already i64).
+        TypedColumn::Int64(values) => minmax_encoded_via(values, |v| v),
+        TypedColumn::Float64(values) => minmax_encoded_via(values, encode_f64_to_i64),
+        TypedColumn::Float32(values) => minmax_encoded_via(values, encode_f32_to_i64),
         _ => (None, None), // Text, Bool — no minmax
     }
 }
 
+/// Reduce a `Vec<Option<T: Ord>>` to its `(min, max)` over non-null entries.
+fn minmax_ord<T: Copy + Ord>(values: &[Option<T>]) -> (Option<T>, Option<T>) {
+    let mut min_v: Option<T> = None;
+    let mut max_v: Option<T> = None;
+    for v in values.iter().flatten() {
+        min_v = Some(min_v.map_or(*v, |cur| cur.min(*v)));
+        max_v = Some(max_v.map_or(*v, |cur| cur.max(*v)));
+    }
+    (min_v, max_v)
+}
+
+/// Float counterpart of `minmax_ord`. Uses `<`/`>` comparisons directly so
+/// NaN tracks like the prior implementation (first non-NaN wins; subsequent
+/// NaN comparisons are false and never update the running min/max).
+fn minmax_float<T: Copy + PartialOrd>(values: &[Option<T>]) -> (Option<T>, Option<T>) {
+    let mut min_v: Option<T> = None;
+    let mut max_v: Option<T> = None;
+    for v in values.iter().flatten() {
+        min_v = Some(min_v.map_or(*v, |cur| if *v < cur { *v } else { cur }));
+        max_v = Some(max_v.map_or(*v, |cur| if *v > cur { *v } else { cur }));
+    }
+    (min_v, max_v)
+}
+
 /// Compute min/max for typed columns, returning string representations for SQL INSERT.
-pub(crate) fn compute_typed_minmax(data: &TypedColumn, data_type: &str) -> (Option<String>, Option<String>) {
+pub(crate) fn compute_typed_minmax(
+    data: &TypedColumn,
+    data_type: &str,
+) -> (Option<String>, Option<String>) {
     match data {
         TypedColumn::Int16(values) => {
-            let mut min_v: Option<i16> = None;
-            let mut max_v: Option<i16> = None;
-            for v in values.iter().flatten() {
-                min_v = Some(min_v.map_or(*v, |cur: i16| cur.min(*v)));
-                max_v = Some(max_v.map_or(*v, |cur: i16| cur.max(*v)));
-            }
+            let (min_v, max_v) = minmax_ord(values);
             (min_v.map(|v| v.to_string()), max_v.map(|v| v.to_string()))
         }
         TypedColumn::Int32(values) => {
-            let mut min_v: Option<i32> = None;
-            let mut max_v: Option<i32> = None;
-            for v in values.iter().flatten() {
-                min_v = Some(min_v.map_or(*v, |cur: i32| cur.min(*v)));
-                max_v = Some(max_v.map_or(*v, |cur: i32| cur.max(*v)));
-            }
+            let (min_v, max_v) = minmax_ord(values);
             (min_v.map(|v| v.to_string()), max_v.map(|v| v.to_string()))
         }
         TypedColumn::Int64(values) => {
-            let mut min_v: Option<i64> = None;
-            let mut max_v: Option<i64> = None;
-            for v in values.iter().flatten() {
-                min_v = Some(min_v.map_or(*v, |cur: i64| cur.min(*v)));
-                max_v = Some(max_v.map_or(*v, |cur: i64| cur.max(*v)));
-            }
+            let (min_v, max_v) = minmax_ord(values);
             let dt = data_type.to_lowercase();
             if dt.contains("timestamp") {
                 (
@@ -2659,26 +2821,16 @@ pub(crate) fn compute_typed_minmax(data: &TypedColumn, data_type: &str) -> (Opti
             }
         }
         TypedColumn::Float64(values) => {
-            let mut min_v: Option<f64> = None;
-            let mut max_v: Option<f64> = None;
-            for v in values.iter().flatten() {
-                min_v = Some(min_v.map_or(*v, |cur: f64| if *v < cur { *v } else { cur }));
-                max_v = Some(max_v.map_or(*v, |cur: f64| if *v > cur { *v } else { cur }));
-            }
+            let (min_v, max_v) = minmax_float(values);
             (min_v.map(|v| v.to_string()), max_v.map(|v| v.to_string()))
         }
         TypedColumn::Float32(values) => {
-            let mut min_v: Option<f32> = None;
-            let mut max_v: Option<f32> = None;
-            for v in values.iter().flatten() {
-                min_v = Some(min_v.map_or(*v, |cur: f32| if *v < cur { *v } else { cur }));
-                max_v = Some(max_v.map_or(*v, |cur: f32| if *v > cur { *v } else { cur }));
-            }
+            let (min_v, max_v) = minmax_float(values);
             (min_v.map(|v| v.to_string()), max_v.map(|v| v.to_string()))
         }
         TypedColumn::Text(values) => compute_column_minmax(values, data_type),
         TypedColumn::Bytes(_) => (None, None), // jsonb has no meaningful minmax
-        TypedColumn::Bool(_) => (None, None), // booleans don't support minmax
+        TypedColumn::Bool(_) => (None, None),  // booleans don't support minmax
     }
 }
 
@@ -2730,9 +2882,10 @@ fn compress_byte_values(values: &[Option<Vec<u8>>]) -> Vec<u8> {
     // dropped after compression.
     let as_strings: Vec<Option<String>> = values
         .iter()
-        .map(|opt| opt.as_ref().map(|bytes| unsafe {
-            String::from_utf8_unchecked(bytes.clone())
-        }))
+        .map(|opt| {
+            opt.as_ref()
+                .map(|bytes| unsafe { String::from_utf8_unchecked(bytes.clone()) })
+        })
         .collect();
     compress_column_values(&as_strings, "jsonb", "")
 }
@@ -2759,8 +2912,18 @@ pub(crate) fn get_column_metadata(
 
     let mut columns = Vec::new();
     for row in result {
-        let name: String = row.get_datum_by_ordinal(1).unwrap().value::<String>().unwrap().unwrap();
-        let data_type: String = row.get_datum_by_ordinal(2).unwrap().value::<String>().unwrap().unwrap();
+        let name: String = row
+            .get_datum_by_ordinal(1)
+            .unwrap()
+            .value::<String>()
+            .unwrap()
+            .unwrap();
+        let data_type: String = row
+            .get_datum_by_ordinal(2)
+            .unwrap()
+            .value::<String>()
+            .unwrap()
+            .unwrap();
         let is_segment = segment_by.contains(&name);
         let is_time = name == time_column;
         columns.push(ColumnMeta {
@@ -2799,7 +2962,10 @@ pub(crate) fn get_column_metadata(
 fn estimate_raw_size(client: &SpiClient, table_fqn: &str) -> i64 {
     client
         .select(
-            &format!("SELECT pg_total_relation_size('{}'::regclass)::int8", table_fqn),
+            &format!(
+                "SELECT pg_total_relation_size('{}'::regclass)::int8",
+                table_fqn
+            ),
             None,
             &[],
         )
@@ -2828,7 +2994,11 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
     let part_info = catalog::get_partition_by_name(client, &schema, &part_table)
         .expect("failed to query partition")
         .unwrap_or_else(|| {
-            pgrx::error!("pg_deltax: partition {}.{} not found in catalog", schema, part_table)
+            pgrx::error!(
+                "pg_deltax: partition {}.{} not found in catalog",
+                schema,
+                part_table
+            )
         });
 
     if !part_info.is_compressed {
@@ -2889,7 +3059,9 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         meta_select_cols.join(", "),
         meta_fqn
     );
-    let meta_rows = client.select(&meta_query, None, &[]).expect("failed to read meta table");
+    let meta_rows = client
+        .select(&meta_query, None, &[])
+        .expect("failed to read meta table");
 
     // Collect all segment metadata
     struct SegMeta {
@@ -2900,20 +3072,38 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
     let mut seg_metas: Vec<SegMeta> = Vec::new();
     for row in meta_rows {
         let mut col_ordinal: usize = 1;
-        let segment_id: i32 = row.get_datum_by_ordinal(col_ordinal).unwrap().value::<i32>().unwrap().unwrap_or(0);
+        let segment_id: i32 = row
+            .get_datum_by_ordinal(col_ordinal)
+            .unwrap()
+            .value::<i32>()
+            .unwrap()
+            .unwrap_or(0);
         col_ordinal += 1;
 
         let mut segment_by_vals: Vec<Option<String>> = Vec::new();
         for col in &columns {
             if col.is_segment_by {
-                let val: Option<String> = row.get_datum_by_ordinal(col_ordinal).unwrap().value::<String>().unwrap();
+                let val: Option<String> = row
+                    .get_datum_by_ordinal(col_ordinal)
+                    .unwrap()
+                    .value::<String>()
+                    .unwrap();
                 segment_by_vals.push(val);
                 col_ordinal += 1;
             }
         }
 
-        let row_count: i32 = row.get_datum_by_ordinal(col_ordinal).unwrap().value::<i32>().unwrap().unwrap_or(0);
-        seg_metas.push(SegMeta { segment_id, segment_by_vals, row_count });
+        let row_count: i32 = row
+            .get_datum_by_ordinal(col_ordinal)
+            .unwrap()
+            .value::<i32>()
+            .unwrap()
+            .unwrap_or(0);
+        seg_metas.push(SegMeta {
+            segment_id,
+            segment_by_vals,
+            row_count,
+        });
     }
 
     let mut total_rows_restored = 0i64;
@@ -2928,13 +3118,24 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
             "SELECT _col_idx, _data FROM {} WHERE _segment_id = $1 ORDER BY _col_idx",
             blobs_fqn
         );
-        let blob_rows = client.select(&blob_query, None, &[seg_meta.segment_id.into()])
+        let blob_rows = client
+            .select(&blob_query, None, &[seg_meta.segment_id.into()])
             .expect("failed to read blobs");
 
-        let mut blob_map: std::collections::HashMap<u16, Vec<u8>> = std::collections::HashMap::new();
+        let mut blob_map: std::collections::HashMap<u16, Vec<u8>> =
+            std::collections::HashMap::new();
         for brow in blob_rows {
-            let ci: i16 = brow.get_datum_by_ordinal(1).unwrap().value::<i16>().unwrap().unwrap_or(0);
-            let data: Option<Vec<u8>> = brow.get_datum_by_ordinal(2).unwrap().value::<Vec<u8>>().unwrap();
+            let ci: i16 = brow
+                .get_datum_by_ordinal(1)
+                .unwrap()
+                .value::<i16>()
+                .unwrap()
+                .unwrap_or(0);
+            let data: Option<Vec<u8>> = brow
+                .get_datum_by_ordinal(2)
+                .unwrap()
+                .value::<Vec<u8>>()
+                .unwrap();
             blob_map.insert(ci as u16, data.unwrap_or_default());
         }
 
@@ -3006,7 +3207,9 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
                 col_names,
                 all_row_values.join(", ")
             );
-            client.update(&insert_sql, None, &[]).expect("failed to insert decompressed rows");
+            client
+                .update(&insert_sql, None, &[])
+                .expect("failed to insert decompressed rows");
 
             batch_start = batch_end;
         }
@@ -3022,10 +3225,18 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         .update(&format!("DROP TABLE IF EXISTS {}", blooms_fqn), None, &[])
         .expect("failed to drop blooms table");
     client
-        .update(&format!("DROP TABLE IF EXISTS {}", text_lengths_fqn), None, &[])
+        .update(
+            &format!("DROP TABLE IF EXISTS {}", text_lengths_fqn),
+            None,
+            &[],
+        )
         .expect("failed to drop text_lengths table");
     client
-        .update(&format!("DROP TABLE IF EXISTS {}", valbitmap_fqn), None, &[])
+        .update(
+            &format!("DROP TABLE IF EXISTS {}", valbitmap_fqn),
+            None,
+            &[],
+        )
         .expect("failed to drop valbitmap table");
     client
         .update(&format!("DROP TABLE IF EXISTS {}", colstats_fqn), None, &[])
@@ -3035,8 +3246,7 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         .expect("failed to drop meta table");
 
     // 5. Update catalog
-    catalog::mark_partition_decompressed(client, part_info.id)
-        .expect("failed to update catalog");
+    catalog::mark_partition_decompressed(client, part_info.id).expect("failed to update catalog");
 
     crate::scan::invalidate_compressed_cache();
 
@@ -3059,7 +3269,10 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
     match cc.type_tag {
         CompressionType::Gorilla => {
             if dt.contains("timestamp") || dt == "date" {
-                let timestamps = compression::gorilla::decode_timestamps(&cc.data, count_non_null(&cc.null_bitmap, total_count));
+                let timestamps = compression::gorilla::decode_timestamps(
+                    &cc.data,
+                    count_non_null(&cc.null_bitmap, total_count),
+                );
                 let strings: Vec<String> = if dt == "date" {
                     timestamps
                         .iter()
@@ -3073,11 +3286,17 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
                 };
                 compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
             } else if dt == "real" || dt == "float4" {
-                let floats = compression::gorilla::decode_floats_f32(&cc.data, count_non_null(&cc.null_bitmap, total_count));
+                let floats = compression::gorilla::decode_floats_f32(
+                    &cc.data,
+                    count_non_null(&cc.null_bitmap, total_count),
+                );
                 let strings: Vec<String> = floats.iter().map(|v| v.to_string()).collect();
                 compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
             } else {
-                let floats = compression::gorilla::decode_floats(&cc.data, count_non_null(&cc.null_bitmap, total_count));
+                let floats = compression::gorilla::decode_floats(
+                    &cc.data,
+                    count_non_null(&cc.null_bitmap, total_count),
+                );
                 let strings: Vec<String> = floats.iter().map(|v| v.to_string()).collect();
                 compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
             }
@@ -3085,39 +3304,64 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
         CompressionType::DeltaVarint => {
             if dt == "smallint" || dt == "int2" {
                 // Decode as i32 and downcast to i16
-                let ints = compression::integer::decode_i32(&cc.data, count_non_null(&cc.null_bitmap, total_count));
+                let ints = compression::integer::decode_i32(
+                    &cc.data,
+                    count_non_null(&cc.null_bitmap, total_count),
+                );
                 let strings: Vec<String> = ints.iter().map(|v| (*v as i16).to_string()).collect();
                 compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
             } else if dt == "integer" || dt == "int4" {
-                let ints = compression::integer::decode_i32(&cc.data, count_non_null(&cc.null_bitmap, total_count));
+                let ints = compression::integer::decode_i32(
+                    &cc.data,
+                    count_non_null(&cc.null_bitmap, total_count),
+                );
                 let strings: Vec<String> = ints.iter().map(|v| v.to_string()).collect();
                 compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
             } else {
-                let ints = compression::integer::decode_i64(&cc.data, count_non_null(&cc.null_bitmap, total_count));
+                let ints = compression::integer::decode_i64(
+                    &cc.data,
+                    count_non_null(&cc.null_bitmap, total_count),
+                );
                 let strings: Vec<String> = ints.iter().map(|v| v.to_string()).collect();
                 compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
             }
         }
         CompressionType::Dictionary => {
-            let strings = compression::dictionary::decode(&cc.data, count_non_null(&cc.null_bitmap, total_count));
+            let strings = compression::dictionary::decode(
+                &cc.data,
+                count_non_null(&cc.null_bitmap, total_count),
+            );
             compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
         }
         CompressionType::DictionaryLz4 => {
             let normalized = compression::dictionary::normalize_lz4(&cc.data);
-            let strings = compression::dictionary::decode(&normalized, count_non_null(&cc.null_bitmap, total_count));
+            let strings = compression::dictionary::decode(
+                &normalized,
+                count_non_null(&cc.null_bitmap, total_count),
+            );
             compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
         }
         CompressionType::Lz4 => {
-            let strings = compression::lz4::decode(&cc.data, count_non_null(&cc.null_bitmap, total_count));
+            let strings =
+                compression::lz4::decode(&cc.data, count_non_null(&cc.null_bitmap, total_count));
             compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
         }
         CompressionType::Lz4Blocked => {
-            let strings = compression::lz4::decode_blocked(&cc.data, count_non_null(&cc.null_bitmap, total_count));
+            let strings = compression::lz4::decode_blocked(
+                &cc.data,
+                count_non_null(&cc.null_bitmap, total_count),
+            );
             compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
         }
         CompressionType::BooleanBitmap => {
-            let bools = compression::boolean::decode(&cc.data, count_non_null(&cc.null_bitmap, total_count));
-            let strings: Vec<String> = bools.iter().map(|&b| if b { "t".to_string() } else { "f".to_string() }).collect();
+            let bools = compression::boolean::decode(
+                &cc.data,
+                count_non_null(&cc.null_bitmap, total_count),
+            );
+            let strings: Vec<String> = bools
+                .iter()
+                .map(|&b| if b { "t".to_string() } else { "f".to_string() })
+                .collect();
             compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
         }
         CompressionType::Constant => {
@@ -3182,9 +3426,16 @@ fn format_value_for_insert(value: &str, data_type: &str) -> String {
         } else {
             "false".to_string()
         }
-    } else if dt == "integer" || dt == "int4" || dt == "bigint" || dt == "int8"
-        || dt == "smallint" || dt == "int2"
-        || dt == "double precision" || dt == "float8" || dt == "real" || dt == "float4"
+    } else if dt == "integer"
+        || dt == "int4"
+        || dt == "bigint"
+        || dt == "int8"
+        || dt == "smallint"
+        || dt == "int2"
+        || dt == "double precision"
+        || dt == "float8"
+        || dt == "real"
+        || dt == "float4"
     {
         value.to_string()
     } else {
@@ -3197,11 +3448,16 @@ pub(crate) fn supports_minmax(data_type: &str) -> bool {
     let dt = data_type.to_lowercase();
     dt.contains("timestamp")
         || dt == "date"
-        || dt == "integer" || dt == "int4"
-        || dt == "bigint" || dt == "int8"
-        || dt == "smallint" || dt == "int2"
-        || dt == "double precision" || dt == "float8"
-        || dt == "real" || dt == "float4"
+        || dt == "integer"
+        || dt == "int4"
+        || dt == "bigint"
+        || dt == "int8"
+        || dt == "smallint"
+        || dt == "int2"
+        || dt == "double precision"
+        || dt == "float8"
+        || dt == "real"
+        || dt == "float4"
 }
 
 /// Check if a column type supports sum metadata. Numeric types get SUM(col);
@@ -3210,11 +3466,16 @@ pub(crate) fn supports_minmax(data_type: &str) -> bool {
 /// at read time is driven by column type).
 pub(crate) fn supports_sum(data_type: &str) -> bool {
     let dt = data_type.to_lowercase();
-    dt == "integer" || dt == "int4"
-        || dt == "bigint" || dt == "int8"
-        || dt == "smallint" || dt == "int2"
-        || dt == "double precision" || dt == "float8"
-        || dt == "real" || dt == "float4"
+    dt == "integer"
+        || dt == "int4"
+        || dt == "bigint"
+        || dt == "int8"
+        || dt == "smallint"
+        || dt == "int2"
+        || dt == "double precision"
+        || dt == "float8"
+        || dt == "real"
+        || dt == "float4"
         || is_text_data_type(&dt)
 }
 
@@ -3232,65 +3493,63 @@ pub(crate) fn is_text_data_type(dt: &str) -> bool {
         || dt == "bpchar"
 }
 
+/// Walk an integer column, accumulating sum (as i128 to avoid overflow on
+/// large segments), non-null count, and nonzero count. Returns the same
+/// `(sum_str, nonnull, nonzero)` shape `compute_typed_sum` expects.
+fn sum_int_column<T: Copy + Into<i128> + PartialEq + Default>(
+    v: &[Option<T>],
+) -> (Option<String>, i64, i64) {
+    let zero = T::default();
+    let mut sum: i128 = 0;
+    let mut count: i64 = 0;
+    let mut nonzero: i64 = 0;
+    for val in v.iter().flatten() {
+        sum += (*val).into();
+        count += 1;
+        if *val != zero {
+            nonzero += 1;
+        }
+    }
+    if count > 0 {
+        (Some(sum.to_string()), count, nonzero)
+    } else {
+        (None, 0, 0)
+    }
+}
+
+/// Float counterpart of `sum_int_column`. Accumulates in f64 (sufficient for
+/// SUM(real)/SUM(double) over a segment); formats with `{:.17e}` to round-trip
+/// exactly.
+fn sum_float_column<T: Copy + Into<f64> + PartialEq + Default>(
+    v: &[Option<T>],
+) -> (Option<String>, i64, i64) {
+    let zero = T::default();
+    let mut sum: f64 = 0.0;
+    let mut count: i64 = 0;
+    let mut nonzero: i64 = 0;
+    for val in v.iter().flatten() {
+        sum += (*val).into();
+        count += 1;
+        if *val != zero {
+            nonzero += 1;
+        }
+    }
+    if count > 0 {
+        (Some(format!("{:.17e}", sum)), count, nonzero)
+    } else {
+        (None, 0, 0)
+    }
+}
+
 /// Compute sum, non-null count, and nonzero count for a typed column.
 /// Returns (sum_as_string, nonnull_count, nonzero_count). Uses i128 for integer sums to avoid overflow.
 pub(crate) fn compute_typed_sum(data: &TypedColumn) -> (Option<String>, i64, i64) {
     match data {
-        TypedColumn::Int16(v) => {
-            let mut sum: i128 = 0;
-            let mut count: i64 = 0;
-            let mut nonzero: i64 = 0;
-            for val in v.iter().flatten() {
-                sum += *val as i128;
-                count += 1;
-                if *val != 0 { nonzero += 1; }
-            }
-            if count > 0 { (Some(sum.to_string()), count, nonzero) } else { (None, 0, 0) }
-        }
-        TypedColumn::Int32(v) => {
-            let mut sum: i128 = 0;
-            let mut count: i64 = 0;
-            let mut nonzero: i64 = 0;
-            for val in v.iter().flatten() {
-                sum += *val as i128;
-                count += 1;
-                if *val != 0 { nonzero += 1; }
-            }
-            if count > 0 { (Some(sum.to_string()), count, nonzero) } else { (None, 0, 0) }
-        }
-        TypedColumn::Int64(v) => {
-            let mut sum: i128 = 0;
-            let mut count: i64 = 0;
-            let mut nonzero: i64 = 0;
-            for val in v.iter().flatten() {
-                sum += *val as i128;
-                count += 1;
-                if *val != 0 { nonzero += 1; }
-            }
-            if count > 0 { (Some(sum.to_string()), count, nonzero) } else { (None, 0, 0) }
-        }
-        TypedColumn::Float32(v) => {
-            let mut sum: f64 = 0.0;
-            let mut count: i64 = 0;
-            let mut nonzero: i64 = 0;
-            for val in v.iter().flatten() {
-                sum += *val as f64;
-                count += 1;
-                if *val != 0.0 { nonzero += 1; }
-            }
-            if count > 0 { (Some(format!("{:.17e}", sum)), count, nonzero) } else { (None, 0, 0) }
-        }
-        TypedColumn::Float64(v) => {
-            let mut sum: f64 = 0.0;
-            let mut count: i64 = 0;
-            let mut nonzero: i64 = 0;
-            for val in v.iter().flatten() {
-                sum += *val;
-                count += 1;
-                if *val != 0.0 { nonzero += 1; }
-            }
-            if count > 0 { (Some(format!("{:.17e}", sum)), count, nonzero) } else { (None, 0, 0) }
-        }
+        TypedColumn::Int16(v) => sum_int_column(v),
+        TypedColumn::Int32(v) => sum_int_column(v),
+        TypedColumn::Int64(v) => sum_int_column(v),
+        TypedColumn::Float32(v) => sum_float_column(v),
+        TypedColumn::Float64(v) => sum_float_column(v),
         TypedColumn::Bool(_) => (None, 0, 0),
         TypedColumn::Text(v) => {
             // For text columns we store in _sum the sum of length(value) over
@@ -3353,7 +3612,6 @@ pub(crate) fn compress_text_lengths(values: &[Option<String>]) -> Vec<u8> {
     .to_bytes()
 }
 
-
 /// Compute the min and max of a column's string values using type-aware comparison.
 fn compute_column_minmax(
     values: &[Option<String>],
@@ -3386,7 +3644,10 @@ fn compute_column_minmax(
         });
     }
 
-    (min_val.map(|s| s.to_string()), max_val.map(|s| s.to_string()))
+    (
+        min_val.map(|s| s.to_string()),
+        max_val.map(|s| s.to_string()),
+    )
 }
 
 /// Type-aware comparison of string-encoded values.
@@ -3503,10 +3764,7 @@ pub(crate) fn analyze_partition_impl_split(
     let ht = match catalog::get_deltatable_by_id(client, part_info.deltatable_id) {
         Ok(Some(h)) => h,
         _ => {
-            return format!(
-                "Failed to look up deltatable for {}.{}",
-                schema, part_table
-            );
+            return format!("Failed to look up deltatable for {}.{}", schema, part_table);
         }
     };
 
@@ -3525,11 +3783,7 @@ pub(crate) fn analyze_partition_impl_split(
     let ddl = build_companion_ddl(&part_table, &columns);
 
     let part_rel_oid: pg_sys::Oid = client
-        .select(
-            &format!("SELECT '{}'::regclass::oid", part_fqn),
-            None,
-            &[],
-        )
+        .select(&format!("SELECT '{}'::regclass::oid", part_fqn), None, &[])
         .ok()
         .and_then(|r| r.first().get_one::<pg_sys::Oid>().ok().flatten())
         .unwrap_or(pg_sys::InvalidOid);
@@ -3551,7 +3805,11 @@ pub(crate) fn analyze_partition_impl_split(
     }
 
     if let Err(e) = crate::stats::analyze_partition_from_catalog(
-        client, part_rel_oid, &ddl.colstats_fqn, &columns, row_count,
+        client,
+        part_rel_oid,
+        &ddl.colstats_fqn,
+        &columns,
+        row_count,
     ) {
         return format!("Failed to update pg_statistic for {}: {}", part_fqn, e);
     }
@@ -3583,8 +3841,14 @@ fn analyze_table_impl(client: &mut SpiClient, relation: &str) -> String {
 
     let mut partitions: Vec<(String, String)> = Vec::new();
     for row in rows {
-        let s: Option<String> = row.get_datum_by_ordinal(1).ok().and_then(|d| d.value().ok().flatten());
-        let t: Option<String> = row.get_datum_by_ordinal(2).ok().and_then(|d| d.value().ok().flatten());
+        let s: Option<String> = row
+            .get_datum_by_ordinal(1)
+            .ok()
+            .and_then(|d| d.value().ok().flatten());
+        let t: Option<String> = row
+            .get_datum_by_ordinal(2)
+            .ok()
+            .and_then(|d| d.value().ok().flatten());
         if let (Some(s), Some(t)) = (s, t) {
             partitions.push((s, t));
         }
@@ -3629,11 +3893,17 @@ mod tests {
     #[test]
     fn test_split_off_text_with_nulls() {
         let mut col = TypedColumn::Text(vec![
-            Some("a".into()), None, Some("c".into()), Some("d".into()),
+            Some("a".into()),
+            None,
+            Some("c".into()),
+            Some("d".into()),
         ]);
         let tail = col.split_off(2);
         assert_eq!(col, TypedColumn::Text(vec![Some("a".into()), None]));
-        assert_eq!(tail, TypedColumn::Text(vec![Some("c".into()), Some("d".into())]));
+        assert_eq!(
+            tail,
+            TypedColumn::Text(vec![Some("c".into()), Some("d".into())])
+        );
     }
 
     #[test]
@@ -3742,7 +4012,10 @@ mod tests {
             );
         }
         for value in values {
-            assert_eq!(decode_i64_to_f64(encode_f64_to_i64(value)).to_bits(), value.to_bits());
+            assert_eq!(
+                decode_i64_to_f64(encode_f64_to_i64(value)).to_bits(),
+                value.to_bits()
+            );
         }
     }
 
@@ -3767,7 +4040,298 @@ mod tests {
             );
         }
         for value in values {
-            assert_eq!(decode_i64_to_f32(encode_f32_to_i64(value)).to_bits(), value.to_bits());
+            assert_eq!(
+                decode_i64_to_f32(encode_f32_to_i64(value)).to_bits(),
+                value.to_bits()
+            );
         }
+    }
+
+    #[test]
+    fn compute_minmax_encoded_i64_handles_each_numeric_kind() {
+        // Int16 widens to i64.
+        let col = TypedColumn::Int16(vec![Some(-3), None, Some(5), Some(-1)]);
+        assert_eq!(
+            compute_minmax_encoded_i64(&col, "smallint"),
+            (Some(-3), Some(5))
+        );
+
+        // Int32 widens to i64.
+        let col = TypedColumn::Int32(vec![Some(100), Some(-200), Some(0)]);
+        assert_eq!(
+            compute_minmax_encoded_i64(&col, "integer"),
+            (Some(-200), Some(100))
+        );
+
+        // Int64 is identity-encoded (matches timestamp/date encoding too).
+        let col = TypedColumn::Int64(vec![Some(1_000), Some(7_000), None]);
+        assert_eq!(
+            compute_minmax_encoded_i64(&col, "bigint"),
+            (Some(1_000), Some(7_000))
+        );
+
+        // Float kinds use the order-preserving i64 encoding; -100 < -2.5 < 3.25.
+        let col = TypedColumn::Float64(vec![Some(-100.0), Some(3.25), Some(-2.5)]);
+        let (min, max) = compute_minmax_encoded_i64(&col, "double precision");
+        assert_eq!(min, Some(encode_f64_to_i64(-100.0)));
+        assert_eq!(max, Some(encode_f64_to_i64(3.25)));
+
+        let col = TypedColumn::Float32(vec![Some(1.5f32), Some(-0.5)]);
+        let (min, max) = compute_minmax_encoded_i64(&col, "real");
+        assert_eq!(min, Some(encode_f32_to_i64(-0.5)));
+        assert_eq!(max, Some(encode_f32_to_i64(1.5)));
+
+        // All-null column yields (None, None).
+        let col = TypedColumn::Int32(vec![None, None]);
+        assert_eq!(compute_minmax_encoded_i64(&col, "integer"), (None, None));
+    }
+
+    #[test]
+    fn compute_minmax_encoded_i64_returns_none_for_unsupported_types() {
+        let col = TypedColumn::Text(vec![Some("hello".into())]);
+        assert_eq!(compute_minmax_encoded_i64(&col, "text"), (None, None));
+        let col = TypedColumn::Bool(vec![Some(true)]);
+        assert_eq!(compute_minmax_encoded_i64(&col, "boolean"), (None, None));
+        // Even though the column has integers, an unsupported data_type bails out.
+        let col = TypedColumn::Int32(vec![Some(1)]);
+        assert_eq!(compute_minmax_encoded_i64(&col, "uuid"), (None, None));
+    }
+
+    #[test]
+    fn compute_typed_sum_integer_branches() {
+        // Three non-null values, two non-zero: sum=10+(-3)+0 = 7, count=3, nonzero=2.
+        let col = TypedColumn::Int32(vec![Some(10), Some(-3), Some(0), None]);
+        assert_eq!(compute_typed_sum(&col), (Some("7".to_string()), 3, 2));
+
+        // Empty (or all-null) → None.
+        let col = TypedColumn::Int64(vec![None, None]);
+        assert_eq!(compute_typed_sum(&col), (None, 0, 0));
+
+        // Int16 widens to i128 — sum of three i16::MAX must not overflow.
+        let col = TypedColumn::Int16(vec![Some(i16::MAX), Some(i16::MAX), Some(i16::MAX)]);
+        let (sum, count, nonzero) = compute_typed_sum(&col);
+        assert_eq!(sum, Some((3 * i16::MAX as i128).to_string()));
+        assert_eq!((count, nonzero), (3, 3));
+    }
+
+    #[test]
+    fn compute_typed_sum_float_branches() {
+        let col = TypedColumn::Float64(vec![Some(1.0), Some(2.5), Some(0.0), None]);
+        let (sum, count, nonzero) = compute_typed_sum(&col);
+        assert!(sum.unwrap().starts_with("3."));
+        assert_eq!((count, nonzero), (3, 2));
+
+        // Float32 widens to f64 internally; result string uses {:.17e}.
+        let col = TypedColumn::Float32(vec![Some(1.5)]);
+        let (sum, count, nonzero) = compute_typed_sum(&col);
+        assert!(sum.is_some());
+        assert_eq!((count, nonzero), (1, 1));
+    }
+
+    #[test]
+    fn compute_typed_sum_text_returns_char_count_sum() {
+        // Char count, not byte count: "héllo" is 5 characters (é = 2 bytes).
+        let col = TypedColumn::Text(vec![
+            Some("héllo".into()),
+            Some("".into()),
+            None,
+            Some("ab".into()),
+        ]);
+        let (sum, nonnull, nonempty) = compute_typed_sum(&col);
+        assert_eq!(sum, Some("7".to_string()));
+        assert_eq!(nonnull, 3); // 3 non-null rows
+        assert_eq!(nonempty, 2); // 2 non-empty strings
+    }
+
+    #[test]
+    fn compute_typed_sum_bool_and_bytes_have_no_sum() {
+        let col = TypedColumn::Bool(vec![Some(true), Some(false)]);
+        assert_eq!(compute_typed_sum(&col), (None, 0, 0));
+        let col = TypedColumn::Bytes(vec![Some(vec![1, 2]), None]);
+        assert_eq!(compute_typed_sum(&col), (None, 0, 0));
+    }
+
+    #[test]
+    fn supports_minmax_matrix() {
+        for ty in [
+            "smallint",
+            "int2",
+            "integer",
+            "int4",
+            "bigint",
+            "int8",
+            "real",
+            "float4",
+            "double precision",
+            "float8",
+            "timestamp",
+            "timestamp without time zone",
+            "timestamp with time zone",
+            "date",
+        ] {
+            assert!(supports_minmax(ty), "expected {} to support minmax", ty);
+        }
+        // Uppercase echoes from PG catalogs work too.
+        assert!(supports_minmax("INTEGER"));
+        for ty in ["text", "varchar", "boolean", "jsonb", "uuid"] {
+            assert!(
+                !supports_minmax(ty),
+                "expected {} to NOT support minmax",
+                ty
+            );
+        }
+    }
+
+    #[test]
+    fn supports_sum_matrix() {
+        // Numeric and text accepted; bool/jsonb rejected.
+        for ty in [
+            "integer",
+            "bigint",
+            "real",
+            "float8",
+            "text",
+            "varchar(100)",
+            "char(8)",
+        ] {
+            assert!(supports_sum(ty), "expected {} to support sum", ty);
+        }
+        for ty in ["boolean", "jsonb", "date", "timestamp"] {
+            assert!(!supports_sum(ty), "expected {} to NOT support sum", ty);
+        }
+    }
+
+    #[test]
+    fn is_text_data_type_matrix() {
+        for ty in [
+            "text",
+            "varchar",
+            "varchar(100)",
+            "char",
+            "char(8)",
+            "character",
+            "character(1)",
+            "character varying",
+            "character varying(64)",
+            "bpchar",
+        ] {
+            assert!(is_text_data_type(ty), "expected {} to be text", ty);
+        }
+        for ty in ["integer", "bigint", "boolean", "jsonb", "timestamp", "date"] {
+            assert!(!is_text_data_type(ty), "expected {} to NOT be text", ty);
+        }
+    }
+
+    #[test]
+    fn is_valid_identifier_accepts_legal_names() {
+        // Letters / underscore start; alphanumeric or underscore body.
+        for ok in ["x", "_y", "ColumnName", "snake_case", "a_1", "Z9"] {
+            assert!(is_valid_identifier(ok), "{} should be valid", ok);
+        }
+        for bad in [
+            "",
+            "1col",
+            "-name",
+            "col-name",
+            "with space",
+            "col$1",
+            "café",
+        ] {
+            assert!(!is_valid_identifier(bad), "{} should be invalid", bad);
+        }
+    }
+
+    #[test]
+    fn is_recognized_extract_type_matrix() {
+        for ok in [
+            "text",
+            "TEXT",
+            "varchar",
+            "char",
+            "smallint",
+            "int2",
+            "integer",
+            "int4",
+            "bigint",
+            "int8",
+            "real",
+            "float4",
+            "double precision",
+            "float8",
+            "boolean",
+            "bool",
+            "timestamp",
+            "timestamp without time zone",
+            "timestamp with time zone",
+            "timestamptz",
+            "date",
+        ] {
+            assert!(
+                is_recognized_extract_type(ok),
+                "{} should be recognized",
+                ok
+            );
+        }
+        // Jsonb is intentionally rejected at parse time (see parse_extract_specs).
+        for bad in ["jsonb", "uuid", "numeric", "interval", "money"] {
+            assert!(
+                !is_recognized_extract_type(bad),
+                "{} should NOT be recognized",
+                bad
+            );
+        }
+    }
+
+    #[test]
+    fn classify_column_segment_by_is_text() {
+        // Any column with is_segment_by = true is forced to Text so the SQL
+        // literal round-trip works uniformly.
+        assert!(matches!(classify_column("integer", true), ColumnKind::Text));
+        assert!(matches!(
+            classify_column("timestamp", true),
+            ColumnKind::Text
+        ));
+    }
+
+    #[test]
+    fn classify_column_maps_pg_aliases() {
+        assert!(matches!(
+            classify_column("smallint", false),
+            ColumnKind::Int16
+        ));
+        assert!(matches!(classify_column("int2", false), ColumnKind::Int16));
+        assert!(matches!(
+            classify_column("integer", false),
+            ColumnKind::Int32
+        ));
+        assert!(matches!(classify_column("int4", false), ColumnKind::Int32));
+        assert!(matches!(
+            classify_column("bigint", false),
+            ColumnKind::Int64
+        ));
+        assert!(matches!(
+            classify_column("real", false),
+            ColumnKind::Float32
+        ));
+        assert!(matches!(
+            classify_column("double precision", false),
+            ColumnKind::Float64
+        ));
+        assert!(matches!(
+            classify_column("boolean", false),
+            ColumnKind::Bool
+        ));
+        assert!(matches!(
+            classify_column("timestamp", false),
+            ColumnKind::Timestamp
+        ));
+        assert!(matches!(
+            classify_column("timestamp with time zone", false),
+            ColumnKind::TimestampTz
+        ));
+        assert!(matches!(classify_column("date", false), ColumnKind::Date));
+        assert!(matches!(classify_column("jsonb", false), ColumnKind::Jsonb));
+        // Unknown types default to Text (no error — caller doesn't see this).
+        assert!(matches!(classify_column("uuid", false), ColumnKind::Text));
     }
 }
