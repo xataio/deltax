@@ -30,7 +30,7 @@ narration.
 
 ## Sessions
 
-### 2026-05-16 — `src/compress.rs` — TBD
+### 2026-05-16 — `src/compress.rs` — 8f54e9d
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
 `unsafe` audit deferred — the file only has 7 `unsafe` ops, all narrow PG
