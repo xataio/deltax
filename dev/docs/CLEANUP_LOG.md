@@ -30,6 +30,67 @@ narration.
 
 ## Sessions
 
+### 2026-05-16 — `src/scan/exec/batch_qual.rs` — TBD
+
+**Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
+`unsafe` audit deferred — the file only has 4 `unsafe` ops, all narrow
+PG FFI in `extract_batch_quals` for reading planner Var/Const trees and
+deconstructing `ScalarArrayOpExpr` arrays.
+**LOC:** 884 → 829 (non-test) / 1102 total with 273 lines of tests added.
+Non-test code shrunk by 55 lines from the generic-filter dedup.
+**`unsafe`:** 4 → 4 (unchanged).
+**Tests:** 0 → 18 (all `#[test]`, pure logic — first tests in this file).
+
+- Extracted `apply_batch_filter_typed<T, F>(col, sel, op, constant, decode)`
+  to dedupe the 5 monomorphic batch filters (`apply_batch_filter_{i64,
+  i32, i16, f64, f32}`). Each was a 28-30 line copy of the same null-
+  handling + 6-arm match. Each public wrapper now collapses to a single
+  call passing in the type-specific `decode` closure (`d.value() as i64`
+  for ints, `f64::from_bits(d.value() as u64)` for floats). Rust
+  monomorphises one tight loop per call site, so this doesn't cost the
+  auto-vectorisation the explicit versions had.
+- Kept `apply_batch_filter_bool` separate — bool only supports `=`/`<>`
+  so the generic helper's PartialOrd arithmetic match arms aren't
+  meaningful. Note in the body documents why.
+- Added `Default for BatchQual`. Replaces the trailing
+  `like_strategy: None, text_const: None, in_list_i64: None,
+  in_list_text: None` boilerplate at 5 construction sites in
+  `extract_batch_quals` with `..Default::default()`.
+- Added 18 `#[test]` cases (pure logic, no PG harness):
+  - `parse_compare_op_recognised_set`, `parse_compare_op_rejects_non_comparisons`
+  - `flip_compare_op_is_involutive_for_symmetric_ops`,
+    `flip_compare_op_is_involutive` — `flip(flip(op)) == op` for every variant
+  - `compile_like_pattern_classifies_simple_shapes` — Exact / Contains /
+    StartsWith / EndsWith / `%`-bare
+  - `compile_like_pattern_falls_back_to_general` — backslash / `_` /
+    mid-pattern `%` / three+ `%`s all → General
+  - `sql_like_match_basic` + `_backslash_escapes_metachars` +
+    `_empty_strings` — wildcard semantics, escape, edge cases
+  - `apply_batch_filter_i64_ands_into_existing_selection` — confirms
+    that an existing `false` bit stays `false` (the AND semantics that
+    makes multi-qual evaluation correct)
+  - `apply_batch_filter_i64_null_rows_are_dropped` — SQL three-valued
+    logic: NULL drops regardless of operator
+  - `apply_batch_filter_f64_handles_each_op` — every comparison op
+    matrix
+  - `apply_batch_filter_in_list_int4` — IN list with mixed match/no-
+    match/NULL
+  - `batch_qual_default_is_safe_neutral` — `BatchQual::default()`
+    populates every field
+  - `is_batch_comparable_type_matrix`, `is_text_type_matrix`
+- Deferred: SAFETY: comment pass on the 4 `unsafe` blocks (PG node-tree
+  reads + `deconstruct_array`).
+- **Benchmarks**:
+  - ClickBench EC2 (c6a.4xlarge, 100M-row full dataset): **62.62s vs
+    prior 62.63s** (essentially identical, -0.0% total). Zero
+    regressions >10%; all queries within ±5%.
+  - JSONBench EC2 (m6i.8xlarge, 100M Bluesky events): **3.631s vs prior
+    3.633s** (-0.1%). All queries within ±1.5% — tightest run yet.
+- **Correctness:** `make correctness` 999 passed / 3 skipped / 6 xfailed
+  (matches baseline). Unit: 486 pass on PG17 and PG18 (was 470).
+  Integration: 234 pass on PG17 and PG18.
+- **Perf opportunities surfaced:** none.
+
 ### 2026-05-16 — `src/blob_cache/storage.rs` — 15eeee3
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
