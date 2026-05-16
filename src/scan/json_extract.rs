@@ -76,9 +76,7 @@ pub(crate) struct AggChainCtx {
 impl AggChainCtx {
     /// Discover the inh parent of this query, load its `json_extract` specs
     /// + physical columns, and confirm the rewrite is partition-safe.
-    pub(crate) unsafe fn from_root(
-        root: *mut pg_sys::PlannerInfo,
-    ) -> Option<Self> {
+    pub(crate) unsafe fn from_root(root: *mut pg_sys::PlannerInfo) -> Option<Self> {
         unsafe {
             let array_size = (*root).simple_rel_array_size;
             for rti in 1..array_size {
@@ -134,7 +132,6 @@ impl AggChainCtx {
 }
 
 impl PhysicalCols {
-    #[allow(dead_code)] // Wired up in step 4 follow-up.
     pub(crate) unsafe fn from_rel_oid(rel_oid: pg_sys::Oid) -> Self {
         let mut by_attno: HashMap<i16, String> = HashMap::new();
         unsafe {
@@ -173,62 +170,16 @@ pub(crate) unsafe fn match_extract_chain(
     phys: &PhysicalCols,
 ) -> Option<usize> {
     unsafe {
-        if node.is_null() {
+        let shape = walk_chain_shape(node)?;
+        if (*shape.inner_var).varno != rti as i32 {
             return None;
         }
-
-        // Strip an outer cast to a non-text type (CoerceViaIO is what PG emits
-        // for `(text)::int8` / `::int4` / `::float8` / etc.). RelabelType
-        // covers binary-compatible casts (less common here but cheap to peel).
-        let (inner, leaf_kind) = strip_outer_cast(node);
-
-        // Inner must be the chain itself, ending in `->>` (text).
-        let mut path_keys: Vec<String> = Vec::new();
-        let mut cursor = inner;
-
-        // Outermost step: ->> with a string Const right operand.
-        let (k, deeper) = match_op_step(cursor, JSONB_OBJECT_FIELD_TEXT_OPNO)?;
-        path_keys.push(k);
-        cursor = deeper;
-
-        // Subsequent inner steps must be -> with string keys, until we hit a Var.
-        loop {
-            // Allow RelabelType wrappers between op steps (rare).
-            cursor = unwrap_relabel(cursor);
-            match match_op_step(cursor, JSONB_OBJECT_FIELD_OPNO) {
-                Some((k, deeper)) => {
-                    path_keys.push(k);
-                    cursor = deeper;
-                }
-                None => break,
-            }
-        }
-
-        // Innermost should be a Var(varno=rti).
-        cursor = unwrap_relabel(cursor);
-        if (*cursor).type_ != pg_sys::NodeTag::T_Var {
-            return None;
-        }
-        let var = cursor as *mut pg_sys::Var;
-        if (*var).varno != rti as i32 {
-            return None;
-        }
-        let var_attno = (*var).varattno;
-        let src_col_name = phys.by_attno.get(&var_attno)?;
-
-        // Path was accumulated outermost-first while spec.path is innermost-first;
-        // reverse to match.
-        path_keys.reverse();
-
-        for (i, spec) in specs.iter().enumerate() {
-            if &spec.src_column == src_col_name
-                && spec.path == path_keys
-                && spec.target_kind == leaf_kind
-            {
-                return Some(i);
-            }
-        }
-        None
+        let src_col_name = phys.by_attno.get(&(*shape.inner_var).varattno)?;
+        specs.iter().position(|s| {
+            &s.src_column == src_col_name
+                && s.path == shape.keys
+                && s.target_kind == shape.leaf_kind
+        })
     }
 }
 
@@ -326,6 +277,53 @@ unsafe fn unwrap_relabel(n: *mut pg_sys::Node) -> *mut pg_sys::Node {
     }
 }
 
+/// Result of walking a JSONB-extract chain shape: the keys (innermost-first),
+/// the effective leaf type after any outer cast, and the innermost Var pointer
+/// the chain reads from. Returned by [`walk_chain_shape`].
+struct ChainShape {
+    keys: Vec<String>,
+    leaf_kind: ColumnKind,
+    inner_var: *mut pg_sys::Var,
+}
+
+/// Recognize the JSONB-extract chain shape `cast?(->>(... ->(Var, k), k))`
+/// and return its constituent parts. Used by every chain-matching site in
+/// this file (planner-level recognition, plan-tree rewrite, scan-level qual
+/// rewrite, cstlist classification). Callers add their own constraints on
+/// `inner_var.varno` / `varattno` and on the spec lookup.
+unsafe fn walk_chain_shape(node: *mut pg_sys::Node) -> Option<ChainShape> {
+    unsafe {
+        if node.is_null() {
+            return None;
+        }
+        // Peel outer cast wrappers to learn the effective result type.
+        let (chain_root, leaf_kind) = strip_outer_cast(node);
+
+        // Outermost step is `->>` (text result); inner steps are `->` until
+        // a Var. `match_op_step` returns `deeper` already unwrap_relabel'd,
+        // so we don't need to peel again between iterations.
+        let mut keys: Vec<String> = Vec::new();
+        let (k, mut cursor) = match_op_step(chain_root, JSONB_OBJECT_FIELD_TEXT_OPNO)?;
+        keys.push(k);
+        while let Some((k, deeper)) = match_op_step(cursor, JSONB_OBJECT_FIELD_OPNO) {
+            keys.push(k);
+            cursor = deeper;
+        }
+        // Innermost must be a Var. unwrap any RelabelType the planner inserted
+        // (rare, but cheap).
+        cursor = unwrap_relabel(cursor);
+        if (*cursor).type_ != pg_sys::NodeTag::T_Var {
+            return None;
+        }
+        keys.reverse();
+        Some(ChainShape {
+            keys,
+            leaf_kind,
+            inner_var: cursor as *mut pg_sys::Var,
+        })
+    }
+}
+
 /// Reverse mapping of `kind_to_type_oid`.
 fn type_oid_to_kind(oid: pg_sys::Oid) -> Option<ColumnKind> {
     match oid {
@@ -344,23 +342,10 @@ fn type_oid_to_kind(oid: pg_sys::Oid) -> Option<ColumnKind> {
     }
 }
 
-/// Recursively walk `node`, replacing every matched chain with
-/// `Var(varno=INDEX_VAR, varattno=physical_natts + spec_idx + 1, vartype=...)`.
-/// Returns the rewritten node; `node` itself is mutated in place where feasible
-/// (PG nodes are heap-allocated, so callers should reassign the returned ptr).
-#[allow(dead_code)]
-pub(crate) unsafe fn rewrite_chains_in_node(
-    node: *mut pg_sys::Node,
-    rti: pg_sys::Index,
-    specs: &[ExtractSpec],
-    phys: &PhysicalCols,
-    physical_natts: i16,
-) -> *mut pg_sys::Node {
-    unsafe { rewrite_walker(node, rti, specs, phys, physical_natts) }
-}
-
-/// Same as `rewrite_chains_in_node` but for a list of expressions; returns a
-/// new list with each element mapped through the rewriter.
+/// Walk a list of expressions and rewrite each in place, returning a new list
+/// with each element mapped through the JSONB-extract chain rewriter. Matched
+/// chains become `Var(varno=INDEX_VAR, varattno=physical_natts + spec_idx + 1,
+/// vartype=...)`.
 pub(crate) unsafe fn rewrite_chains_in_list(
     list: *mut pg_sys::List,
     rti: pg_sys::Index,
@@ -379,32 +364,6 @@ pub(crate) unsafe fn rewrite_chains_in_list(
             out = pg_sys::lappend(out, rewritten as *mut _);
         }
         out
-    }
-}
-
-/// Rewrite each `RestrictInfo->clause` in-place. Returns the same list
-/// (RestrictInfos are reused; only their clause pointer is swapped).
-#[allow(dead_code)]
-pub(crate) unsafe fn rewrite_chains_in_restrictinfo_list(
-    list: *mut pg_sys::List,
-    rti: pg_sys::Index,
-    specs: &[ExtractSpec],
-    phys: &PhysicalCols,
-    physical_natts: i16,
-) {
-    unsafe {
-        if list.is_null() {
-            return;
-        }
-        for i in 0..(*list).length {
-            let ri = pg_sys::list_nth(list, i) as *mut pg_sys::RestrictInfo;
-            if ri.is_null() || (*ri).clause.is_null() {
-                continue;
-            }
-            let clause = (*ri).clause as *mut pg_sys::Node;
-            let rewritten = rewrite_walker(clause, rti, specs, phys, physical_natts);
-            (*ri).clause = rewritten as *mut pg_sys::Expr;
-        }
     }
 }
 
@@ -536,7 +495,7 @@ unsafe fn rewrite_walker(
 }
 
 /// Build the `custom_scan_tlist` for a json-extract-enabled DeltaXDecompress.
-#[allow(dead_code)] // Activated by the upper-plan rewrite follow-up.
+///
 /// Layout:
 ///   resno = 1..physical_natts:    Var(rti, attno=k, vartype=physical type)
 ///   resno = physical_natts+1..M:  the original chain Expr (kept verbatim so
@@ -608,7 +567,6 @@ pub(crate) unsafe fn build_custom_scan_tlist(
 
 /// Construct the Expr `( ... ((Var(rti, src_attno) -> 'k1') -> 'k2') ->> 'kN' )`,
 /// optionally wrapped in `CoerceViaIO(target_kind)` when the target isn't text.
-#[allow(dead_code)] // Activated by the upper-plan rewrite follow-up.
 unsafe fn build_chain_expr_for_spec(
     rti: pg_sys::Index,
     _rel_oid: pg_sys::Oid,
@@ -702,7 +660,6 @@ unsafe fn build_chain_expr_for_spec(
     }
 }
 
-#[allow(dead_code)] // Activated by the upper-plan rewrite follow-up.
 unsafe fn make_text_const(s: &str) -> *mut pg_sys::Const {
     unsafe {
         // cstring_to_text_with_len allocates a varlena in CurrentMemoryContext;
@@ -980,33 +937,7 @@ unsafe fn collect_chain_signatures_in_node(
 /// Walk a candidate chain Expr; return its `(path, leaf_kind)` signature if
 /// it has the JSON-extract chain shape (cast?(`->>`(`->`*(Var, key), key))).
 unsafe fn chain_signature_of(node: *mut pg_sys::Node) -> Option<ChainSig> {
-    unsafe {
-        if node.is_null() {
-            return None;
-        }
-        let (chain_root, leaf_kind) = strip_outer_cast(node);
-        let mut path_keys: Vec<String> = Vec::new();
-        let mut cursor = chain_root;
-        let (k, deeper) = match_op_step(cursor, JSONB_OBJECT_FIELD_TEXT_OPNO)?;
-        path_keys.push(k);
-        cursor = deeper;
-        loop {
-            cursor = unwrap_relabel(cursor);
-            match match_op_step(cursor, JSONB_OBJECT_FIELD_OPNO) {
-                Some((k, deeper)) => {
-                    path_keys.push(k);
-                    cursor = deeper;
-                }
-                None => break,
-            }
-        }
-        cursor = unwrap_relabel(cursor);
-        if (*cursor).type_ != pg_sys::NodeTag::T_Var {
-            return None;
-        }
-        path_keys.reverse();
-        Some((path_keys, leaf_kind))
-    }
+    unsafe { walk_chain_shape(node).map(|s| (s.keys, s.leaf_kind)) }
 }
 
 /// Walk a plan subtree. Returns the `SubplanTlist` describing what each
@@ -1046,7 +977,8 @@ unsafe fn rewrite_plan_subtree_with_stack(
         // Leaf cases first.
         if (*plan).type_ == pg_sys::NodeTag::T_CustomScan {
             let cscan = plan as *mut pg_sys::CustomScan;
-            let stl = subplan_tlist_from_deltax_decompress(cscan, rtable, needed).unwrap_or_default();
+            let stl =
+                subplan_tlist_from_deltax_decompress(cscan, rtable, needed).unwrap_or_default();
             if !stl.is_empty() {
                 // Add resjunk forwarder TLEs to every ancestor so chains in
                 // upper-level Aggrefs/exprs can reference the synthetic via
@@ -1130,22 +1062,15 @@ unsafe fn propagate_synthetics_through_ancestors(
                     continue;
                 }
                 let new_resno = ((*(*ancestor).targetlist).length + 1) as i16;
-                let new_var = pg_sys::makeVar(
-                    pg_sys::OUTER_VAR,
-                    current_pos,
-                    var_type,
-                    -1,
-                    var_collid,
-                    0,
-                );
+                let new_var =
+                    pg_sys::makeVar(pg_sys::OUTER_VAR, current_pos, var_type, -1, var_collid, 0);
                 let new_tle = pg_sys::makeTargetEntry(
                     new_var as *mut pg_sys::Expr,
                     new_resno,
                     std::ptr::null_mut(),
                     true,
                 );
-                (*ancestor).targetlist =
-                    pg_sys::lappend((*ancestor).targetlist, new_tle as *mut _);
+                (*ancestor).targetlist = pg_sys::lappend((*ancestor).targetlist, new_tle as *mut _);
                 current_pos = new_resno;
             }
         }
@@ -1358,32 +1283,11 @@ unsafe fn match_chain_against_child_stl(
     child_stl: &SubplanTlist,
 ) -> Option<*mut pg_sys::Node> {
     unsafe {
-        if node.is_null() {
-            return None;
-        }
-        let (chain_root, leaf_kind) = strip_outer_cast(node);
-        let mut path_keys: Vec<String> = Vec::new();
-        let mut cursor = chain_root;
-
-        let (k, deeper) = match_op_step(cursor, JSONB_OBJECT_FIELD_TEXT_OPNO)?;
-        path_keys.push(k);
-        cursor = deeper;
-        loop {
-            cursor = unwrap_relabel(cursor);
-            match match_op_step(cursor, JSONB_OBJECT_FIELD_OPNO) {
-                Some((k, deeper)) => {
-                    path_keys.push(k);
-                    cursor = deeper;
-                }
-                None => break,
-            }
-        }
-        cursor = unwrap_relabel(cursor);
-        if (*cursor).type_ != pg_sys::NodeTag::T_Var {
-            return None;
-        }
-        let inner_var = cursor as *mut pg_sys::Var;
-        path_keys.reverse();
+        let ChainShape {
+            keys: path_keys,
+            leaf_kind,
+            inner_var,
+        } = walk_chain_shape(node)?;
 
         // Inner var attno indexes into child's tlist. The child's STL at that
         // position must be Physical (the underlying jsonb column).
@@ -1593,10 +1497,7 @@ unsafe fn build_subplan_tlist_from_scan_targetlist(
 /// (post-setrefs scan-level Var), not `Var(varno=OUTER_VAR, ...)`. Match by
 /// `(src_var_attno, path, target_kind)` against cstlist synthetics; the
 /// physical attno comparison goes against the `Var.varattno` directly.
-unsafe fn rewrite_scan_qual_chains(
-    cscan: *mut pg_sys::CustomScan,
-    cstlist: *mut pg_sys::List,
-) {
+unsafe fn rewrite_scan_qual_chains(cscan: *mut pg_sys::CustomScan, cstlist: *mut pg_sys::List) {
     unsafe {
         let qual = (*cscan).scan.plan.qual;
         if qual.is_null() || cstlist.is_null() {
@@ -1671,21 +1572,18 @@ unsafe fn substitute_scan_chains_in_node(
             }
             pg_sys::NodeTag::T_CoerceViaIO => {
                 let c = node as *mut pg_sys::CoerceViaIO;
-                (*c).arg =
-                    substitute_scan_chains_in_node((*c).arg as *mut pg_sys::Node, synths)
-                        as *mut pg_sys::Expr;
+                (*c).arg = substitute_scan_chains_in_node((*c).arg as *mut pg_sys::Node, synths)
+                    as *mut pg_sys::Expr;
             }
             pg_sys::NodeTag::T_RelabelType => {
                 let r = node as *mut pg_sys::RelabelType;
-                (*r).arg =
-                    substitute_scan_chains_in_node((*r).arg as *mut pg_sys::Node, synths)
-                        as *mut pg_sys::Expr;
+                (*r).arg = substitute_scan_chains_in_node((*r).arg as *mut pg_sys::Node, synths)
+                    as *mut pg_sys::Expr;
             }
             pg_sys::NodeTag::T_NullTest => {
                 let n = node as *mut pg_sys::NullTest;
-                (*n).arg =
-                    substitute_scan_chains_in_node((*n).arg as *mut pg_sys::Node, synths)
-                        as *mut pg_sys::Expr;
+                (*n).arg = substitute_scan_chains_in_node((*n).arg as *mut pg_sys::Node, synths)
+                    as *mut pg_sys::Expr;
             }
             pg_sys::NodeTag::T_ScalarArrayOpExpr => {
                 let s = node as *mut pg_sys::ScalarArrayOpExpr;
@@ -1720,38 +1618,16 @@ unsafe fn match_scan_chain_against_synths(
     synths: &[SynthInfo],
 ) -> Option<*mut pg_sys::Node> {
     unsafe {
-        if node.is_null() {
-            return None;
-        }
-        let (chain_root, leaf_kind) = strip_outer_cast(node);
-        let mut path_keys: Vec<String> = Vec::new();
-        let mut cursor = chain_root;
-        let (k, deeper) = match_op_step(cursor, JSONB_OBJECT_FIELD_TEXT_OPNO)?;
-        path_keys.push(k);
-        cursor = deeper;
-        loop {
-            cursor = unwrap_relabel(cursor);
-            match match_op_step(cursor, JSONB_OBJECT_FIELD_OPNO) {
-                Some((k, deeper)) => {
-                    path_keys.push(k);
-                    cursor = deeper;
-                }
-                None => break,
-            }
-        }
-        cursor = unwrap_relabel(cursor);
-        if (*cursor).type_ != pg_sys::NodeTag::T_Var {
-            return None;
-        }
-        let inner_var = cursor as *mut pg_sys::Var;
+        let ChainShape {
+            keys: path_keys,
+            leaf_kind,
+            inner_var,
+        } = walk_chain_shape(node)?;
         // At scan level, the inner var should be `Var(varno = rti)`; we
         // accept any varno except OUTER/INNER (those are upper-plan refs).
-        if (*inner_var).varno == pg_sys::OUTER_VAR
-            || (*inner_var).varno == pg_sys::INNER_VAR
-        {
+        if (*inner_var).varno == pg_sys::OUTER_VAR || (*inner_var).varno == pg_sys::INNER_VAR {
             return None;
         }
-        path_keys.reverse();
         let src_attno = (*inner_var).varattno;
 
         for s in synths {
@@ -1804,10 +1680,7 @@ struct SynthInfo {
 /// targetlist. Stored in a small Vec since these sets are tiny.
 type PosSet = Vec<i16>;
 
-unsafe fn descend_for_refs(
-    plan: *mut pg_sys::Plan,
-    my_refs: &PosSet,
-) {
+unsafe fn descend_for_refs(plan: *mut pg_sys::Plan, my_refs: &PosSet) {
     unsafe {
         if plan.is_null() {
             return;
@@ -1845,10 +1718,7 @@ unsafe fn descend_for_refs(
                 if tle.is_null() || (*tle).expr.is_null() {
                     continue;
                 }
-                collect_outer_var_attnos(
-                    (*tle).expr as *mut pg_sys::Node,
-                    &mut child_refs,
-                );
+                collect_outer_var_attnos((*tle).expr as *mut pg_sys::Node, &mut child_refs);
             }
         }
         // Always-evaluated exprs.
@@ -1955,7 +1825,11 @@ unsafe fn prune_cscans_by_ref_count(root: *mut pg_sys::Plan) {
         }
         // Root is the query output: every targetlist position is referenced.
         let tlist = (*root).targetlist;
-        let n = if tlist.is_null() { 0 } else { (*tlist).length as i16 };
+        let n = if tlist.is_null() {
+            0
+        } else {
+            (*tlist).length as i16
+        };
         let initial: PosSet = (1..=n).collect();
         descend_for_refs(root, &initial);
     }
@@ -1986,10 +1860,7 @@ unsafe fn cscan_is_touched(cscan: *mut pg_sys::CustomScan) -> bool {
 /// Add positions in `plan.targetlist` that are referenced by node-specific
 /// indirect mechanisms (sort keys, group keys, etc.) — i.e., positions that
 /// must be evaluated even if the parent doesn't read them.
-unsafe fn add_node_specific_referenced_positions(
-    plan: *mut pg_sys::Plan,
-    out: &mut PosSet,
-) {
+unsafe fn add_node_specific_referenced_positions(plan: *mut pg_sys::Plan, out: &mut PosSet) {
     unsafe {
         match (*plan).type_ {
             pg_sys::NodeTag::T_Sort => {
@@ -2026,10 +1897,7 @@ unsafe fn add_node_specific_referenced_positions(
 /// expressions, so passing them to `pull_var_clause` errors with
 /// "unrecognized node type" on T_Agg. Each chain Agg has its own
 /// targetlist/qual that PG processes separately at execution time.
-unsafe fn add_node_specific_outer_var_refs(
-    plan: *mut pg_sys::Plan,
-    out: &mut PosSet,
-) {
+unsafe fn add_node_specific_outer_var_refs(plan: *mut pg_sys::Plan, out: &mut PosSet) {
     unsafe {
         if (*plan).type_ == pg_sys::NodeTag::T_WindowAgg {
             let w = plan as *mut pg_sys::WindowAgg;
@@ -2115,10 +1983,7 @@ unsafe fn collect_outer_var_attnos_in_list(list: *mut pg_sys::List, out: &mut Po
 ///
 /// New encoding (preserving everything the executor expects):
 ///   `[oid_0, oid_1, ..., -1, cols..., (-2, topn0..topn3,)? -3, synth...]`
-unsafe fn rebuild_cscan_custom_private(
-    cscan: *mut pg_sys::CustomScan,
-    referenced: &PosSet,
-) {
+unsafe fn rebuild_cscan_custom_private(cscan: *mut pg_sys::CustomScan, referenced: &PosSet) {
     unsafe {
         let cstlist = (*cscan).custom_scan_tlist;
         let scan_tlist = (*cscan).scan.plan.targetlist;
@@ -2174,10 +2039,10 @@ unsafe fn rebuild_cscan_custom_private(
         // matching varattno.
         let scan_qual = (*cscan).scan.plan.qual;
         if !scan_qual.is_null() {
-            let mut qual_outer: PosSet = Vec::new();
-            collect_outer_var_attnos_in_list(scan_qual, &mut qual_outer);
-            // Reuse the OUTER_VAR collector for INDEX_VAR — easier: walk and
-            // find any Var refs to the cstlist or the underlying rel.
+            // OUTER_VAR refs in scan-level qual shouldn't normally appear
+            // here; if they did, they'd already be in `referenced` (from the
+            // parent's descent). Walk for INDEX_VAR (cstlist refs) and
+            // relation-level Vars (unrewritten quals).
             let mut qual_index: PosSet = Vec::new();
             let mut qual_relvar_attnos: PosSet = Vec::new();
             collect_index_and_rel_var_attnos_in_list(
@@ -2225,10 +2090,6 @@ unsafe fn rebuild_cscan_custom_private(
                     }
                 }
             }
-            // OUTER_VAR refs in scan-level qual shouldn't normally appear
-            // here, but if they do we'd already have accounted for them
-            // via `referenced` (they came from the parent's descent).
-            let _ = qual_outer;
         }
 
         // Walk the existing custom_private to:
@@ -2414,16 +2275,16 @@ unsafe fn extend_scan_targetlist_with_forwarders(
             // deltatable has json_extract configured end up with the
             // synthetic in cscan output → Append width mismatch when mixed
             // with non-cscan partition children.
-            // Only emit forwarders for synthetics whose `(path, leaf_kind)`
-            // signature is in the plan tree. Without this gate, queries that
-            // don't reference a chain Expr but run over a parent table whose
-            // deltatable has json_extract configured end up with the
-            // synthetic in cscan output → Append width mismatch when mixed
-            // with non-cscan partition children.
             match classify_custom_scan_tlist_entry(cs_expr as *mut pg_sys::Node, (*cs_tle).resno) {
-                SubplanColumn::Synthetic { ref path, target_kind, .. } => {
+                SubplanColumn::Synthetic {
+                    ref path,
+                    target_kind,
+                    ..
+                } => {
                     let sig: ChainSig = (path.clone(), target_kind);
-                    if !needed.contains(&sig) { continue; }
+                    if !needed.contains(&sig) {
+                        continue;
+                    }
                 }
                 _ => continue,
             }
@@ -2471,43 +2332,20 @@ unsafe fn classify_custom_scan_tlist_entry(
 ) -> SubplanColumn {
     unsafe {
         // Physical: a top-level Var referencing the underlying rel.
-        if (*expr).type_ == pg_sys::NodeTag::T_Var {
+        if !expr.is_null() && (*expr).type_ == pg_sys::NodeTag::T_Var {
             let v = expr as *mut pg_sys::Var;
             return SubplanColumn::Physical {
                 rel_var_attno: (*v).varattno,
             };
         }
-
-        // Synthetic: peel cast wrappers and walk the `->`/`->>` chain.
-        let (chain_root, leaf_kind) = strip_outer_cast(expr);
-        let mut path_keys: Vec<String> = Vec::new();
-        let mut cursor = chain_root;
-        let Some((k, deeper)) = match_op_step(cursor, JSONB_OBJECT_FIELD_TEXT_OPNO) else {
-            return SubplanColumn::Other;
-        };
-        path_keys.push(k);
-        cursor = deeper;
-        loop {
-            cursor = unwrap_relabel(cursor);
-            match match_op_step(cursor, JSONB_OBJECT_FIELD_OPNO) {
-                Some((k, deeper)) => {
-                    path_keys.push(k);
-                    cursor = deeper;
-                }
-                None => break,
-            }
-        }
-        cursor = unwrap_relabel(cursor);
-        if (*cursor).type_ != pg_sys::NodeTag::T_Var {
-            return SubplanColumn::Other;
-        }
-        let v = cursor as *mut pg_sys::Var;
-        path_keys.reverse();
-        SubplanColumn::Synthetic {
-            path: path_keys,
-            target_kind: leaf_kind,
-            src_var_attno: (*v).varattno,
-            forwarder_resno,
+        match walk_chain_shape(expr) {
+            Some(shape) => SubplanColumn::Synthetic {
+                path: shape.keys,
+                target_kind: shape.leaf_kind,
+                src_var_attno: (*shape.inner_var).varattno,
+                forwarder_resno,
+            },
+            None => SubplanColumn::Other,
         }
     }
 }
@@ -2525,15 +2363,11 @@ unsafe fn collect_child_subplan_tlist(
         match (*plan).type_ {
             pg_sys::NodeTag::T_Append => {
                 let app = plan as *mut pg_sys::Append;
-                intersect_children_subplan_tlists(
-                    (*app).appendplans, parent_stack, rtable, needed,
-                )
+                intersect_children_subplan_tlists((*app).appendplans, parent_stack, rtable, needed)
             }
             pg_sys::NodeTag::T_MergeAppend => {
                 let mapp = plan as *mut pg_sys::MergeAppend;
-                intersect_children_subplan_tlists(
-                    (*mapp).mergeplans, parent_stack, rtable, needed,
-                )
+                intersect_children_subplan_tlists((*mapp).mergeplans, parent_stack, rtable, needed)
             }
             _ => {
                 if !(*plan).lefttree.is_null() {
@@ -2577,12 +2411,6 @@ unsafe fn intersect_children_subplan_tlists(
     }
 }
 
-/// Resolve `cscan->scan.scanrelid` to the underlying relation OID by
-/// indexing into the PlannedStmt range table, then SPI-look up the
-/// deltatable's `json_extract` config and rebuild the custom_scan_tlist
-/// from scratch. Returns `None` when the rel isn't a deltax-managed table
-/// or has no extraction configured. Returns `Some(NIL)` to signal "tried
-/// but nothing to add" (caller treats as None).
 /// Companion to `rebuild_custom_scan_tlist_from_catalog`: returns true iff
 /// any `json_extract` spec for this cscan's parent rel matches a chain
 /// signature in `needed` (the set collected from upper-plan chain Exprs).
@@ -2628,6 +2456,13 @@ unsafe fn check_cscan_has_relevant_synthetics(
     }
 }
 
+/// Resolve `cscan->scan.scanrelid` to the underlying relation OID by indexing
+/// into the PlannedStmt range table, then SPI-look up the deltatable's
+/// `json_extract` config and rebuild the custom_scan_tlist from scratch.
+/// Returns `None` when the rel isn't a deltax-managed table, has no extraction
+/// configured, or when the mixed-partition gate fires (some relevant
+/// compressed partition predates `json_extract_added_at` and lacks the
+/// synthetic columns).
 unsafe fn rebuild_custom_scan_tlist_from_catalog(
     cscan: *mut pg_sys::CustomScan,
     rtable: *mut pg_sys::List,
@@ -2771,6 +2606,107 @@ mod tests {
             let oid = kind_to_type_oid(kind);
             let back = type_oid_to_kind(oid).expect("recognized");
             assert_eq!(back, kind, "round trip failed for {:?}", kind);
+        }
+    }
+
+    /// Build a `Var(varno=1, varattno=1, vartype=jsonb)` for chain tests.
+    unsafe fn make_jsonb_var() -> *mut pg_sys::Var {
+        unsafe { pg_sys::makeVar(1, 1, pg_sys::JSONBOID, -1, pg_sys::InvalidOid, 0) }
+    }
+
+    /// Wrap `left` with `left <opno> <Const(key)>`, mirroring how the parser
+    /// emits `->`/`->>` OpExprs. Reuses `make_text_const` / OpExpr layout from
+    /// `build_chain_expr_for_spec`.
+    unsafe fn make_op_expr(
+        left: *mut pg_sys::Node,
+        key: &str,
+        opno: pg_sys::Oid,
+        result_oid: pg_sys::Oid,
+    ) -> *mut pg_sys::Node {
+        unsafe {
+            let key_const = make_text_const(key);
+            let mut args: *mut pg_sys::List = std::ptr::null_mut();
+            args = pg_sys::lappend(args, left as *mut _);
+            args = pg_sys::lappend(args, key_const as *mut _);
+            let op = pg_sys::palloc0(std::mem::size_of::<pg_sys::OpExpr>()) as *mut pg_sys::OpExpr;
+            (*op).xpr.type_ = pg_sys::NodeTag::T_OpExpr;
+            (*op).opno = opno;
+            (*op).opresulttype = result_oid;
+            (*op).args = args;
+            (*op).location = -1;
+            op as *mut pg_sys::Node
+        }
+    }
+
+    #[pg_test]
+    fn walk_chain_shape_simple_extract() {
+        unsafe {
+            let var = make_jsonb_var() as *mut pg_sys::Node;
+            let expr = make_op_expr(var, "kind", JSONB_OBJECT_FIELD_TEXT_OPNO, pg_sys::TEXTOID);
+            let shape = walk_chain_shape(expr).expect("recognized");
+            assert_eq!(shape.keys, vec!["kind".to_string()]);
+            assert_eq!(shape.leaf_kind, ColumnKind::Text);
+            assert_eq!((*shape.inner_var).varattno, 1);
+        }
+    }
+
+    #[pg_test]
+    fn walk_chain_shape_nested_path() {
+        // `((var -> 'a') -> 'b') ->> 'c'`
+        unsafe {
+            let var = make_jsonb_var() as *mut pg_sys::Node;
+            let step_a = make_op_expr(var, "a", JSONB_OBJECT_FIELD_OPNO, pg_sys::JSONBOID);
+            let step_b = make_op_expr(step_a, "b", JSONB_OBJECT_FIELD_OPNO, pg_sys::JSONBOID);
+            let step_c = make_op_expr(step_b, "c", JSONB_OBJECT_FIELD_TEXT_OPNO, pg_sys::TEXTOID);
+            let shape = walk_chain_shape(step_c).expect("recognized");
+            assert_eq!(
+                shape.keys,
+                vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            );
+            assert_eq!(shape.leaf_kind, ColumnKind::Text);
+        }
+    }
+
+    #[pg_test]
+    fn walk_chain_shape_with_outer_cast() {
+        // `(var ->> 'n')::int4` — CoerceViaIO wrapper around the ->> chain.
+        unsafe {
+            let var = make_jsonb_var() as *mut pg_sys::Node;
+            let inner = make_op_expr(var, "n", JSONB_OBJECT_FIELD_TEXT_OPNO, pg_sys::TEXTOID);
+            let coerce = pg_sys::palloc0(std::mem::size_of::<pg_sys::CoerceViaIO>())
+                as *mut pg_sys::CoerceViaIO;
+            (*coerce).xpr.type_ = pg_sys::NodeTag::T_CoerceViaIO;
+            (*coerce).arg = inner as *mut pg_sys::Expr;
+            (*coerce).resulttype = pg_sys::INT4OID;
+            (*coerce).location = -1;
+            let shape = walk_chain_shape(coerce as *mut pg_sys::Node).expect("recognized");
+            assert_eq!(shape.keys, vec!["n".to_string()]);
+            assert_eq!(shape.leaf_kind, ColumnKind::Int32);
+        }
+    }
+
+    #[pg_test]
+    fn walk_chain_shape_rejects_bare_var() {
+        unsafe {
+            let var = make_jsonb_var();
+            assert!(walk_chain_shape(var as *mut pg_sys::Node).is_none());
+        }
+    }
+
+    #[pg_test]
+    fn walk_chain_shape_rejects_no_terminal_text_arrow() {
+        // `var -> 'k'` alone (no terminal `->>`) is not a recognized chain.
+        unsafe {
+            let var = make_jsonb_var() as *mut pg_sys::Node;
+            let only_obj_field = make_op_expr(var, "k", JSONB_OBJECT_FIELD_OPNO, pg_sys::JSONBOID);
+            assert!(walk_chain_shape(only_obj_field).is_none());
+        }
+    }
+
+    #[pg_test]
+    fn walk_chain_shape_rejects_null_node() {
+        unsafe {
+            assert!(walk_chain_shape(std::ptr::null_mut()).is_none());
         }
     }
 }

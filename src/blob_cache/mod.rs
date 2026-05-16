@@ -160,11 +160,7 @@ fn resolve_configured_bytes() -> usize {
     if mb == 0 {
         return 0;
     }
-    let effective_mb = if mb < 0 {
-        auto_size_mb()
-    } else {
-        mb
-    };
+    let effective_mb = if mb < 0 { auto_size_mb() } else { mb };
     (effective_mb as usize).saturating_mul(1024 * 1024)
 }
 
@@ -240,6 +236,7 @@ fn pg_deltax_blob_cache_stats() -> TableIterator<
 /// counts entries with pin_count > 0 vs == 0, and reports the LRU
 /// tail pointer. Used to debug why evictions might not be firing.
 #[pg_extern]
+#[allow(clippy::type_complexity)] // pgrx pg_extern macros don't expand type aliases.
 fn pg_deltax_blob_cache_shard_stats() -> TableIterator<
     'static,
     (

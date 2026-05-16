@@ -72,7 +72,7 @@ const SHMEM_NAME: &std::ffi::CStr = c"pg_deltax_blob_cache";
 
 // From PG 17 dsa.h (#defines, not bound by pgrx). Mirror pgstat_shmem.c's
 // usage: passing 0,0 violates the contract Assert'd at dsa.c:1233.
-const DSA_DEFAULT_INIT_SEGMENT_SIZE: usize = 1 * 1024 * 1024;
+const DSA_DEFAULT_INIT_SEGMENT_SIZE: usize = 1024 * 1024;
 const DSA_MAX_SEGMENT_SIZE: usize = 1usize << 40;
 
 // ---------------------------------------------------------------------------
@@ -432,7 +432,8 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
                 // DSA exhausted despite soft cap saying we're OK. Free
                 // some entries and retry. Target a chunk larger than
                 // the entry so we make real progress.
-                let freed = evict_in_shard(ctl, area, shard, shard_idx, (entry_size as u64).max(4096));
+                let freed =
+                    evict_in_shard(ctl, area, shard, shard_idx, (entry_size as u64).max(4096));
                 if freed == 0 {
                     pg_sys::LWLockRelease(lock);
                     ctl.insert_failures_total.fetch_add(1, Ordering::Relaxed);
@@ -441,11 +442,8 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
                 continue;
             }
 
-            let data_alloc = pg_sys::dsa_allocate_extended(
-                area,
-                bytes.len(),
-                pg_sys::DSA_ALLOC_NO_OOM as i32,
-            );
+            let data_alloc =
+                pg_sys::dsa_allocate_extended(area, bytes.len(), pg_sys::DSA_ALLOC_NO_OOM as i32);
             if data_alloc == 0 {
                 pg_sys::dsa_free(area, entry_alloc);
                 let freed = evict_in_shard(ctl, area, shard, shard_idx, needed);
@@ -484,7 +482,8 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
         lru_prepend(shard, new_entry_dp, entry);
 
         shard.n_entries.fetch_add(1, Ordering::Relaxed);
-        shard.bytes_used
+        shard
+            .bytes_used
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         ctl.n_entries.fetch_add(1, Ordering::Relaxed);
         ctl.total_bytes
@@ -494,10 +493,15 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
     }
 }
 
+/// Per-shard diagnostic row: `(shard_id, n_entries, bytes_used, lru_walk,
+/// pinned, unpinned, lru_head_dp, lru_tail_dp)`. Returned by
+/// [`shard_diag`].
+pub(super) type ShardDiagRow = (i32, i64, i64, i64, i64, i64, i64, i64);
+
 /// Per-shard diagnostic snapshot. Walks each shard's LRU list under
 /// shared lock and reports counts. Slow; only for debugging.
-pub(super) fn shard_diag() -> Vec<(i32, i64, i64, i64, i64, i64, i64, i64)> {
-    let mut out: Vec<(i32, i64, i64, i64, i64, i64, i64, i64)> = Vec::new();
+pub(super) fn shard_diag() -> Vec<ShardDiagRow> {
+    let mut out: Vec<ShardDiagRow> = Vec::new();
     if !CACHE_USABLE.load(Ordering::Acquire) || !attach() {
         return out;
     }
@@ -532,8 +536,14 @@ pub(super) fn shard_diag() -> Vec<(i32, i64, i64, i64, i64, i64, i64, i64)> {
             // Only include shards with state to keep output small.
             if n_entries > 0 || head_dp != 0 || tail_dp != 0 {
                 out.push((
-                    i as i32, n_entries, bytes_used, walk, pinned, unpinned,
-                    head_dp as i64, tail_dp as i64,
+                    i as i32,
+                    n_entries,
+                    bytes_used,
+                    walk,
+                    pinned,
+                    unpinned,
+                    head_dp as i64,
+                    tail_dp as i64,
                 ));
             }
         }
@@ -583,13 +593,11 @@ pub(super) fn register_hooks() {
         }
         #[cfg(not(feature = "pg14"))]
         {
-            let _ = PREV_SHMEM_REQUEST_HOOK
-                .set(pg_sys::shmem_request_hook);
+            let _ = PREV_SHMEM_REQUEST_HOOK.set(pg_sys::shmem_request_hook);
             pg_sys::shmem_request_hook = Some(my_shmem_request_hook);
         }
 
-        let _ = PREV_SHMEM_STARTUP_HOOK
-            .set(pg_sys::shmem_startup_hook);
+        let _ = PREV_SHMEM_STARTUP_HOOK.set(pg_sys::shmem_startup_hook);
         pg_sys::shmem_startup_hook = Some(my_shmem_startup_hook);
     }
 }
@@ -620,11 +628,7 @@ unsafe extern "C-unwind" fn my_shmem_startup_hook() {
 
         let mut found: bool = false;
         let total = reservation_total_bytes(shards);
-        let block = pg_sys::ShmemInitStruct(
-            SHMEM_NAME.as_ptr(),
-            total,
-            &mut found as *mut bool,
-        );
+        let block = pg_sys::ShmemInitStruct(SHMEM_NAME.as_ptr(), total, &mut found as *mut bool);
         if block.is_null() {
             return;
         }
@@ -633,7 +637,8 @@ unsafe extern "C-unwind" fn my_shmem_startup_hook() {
         if !found {
             std::ptr::write_bytes(ctl, 0, 1);
             (*ctl).n_shards.store(shards as u32, Ordering::Relaxed);
-            (*ctl).max_bytes
+            (*ctl)
+                .max_bytes
                 .store(RESERVATION_BYTES.load(Ordering::Relaxed), Ordering::Relaxed);
 
             // Allocate a private LWLock tranche id and register the
@@ -641,13 +646,12 @@ unsafe extern "C-unwind" fn my_shmem_startup_hook() {
             // BlobCacheCtl::shard_locks (already zero-initialised by
             // write_bytes above); we call LWLockInitialize on each one.
             let tranche_id = pg_sys::LWLockNewTrancheId();
-            (*ctl).lwlock_tranche_id.store(tranche_id, Ordering::Relaxed);
+            (*ctl)
+                .lwlock_tranche_id
+                .store(tranche_id, Ordering::Relaxed);
             pg_sys::LWLockRegisterTranche(tranche_id, SHMEM_NAME.as_ptr());
             for i in 0..shards {
-                pg_sys::LWLockInitialize(
-                    &mut (*ctl).shard_locks[i].lock,
-                    tranche_id,
-                );
+                pg_sys::LWLockInitialize(&mut (*ctl).shard_locks[i].lock, tranche_id);
             }
 
             // Create the DSA in place inside the named shmem block we
@@ -828,8 +832,8 @@ unsafe fn dsa_area_ptr() -> *mut pg_sys::dsa_area {
 #[inline]
 unsafe fn shard_lwlock(shard_idx: usize) -> *mut pg_sys::LWLock {
     unsafe {
-        let base = *LWLOCK_BASE_PTR.get().expect("lwlock base not yet set")
-            as *mut pg_sys::LWLockPadded;
+        let base =
+            *LWLOCK_BASE_PTR.get().expect("lwlock base not yet set") as *mut pg_sys::LWLockPadded;
         &mut (*base.add(shard_idx)).lock as *mut pg_sys::LWLock
     }
 }
@@ -880,7 +884,9 @@ unsafe fn lru_prepend(shard: &Shard, new_entry_dp: u64, new_entry: *mut Entry) {
         (*new_entry).lru_next.store(old_head, Ordering::Release);
         if old_head != 0 {
             let old_head_ptr = entry_ptr(old_head);
-            (*old_head_ptr).lru_prev.store(new_entry_dp, Ordering::Release);
+            (*old_head_ptr)
+                .lru_prev
+                .store(new_entry_dp, Ordering::Release);
         } else {
             // List was empty — new entry is also the tail.
             shard.lru_tail.store(new_entry_dp, Ordering::Release);
