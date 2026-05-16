@@ -160,3 +160,17 @@ __attribute__((weak)) void table_open(void) {}
 __attribute__((weak)) void table_slot_create(void) {}
 __attribute__((weak)) void text_to_cstring(void) {}
 __attribute__((weak)) void varstr_cmp(void) {}
+
+/* pgrx-internal panic/ereport plumbing — pgrx-pg-sys/src/submodules/panic.rs
+ * declares these externs directly (not via the generated bindings), so they
+ * don't show up in a grep of our src/ for `pg_sys::*`. They're reachable from
+ * any panic path in the test binary. */
+__attribute__((weak)) int  errcode(int sqlerrcode) { (void)sqlerrcode; return 0; }
+__attribute__((weak)) int  errcontext_msg(const char *fmt, ...) { (void)fmt; return 0; }
+__attribute__((weak)) int  errdetail(const char *fmt, ...) { (void)fmt; return 0; }
+__attribute__((weak)) void errfinish(void) {}
+__attribute__((weak)) int  errhint(const char *fmt, ...) { (void)fmt; return 0; }
+__attribute__((weak)) int  errmsg(const char *fmt, ...) { (void)fmt; return 0; }
+__attribute__((weak)) int  errstart(int elevel, const char *domain) { (void)elevel; (void)domain; return 0; }
+__attribute__((weak)) void errstart_cold(void) {}
+__attribute__((weak)) void pg_re_throw(void) {}
