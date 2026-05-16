@@ -30,7 +30,7 @@ narration.
 
 ## Sessions
 
-### 2026-05-16 — `src/copy.rs` — TBD
+### 2026-05-16 — `src/copy.rs` — a41585d
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
 `unsafe` audit deferred — all 69 blocks are PG FFI (table_open, heap_insert,
