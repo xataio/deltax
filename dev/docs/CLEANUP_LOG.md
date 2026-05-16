@@ -30,6 +30,49 @@ narration.
 
 ## Sessions
 
+### 2026-05-16 — `src/scan/exec/agg_wire.rs` — TBD
+
+**Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
+Same triage drift as `append_wire.rs`: the file had 7 `#[pgrx::pg_test]`
+tests but the triage row read "0 tests" because it only counted `#[test]`.
+None of these tests need PG state — they're byte-buffer round-trip
+verification.
+**LOC:** 680 → 743.
+**`unsafe`:** 13 → 16 (+3 from the three new buffer-corruption tests
+that mutate the slab via raw pointers).
+**Tests:** 7 `#[pgrx::pg_test]` → 10 `#[test]` (7 converted + 3 added).
+
+- Converted all 7 `#[pgrx::pg_test]` tests to plain `#[test]`. The
+  tests only use `pg_sys::INT8OID / INT4OID / TEXTOID` for type
+  tagging in `AggExecSpec` builders — no PG state, no SPI. Plain
+  `#[test]` runs without the harness boot.
+- Added 3 `#[test]` cases:
+  - `round_up_handles_alignment` — 8- and 16-byte alignment edges.
+    `round_up(16, 16)` (preserving an already-aligned value) is the
+    case most likely to drift if anyone refactors with masks.
+  - `partial_wire_version_mismatch_rejected` — serialise V1, corrupt
+    the version field, confirm `DeError::VersionMismatch` with the
+    correct `got`/`expected` payload. Without this, a future V2
+    leader silently feeds V1 workers garbage.
+  - `partial_wire_truncated_buffer_rejected` — slab shorter than the
+    header surfaces as `DeError::Truncated` (rather than reading past
+    the buffer).
+  - `partial_wire_slot_count_mismatch_rejected` — sender uses
+    `count_star_specs()` (1 slot), receiver tries
+    `sum_int4_count_specs()` (2 slots). Mismatched `agg_specs.len()`
+    must reject with `LayoutMismatch` — otherwise the receiver
+    silently misaligns into group storage.
+- **Benchmarks**:
+  - ClickBench EC2 (c6a.4xlarge, 100M-row full dataset): **62.48s vs
+    prior 63.22s** (-1.2% total). Zero regressions >10%; Q06 -5.9%,
+    Q34 -3.2% (recovery from prior session's high-side noise sample).
+  - JSONBench EC2 (m6i.8xlarge, 100M Bluesky events): **3.588s vs prior
+    3.632s** (-1.2%). Q4 -5.8% recovers from prior +7.5% (run noise).
+- **Correctness:** `make correctness` 999 passed / 3 skipped / 6 xfailed
+  (matches baseline). Unit: 501 pass on PG17 and PG18 (was 497).
+  Integration: 234 pass on PG17 and PG18.
+- **Perf opportunities surfaced:** none.
+
 ### 2026-05-16 — `src/scan/exec/append_wire.rs` — 222d2b6
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
