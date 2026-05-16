@@ -30,7 +30,7 @@ narration.
 
 ## Sessions
 
-### 2026-05-16 — `src/scan/hook.rs` — TBD
+### 2026-05-16 — `src/scan/hook.rs` — f902f7d
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
 `unsafe` audit deferred — almost all 85 blocks are PG FFI for planner
