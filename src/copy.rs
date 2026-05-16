@@ -13,18 +13,15 @@ use pgrx::prelude::*;
 
 use crate::catalog;
 use crate::compress::{
-    ColumnKind, ColumnMeta, TypedColumn,
-    PG_EPOCH_OFFSET_USEC,
-    build_companion_ddl, classify_column, compress_text_lengths, compress_typed_column,
-    compute_segment_blooms, compute_segment_ndistinct,
-    compute_typed_minmax, compute_typed_sum, compute_minmax_encoded_i64,
-    format_minmax_for_insert, init_typed_columns, is_text_data_type, new_typed_column,
-    new_worker_typed_column,
-    get_column_metadata, sort_typed_columns, supports_minmax, supports_sum,
+    ColumnKind, ColumnMeta, PG_EPOCH_OFFSET_USEC, TypedColumn, build_companion_ddl,
+    classify_column, compress_text_lengths, compress_typed_column, compute_minmax_encoded_i64,
+    compute_segment_blooms, compute_segment_ndistinct, compute_typed_minmax, compute_typed_sum,
+    format_minmax_for_insert, get_column_metadata, init_typed_columns, is_text_data_type,
+    new_typed_column, new_worker_typed_column, sort_typed_columns, supports_minmax, supports_sum,
 };
 use crate::copyparse::{
-    CopyLineReader, CopyTextOptions, HeaderMode, LineResult,
-    split_fields, split_field_offsets, parse_and_append, parse_raw_field_and_append,
+    CopyLineReader, CopyTextOptions, HeaderMode, LineResult, parse_and_append,
+    parse_raw_field_and_append, split_field_offsets, split_fields,
 };
 
 static PREV_PROCESS_UTILITY_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
@@ -141,10 +138,12 @@ fn restore_compressed_partition_stats() {
         let partitions: Vec<(String, String)> = rows
             .filter_map(|row| {
                 let s: Option<String> = row
-                    .get_datum_by_ordinal(1).ok()
+                    .get_datum_by_ordinal(1)
+                    .ok()
                     .and_then(|d| d.value().ok().flatten());
                 let t: Option<String> = row
-                    .get_datum_by_ordinal(2).ok()
+                    .get_datum_by_ordinal(2)
+                    .ok()
                     .and_then(|d| d.value().ok().flatten());
                 match (s, t) {
                     (Some(s), Some(t)) => Some((s, t)),
@@ -187,29 +186,43 @@ unsafe fn chain_to_prev(
     unsafe {
         let prev_ptr = PREV_PROCESS_UTILITY_HOOK.load(Ordering::SeqCst);
         if !prev_ptr.is_null() {
-            let prev_fn: pg_sys::ProcessUtility_hook_type = Some(
-                std::mem::transmute::<
-                    *mut (),
-                    unsafe extern "C-unwind" fn(
-                        *mut pg_sys::PlannedStmt,
-                        *const c_char,
-                        bool,
-                        pg_sys::ProcessUtilityContext::Type,
-                        pg_sys::ParamListInfo,
-                        *mut pg_sys::QueryEnvironment,
-                        *mut pg_sys::DestReceiver,
-                        *mut pg_sys::QueryCompletion,
-                    ),
-                >(prev_ptr),
-            );
+            let prev_fn: pg_sys::ProcessUtility_hook_type = Some(std::mem::transmute::<
+                *mut (),
+                unsafe extern "C-unwind" fn(
+                    *mut pg_sys::PlannedStmt,
+                    *const c_char,
+                    bool,
+                    pg_sys::ProcessUtilityContext::Type,
+                    pg_sys::ParamListInfo,
+                    *mut pg_sys::QueryEnvironment,
+                    *mut pg_sys::DestReceiver,
+                    *mut pg_sys::QueryCompletion,
+                ),
+            >(prev_ptr));
             if let Some(f) = prev_fn {
                 pg_guard_ffi_boundary(|| {
-                    f(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc)
+                    f(
+                        pstmt,
+                        query_string,
+                        read_only_tree,
+                        context,
+                        params,
+                        query_env,
+                        dest,
+                        qc,
+                    )
                 });
             }
         } else {
             pg_sys::standard_ProcessUtility(
-                pstmt, query_string, read_only_tree, context, params, query_env, dest, qc,
+                pstmt,
+                query_string,
+                read_only_tree,
+                context,
+                params,
+                query_env,
+                dest,
+                qc,
             );
         }
     }
@@ -241,7 +254,8 @@ unsafe extern "C-unwind" fn deltax_process_utility(
     // every table in its own machinery. Instead we flag the case and
     // restore our stats after the standard executor returns.
     let mut restore_stats_after_vacuum = false;
-    if !utility_stmt.is_null() && unsafe { pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_VacuumStmt) } {
+    if !utility_stmt.is_null() && unsafe { pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_VacuumStmt) }
+    {
         unsafe {
             let vstmt = utility_stmt as *mut pg_sys::VacuumStmt;
             if (*vstmt).rels.is_null() {
@@ -255,7 +269,16 @@ unsafe extern "C-unwind" fn deltax_process_utility(
 
     if utility_stmt.is_null() || !unsafe { pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_CopyStmt) } {
         unsafe {
-            chain_to_prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+            chain_to_prev(
+                pstmt,
+                query_string,
+                read_only_tree,
+                context,
+                params,
+                query_env,
+                dest,
+                qc,
+            );
         }
         if restore_stats_after_vacuum {
             restore_compressed_partition_stats();
@@ -269,7 +292,16 @@ unsafe extern "C-unwind" fn deltax_process_utility(
     // Only intercept COPY FROM (not COPY TO)
     if !cs.is_from {
         unsafe {
-            chain_to_prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+            chain_to_prev(
+                pstmt,
+                query_string,
+                read_only_tree,
+                context,
+                params,
+                query_env,
+                dest,
+                qc,
+            );
         }
         return;
     }
@@ -278,7 +310,16 @@ unsafe extern "C-unwind" fn deltax_process_utility(
     let (format_idx, is_csv) = find_deltax_format_option(cs.options);
     if format_idx < 0 {
         unsafe {
-            chain_to_prev(pstmt, query_string, read_only_tree, context, params, query_env, dest, qc);
+            chain_to_prev(
+                pstmt,
+                query_string,
+                read_only_tree,
+                context,
+                params,
+                query_env,
+                dest,
+                qc,
+            );
         }
         return;
     }
@@ -411,16 +452,68 @@ fn spi_exec(sql: &str) {
     });
 }
 
-/// Allocate a bytea varlena in palloc'd memory and return (Datum, pointer for pfree).
-/// The caller MUST pfree the pointer after SPI_execute_plan to avoid leaking memory.
-fn bytea_to_datum(data: &[u8]) -> (pg_sys::Datum, *mut std::ffi::c_void) {
+/// Allocate a bytea varlena in `CurrentMemoryContext` and return its Datum.
+/// Callers run under a temp context that gets reset/deleted, so the caller
+/// doesn't need to pfree explicitly.
+fn bytea_to_datum(data: &[u8]) -> pg_sys::Datum {
     unsafe {
         let len = data.len() + pg_sys::VARHDRSZ;
         let varlena = pg_sys::palloc(len) as *mut pg_sys::varlena;
         pgrx::set_varsize_4b(varlena, len as i32);
         let dest = pgrx::vardata_any(varlena as *const pg_sys::varlena) as *mut u8;
         std::ptr::copy_nonoverlapping(data.as_ptr(), dest, data.len());
-        (pg_sys::Datum::from(varlena as usize), varlena as *mut std::ffi::c_void)
+        pg_sys::Datum::from(varlena as usize)
+    }
+}
+
+/// Bulk-insert rows into a heap table using `heap_insert` (bypassing SPI).
+///
+/// Opens `oid` with RowExclusiveLock, creates a `BulkInsertState`, and feeds
+/// every item through `build_datums` under a freshly-created temporary
+/// memory context that is reset between rows so TOAST scratch allocations
+/// don't accumulate. `build_datums` returns one Datum slot per non-null
+/// column; this helper assumes no NULL values (all callers insert
+/// non-nullable rows). `ctx_name` is the debug name PG attaches to the
+/// per-row scratch context — keep it short.
+///
+/// # Safety
+/// Must be called on the PG backend thread (uses table_open/heap_insert).
+unsafe fn bulk_heap_insert<T, F>(
+    oid: pg_sys::Oid,
+    ctx_name: &CStr,
+    items: impl IntoIterator<Item = T>,
+    build_datums: F,
+) where
+    F: Fn(&T) -> Vec<pg_sys::Datum>,
+{
+    unsafe {
+        let insert_ctx = pg_sys::AllocSetContextCreateInternal(
+            pg_sys::CurrentMemoryContext,
+            ctx_name.as_ptr(),
+            pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
+            pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
+            pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
+        );
+        let rel = pg_sys::table_open(oid, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
+        let tupdesc = (*rel).rd_att;
+        let bistate = pg_sys::GetBulkInsertState();
+        let cid = pg_sys::GetCurrentCommandId(true);
+
+        for item in items {
+            let old_ctx = pg_sys::MemoryContextSwitchTo(insert_ctx);
+            let mut values = build_datums(&item);
+            let mut nulls = vec![false; values.len()];
+            let tuple = pg_sys::heap_form_tuple(tupdesc, values.as_mut_ptr(), nulls.as_mut_ptr());
+            pg_sys::heap_insert(rel, tuple, cid, 0, bistate);
+            pg_sys::heap_freetuple(tuple);
+            pg_sys::MemoryContextSwitchTo(old_ctx);
+            // Reset frees all TOAST temp allocations + our bytea copy for this row.
+            pg_sys::MemoryContextReset(insert_ctx);
+        }
+
+        pg_sys::FreeBulkInsertState(bistate);
+        pg_sys::table_close(rel, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
+        pg_sys::MemoryContextDelete(insert_ctx);
     }
 }
 
@@ -547,7 +640,67 @@ impl BackfillState {
     }
 }
 
-fn handle_copy_from_deltax_compress(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_csv: bool) {
+/// Companion blobs-table DDL (no PK; PK added in `finalize_partition`).
+fn create_blobs_table(fqn: &str) {
+    spi_exec(&format!(
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4)",
+        fqn
+    ));
+}
+
+/// Companion blooms-table DDL (no PK; PK added in `finalize_partition`).
+fn create_blooms_table(fqn: &str) {
+    spi_exec(&format!(
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _num_hashes SMALLINT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
+        fqn
+    ));
+}
+
+/// Companion text-lengths-table DDL (no PK; PK added in `finalize_partition`).
+fn create_text_lengths_table(fqn: &str) {
+    spi_exec(&format!(
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
+        fqn
+    ));
+}
+
+impl PartitionBuffer {
+    /// Cache the meta/colstats FQNs and the meta INSERT column list. Idempotent;
+    /// the column list is constant for a partition so building it once amortises
+    /// over every segment flush.
+    fn cache_companion_fqns(&mut self, columns: &[ColumnMeta]) {
+        if self.meta_fqn.is_some() && self.colstats_fqn.is_some() {
+            return;
+        }
+        let ddl = build_companion_ddl(&self.partition_table, columns);
+        if self.meta_fqn.is_none() {
+            self.meta_fqn = Some(ddl.meta_fqn);
+            let mut cols: Vec<String> = vec!["_segment_id".to_string()];
+            for col in columns {
+                if col.is_segment_by {
+                    cols.push(format!("\"{}\"", col.name));
+                }
+            }
+            for col in columns {
+                if col.is_time_column && !col.is_segment_by && supports_minmax(&col.data_type) {
+                    cols.push(format!("\"_min_{}\"", col.name));
+                    cols.push(format!("\"_max_{}\"", col.name));
+                }
+            }
+            cols.push("_row_count".to_string());
+            self.meta_insert_cols = Some(cols.join(", "));
+        }
+        if self.colstats_fqn.is_none() {
+            self.colstats_fqn = Some(ddl.colstats_fqn);
+        }
+    }
+}
+
+fn handle_copy_from_deltax_compress(
+    copy_stmt: *mut pg_sys::CopyStmt,
+    format_idx: i32,
+    is_csv: bool,
+) {
     // Bypass DML-on-compressed check for our companion table writes
     crate::scan::set_dml_bypass(true);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -631,69 +784,79 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_
     //    is freed before the long-running COPY loop starts.
     let (partitions, columns, kinds, time_col_index, order_col_indices, segment_size) =
         Spi::connect_mut(|client| {
-        let ht = catalog::get_deltatable(client, &schema, &table)
-            .expect("failed to query deltatable")
-            .unwrap_or_else(|| {
-                pgrx::error!(
-                    "pg_deltax: {}.{} is not a deltax table. Call deltax_create_table() first.",
-                    schema, table
-                );
-            });
+            let ht = catalog::get_deltatable(client, &schema, &table)
+                .expect("failed to query deltatable")
+                .unwrap_or_else(|| {
+                    pgrx::error!(
+                        "pg_deltax: {}.{} is not a deltax table. Call deltax_create_table() first.",
+                        schema,
+                        table
+                    );
+                });
 
-        if ht.order_by.is_empty() && ht.segment_by.is_empty() {
-            pgrx::error!(
-                "pg_deltax: compression not enabled on {}.{}. Call deltax_enable_compression() first.",
-                schema, table
+            if ht.order_by.is_empty() && ht.segment_by.is_empty() {
+                pgrx::error!(
+                    "pg_deltax: compression not enabled on {}.{}. Call deltax_enable_compression() first.",
+                    schema,
+                    table
+                );
+            }
+
+            // 3. Load partitions
+            let partitions =
+                catalog::get_partitions(client, ht.id).expect("failed to query partitions");
+
+            if partitions.is_empty() {
+                pgrx::error!("pg_deltax: no partitions found for {}.{}", schema, table);
+            }
+
+            // Get column metadata from the parent table, with any json_extract
+            // synthetic columns appended at the end.
+            let columns = get_column_metadata(
+                client,
+                &schema,
+                &table,
+                &ht.segment_by,
+                &ht.time_column,
+                ht.json_extract.as_ref(),
             );
-        }
+            if columns.is_empty() {
+                pgrx::error!("pg_deltax: no columns found for {}.{}", schema, table);
+            }
 
-        // 3. Load partitions
-        let partitions = catalog::get_partitions(client, ht.id)
-            .expect("failed to query partitions");
+            let kinds: Vec<ColumnKind> = columns
+                .iter()
+                .map(|c| classify_column(&c.data_type, c.is_segment_by))
+                .collect();
 
-        if partitions.is_empty() {
-            pgrx::error!("pg_deltax: no partitions found for {}.{}", schema, table);
-        }
+            // Find the time column index
+            let time_col_index = columns
+                .iter()
+                .position(|c| c.name == ht.time_column)
+                .unwrap_or_else(|| {
+                    pgrx::error!(
+                        "pg_deltax: time column '{}' not found in column metadata",
+                        ht.time_column
+                    );
+                });
+            // Build order_by column indices
+            let order_col_indices: Vec<usize> = ht
+                .order_by
+                .iter()
+                .filter_map(|name| columns.iter().position(|c| c.name == *name))
+                .collect();
 
-        // Get column metadata from the parent table, with any json_extract
-        // synthetic columns appended at the end.
-        let columns = get_column_metadata(
-            client,
-            &schema,
-            &table,
-            &ht.segment_by,
-            &ht.time_column,
-            ht.json_extract.as_ref(),
-        );
-        if columns.is_empty() {
-            pgrx::error!("pg_deltax: no columns found for {}.{}", schema, table);
-        }
+            let segment_size = ht.segment_size as usize;
 
-        let kinds: Vec<ColumnKind> = columns
-            .iter()
-            .map(|c| classify_column(&c.data_type, c.is_segment_by))
-            .collect();
-
-        // Find the time column index
-        let time_col_index = columns
-            .iter()
-            .position(|c| c.name == ht.time_column)
-            .unwrap_or_else(|| {
-                pgrx::error!(
-                    "pg_deltax: time column '{}' not found in column metadata",
-                    ht.time_column
-                );
-            });
-        // Build order_by column indices
-        let order_col_indices: Vec<usize> = ht.order_by
-            .iter()
-            .filter_map(|name| columns.iter().position(|c| c.name == *name))
-            .collect();
-
-        let segment_size = ht.segment_size as usize;
-
-        (partitions, columns, kinds, time_col_index, order_col_indices, segment_size)
-    });
+            (
+                partitions,
+                columns,
+                kinds,
+                time_col_index,
+                order_col_indices,
+                segment_size,
+            )
+        });
     // SPI connection is now closed — its memory context has been freed.
 
     // Build partition range arrays (in Unix epoch usec) for binary search
@@ -883,7 +1046,8 @@ fn parse_lines_worker(
         extract_targets.len()
     };
     let total_columns = kinds.len();
-    let mut partitions: Vec<Option<WorkerPartitionResult>> = (0..n_partitions).map(|_| None).collect();
+    let mut partitions: Vec<Option<WorkerPartitionResult>> =
+        (0..n_partitions).map(|_| None).collect();
     let mut field_offsets: Vec<(usize, usize)> = Vec::with_capacity(physical_count);
 
     for (row_idx, &(s, e)) in line_ranges.iter().enumerate() {
@@ -932,10 +1096,7 @@ fn parse_lines_worker(
             Some(idx) => idx,
             None => {
                 return Err(crate::copyparse::ParseError {
-                    message: format!(
-                        "timestamp {} does not fit any partition",
-                        time_usec
-                    ),
+                    message: format!("timestamp {} does not fit any partition", time_usec),
                     column: time_col_index,
                     line: line_number,
                 });
@@ -944,7 +1105,8 @@ fn parse_lines_worker(
 
         if is_compressed[part_idx] {
             return Err(crate::copyparse::ParseError {
-                message: "partition is already compressed. Decompress it first to load new data.".to_string(),
+                message: "partition is already compressed. Decompress it first to load new data."
+                    .to_string(),
                 column: 0,
                 line: line_number,
             });
@@ -954,7 +1116,8 @@ fn parse_lines_worker(
         // (jsonb_in is not thread-safe), so JSONB columns accumulate as Text
         // and the merge phase converts them to binary on the main thread.
         let wp = partitions[part_idx].get_or_insert_with(|| {
-            let typed_cols: Vec<TypedColumn> = kinds.iter().map(|k| new_worker_typed_column(*k)).collect();
+            let typed_cols: Vec<TypedColumn> =
+                kinds.iter().map(|k| new_worker_typed_column(*k)).collect();
             WorkerPartitionResult {
                 typed_cols,
                 row_count: 0,
@@ -1010,7 +1173,13 @@ fn handle_copy_from_file(
     let n_workers = crate::get_parallel_workers();
     if n_workers <= 1 {
         return handle_copy_from_file_sequential(
-            filename, opts, state, part_buffers, partitions, range_starts, range_ends,
+            filename,
+            opts,
+            state,
+            part_buffers,
+            partitions,
+            range_starts,
+            range_ends,
         );
     }
 
@@ -1059,10 +1228,7 @@ fn handle_copy_from_file(
     let is_compressed: Vec<bool> = partitions.iter().map(|p| p.is_compressed).collect();
     let n_partitions = part_buffers.len();
 
-    pgrx::notice!(
-        "pg_deltax: parallel COPY with {} workers",
-        n_workers
-    );
+    pgrx::notice!("pg_deltax: parallel COPY with {} workers", n_workers);
 
     loop {
         // Phase 1: Find all line boundaries (sequential, memchr-fast)
@@ -1105,9 +1271,16 @@ fn handle_copy_from_file(
                     if raw_fields.len() == num_columns {
                         line_reader.line_number += 1;
                         handle_trailing_line(
-                            &raw_fields, &opts, state, part_buffers, partitions,
-                            range_starts, range_ends, &mut last_part_idx,
-                            &mut total_rows, line_reader.line_number,
+                            &raw_fields,
+                            &opts,
+                            state,
+                            part_buffers,
+                            partitions,
+                            range_starts,
+                            range_ends,
+                            &mut last_part_idx,
+                            &mut total_rows,
+                            line_reader.line_number,
                         );
                     }
                 }
@@ -1160,29 +1333,31 @@ fn handle_copy_from_file(
                     })
                     .collect::<Vec<_>>()
                     .into_iter()
-                    .map(|h| h.join().unwrap_or_else(|payload| {
-                        // Surface the actual panic message rather than the
-                        // opaque `Any { .. }` Display impl on Box<dyn Any>.
-                        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                            (*s).to_string()
-                        } else if let Some(s) = payload.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "unknown panic payload".to_string()
-                        };
-                        Err(crate::copyparse::ParseError {
-                            message: format!("worker thread panicked: {}", msg),
-                            column: 0,
-                            line: 0,
+                    .map(|h| {
+                        h.join().unwrap_or_else(|payload| {
+                            // Surface the actual panic message rather than the
+                            // opaque `Any { .. }` Display impl on Box<dyn Any>.
+                            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                                (*s).to_string()
+                            } else if let Some(s) = payload.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic payload".to_string()
+                            };
+                            Err(crate::copyparse::ParseError {
+                                message: format!("worker thread panicked: {}", msg),
+                                column: 0,
+                                line: 0,
+                            })
                         })
-                    }))
+                    })
                     .collect()
             });
 
         parse_time_us += scan_time + t_parallel.elapsed().as_micros() as u64;
 
         // Phase 3: Merge + flush (sequential, on PG backend thread)
-        merge_and_flush_results(worker_results, part_buffers, state, &mut last_part_idx, &mut total_rows);
+        merge_and_flush_results(worker_results, part_buffers, state, &mut total_rows);
 
         // Drain consumed bytes
         if pos > 0 {
@@ -1205,9 +1380,16 @@ fn handle_copy_from_file(
                 if raw_fields.len() == num_columns {
                     line_reader.line_number += 1;
                     handle_trailing_line(
-                        &raw_fields, &opts, state, part_buffers, partitions,
-                        range_starts, range_ends, &mut last_part_idx,
-                        &mut total_rows, line_reader.line_number,
+                        &raw_fields,
+                        &opts,
+                        state,
+                        part_buffers,
+                        partitions,
+                        range_starts,
+                        range_ends,
+                        &mut last_part_idx,
+                        &mut total_rows,
+                        line_reader.line_number,
                     );
                 }
             }
@@ -1277,8 +1459,8 @@ fn handle_trailing_line(
         );
     }
 
-    if let Some(prev_idx) = last_part_idx
-        .filter(|&idx| idx != part_idx && !part_buffers[idx].blob_buffer.is_empty())
+    if let Some(prev_idx) =
+        last_part_idx.filter(|&idx| idx != part_idx && !part_buffers[idx].blob_buffer.is_empty())
     {
         flush_partition_blobs(&mut part_buffers[prev_idx], &state.columns);
     }
@@ -1301,7 +1483,9 @@ fn handle_trailing_line(
         ) {
             pgrx::error!(
                 "pg_deltax: parse error at line {}, column {}: {}",
-                e.line, e.column, e.message
+                e.line,
+                e.column,
+                e.message
             );
         }
     }
@@ -1330,7 +1514,6 @@ fn merge_and_flush_results(
     worker_results: Vec<Result<WorkerResult, crate::copyparse::ParseError>>,
     part_buffers: &mut [PartitionBuffer],
     state: &BackfillState,
-    _last_part_idx: &mut Option<usize>,
     total_rows: &mut i64,
 ) {
     for result in worker_results {
@@ -1357,9 +1540,11 @@ fn merge_and_flush_results(
                         (ColumnKind::Jsonb, TypedColumn::Text(texts)) => {
                             let bytes: Vec<Option<Vec<u8>>> = texts
                                 .into_iter()
-                                .map(|opt| opt.map(|s| unsafe {
-                                    crate::compress::jsonb_text_to_binary(&s)
-                                }))
+                                .map(|opt| {
+                                    opt.map(|s| unsafe {
+                                        crate::compress::jsonb_text_to_binary(&s)
+                                    })
+                                })
                                 .collect();
                             TypedColumn::Bytes(bytes)
                         }
@@ -1441,7 +1626,11 @@ fn handle_copy_from_file_sequential(
 
                 let line_start = s;
                 let line_end = e;
-                split_field_offsets(&buf[line_start..line_end], opts.delimiter, &mut field_offsets);
+                split_field_offsets(
+                    &buf[line_start..line_end],
+                    opts.delimiter,
+                    &mut field_offsets,
+                );
 
                 if field_offsets.len() != num_columns {
                     pgrx::error!(
@@ -1462,10 +1651,16 @@ fn handle_copy_from_file_sequential(
                 }
                 let time_str = if memchr::memchr(b'\\', time_raw).is_none() {
                     std::str::from_utf8(time_raw).unwrap_or_else(|_| {
-                        pgrx::error!("pg_deltax: invalid UTF-8 in time column at line {}", line_reader.line_number);
+                        pgrx::error!(
+                            "pg_deltax: invalid UTF-8 in time column at line {}",
+                            line_reader.line_number
+                        );
                     })
                 } else {
-                    pgrx::error!("pg_deltax: unexpected escape in time column at line {}", line_reader.line_number);
+                    pgrx::error!(
+                        "pg_deltax: unexpected escape in time column at line {}",
+                        line_reader.line_number
+                    );
                 };
                 let time_usec = crate::timeparse::parse_timestamp_to_usec(time_str);
 
@@ -1487,7 +1682,9 @@ fn handle_copy_from_file_sequential(
                     );
                 }
 
-                if let Some(prev_idx) = last_part_idx.filter(|&idx| idx != part_idx && !part_buffers[idx].blob_buffer.is_empty()) {
+                if let Some(prev_idx) = last_part_idx
+                    .filter(|&idx| idx != part_idx && !part_buffers[idx].blob_buffer.is_empty())
+                {
                     flush_partition_blobs(&mut part_buffers[prev_idx], &state.columns);
                 }
                 last_part_idx = Some(part_idx);
@@ -1559,9 +1756,16 @@ fn handle_copy_from_file_sequential(
                         if raw_fields.len() == num_columns {
                             line_reader.line_number += 1;
                             handle_trailing_line(
-                                &raw_fields, &opts, state, part_buffers, partitions,
-                                range_starts, range_ends, &mut last_part_idx,
-                                &mut total_rows, line_reader.line_number,
+                                &raw_fields,
+                                &opts,
+                                state,
+                                part_buffers,
+                                partitions,
+                                range_starts,
+                                range_ends,
+                                &mut last_part_idx,
+                                &mut total_rows,
+                                line_reader.line_number,
                             );
                         }
                     }
@@ -1657,9 +1861,8 @@ fn handle_copy_from_legacy(
 
     loop {
         let t_parse = std::time::Instant::now();
-        let has_row = unsafe {
-            pg_sys::NextCopyFromRawFields(cstate, &mut raw_fields, &mut nfields)
-        };
+        let has_row =
+            unsafe { pg_sys::NextCopyFromRawFields(cstate, &mut raw_fields, &mut nfields) };
         parse_time_us += t_parse.elapsed().as_micros() as u64;
 
         if !has_row {
@@ -1688,7 +1891,10 @@ fn handle_copy_from_legacy(
                 );
             }
             CStr::from_ptr(ptr).to_str().unwrap_or_else(|_| {
-                pgrx::error!("pg_deltax: invalid UTF-8 in time column at line {}", line_number);
+                pgrx::error!(
+                    "pg_deltax: invalid UTF-8 in time column at line {}",
+                    line_number
+                );
             })
         };
         let time_usec = crate::timeparse::parse_timestamp_to_usec(time_str);
@@ -1711,7 +1917,9 @@ fn handle_copy_from_legacy(
             );
         }
 
-        if let Some(prev_idx) = last_part_idx.filter(|&idx| idx != part_idx && !part_buffers[idx].blob_buffer.is_empty()) {
+        if let Some(prev_idx) = last_part_idx
+            .filter(|&idx| idx != part_idx && !part_buffers[idx].blob_buffer.is_empty())
+        {
             flush_partition_blobs(&mut part_buffers[prev_idx], &state.columns);
         }
         last_part_idx = Some(part_idx);
@@ -1727,7 +1935,8 @@ fn handle_copy_from_legacy(
                     Some(CStr::from_ptr(ptr).to_str().unwrap_or_else(|_| {
                         pgrx::error!(
                             "pg_deltax: invalid UTF-8 in column {} at line {}",
-                            i, line_number
+                            i,
+                            line_number
                         );
                     }))
                 }
@@ -1802,6 +2011,76 @@ fn build_text_length_blob(col: &TypedColumn, data_type: &str) -> Option<Vec<u8>>
     }
 }
 
+/// Compress one column and gather its per-segment stats. Pure Rust (no PG
+/// calls), safe to invoke from worker threads.
+fn compress_one_col(
+    col_idx: u16,
+    col_i: usize,
+    typed_cols: &[TypedColumn],
+    columns: &[ColumnMeta],
+) -> ColResult {
+    let col = &columns[col_i];
+    let compressed = compress_typed_column(&typed_cols[col_i], &col.data_type);
+    let (min_val, max_val) = if supports_minmax(&col.data_type) {
+        compute_typed_minmax(&typed_cols[col_i], &col.data_type)
+    } else {
+        (None, None)
+    };
+    let (sum_val, nonnull_count, nonzero_count) = if supports_sum(&col.data_type) {
+        compute_typed_sum(&typed_cols[col_i])
+    } else {
+        (None, 0, 0)
+    };
+    let text_length_blob = build_text_length_blob(&typed_cols[col_i], &col.data_type);
+    ColResult {
+        col_idx,
+        col_i,
+        compressed,
+        min_val,
+        max_val,
+        sum_val,
+        nonnull_count,
+        nonzero_count,
+        text_length_blob,
+    }
+}
+
+/// Compress every non-segment-by column in parallel when worth it; fall
+/// back to single-threaded when `n_workers <= 1` or there's a single column.
+fn parallel_compress_cols(
+    non_segby: &[(u16, usize)],
+    typed_cols: &[TypedColumn],
+    columns: &[ColumnMeta],
+    n_workers: usize,
+) -> Vec<ColResult> {
+    if n_workers > 1 && non_segby.len() > 1 {
+        let chunk_size = non_segby.len().div_ceil(n_workers);
+        std::thread::scope(|s| {
+            non_segby
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|&(col_idx, col_i)| {
+                                compress_one_col(col_idx, col_i, typed_cols, columns)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        })
+    } else {
+        non_segby
+            .iter()
+            .map(|&(col_idx, col_i)| compress_one_col(col_idx, col_i, typed_cols, columns))
+            .collect()
+    }
+}
+
 /// Per-column compression result produced by worker threads.
 struct ColResult {
     col_idx: u16,
@@ -1822,7 +2101,7 @@ struct CompressedSegment {
     partition_idx: usize,
     seg_id: i32,
     row_count: usize,
-    blobs: Vec<(u16, Vec<u8>)>,      // (col_idx, compressed_data)
+    blobs: Vec<(u16, Vec<u8>)>,             // (col_idx, compressed_data)
     bloom_entries: Vec<(u16, u8, Vec<u8>)>, // (col_idx, num_hashes, bytes); empty if blooms disabled
     /// Per-text-column length sidecars (col_idx, length_blob).
     text_length_blobs: Vec<(u16, Vec<u8>)>,
@@ -1830,8 +2109,8 @@ struct CompressedSegment {
     /// Encoded into bitmaps in `finalize_partition` once the partition-level
     /// value list is finalized.
     valbitmap_value_sets: Vec<(u16, Vec<String>)>,
-    meta_values_csv: String,          // pre-formatted VALUES clause for thin meta
-    colstats_rows_csv: Vec<String>,   // pre-formatted VALUES tuples, one per non-segment-by column
+    meta_values_csv: String, // pre-formatted VALUES clause for thin meta
+    colstats_rows_csv: Vec<String>, // pre-formatted VALUES tuples, one per non-segment-by column
     total_compressed_size: i64,
 }
 
@@ -1873,62 +2152,15 @@ fn compress_segment(
         let mut col_idx: u16 = 0;
         let mut result = Vec::new();
         for (i, col) in columns.iter().enumerate() {
-            if col.is_segment_by { continue; }
+            if col.is_segment_by {
+                continue;
+            }
             result.push((col_idx, i));
             col_idx += 1;
         }
         result
     };
-    let col_results: Vec<ColResult> = if n_workers > 1 && non_segby.len() > 1 {
-        let chunk_size = non_segby.len().div_ceil(n_workers);
-        let typed_cols_ref = &typed_cols;
-        let columns_ref = columns;
-        std::thread::scope(|s| {
-            non_segby
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    s.spawn(move || {
-                        chunk.iter().map(|&(col_idx, col_i)| {
-                            let col = &columns_ref[col_i];
-                            let compressed = compress_typed_column(&typed_cols_ref[col_i], &col.data_type);
-                            let (min_val, max_val) = if supports_minmax(&col.data_type) {
-                                compute_typed_minmax(&typed_cols_ref[col_i], &col.data_type)
-                            } else {
-                                (None, None)
-                            };
-                            let (sum_val, nonnull_count, nonzero_count) = if supports_sum(&col.data_type) {
-                                compute_typed_sum(&typed_cols_ref[col_i])
-                            } else {
-                                (None, 0, 0)
-                            };
-                            let text_length_blob = build_text_length_blob(&typed_cols_ref[col_i], &col.data_type);
-                            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count, text_length_blob }
-                        }).collect::<Vec<_>>()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .flat_map(|h| h.join().unwrap())
-                .collect()
-        })
-    } else {
-        non_segby.iter().map(|&(col_idx, col_i)| {
-            let col = &columns[col_i];
-            let compressed = compress_typed_column(&typed_cols[col_i], &col.data_type);
-            let (min_val, max_val) = if supports_minmax(&col.data_type) {
-                compute_typed_minmax(&typed_cols[col_i], &col.data_type)
-            } else {
-                (None, None)
-            };
-            let (sum_val, nonnull_count, nonzero_count) = if supports_sum(&col.data_type) {
-                compute_typed_sum(&typed_cols[col_i])
-            } else {
-                (None, 0, 0)
-            };
-            let text_length_blob = build_text_length_blob(&typed_cols[col_i], &col.data_type);
-            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count, text_length_blob }
-        }).collect()
-    };
+    let col_results = parallel_compress_cols(&non_segby, &typed_cols, columns, n_workers);
 
     // Build blobs and meta
     let mut total_size: i64 = 0;
@@ -1945,7 +2177,10 @@ fn compress_segment(
             col_minmax.insert(cr.col_i, (cr.min_val.clone(), cr.max_val.clone()));
         }
         if supports_sum(&columns[cr.col_i].data_type) {
-            col_sums.insert(cr.col_i, (cr.sum_val.clone(), cr.nonnull_count, cr.nonzero_count));
+            col_sums.insert(
+                cr.col_i,
+                (cr.sum_val.clone(), cr.nonnull_count, cr.nonzero_count),
+            );
         }
     }
     for cr in col_results {
@@ -2009,7 +2244,11 @@ fn compress_segment(
             ("NULL".to_string(), 0, 0)
         };
 
-        let nd = if nd_idx < ndistinct.len() { ndistinct[nd_idx] } else { 0 };
+        let nd = if nd_idx < ndistinct.len() {
+            ndistinct[nd_idx]
+        } else {
+            0
+        };
         nd_idx += 1;
 
         colstats_rows_csv.push(format!(
@@ -2044,10 +2283,7 @@ fn compress_segment(
 }
 
 /// Flush a full segment from a partition buffer, using parallel compression.
-fn flush_segment(
-    buf: &mut PartitionBuffer,
-    state: &BackfillState,
-) {
+fn flush_segment(buf: &mut PartitionBuffer, state: &BackfillState) {
     let t_start = std::time::Instant::now();
 
     // Ensure companion tables exist (created together on first segment).
@@ -2057,15 +2293,9 @@ fn flush_segment(
         let ddl = build_companion_ddl(&buf.partition_table, &state.columns);
         spi_exec(&ddl.meta_ddl);
         spi_exec(&ddl.colstats_ddl);
-        spi_exec(&format!(
-            "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4)",
-            ddl.blobs_fqn
-        ));
+        create_blobs_table(&ddl.blobs_fqn);
         if crate::BLOOM_FILTERS.get() {
-            spi_exec(&format!(
-                "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _num_hashes SMALLINT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
-                ddl.blooms_fqn
-            ));
+            create_blooms_table(&ddl.blooms_fqn);
         }
         buf.meta_table_created = true;
         buf.blobs_table_created = true;
@@ -2076,13 +2306,12 @@ fn flush_segment(
     sort_typed_columns(&mut buf.typed_cols, &state.order_col_indices, buf.row_count);
     let sort_ms = t_sort_start.elapsed().as_millis();
 
-    let companion_ddl = build_companion_ddl(&buf.partition_table, &state.columns);
-
     // Compute ndistinct
     let (ndistinct, _hll_sketches) = compute_segment_ndistinct(&buf.typed_cols, &state.columns);
 
     // Segment_by values from the buffered data (extract from first row if present)
-    let seg_values: Vec<Option<String>> = state.columns
+    let seg_values: Vec<Option<String>> = state
+        .columns
         .iter()
         .enumerate()
         .filter(|(_, c)| c.is_segment_by)
@@ -2115,59 +2344,8 @@ fn flush_segment(
     // Parallel compression: distribute columns across workers
     let t_compress_start = std::time::Instant::now();
     let n_workers = crate::get_parallel_workers();
-    let typed_cols_ref = &buf.typed_cols;
-    let columns_ref = &state.columns;
-
-    let col_results: Vec<ColResult> = if n_workers > 1 && non_segby.len() > 1 {
-        let chunk_size = non_segby.len().div_ceil(n_workers);
-        std::thread::scope(|s| {
-            non_segby
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    s.spawn(move || {
-                        chunk.iter().map(|&(col_idx, col_i)| {
-                            let col = &columns_ref[col_i];
-                            let compressed = compress_typed_column(&typed_cols_ref[col_i], &col.data_type);
-                            let (min_val, max_val) = if supports_minmax(&col.data_type) {
-                                compute_typed_minmax(&typed_cols_ref[col_i], &col.data_type)
-                            } else {
-                                (None, None)
-                            };
-                            let (sum_val, nonnull_count, nonzero_count) = if supports_sum(&col.data_type) {
-                                compute_typed_sum(&typed_cols_ref[col_i])
-                            } else {
-                                (None, 0, 0)
-                            };
-                            let text_length_blob = build_text_length_blob(&typed_cols_ref[col_i], &col.data_type);
-                            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count, text_length_blob }
-                        }).collect::<Vec<_>>()
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .flat_map(|h| h.join().unwrap())
-                .collect()
-        })
-    } else {
-        // Single-threaded fallback
-        non_segby.iter().map(|&(col_idx, col_i)| {
-            let col = &columns_ref[col_i];
-            let compressed = compress_typed_column(&typed_cols_ref[col_i], &col.data_type);
-            let (min_val, max_val) = if supports_minmax(&col.data_type) {
-                compute_typed_minmax(&typed_cols_ref[col_i], &col.data_type)
-            } else {
-                (None, None)
-            };
-            let (sum_val, nonnull_count, nonzero_count) = if supports_sum(&col.data_type) {
-                compute_typed_sum(&typed_cols_ref[col_i])
-            } else {
-                (None, 0, 0)
-            };
-            let text_length_blob = build_text_length_blob(&typed_cols_ref[col_i], &col.data_type);
-            ColResult { col_idx, col_i, compressed, min_val, max_val, sum_val, nonnull_count, nonzero_count, text_length_blob }
-        }).collect()
-    };
-
+    let col_results =
+        parallel_compress_cols(&non_segby, &buf.typed_cols, &state.columns, n_workers);
     let compress_ms = t_compress_start.elapsed().as_millis();
 
     // Build meta INSERT SQL on main thread
@@ -2188,7 +2366,10 @@ fn flush_segment(
             col_minmax.insert(cr.col_i, (cr.min_val.clone(), cr.max_val.clone()));
         }
         if supports_sum(&state.columns[cr.col_i].data_type) {
-            col_sums.insert(cr.col_i, (cr.sum_val.clone(), cr.nonnull_count, cr.nonzero_count));
+            col_sums.insert(
+                cr.col_i,
+                (cr.sum_val.clone(), cr.nonnull_count, cr.nonzero_count),
+            );
         }
     }
     for cr in col_results {
@@ -2253,7 +2434,11 @@ fn flush_segment(
             ("NULL".to_string(), 0, 0)
         };
 
-        let nd = if nd_idx < ndistinct.len() { ndistinct[nd_idx] } else { 0 };
+        let nd = if nd_idx < ndistinct.len() {
+            ndistinct[nd_idx]
+        } else {
+            0
+        };
         nd_idx += 1;
 
         colstats_rows_csv.push(format!(
@@ -2270,31 +2455,11 @@ fn flush_segment(
     };
 
     // Cache table names and column lists (same for every segment of this partition)
-    if buf.meta_fqn.is_none() {
-        buf.meta_fqn = Some(companion_ddl.meta_fqn.clone());
-
-        let mut cols = Vec::new();
-        cols.push("_segment_id".to_string());
-        for col in &state.columns {
-            if col.is_segment_by {
-                cols.push(format!("\"{}\"", col.name));
-            }
-        }
-        for col in &state.columns {
-            if col.is_time_column && !col.is_segment_by && supports_minmax(&col.data_type) {
-                cols.push(format!("\"_min_{}\"", col.name));
-                cols.push(format!("\"_max_{}\"", col.name));
-            }
-        }
-        cols.push("_row_count".to_string());
-        buf.meta_insert_cols = Some(cols.join(", "));
-    }
-    if buf.colstats_fqn.is_none() {
-        buf.colstats_fqn = Some(companion_ddl.colstats_fqn.clone());
-    }
+    buf.cache_companion_fqns(&state.columns);
 
     // Buffer the VALUES rows
-    buf.meta_insert_rows.push(format!("({})", meta_vals.join(", ")));
+    buf.meta_insert_rows
+        .push(format!("({})", meta_vals.join(", ")));
     for row in colstats_rows_csv {
         buf.colstats_insert_rows.push(row);
     }
@@ -2319,10 +2484,8 @@ fn flush_segment(
     for (col_idx, length_blob) in length_blobs {
         buf.text_length_buffer.push((col_idx, seg_id, length_blob));
     }
-    let vb_values = crate::compress::compute_segment_valbitmap_values(
-        &buf.typed_cols,
-        &state.columns,
-    );
+    let vb_values =
+        crate::compress::compute_segment_valbitmap_values(&buf.typed_cols, &state.columns);
     for (col_idx, vals) in vb_values {
         buf.valbitmap_value_buffer.push((col_idx, seg_id, vals));
     }
@@ -2340,8 +2503,13 @@ fn flush_segment(
     if buf.next_segment_id % 100 == 0 || did_flush_blobs {
         pgrx::notice!(
             "pg_deltax: segment timing: sort={}ms compress={}ms meta={}ms blob_flush={}ms total={}ms (workers={}, {} rows)",
-            sort_ms, compress_ms, meta_ms, blob_flush_ms, total_ms,
-            n_workers, buf.row_count
+            sort_ms,
+            compress_ms,
+            meta_ms,
+            blob_flush_ms,
+            total_ms,
+            n_workers,
+            buf.row_count
         );
     }
 
@@ -2357,7 +2525,10 @@ fn flush_segment(
 fn flush_meta_buffer(buf: &mut PartitionBuffer) {
     if !buf.meta_insert_rows.is_empty() {
         let meta_fqn = buf.meta_fqn.as_ref().expect("meta_fqn not set");
-        let cols = buf.meta_insert_cols.as_ref().expect("meta_insert_cols not set");
+        let cols = buf
+            .meta_insert_cols
+            .as_ref()
+            .expect("meta_insert_cols not set");
         let insert_sql = format!(
             "INSERT INTO {} ({}) VALUES {}",
             meta_fqn,
@@ -2407,11 +2578,11 @@ fn flush_colstats_buffer(buf: &mut PartitionBuffer) {
 /// Called when the COPY loop moves to a different partition (for time-sorted data),
 /// or at end-of-COPY for remaining buffers. This keeps peak memory bounded to
 /// one partition's worth of compressed blobs at a time.
-fn flush_partition_blobs(
-    buf: &mut PartitionBuffer,
-    columns: &[ColumnMeta],
-) {
-    if buf.blob_buffer.is_empty() && buf.bloom_buffer.is_empty() && buf.text_length_buffer.is_empty() {
+fn flush_partition_blobs(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
+    if buf.blob_buffer.is_empty()
+        && buf.bloom_buffer.is_empty()
+        && buf.text_length_buffer.is_empty()
+    {
         return;
     }
 
@@ -2428,183 +2599,93 @@ fn flush_partition_blobs(
 
     // Create tables without PK for fast heap_insert (PK added in finalize_partition)
     if !buf.blobs_table_created {
-        spi_exec(&format!(
-            "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4)",
-            blobs_fqn
-        ));
+        create_blobs_table(blobs_fqn);
         if crate::BLOOM_FILTERS.get() {
-            spi_exec(&format!(
-                "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _num_hashes SMALLINT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
-                blooms_fqn
-            ));
+            create_blooms_table(blooms_fqn);
         }
         buf.blobs_table_created = true;
     }
     if !buf.text_lengths_table_created && !buf.text_length_buffer.is_empty() {
-        spi_exec(&format!(
-            "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
-            text_lengths_fqn
-        ));
+        create_text_lengths_table(text_lengths_fqn);
         buf.text_lengths_table_created = true;
     }
 
-    // Sort blobs column-major (col_idx, segment_id) for sequential TOAST I/O on read
-    buf.blob_buffer.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
+    // Use direct heap_insert bypassing SPI entirely. This avoids per-INSERT
+    // executor overhead, plan caching, and catalog cache bloat. BulkInsertState
+    // uses a ring buffer to avoid polluting shared_buffers. A per-row temp
+    // context (created inside `bulk_heap_insert`) bounds memory: heap_insert
+    // calls toast_insert_or_update which palloc's compressed copies in
+    // CurrentMemoryContext; without resetting between rows these accumulate
+    // for the entire transaction (~30 GB on ClickBench).
 
-    // Use direct heap_insert bypassing SPI entirely.
-    // This avoids per-INSERT executor overhead, plan caching, and catalog cache bloat.
-    // BulkInsertState uses a ring buffer to avoid polluting shared_buffers.
+    // Sort blobs column-major (col_idx, segment_id) for sequential TOAST I/O on read.
     if !buf.blob_buffer.is_empty() {
-        let blobs_oid = *buf.blobs_oid_cached.get_or_insert_with(|| resolve_relation_oid(blobs_fqn));
+        buf.blob_buffer
+            .sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
+        let blobs_oid = *buf
+            .blobs_oid_cached
+            .get_or_insert_with(|| resolve_relation_oid(blobs_fqn));
+        let drained: Vec<_> = buf.blob_buffer.drain(..).collect();
         unsafe {
-            // Create a temporary memory context for TOAST processing.
-            // heap_insert internally calls toast_insert_or_update which palloc's
-            // compressed copies and intermediate buffers in CurrentMemoryContext.
-            // Without resetting, these accumulate for the entire transaction (~30GB for ClickBench).
-            let insert_ctx = pg_sys::AllocSetContextCreateInternal(
-                pg_sys::CurrentMemoryContext,
-                c"direct_backfill_insert".as_ptr(),
-                pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
-                pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
-                pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
+            bulk_heap_insert(
+                blobs_oid,
+                c"direct_backfill_insert",
+                drained,
+                |(col_idx, seg_id, blob)| {
+                    vec![
+                        pg_sys::Datum::from(*col_idx as i16),
+                        pg_sys::Datum::from(*seg_id),
+                        bytea_to_datum(blob),
+                    ]
+                },
             );
-
-            let rel = pg_sys::table_open(blobs_oid, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
-            let tupdesc = (*rel).rd_att;
-            let bistate = pg_sys::GetBulkInsertState();
-            let cid = pg_sys::GetCurrentCommandId(true);
-
-            for (col_idx, seg_id, blob) in buf.blob_buffer.drain(..) {
-                let old_ctx = pg_sys::MemoryContextSwitchTo(insert_ctx);
-
-                let (bytea_datum, _) = bytea_to_datum(&blob);
-                drop(blob);
-
-                let mut values: [pg_sys::Datum; 3] = [
-                    pg_sys::Datum::from(col_idx as i16),
-                    pg_sys::Datum::from(seg_id),
-                    bytea_datum,
-                ];
-                let mut nulls: [bool; 3] = [false, false, false];
-
-                let tuple = pg_sys::heap_form_tuple(
-                    tupdesc,
-                    values.as_mut_ptr(),
-                    nulls.as_mut_ptr(),
-                );
-                pg_sys::heap_insert(rel, tuple, cid, 0, bistate);
-                pg_sys::heap_freetuple(tuple);
-
-                // Switch back and reset: frees all TOAST temp allocations + our bytea copy
-                pg_sys::MemoryContextSwitchTo(old_ctx);
-                pg_sys::MemoryContextReset(insert_ctx);
-            }
-
-            pg_sys::FreeBulkInsertState(bistate);
-            pg_sys::table_close(rel, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
-            pg_sys::MemoryContextDelete(insert_ctx);
         }
     }
 
-    // Blooms: same approach with per-insert context reset
     if !buf.bloom_buffer.is_empty() {
-        // Sort column-major for sequential TOAST I/O on read
-        buf.bloom_buffer.sort_by_key(|&(col_idx, seg_id, _, _)| (col_idx, seg_id));
-
-        let blooms_oid = *buf.blooms_oid_cached.get_or_insert_with(|| resolve_relation_oid(blooms_fqn));
+        buf.bloom_buffer
+            .sort_by_key(|&(col_idx, seg_id, _, _)| (col_idx, seg_id));
+        let blooms_oid = *buf
+            .blooms_oid_cached
+            .get_or_insert_with(|| resolve_relation_oid(blooms_fqn));
+        let drained: Vec<_> = buf.bloom_buffer.drain(..).collect();
         unsafe {
-            let insert_ctx = pg_sys::AllocSetContextCreateInternal(
-                pg_sys::CurrentMemoryContext,
-                c"direct_backfill_bloom_insert".as_ptr(),
-                pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
-                pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
-                pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
+            bulk_heap_insert(
+                blooms_oid,
+                c"direct_backfill_bloom_insert",
+                drained,
+                |(col_idx, seg_id, num_hashes, bytes)| {
+                    vec![
+                        pg_sys::Datum::from(*col_idx as i16),
+                        pg_sys::Datum::from(*seg_id),
+                        pg_sys::Datum::from(*num_hashes as i16),
+                        bytea_to_datum(bytes),
+                    ]
+                },
             );
-
-            let rel = pg_sys::table_open(blooms_oid, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
-            let tupdesc = (*rel).rd_att;
-            let bistate = pg_sys::GetBulkInsertState();
-            let cid = pg_sys::GetCurrentCommandId(true);
-
-            for (col_idx, seg_id, num_hashes, bloom_data) in buf.bloom_buffer.drain(..) {
-                let old_ctx = pg_sys::MemoryContextSwitchTo(insert_ctx);
-
-                let (bytea_datum, _) = bytea_to_datum(&bloom_data);
-                drop(bloom_data);
-
-                let mut values: [pg_sys::Datum; 4] = [
-                    pg_sys::Datum::from(col_idx as i16),
-                    pg_sys::Datum::from(seg_id),
-                    pg_sys::Datum::from(num_hashes as i16),
-                    bytea_datum,
-                ];
-                let mut nulls: [bool; 4] = [false, false, false, false];
-
-                let tuple = pg_sys::heap_form_tuple(
-                    tupdesc,
-                    values.as_mut_ptr(),
-                    nulls.as_mut_ptr(),
-                );
-                pg_sys::heap_insert(rel, tuple, cid, 0, bistate);
-                pg_sys::heap_freetuple(tuple);
-
-                pg_sys::MemoryContextSwitchTo(old_ctx);
-                pg_sys::MemoryContextReset(insert_ctx);
-            }
-
-            pg_sys::FreeBulkInsertState(bistate);
-            pg_sys::table_close(rel, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
-            pg_sys::MemoryContextDelete(insert_ctx);
         }
     }
 
-    // Text-length sidecars: same direct heap_insert pattern as blobs.
     if !buf.text_length_buffer.is_empty() {
-        buf.text_length_buffer.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
-
-        let text_lengths_oid = *buf.text_lengths_oid_cached.get_or_insert_with(|| resolve_relation_oid(text_lengths_fqn));
+        buf.text_length_buffer
+            .sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
+        let text_lengths_oid = *buf
+            .text_lengths_oid_cached
+            .get_or_insert_with(|| resolve_relation_oid(text_lengths_fqn));
+        let drained: Vec<_> = buf.text_length_buffer.drain(..).collect();
         unsafe {
-            let insert_ctx = pg_sys::AllocSetContextCreateInternal(
-                pg_sys::CurrentMemoryContext,
-                c"direct_backfill_text_lengths_insert".as_ptr(),
-                pg_sys::ALLOCSET_DEFAULT_MINSIZE as usize,
-                pg_sys::ALLOCSET_DEFAULT_INITSIZE as usize,
-                pg_sys::ALLOCSET_DEFAULT_MAXSIZE as usize,
+            bulk_heap_insert(
+                text_lengths_oid,
+                c"direct_backfill_text_lengths_insert",
+                drained,
+                |(col_idx, seg_id, length_blob)| {
+                    vec![
+                        pg_sys::Datum::from(*col_idx as i16),
+                        pg_sys::Datum::from(*seg_id),
+                        bytea_to_datum(length_blob),
+                    ]
+                },
             );
-
-            let rel = pg_sys::table_open(text_lengths_oid, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
-            let tupdesc = (*rel).rd_att;
-            let bistate = pg_sys::GetBulkInsertState();
-            let cid = pg_sys::GetCurrentCommandId(true);
-
-            for (col_idx, seg_id, length_blob) in buf.text_length_buffer.drain(..) {
-                let old_ctx = pg_sys::MemoryContextSwitchTo(insert_ctx);
-
-                let (bytea_datum, _) = bytea_to_datum(&length_blob);
-                drop(length_blob);
-
-                let mut values: [pg_sys::Datum; 3] = [
-                    pg_sys::Datum::from(col_idx as i16),
-                    pg_sys::Datum::from(seg_id),
-                    bytea_datum,
-                ];
-                let mut nulls: [bool; 3] = [false, false, false];
-
-                let tuple = pg_sys::heap_form_tuple(
-                    tupdesc,
-                    values.as_mut_ptr(),
-                    nulls.as_mut_ptr(),
-                );
-                pg_sys::heap_insert(rel, tuple, cid, 0, bistate);
-                pg_sys::heap_freetuple(tuple);
-
-                pg_sys::MemoryContextSwitchTo(old_ctx);
-                pg_sys::MemoryContextReset(insert_ctx);
-            }
-
-            pg_sys::FreeBulkInsertState(bistate);
-            pg_sys::table_close(rel, pg_sys::RowExclusiveLock as pg_sys::LOCKMODE);
-            pg_sys::MemoryContextDelete(insert_ctx);
         }
     }
 
@@ -2630,48 +2711,20 @@ fn write_compressed_segment(
         let ddl = build_companion_ddl(&buf.partition_table, &state.columns);
         spi_exec(&ddl.meta_ddl);
         spi_exec(&ddl.colstats_ddl);
-        spi_exec(&format!(
-            "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4)",
-            ddl.blobs_fqn
-        ));
+        create_blobs_table(&ddl.blobs_fqn);
         if crate::BLOOM_FILTERS.get() {
-            spi_exec(&format!(
-                "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _num_hashes SMALLINT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
-                ddl.blooms_fqn
-            ));
+            create_blooms_table(&ddl.blooms_fqn);
         }
         buf.meta_table_created = true;
         buf.blobs_table_created = true;
     }
 
     // Cache meta and colstats column lists
-    if buf.meta_fqn.is_none() {
-        let ddl = build_companion_ddl(&buf.partition_table, &state.columns);
-        buf.meta_fqn = Some(ddl.meta_fqn);
-
-        let mut cols = Vec::new();
-        cols.push("_segment_id".to_string());
-        for col in &state.columns {
-            if col.is_segment_by {
-                cols.push(format!("\"{}\"", col.name));
-            }
-        }
-        for col in &state.columns {
-            if col.is_time_column && !col.is_segment_by && supports_minmax(&col.data_type) {
-                cols.push(format!("\"_min_{}\"", col.name));
-                cols.push(format!("\"_max_{}\"", col.name));
-            }
-        }
-        cols.push("_row_count".to_string());
-        buf.meta_insert_cols = Some(cols.join(", "));
-    }
-    if buf.colstats_fqn.is_none() {
-        let ddl = build_companion_ddl(&buf.partition_table, &state.columns);
-        buf.colstats_fqn = Some(ddl.colstats_fqn);
-    }
+    buf.cache_companion_fqns(&state.columns);
 
     // Buffer meta and colstats rows
-    buf.meta_insert_rows.push(format!("({})", cs.meta_values_csv));
+    buf.meta_insert_rows
+        .push(format!("({})", cs.meta_values_csv));
     for row in cs.colstats_rows_csv {
         buf.colstats_insert_rows.push(row);
     }
@@ -2693,10 +2746,12 @@ fn write_compressed_segment(
         buf.blob_buffer.push((col_idx, cs.seg_id, blob));
     }
     for (col_idx, num_hashes, bytes) in cs.bloom_entries {
-        buf.bloom_buffer.push((col_idx, cs.seg_id, num_hashes, bytes));
+        buf.bloom_buffer
+            .push((col_idx, cs.seg_id, num_hashes, bytes));
     }
     for (col_idx, length_blob) in cs.text_length_blobs {
-        buf.text_length_buffer.push((col_idx, cs.seg_id, length_blob));
+        buf.text_length_buffer
+            .push((col_idx, cs.seg_id, length_blob));
     }
     for (col_idx, vals) in cs.valbitmap_value_sets {
         buf.valbitmap_value_buffer.push((col_idx, cs.seg_id, vals));
@@ -2709,10 +2764,7 @@ fn write_compressed_segment(
 }
 
 /// ANALYZE companion tables and mark partition as compressed in catalog.
-fn finalize_partition(
-    buf: &mut PartitionBuffer,
-    columns: &[ColumnMeta],
-) {
+fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
     if buf.total_rows == 0 {
         return;
     }
@@ -2824,17 +2876,14 @@ fn finalize_and_insert_valbitmap(
 
     // Aggregate per-col_idx union, dropping columns that overflow.
     let mut union_by_col: HashMap<u16, BTreeSet<String>> = HashMap::new();
-    let mut overflow_cols: std::collections::HashSet<u16> =
-        std::collections::HashSet::new();
+    let mut overflow_cols: std::collections::HashSet<u16> = std::collections::HashSet::new();
     for (col_idx, _seg_id, vals) in &value_buffer {
         if overflow_cols.contains(col_idx) {
             continue;
         }
         let entry = union_by_col.entry(*col_idx).or_default();
         for v in vals {
-            if entry.len() >= crate::compress::VALBITMAP_MAX_DISTINCT
-                && !entry.contains(v)
-            {
+            if entry.len() >= crate::compress::VALBITMAP_MAX_DISTINCT && !entry.contains(v) {
                 overflow_cols.insert(*col_idx);
                 union_by_col.remove(col_idx);
                 break;
@@ -2902,10 +2951,7 @@ fn finalize_and_insert_valbitmap(
         for (col_idx, seg_id, bits) in chunk {
             // Hex-encode bytes as `'\x...'::bytea`.
             let hex: String = bits.iter().map(|b| format!("{:02x}", b)).collect();
-            values.push(format!(
-                "({}, {}, '\\x{}'::bytea)",
-                col_idx, seg_id, hex
-            ));
+            values.push(format!("({}, {}, '\\x{}'::bytea)", col_idx, seg_id, hex));
         }
         let sql = format!(
             "INSERT INTO {} (_col_idx, _segment_id, _bits) VALUES {}",
@@ -2989,7 +3035,8 @@ fn handle_copy_from_parquet(
     let col_mapping = crate::copyparquet::map_parquet_to_pg_columns(
         reader.metadata().file_metadata().schema_descr(),
         &state.columns,
-    ).unwrap_or_else(|e| pgrx::error!("{}", e));
+    )
+    .unwrap_or_else(|e| pgrx::error!("{}", e));
 
     let mut file_rows: i64 = 0;
     let mut file_skipped: i64 = 0;
@@ -3002,9 +3049,9 @@ fn handle_copy_from_parquet(
         if num_rows == 0 {
             continue;
         }
-        let rg_reader = reader
-            .get_row_group(rg_idx)
-            .unwrap_or_else(|e| pgrx::error!("pg_deltax: failed to read row group {}: {}", rg_idx, e));
+        let rg_reader = reader.get_row_group(rg_idx).unwrap_or_else(|e| {
+            pgrx::error!("pg_deltax: failed to read row group {}: {}", rg_idx, e)
+        });
 
         let typed_cols = crate::copyparquet::read_row_group_columns(
             &*rg_reader,
@@ -3012,7 +3059,8 @@ fn handle_copy_from_parquet(
             &state.kinds,
             num_rows,
             state.columns.len(),
-        ).unwrap_or_else(|e| pgrx::error!("{}", e));
+        )
+        .unwrap_or_else(|e| pgrx::error!("{}", e));
 
         let before = file_rows;
         route_rows_to_partitions(
@@ -3030,7 +3078,10 @@ fn handle_copy_from_parquet(
     if file_skipped > 0 {
         pgrx::warning!(
             "pg_deltax: loaded {} rows, skipped {} rows (no matching partition) from parquet file '{}' ({} total in file)",
-            file_rows, file_skipped, filename, total_parquet_rows
+            file_rows,
+            file_skipped,
+            filename,
+            total_parquet_rows
         );
     } else {
         pgrx::notice!(
@@ -3105,8 +3156,12 @@ fn decode_and_route_parquet_file(
         let mut min_ts = i64::MAX;
         let mut max_ts = i64::MIN;
         for &ts in time_vals.iter().take(num_rows).flatten() {
-            if ts < min_ts { min_ts = ts; }
-            if ts > max_ts { max_ts = ts; }
+            if ts < min_ts {
+                min_ts = ts;
+            }
+            if ts > max_ts {
+                max_ts = ts;
+            }
         }
 
         let min_part = find_partition(&job.range_starts, &job.range_ends, min_ts);
@@ -3114,14 +3169,21 @@ fn decode_and_route_parquet_file(
 
         if min_part == max_part {
             if let Some(part_idx) = min_part {
-                let batch = RoutedBatch { partition_idx: part_idx, typed_cols, num_rows };
-                if tx.send(Ok(batch)).is_err() { return Ok(()); }
+                let batch = RoutedBatch {
+                    partition_idx: part_idx,
+                    typed_cols,
+                    num_rows,
+                };
+                if tx.send(Ok(batch)).is_err() {
+                    return Ok(());
+                }
             }
             continue;
         }
 
         // Slow path: scatter rows into per-partition buffers
-        let mut part_cols: Vec<Option<Vec<TypedColumn>>> = (0..job.n_partitions).map(|_| None).collect();
+        let mut part_cols: Vec<Option<Vec<TypedColumn>>> =
+            (0..job.n_partitions).map(|_| None).collect();
         let mut part_counts: Vec<usize> = vec![0; job.n_partitions];
 
         for (row, ts_opt) in time_vals.iter().enumerate().take(num_rows) {
@@ -3145,7 +3207,9 @@ fn decode_and_route_parquet_file(
                     typed_cols: cols,
                     num_rows: part_counts[part_idx],
                 };
-                if tx.send(Ok(batch)).is_err() { return Ok(()); }
+                if tx.send(Ok(batch)).is_err() {
+                    return Ok(());
+                }
             }
         }
     }
@@ -3218,7 +3282,9 @@ fn handle_copy_from_parquet_parallel(
 
     pgrx::notice!(
         "pg_deltax: parallel parquet pipeline: {} decode + {} compress workers, {} files",
-        n_decode, n_compress, files.len()
+        n_decode,
+        n_compress,
+        files.len()
     );
 
     // Stage 1: Decode+route workers
@@ -3229,7 +3295,9 @@ fn handle_copy_from_parquet_parallel(
         handles.push(std::thread::spawn(move || {
             loop {
                 let idx = job.next_file.fetch_add(1, Ordering::Relaxed);
-                if idx >= job.files.len() { break; }
+                if idx >= job.files.len() {
+                    break;
+                }
                 if let Err(e) = decode_and_route_parquet_file(&job.files[idx], &job, &tx) {
                     let _ = tx.send(Err(e));
                     return;
@@ -3255,10 +3323,18 @@ fn handle_copy_from_parquet_parallel(
                     }
                 };
                 let cs = compress_segment(
-                    typed_cols, row_count, seg_id, partition_idx,
-                    &columns, &order, bloom_enabled, 1,
+                    typed_cols,
+                    row_count,
+                    seg_id,
+                    partition_idx,
+                    &columns,
+                    &order,
+                    bloom_enabled,
+                    1,
                 );
-                if compress_tx.send(cs).is_err() { return; }
+                if compress_tx.send(cs).is_err() {
+                    return;
+                }
             }
         }));
     }
@@ -3343,20 +3419,22 @@ fn handle_copy_from_parquet_parallel(
                 while part_buffers[part_idx].row_count >= state.segment_size {
                     let seg_size = state.segment_size;
                     // Split off remainder, keep exactly seg_size rows
-                    let remainder: Vec<TypedColumn> = part_buffers[part_idx].typed_cols
+                    let remainder: Vec<TypedColumn> = part_buffers[part_idx]
+                        .typed_cols
                         .iter_mut()
                         .map(|col| col.split_off(seg_size))
                         .collect();
-                    let typed_cols = std::mem::replace(
-                        &mut part_buffers[part_idx].typed_cols, remainder,
-                    );
+                    let typed_cols =
+                        std::mem::replace(&mut part_buffers[part_idx].typed_cols, remainder);
                     part_buffers[part_idx].row_count -= seg_size;
                     let seg_id = next_seg_ids[part_idx];
                     next_seg_ids[part_idx] += 1;
                     send_to_compress(
                         (typed_cols, seg_size, seg_id, part_idx),
                         seg_tx.as_ref().unwrap(),
-                        part_buffers, &compress_rx, state,
+                        part_buffers,
+                        &compress_rx,
+                        state,
                     );
                 }
             }
@@ -3379,7 +3457,9 @@ fn handle_copy_from_parquet_parallel(
             send_to_compress(
                 (typed_cols, row_count, seg_id, part_idx),
                 seg_tx.as_ref().unwrap(),
-                part_buffers, &compress_rx, state,
+                part_buffers,
+                &compress_rx,
+                state,
             );
         }
     }
@@ -3417,14 +3497,20 @@ fn route_rows_to_partitions(
     let mut min_ts = i64::MAX;
     let mut max_ts = i64::MIN;
     for &ts in time_vals.iter().take(num_rows).flatten() {
-        if ts < min_ts { min_ts = ts; }
-        if ts > max_ts { max_ts = ts; }
+        if ts < min_ts {
+            min_ts = ts;
+        }
+        if ts > max_ts {
+            max_ts = ts;
+        }
     }
 
     let min_part = find_partition(range_starts, range_ends, min_ts);
     let max_part = find_partition(range_starts, range_ends, max_ts);
 
-    if min_part == max_part && let Some(part_idx) = min_part {
+    if min_part == max_part
+        && let Some(part_idx) = min_part
+    {
         // All rows fall in the same partition — bulk extend
         let pbuf = &mut part_buffers[part_idx];
         for (i, col) in typed_cols.into_iter().enumerate() {
@@ -3452,5 +3538,98 @@ fn route_rows_to_partitions(
                 flush_segment(pbuf, state);
             }
         }
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use super::*;
+
+    fn ranges(starts: &[i64], lens: &[i64]) -> (Vec<i64>, Vec<i64>) {
+        let ends: Vec<i64> = starts.iter().zip(lens).map(|(s, l)| s + l).collect();
+        (starts.to_vec(), ends)
+    }
+
+    #[test]
+    fn find_partition_empty_ranges() {
+        assert_eq!(find_partition(&[], &[], 100), None);
+    }
+
+    #[test]
+    fn find_partition_before_first_range() {
+        let (s, e) = ranges(&[100, 200, 300], &[100, 100, 100]);
+        assert_eq!(find_partition(&s, &e, 50), None);
+        assert_eq!(find_partition(&s, &e, 99), None);
+    }
+
+    #[test]
+    fn find_partition_after_last_range() {
+        let (s, e) = ranges(&[100, 200, 300], &[100, 100, 100]);
+        // end is exclusive: 300 + 100 = 400, so 400 falls outside
+        assert_eq!(find_partition(&s, &e, 400), None);
+        assert_eq!(find_partition(&s, &e, 10_000), None);
+    }
+
+    #[test]
+    fn find_partition_exact_start_is_inclusive() {
+        let (s, e) = ranges(&[100, 200, 300], &[100, 100, 100]);
+        assert_eq!(find_partition(&s, &e, 100), Some(0));
+        assert_eq!(find_partition(&s, &e, 200), Some(1));
+        assert_eq!(find_partition(&s, &e, 300), Some(2));
+    }
+
+    #[test]
+    fn find_partition_exact_end_is_exclusive() {
+        // end of [100, 200) is 200, which belongs to the NEXT partition.
+        let (s, e) = ranges(&[100, 200, 300], &[100, 100, 100]);
+        assert_eq!(find_partition(&s, &e, 199), Some(0));
+        assert_eq!(find_partition(&s, &e, 200), Some(1));
+        // last partition's end (400) is past the end of all ranges
+        assert_eq!(find_partition(&s, &e, 399), Some(2));
+        assert_eq!(find_partition(&s, &e, 400), None);
+    }
+
+    #[test]
+    fn find_partition_with_gaps() {
+        // gaps between ranges: [100,200), [300,400), [500,600)
+        let s = vec![100, 300, 500];
+        let e = vec![200, 400, 600];
+        assert_eq!(find_partition(&s, &e, 150), Some(0));
+        assert_eq!(find_partition(&s, &e, 200), None); // in gap
+        assert_eq!(find_partition(&s, &e, 250), None);
+        assert_eq!(find_partition(&s, &e, 300), Some(1));
+        assert_eq!(find_partition(&s, &e, 450), None); // in gap
+        assert_eq!(find_partition(&s, &e, 599), Some(2));
+    }
+
+    #[test]
+    fn find_partition_single_range() {
+        let s = vec![1000];
+        let e = vec![2000];
+        assert_eq!(find_partition(&s, &e, 500), None);
+        assert_eq!(find_partition(&s, &e, 1000), Some(0));
+        assert_eq!(find_partition(&s, &e, 1500), Some(0));
+        assert_eq!(find_partition(&s, &e, 1999), Some(0));
+        assert_eq!(find_partition(&s, &e, 2000), None);
+    }
+
+    #[test]
+    fn find_partition_negative_timestamps() {
+        // pg_deltax internally stores Unix-epoch usec which can be negative
+        // for pre-1970 data.
+        let s = vec![-2000, -1000, 0];
+        let e = vec![-1000, 0, 1000];
+        assert_eq!(find_partition(&s, &e, -1500), Some(0));
+        assert_eq!(find_partition(&s, &e, -500), Some(1));
+        assert_eq!(find_partition(&s, &e, 500), Some(2));
+        assert_eq!(find_partition(&s, &e, -3000), None);
+    }
+
+    #[test]
+    fn expand_file_glob_literal_returns_singleton() {
+        // No glob meta-chars → returned verbatim, no FS access.
+        let v = expand_file_glob("/some/literal/path.tsv");
+        assert_eq!(v, vec!["/some/literal/path.tsv".to_string()]);
     }
 }

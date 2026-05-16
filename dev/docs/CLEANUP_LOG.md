@@ -30,6 +30,74 @@ narration.
 
 ## Sessions
 
+### 2026-05-16 — `src/copy.rs` — TBD
+
+**Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
+`unsafe` audit deferred — all 69 blocks are PG FFI (table_open, heap_insert,
+GetBulkInsertState, palloc, MemoryContextSwitchTo, ProcessUtility hook
+chaining, RangeVarGetRelidExtended, list manipulation).
+**LOC:** 3456 → 3543 (non-test) / 3635 total with 110 lines of tests added.
+The non-test count is roughly flat (+87) because the new helpers carry
+docstrings, but functional duplication dropped substantially.
+**`unsafe`:** 67 → 69 (+2 from the new `bulk_heap_insert` helper that
+encapsulates the unsafe ops previously inlined three times).
+**Tests:** 0 → 9 (all `#[test]`, pure logic).
+
+- Extracted `bulk_heap_insert(oid, ctx_name, items, build_datums)`. The three
+  near-identical `flush_partition_blobs` blocks (blobs / blooms / text_lengths)
+  were ~50 LOC each — they all open the table, build a fresh per-row temp
+  memory context to bound TOAST scratch growth, palloc the bytea, form/insert
+  the tuple, and reset the context. Now they're three 4-line closures into
+  one helper.
+- Extracted `parallel_compress_cols` + `compress_one_col`. The
+  parallel-or-sequential compression dispatch (~50 LOC) was inlined inside
+  both `compress_segment` and `flush_segment`; both call sites are now
+  one-liners.
+- Extracted `PartitionBuffer::cache_companion_fqns`. The "stash meta/colstats
+  FQNs + meta INSERT column list on first segment flush" block (~25 LOC) was
+  duplicated between `flush_segment` and `write_compressed_segment`.
+- Extracted `create_blobs_table`, `create_blooms_table`,
+  `create_text_lengths_table`. The DDL strings were inlined at 4 sites; now
+  each is one named helper.
+- Simplified `bytea_to_datum`'s signature: returns `Datum` (was
+  `(Datum, *mut c_void)` for an explicit pfree pointer). All three callers
+  discarded the pfree pointer because the per-row memory context reset
+  already frees the bytea.
+- Removed unused `_last_part_idx: &mut Option<usize>` parameter from
+  `merge_and_flush_results` (the parallel path doesn't update it — the
+  cross-partition `flush_partition_blobs` trigger only fires on the
+  sequential / trailing-line paths).
+- Removed a leftover `let companion_ddl = build_companion_ddl(...);` whose
+  uses had all been replaced.
+- Added 9 `#[test]` cases for `find_partition` (pure binary search, zero
+  prior tests):
+  - empty ranges
+  - lookup before first / after last
+  - exact start inclusive, exact end exclusive
+  - gaps between ranges (lookups in the gap return None)
+  - single-range edge cases
+  - negative-timestamp values (pre-1970 data)
+  - `expand_file_glob` literal-path short-circuit
+- Deferred: SAFETY: comment pass on `unsafe` blocks. Almost all are PG FFI
+  on planner/executor types (heap_insert, table_open, list_nth, palloc,
+  MemoryContextSwitchTo, ProcessUtility_hook chain) and can't go safe
+  without an enormous wrapper layer. Worth a dedicated session focused on
+  SAFETY: comment coverage.
+- **Benchmarks**:
+  - ClickBench EC2 (c6a.4xlarge, 100M-row full dataset): **62.95s vs prior
+    62.43s** (+0.8% total, within session-to-session noise band). Zero
+    regressions >10%. Worst individual: Q18 +8.2% but cold runs match
+    (11.59 vs 11.36) and run 2 is within 1.8% — only the best-of-3 column
+    differs because the prior run got a lucky 3rd-run sample.
+  - JSONBench EC2 (m6i.8xlarge, 100M Bluesky events): **3.637s vs prior
+    3.554s** (+2.3% total). Q1 +4.4% accounts for most of the drift; cold
+    run matches (15.03 vs prior cold), and copy.rs is not on the read
+    path, so this is run-to-run variance.
+- **Correctness:** `make correctness` 999 passed / 3 skipped / 6 xfailed
+  (matches baseline). Unit: 428 pass on PG17 and PG18 (was 419).
+  Integration: 234 pass on PG17 and PG18.
+- **Perf opportunities surfaced:** none.
+
 ### 2026-05-16 — `src/scan/exec/decompress.rs` — 2d4f7e7
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
