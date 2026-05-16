@@ -17,26 +17,26 @@ On the [ClickBench](https://benchmark.clickhouse.com/) benchmark, which runs 43 
 queries against a web analytics dataset of 100M rows x 105 columns, currently ranks lower than specialized analitcal stores like ClickHouse and DuckDB, but it is the highest ranking of all 
 the systems that are storing the data in PostgreSQL.
 
-![ClickBench combined: pg_deltax ranks in-between ClickHouse and TimescaleDB](images/clickbench-combined.png)
+<img src="images/clickbench-combined.png" width="800" alt="ClickBench combined: pg_deltax ranks in-between ClickHouse and TimescaleDB">
 
 #### Compression / storage size
 
 Looking at the **compression ratio / storage size**, δx offers compression ratio of about 7x on
 this particular dataset.
 
-![ClickBench storage size: pg_deltax compression ration is ~7x](images/clickbench-storage-size.png)
+<img src="images/clickbench-storage-size.png" width="800" alt="ClickBench storage size: pg_deltax compression ratio is ~7x">
 
 #### Cold run
 
-![ClickBench cold run result](images/clickbench-cold-run.png)
+<img src="images/clickbench-cold-run.png" width="800" alt="ClickBench cold run result">
 
 #### Hot run
 
-![ClickBench hot run result](images/clickbench-hot-run.png)
+<img src="images/clickbench-hot-run.png" width="800" alt="ClickBench hot run result">
 
 #### Load time
 
-![ClickBench load times result](images/clickbench-load-time.png)
+<img src="images/clickbench-load-time.png" width="800" alt="ClickBench load times result">
 
 The reason δx can load the data faster than Postgres is that it has support for backfilling data directly from Parquet files. On a more standard setup where the data is loaded into normal Postgres tables and them compressed, the load time would be similar to the PostgreSQL result + the time to compress.
 
@@ -48,7 +48,7 @@ on semi-structured data.
 
 δx has support for extracting particular fields from JSONB fields and compressing them with the same columnar algorithms as the native columns. This enables the following result on JSONBench.
 
-![JSONBench hot run results](images/jsonbench-hot-run.png)
+<img src="images/jsonbench-hot-run.png" width="800" alt="JSONBench hot run results">
 
 ## How it works
 
