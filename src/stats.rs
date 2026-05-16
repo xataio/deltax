@@ -167,7 +167,11 @@ fn load_pg_attribute(
             .and_then(|d| d.value::<i16>().ok().flatten())
             .unwrap_or(-1);
         if !attname.is_empty() {
-            out.push(AttrInfo { attname, attnum, attlen });
+            out.push(AttrInfo {
+                attname,
+                attnum,
+                attlen,
+            });
         }
     }
     Ok(out)
@@ -338,5 +342,66 @@ pub fn analyze_partition_from_catalog(
         nonseg_idx += 1;
     }
 
-    write_partition_stats(client, part_rel_oid, &col_ndistinct, row_count, colstats_fqn, columns)
+    write_partition_stats(
+        client,
+        part_rel_oid,
+        &col_ndistinct,
+        row_count,
+        colstats_fqn,
+        columns,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stawidth_for_attlen_uses_fixed_width_directly() {
+        // Positive attlen → bytes-per-row for a fixed-width type. Negative
+        // (varlena, cstring) → conservative 32-byte default per the comment.
+        assert_eq!(stawidth_for_attlen(1), 1);
+        assert_eq!(stawidth_for_attlen(8), 8);
+        assert_eq!(stawidth_for_attlen(16), 16);
+        assert_eq!(stawidth_for_attlen(-1), 32);
+        assert_eq!(stawidth_for_attlen(-2), 32);
+        assert_eq!(stawidth_for_attlen(0), 32);
+    }
+
+    #[test]
+    fn stadistinct_value_returns_zero_for_unknown_inputs() {
+        assert_eq!(stadistinct_value(0, 100), 0.0);
+        assert_eq!(stadistinct_value(-1, 100), 0.0);
+        assert_eq!(stadistinct_value(50, 0), 0.0);
+        assert_eq!(stadistinct_value(50, -10), 0.0);
+    }
+
+    #[test]
+    fn stadistinct_value_emits_absolute_count_when_ndistinct_is_small() {
+        // PG convention: positive stadistinct is an absolute count of
+        // distinct values, used when ndistinct/row_count ≤ 0.1 — the table
+        // is "wide enough" that the count is meaningful as the table grows.
+        assert_eq!(stadistinct_value(10, 1000), 10.0);
+        assert_eq!(stadistinct_value(99, 1000), 99.0);
+    }
+
+    #[test]
+    fn stadistinct_value_flips_to_fraction_at_density_threshold() {
+        // PG convention: when ndistinct/row_count > 0.1, store the
+        // *negated fraction* so the estimator scales correctly as the
+        // partition gains/loses rows without a re-ANALYZE.
+        let v = stadistinct_value(500, 1000);
+        assert!((v - (-0.5)).abs() < 1e-6, "got {}", v);
+
+        let v2 = stadistinct_value(900, 1000);
+        assert!((v2 - (-0.9)).abs() < 1e-6, "got {}", v2);
+
+        // Just past the 0.1 boundary → still negative fraction form.
+        let v3 = stadistinct_value(101, 1000);
+        assert!(
+            v3 < 0.0,
+            "boundary should flip to fraction form, got {}",
+            v3
+        );
+    }
 }

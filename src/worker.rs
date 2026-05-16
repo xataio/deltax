@@ -145,19 +145,10 @@ fn drain_default_partition(
     ht: &catalog::DeltatableInfo,
 ) -> spi::SpiResult<i64> {
     let default_name = format!("{}_default", ht.table_name);
-    let fq_default = if ht.schema_name == "public" {
-        format!("\"{}\"", default_name)
-    } else {
-        format!("\"{}\".\"{}\"", ht.schema_name, default_name)
-    };
+    let fq_default = partition::fqn(&ht.schema_name, &default_name);
 
-    // Check if default partition has rows
     let row_count = client
-        .select(
-            &format!("SELECT count(*) FROM {}", fq_default),
-            None,
-            &[],
-        )?
+        .select(&format!("SELECT count(*) FROM {}", fq_default), None, &[])?
         .first()
         .get_one::<i64>()?
         .unwrap_or(0);
@@ -166,31 +157,10 @@ fn drain_default_partition(
         return Ok(0);
     }
 
-    let interval_usec = {
-        let days: i64 = ht
-            .partition_interval
-            .extract_part(DateTimeParts::Day)
-            .and_then(|v| v.try_into().ok())
-            .unwrap_or(0);
-        let hours: i64 = ht
-            .partition_interval
-            .extract_part(DateTimeParts::Hour)
-            .and_then(|v| v.try_into().ok())
-            .unwrap_or(0);
-        let minutes: i64 = ht
-            .partition_interval
-            .extract_part(DateTimeParts::Minute)
-            .and_then(|v| v.try_into().ok())
-            .unwrap_or(0);
-        let secs: i64 = ht
-            .partition_interval
-            .extract_part(DateTimeParts::Second)
-            .and_then(|v| v.try_into().ok())
-            .unwrap_or(0);
-        days * 86_400_000_000 + hours * 3_600_000_000 + minutes * 60_000_000 + secs * 1_000_000
-    };
+    let interval_usec = partition::interval_to_usec(&ht.partition_interval);
 
-    // Get distinct aligned timestamps from the default partition
+    // Distinct aligned start-of-interval timestamps for the rows currently
+    // sitting in the default partition.
     let boundaries: Vec<i64> = {
         let result = client.select(
             &format!(
@@ -204,103 +174,67 @@ fn drain_default_partition(
         )?;
         let mut v = Vec::new();
         for row in result {
-            let val: Option<i64> = row.get_datum_by_ordinal(1)?.value::<i64>()?;
-            if let Some(b) = val {
+            if let Some(b) = row.get_datum_by_ordinal(1)?.value::<i64>()? {
                 v.push(b);
             }
         }
         v
     };
 
-    if !boundaries.is_empty() {
-        let parent = if ht.schema_name == "public" {
-            format!("\"{}\"", ht.table_name)
-        } else {
-            format!("\"{}\".\"{}\"", ht.schema_name, ht.table_name)
-        };
+    if boundaries.is_empty() {
+        return Ok(row_count);
+    }
 
-        // Detach default first — PG won't allow creating a partition whose
-        // range overlaps with rows already sitting in the default.
-        client.update(
-            &format!("ALTER TABLE {} DETACH PARTITION {}", parent, fq_default),
-            None,
-            &[],
+    let parent = partition::fqn(&ht.schema_name, &ht.table_name);
+
+    // Detach default first — PG won't allow creating a partition whose
+    // range overlaps with rows already sitting in the default.
+    client.update(
+        &format!("ALTER TABLE {} DETACH PARTITION {}", parent, fq_default),
+        None,
+        &[],
+    )?;
+
+    for &boundary_usec in &boundaries {
+        let end_usec = boundary_usec + interval_usec;
+        let start_str = partition::format_ts(boundary_usec);
+        let end_str = partition::format_ts(end_usec);
+        let part_name = partition::partition_name(&ht.table_name, boundary_usec, interval_usec);
+
+        partition::create_partition(
+            client,
+            &ht.schema_name,
+            &ht.table_name,
+            &part_name,
+            &start_str,
+            &end_str,
         )?;
 
-        // Now create the missing partitions
-        for boundary_usec in &boundaries {
-            let end_usec = boundary_usec + interval_usec;
-
-            let start_sec = *boundary_usec as f64 / 1_000_000.0;
-            let end_sec = end_usec as f64 / 1_000_000.0;
-
-            let start_str = Spi::get_one_with_args::<String>(
-                "SELECT to_char(to_timestamp($1), 'YYYY-MM-DD HH24:MI:SS')",
-                &[start_sec.into()],
-            )?
-            .unwrap();
-            let end_str = Spi::get_one_with_args::<String>(
-                "SELECT to_char(to_timestamp($1), 'YYYY-MM-DD HH24:MI:SS')",
-                &[end_sec.into()],
-            )?
-            .unwrap();
-
-            let query = if interval_usec >= 86_400_000_000 {
-                "SELECT to_char(to_timestamp($1), 'YYYYMMDD')"
-            } else {
-                "SELECT to_char(to_timestamp($1), 'YYYYMMDD_HH24MI')"
-            };
-            let suffix =
-                Spi::get_one_with_args::<String>(query, &[start_sec.into()])?.unwrap();
-            let part_name = format!("{}_p{}", ht.table_name, suffix);
-
-            partition::create_partition(
-                client,
-                &ht.schema_name,
-                &ht.table_name,
-                &part_name,
-                &start_str,
-                &end_str,
-            )?;
-
-            let start_tstz = Spi::get_one_with_args::<TimestampWithTimeZone>(
-                "SELECT to_timestamp($1)",
-                &[start_sec.into()],
-            )?
-            .unwrap();
-            let end_tstz = Spi::get_one_with_args::<TimestampWithTimeZone>(
-                "SELECT to_timestamp($1)",
-                &[end_sec.into()],
-            )?
-            .unwrap();
-            catalog::register_partition(
-                client,
-                ht.id,
-                &ht.schema_name,
-                &part_name,
-                start_tstz,
-                end_tstz,
-            )?;
-        }
-
-        // Move rows from the detached default into the proper partitions
-        client.update(
-            &format!("INSERT INTO {} SELECT * FROM {}", parent, fq_default),
-            None,
-            &[],
-        )?;
-
-        client.update(&format!("TRUNCATE {}", fq_default), None, &[])?;
-
-        client.update(
-            &format!(
-                "ALTER TABLE {} ATTACH PARTITION {} DEFAULT",
-                parent, fq_default
-            ),
-            None,
-            &[],
+        catalog::register_partition(
+            client,
+            ht.id,
+            &ht.schema_name,
+            &part_name,
+            partition::usec_to_tstz(boundary_usec),
+            partition::usec_to_tstz(end_usec),
         )?;
     }
+
+    // Move rows from the detached default into the proper partitions.
+    client.update(
+        &format!("INSERT INTO {} SELECT * FROM {}", parent, fq_default),
+        None,
+        &[],
+    )?;
+    client.update(&format!("TRUNCATE {}", fq_default), None, &[])?;
+    client.update(
+        &format!(
+            "ALTER TABLE {} ATTACH PARTITION {} DEFAULT",
+            parent, fq_default
+        ),
+        None,
+        &[],
+    )?;
 
     Ok(row_count)
 }

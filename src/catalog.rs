@@ -110,10 +110,7 @@ pub fn get_deltatable(
 }
 
 /// Look up a deltatable by its catalog id.
-pub fn get_deltatable_by_id(
-    client: &SpiClient,
-    id: i32,
-) -> spi::SpiResult<Option<DeltatableInfo>> {
+pub fn get_deltatable_by_id(client: &SpiClient, id: i32) -> spi::SpiResult<Option<DeltatableInfo>> {
     let mut result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval,
                 segment_by, order_by, compress_after, drop_after, segment_size,
@@ -129,7 +126,10 @@ pub fn get_deltatable_by_id(
         let s: String = row.get_datum_by_ordinal(2)?.value::<String>()?.unwrap();
         let t: String = row.get_datum_by_ordinal(3)?.value::<String>()?.unwrap();
         let tc: String = row.get_datum_by_ordinal(4)?.value::<String>()?.unwrap();
-        let pi: pgrx::datum::Interval = row.get_datum_by_ordinal(5)?.value::<pgrx::datum::Interval>()?.unwrap();
+        let pi: pgrx::datum::Interval = row
+            .get_datum_by_ordinal(5)?
+            .value::<pgrx::datum::Interval>()?
+            .unwrap();
         let segment_by: Vec<String> = row
             .get_datum_by_ordinal(6)?
             .value::<Vec<String>>()?
@@ -138,11 +138,16 @@ pub fn get_deltatable_by_id(
             .get_datum_by_ordinal(7)?
             .value::<Vec<String>>()?
             .unwrap_or_default();
-        let compress_after: Option<pgrx::datum::Interval> =
-            row.get_datum_by_ordinal(8)?.value::<pgrx::datum::Interval>()?;
-        let drop_after: Option<pgrx::datum::Interval> =
-            row.get_datum_by_ordinal(9)?.value::<pgrx::datum::Interval>()?;
-        let segment_size: i32 = row.get_datum_by_ordinal(10)?.value::<i32>()?.unwrap_or(30000);
+        let compress_after: Option<pgrx::datum::Interval> = row
+            .get_datum_by_ordinal(8)?
+            .value::<pgrx::datum::Interval>()?;
+        let drop_after: Option<pgrx::datum::Interval> = row
+            .get_datum_by_ordinal(9)?
+            .value::<pgrx::datum::Interval>()?;
+        let segment_size: i32 = row
+            .get_datum_by_ordinal(10)?
+            .value::<i32>()?
+            .unwrap_or(30000);
         let json_extract: Option<serde_json::Value> = row
             .get_datum_by_ordinal(11)?
             .value::<pgrx::datum::JsonB>()?
@@ -166,9 +171,7 @@ pub fn get_deltatable_by_id(
 }
 
 /// Get all deltatables.
-pub fn get_all_deltatables(
-    client: &SpiClient,
-) -> spi::SpiResult<Vec<DeltatableInfo>> {
+pub fn get_all_deltatables(client: &SpiClient) -> spi::SpiResult<Vec<DeltatableInfo>> {
     let result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval,
                 segment_by, order_by, compress_after, drop_after, segment_size,
@@ -185,12 +188,28 @@ pub fn get_all_deltatables(
             schema_name: row.get_datum_by_ordinal(2)?.value::<String>()?.unwrap(),
             table_name: row.get_datum_by_ordinal(3)?.value::<String>()?.unwrap(),
             time_column: row.get_datum_by_ordinal(4)?.value::<String>()?.unwrap(),
-            partition_interval: row.get_datum_by_ordinal(5)?.value::<pgrx::datum::Interval>()?.unwrap(),
-            segment_by: row.get_datum_by_ordinal(6)?.value::<Vec<String>>()?.unwrap_or_default(),
-            order_by: row.get_datum_by_ordinal(7)?.value::<Vec<String>>()?.unwrap_or_default(),
-            compress_after: row.get_datum_by_ordinal(8)?.value::<pgrx::datum::Interval>()?,
-            drop_after: row.get_datum_by_ordinal(9)?.value::<pgrx::datum::Interval>()?,
-            segment_size: row.get_datum_by_ordinal(10)?.value::<i32>()?.unwrap_or(30000),
+            partition_interval: row
+                .get_datum_by_ordinal(5)?
+                .value::<pgrx::datum::Interval>()?
+                .unwrap(),
+            segment_by: row
+                .get_datum_by_ordinal(6)?
+                .value::<Vec<String>>()?
+                .unwrap_or_default(),
+            order_by: row
+                .get_datum_by_ordinal(7)?
+                .value::<Vec<String>>()?
+                .unwrap_or_default(),
+            compress_after: row
+                .get_datum_by_ordinal(8)?
+                .value::<pgrx::datum::Interval>()?,
+            drop_after: row
+                .get_datum_by_ordinal(9)?
+                .value::<pgrx::datum::Interval>()?,
+            segment_size: row
+                .get_datum_by_ordinal(10)?
+                .value::<i32>()?
+                .unwrap_or(30000),
             json_extract: row
                 .get_datum_by_ordinal(11)?
                 .value::<pgrx::datum::JsonB>()?
@@ -221,9 +240,18 @@ pub fn get_partitions(
             deltatable_id: row.get_datum_by_ordinal(2)?.value::<i32>()?.unwrap(),
             schema_name: row.get_datum_by_ordinal(3)?.value::<String>()?.unwrap(),
             table_name: row.get_datum_by_ordinal(4)?.value::<String>()?.unwrap(),
-            range_start: row.get_datum_by_ordinal(5)?.value::<TimestampWithTimeZone>()?.unwrap(),
-            range_end: row.get_datum_by_ordinal(6)?.value::<TimestampWithTimeZone>()?.unwrap(),
-            is_compressed: row.get_datum_by_ordinal(7)?.value::<bool>()?.unwrap_or(false),
+            range_start: row
+                .get_datum_by_ordinal(5)?
+                .value::<TimestampWithTimeZone>()?
+                .unwrap(),
+            range_end: row
+                .get_datum_by_ordinal(6)?
+                .value::<TimestampWithTimeZone>()?
+                .unwrap(),
+            is_compressed: row
+                .get_datum_by_ordinal(7)?
+                .value::<bool>()?
+                .unwrap_or(false),
         });
     }
     Ok(partitions)
@@ -269,7 +297,12 @@ pub fn update_deltatable_compression(
              SET segment_by = $1, order_by = $2, segment_size = $3
              WHERE id = $4",
             None,
-            &[seg_vec.into(), ord_vec.into(), segment_size.into(), deltatable_id.into()],
+            &[
+                seg_vec.into(),
+                ord_vec.into(),
+                segment_size.into(),
+                deltatable_id.into(),
+            ],
         )?;
     }
     Ok(())
@@ -304,10 +337,7 @@ pub fn set_drop_after(
 }
 
 /// Clear the drop_after interval for a deltatable (remove retention policy).
-pub fn clear_drop_after(
-    client: &mut SpiClient,
-    deltatable_id: i32,
-) -> spi::SpiResult<()> {
+pub fn clear_drop_after(client: &mut SpiClient, deltatable_id: i32) -> spi::SpiResult<()> {
     client.update(
         "UPDATE deltax_deltatable SET drop_after = NULL WHERE id = $1",
         None,
@@ -352,9 +382,7 @@ pub fn update_partition_column_ndistinct_from_map(
     let mut names: Vec<&String> = col_ndistinct.keys().collect();
     names.sort();
     for name in names {
-        let nd_val = col_ndistinct[name];
-        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-        parts.push(format!("\"{}\":{}", escaped, nd_val));
+        parts.push(format!("\"{}\":{}", json_escape(name), col_ndistinct[name]));
     }
     let json = format!("{{{}}}", parts.join(","));
 
@@ -463,12 +491,15 @@ pub fn update_partition_column_ndistinct(
             .ok()
             .and_then(|d| d.value::<i64>().ok().flatten());
 
-        if col_idx >= 0 && (col_idx as usize) < col_names.len()
+        if col_idx >= 0
+            && (col_idx as usize) < col_names.len()
             && let Some(nd_val) = nd
         {
-            let name = &col_names[col_idx as usize];
-            let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-            parts.push(format!("\"{}\":{}", escaped, nd_val));
+            parts.push(format!(
+                "\"{}\":{}",
+                json_escape(&col_names[col_idx as usize]),
+                nd_val,
+            ));
         }
     }
     let json = format!("{{{}}}", parts.join(","));
@@ -567,11 +598,60 @@ pub fn get_partition_by_name(
             deltatable_id: row.get_datum_by_ordinal(2)?.value::<i32>()?.unwrap(),
             schema_name: row.get_datum_by_ordinal(3)?.value::<String>()?.unwrap(),
             table_name: row.get_datum_by_ordinal(4)?.value::<String>()?.unwrap(),
-            range_start: row.get_datum_by_ordinal(5)?.value::<TimestampWithTimeZone>()?.unwrap(),
-            range_end: row.get_datum_by_ordinal(6)?.value::<TimestampWithTimeZone>()?.unwrap(),
-            is_compressed: row.get_datum_by_ordinal(7)?.value::<bool>()?.unwrap_or(false),
+            range_start: row
+                .get_datum_by_ordinal(5)?
+                .value::<TimestampWithTimeZone>()?
+                .unwrap(),
+            range_end: row
+                .get_datum_by_ordinal(6)?
+                .value::<TimestampWithTimeZone>()?
+                .unwrap(),
+            is_compressed: row
+                .get_datum_by_ordinal(7)?
+                .value::<bool>()?
+                .unwrap_or(false),
         }));
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_escape_passes_through_plain_ascii() {
+        assert_eq!(json_escape(""), "");
+        assert_eq!(json_escape("hello"), "hello");
+        assert_eq!(json_escape("col_42"), "col_42");
+    }
+
+    #[test]
+    fn json_escape_handles_mandatory_escapes() {
+        assert_eq!(json_escape("a\"b"), "a\\\"b");
+        assert_eq!(json_escape("a\\b"), "a\\\\b");
+        assert_eq!(json_escape("a\nb"), "a\\nb");
+        assert_eq!(json_escape("a\rb"), "a\\rb");
+        assert_eq!(json_escape("a\tb"), "a\\tb");
+        assert_eq!(json_escape("a\x08b"), "a\\bb");
+        assert_eq!(json_escape("a\x0cb"), "a\\fb");
+    }
+
+    #[test]
+    fn json_escape_uses_unicode_for_other_control_chars() {
+        // Anything below 0x20 without a short form falls through to \uXXXX —
+        // omitting this would emit unparseable JSON for raw control bytes.
+        assert_eq!(json_escape("\x00"), "\\u0000");
+        assert_eq!(json_escape("\x01"), "\\u0001");
+        assert_eq!(json_escape("\x1f"), "\\u001f");
+    }
+
+    #[test]
+    fn json_escape_leaves_high_unicode_alone() {
+        // The JSON spec allows any non-control codepoint verbatim, so we
+        // don't bloat output for accented or CJK column names.
+        assert_eq!(json_escape("héllo"), "héllo");
+        assert_eq!(json_escape("日本語"), "日本語");
+    }
 }

@@ -116,12 +116,11 @@ impl BloomFilter {
     }
 }
 
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    #[pgrx::pg_test]
+    #[test]
     fn test_bloom_basic() {
         let mut bf = BloomFilter::for_ndistinct(100);
         let h = hash_datum_i64(42);
@@ -130,7 +129,7 @@ mod tests {
         assert!(bf.might_contain(h));
     }
 
-    #[pgrx::pg_test]
+    #[test]
     fn test_bloom_no_false_negatives() {
         let mut bf = BloomFilter::for_ndistinct(200);
         let values: Vec<i64> = (0..200).collect();
@@ -146,7 +145,7 @@ mod tests {
         }
     }
 
-    #[pgrx::pg_test]
+    #[test]
     fn test_bloom_no_false_negatives_large() {
         // Test with ndistinct similar to ClickBench userid
         let mut bf = BloomFilter::for_ndistinct(5000);
@@ -163,7 +162,7 @@ mod tests {
         }
     }
 
-    #[pgrx::pg_test]
+    #[test]
     fn test_bloom_fpr_large() {
         // Verify FPR is reasonable at ndistinct=5000
         let mut bf = BloomFilter::for_ndistinct(5000);
@@ -182,7 +181,7 @@ mod tests {
         assert!(fpr < 0.03, "FPR too high: {:.1}%", fpr * 100.0);
     }
 
-    #[pgrx::pg_test]
+    #[test]
     fn test_bloom_serialization_roundtrip() {
         let mut bf = BloomFilter::for_ndistinct(500);
         for i in 0..100 {
@@ -195,7 +194,7 @@ mod tests {
         assert_eq!(bf.num_hashes, bf2.num_hashes);
     }
 
-    #[pgrx::pg_test]
+    #[test]
     fn test_bloom_sizing() {
         assert_eq!(bloom_size_for_ndistinct(1), MIN_BLOOM_BYTES); // tiny
         assert_eq!(bloom_size_for_ndistinct(100), 125); // 100*10/8
@@ -203,7 +202,7 @@ mod tests {
         assert_eq!(bloom_size_for_ndistinct(100000), MAX_BLOOM_BYTES); // capped
     }
 
-    #[pgrx::pg_test]
+    #[test]
     fn test_optimal_k() {
         // At 10 bits/element, optimal k ≈ 10*ln(2) ≈ 6.93 → 7
         assert_eq!(optimal_k(10000, 1000), 7);

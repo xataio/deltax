@@ -102,8 +102,7 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
         Ok(Some(row_count)) => {
             let segments = (row_count / 100_000).max(1);
             let stats = (row_count, segments);
-            PARTITION_STATS_CACHE
-                .with(|cache| cache.borrow_mut().insert(companion_oid, stats));
+            PARTITION_STATS_CACHE.with(|cache| cache.borrow_mut().insert(companion_oid, stats));
             stats
         }
         // Do not cache misses: companion lookups can race with partition creation.
@@ -171,13 +170,14 @@ pub(super) fn estimate_agg_cost(
     // Calibrated against RTABench suite (Apr 2026). Adjusting any of these
     // risks regressing planner selection on a subset of queries; re-run
     // `make bench-rtabench` + the EC2 suite after tuning.
-    const PER_PARTITION: f64 = 50.0;      // metadata SPI + heap-scan startup
-    const PER_ROW: f64 = 0.0005;          // 20× below pg cpu_tuple_cost
-    const PER_AGG_EXPR: f64 = 0.00005;    // 50× below pg cpu_operator_cost
-    const PER_GROUP: f64 = 0.01;          // matches cpu_tuple_cost for output
-    const PER_HAVING: f64 = 0.00005;      // per-group HAVING eval
+    const PER_PARTITION: f64 = 50.0; // metadata SPI + heap-scan startup
+    const PER_ROW: f64 = 0.0005; // 20× below pg cpu_tuple_cost
+    const PER_AGG_EXPR: f64 = 0.00005; // 50× below pg cpu_operator_cost
+    const PER_GROUP: f64 = 0.01; // matches cpu_tuple_cost for output
+    const PER_HAVING: f64 = 0.00005; // per-group HAVING eval
 
-    let total_rows: f64 = companion_oids.iter()
+    let total_rows: f64 = companion_oids
+        .iter()
         .map(|&oid| get_row_count(oid).unwrap_or(0) as f64)
         .sum();
 
@@ -229,8 +229,7 @@ fn recommend_agg_workers_inner(total_segments: i64, max_per_gather: i32) -> i32 
         return 0;
     }
     const MIN_SEGS_PER_WORKER: i64 = 8;
-    const MAX_AGG_WORKER_SLOTS_MINUS_ONE: i32 =
-        (super::exec::MAX_AGG_WORKER_SLOTS as i32) - 1;
+    const MAX_AGG_WORKER_SLOTS_MINUS_ONE: i32 = (super::exec::MAX_AGG_WORKER_SLOTS as i32) - 1;
     let seg_floor = (total_segments / MIN_SEGS_PER_WORKER) as i32;
     seg_floor
         .min(max_per_gather)
@@ -252,9 +251,10 @@ pub(super) fn get_segment_count(companion_oid: pg_sys::Oid) -> i64 {
 /// was cheap warm but forced ~9 MB of cold reads on the meta table during
 /// planning on every fresh backend. Now the info is persisted once at
 /// compression time and read via a small catalog lookup.
-pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collections::HashMap<String, i64> {
-    if let Some(cached) =
-        NDISTINCT_CACHE.with(|cache| cache.borrow().get(&companion_oid).cloned())
+pub(super) fn get_column_ndistinct(
+    companion_oid: pg_sys::Oid,
+) -> std::collections::HashMap<String, i64> {
+    if let Some(cached) = NDISTINCT_CACHE.with(|cache| cache.borrow().get(&companion_oid).cloned())
     {
         return cached;
     }
@@ -264,10 +264,14 @@ pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collectio
         if name_ptr.is_null() {
             return std::collections::HashMap::new();
         }
-        std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
+        std::ffi::CStr::from_ptr(name_ptr)
+            .to_string_lossy()
+            .into_owned()
     };
     // Strip _meta suffix to get the partition name for catalog lookup
-    let partition_name = companion_name.strip_suffix("_meta").unwrap_or(&companion_name);
+    let partition_name = companion_name
+        .strip_suffix("_meta")
+        .unwrap_or(&companion_name);
 
     let mut result_map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
 
@@ -283,8 +287,7 @@ pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collectio
         parse_ndistinct_json(&text, &mut result_map);
     }
 
-    NDISTINCT_CACHE
-        .with(|cache| cache.borrow_mut().insert(companion_oid, result_map.clone()));
+    NDISTINCT_CACHE.with(|cache| cache.borrow_mut().insert(companion_oid, result_map.clone()));
     result_map
 }
 
@@ -295,9 +298,7 @@ pub(super) fn get_column_ndistinct(companion_oid: pg_sys::Oid) -> std::collectio
 pub(crate) fn get_column_valmap(
     companion_oid: pg_sys::Oid,
 ) -> std::collections::HashMap<String, Vec<String>> {
-    if let Some(cached) =
-        VALMAP_CACHE.with(|cache| cache.borrow().get(&companion_oid).cloned())
-    {
+    if let Some(cached) = VALMAP_CACHE.with(|cache| cache.borrow().get(&companion_oid).cloned()) {
         return cached;
     }
 
@@ -306,9 +307,13 @@ pub(crate) fn get_column_valmap(
         if name_ptr.is_null() {
             return std::collections::HashMap::new();
         }
-        std::ffi::CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
+        std::ffi::CStr::from_ptr(name_ptr)
+            .to_string_lossy()
+            .into_owned()
     };
-    let partition_name = companion_name.strip_suffix("_meta").unwrap_or(&companion_name);
+    let partition_name = companion_name
+        .strip_suffix("_meta")
+        .unwrap_or(&companion_name);
 
     let mut result_map: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -323,8 +328,7 @@ pub(crate) fn get_column_valmap(
         parse_valmap_json(&text, &mut result_map);
     }
 
-    VALMAP_CACHE
-        .with(|cache| cache.borrow_mut().insert(companion_oid, result_map.clone()));
+    VALMAP_CACHE.with(|cache| cache.borrow_mut().insert(companion_oid, result_map.clone()));
     result_map
 }
 
@@ -335,16 +339,24 @@ pub(crate) fn get_column_valmap(
 fn parse_valmap_json(text: &str, out: &mut std::collections::HashMap<String, Vec<String>>) {
     let bytes = text.as_bytes();
     let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
-    if i >= bytes.len() || bytes[i] != b'{' { return; }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'{' {
+        return;
+    }
     i += 1;
 
     loop {
         while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
             i += 1;
         }
-        if i >= bytes.len() || bytes[i] == b'}' { return; }
-        if bytes[i] != b'"' { return; }
+        if i >= bytes.len() || bytes[i] == b'}' {
+            return;
+        }
+        if bytes[i] != b'"' {
+            return;
+        }
         i += 1;
 
         // Key.
@@ -358,13 +370,17 @@ fn parse_valmap_json(text: &str, out: &mut std::collections::HashMap<String, Vec
                 i += 1;
             }
         }
-        if i >= bytes.len() { return; }
+        if i >= bytes.len() {
+            return;
+        }
         i += 1;
 
         while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b':') {
             i += 1;
         }
-        if i >= bytes.len() || bytes[i] != b'[' { return; }
+        if i >= bytes.len() || bytes[i] != b'[' {
+            return;
+        }
         i += 1;
 
         let mut vals: Vec<String> = Vec::new();
@@ -375,7 +391,9 @@ fn parse_valmap_json(text: &str, out: &mut std::collections::HashMap<String, Vec
             if i >= bytes.len() || bytes[i] == b']' {
                 break;
             }
-            if bytes[i] != b'"' { return; }
+            if bytes[i] != b'"' {
+                return;
+            }
             i += 1;
             let mut v = String::new();
             while i < bytes.len() && bytes[i] != b'"' {
@@ -387,11 +405,15 @@ fn parse_valmap_json(text: &str, out: &mut std::collections::HashMap<String, Vec
                     i += 1;
                 }
             }
-            if i >= bytes.len() { return; }
+            if i >= bytes.len() {
+                return;
+            }
             i += 1;
             vals.push(v);
         }
-        if i < bytes.len() && bytes[i] == b']' { i += 1; }
+        if i < bytes.len() && bytes[i] == b']' {
+            i += 1;
+        }
         out.insert(key, vals);
     }
 }
@@ -404,16 +426,24 @@ fn parse_ndistinct_json(text: &str, out: &mut std::collections::HashMap<String, 
     let bytes = text.as_bytes();
     let mut i = 0;
     // Skip leading whitespace and opening brace
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() { i += 1; }
-    if i >= bytes.len() || bytes[i] != b'{' { return; }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'{' {
+        return;
+    }
     i += 1;
 
     loop {
         while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
             i += 1;
         }
-        if i >= bytes.len() || bytes[i] == b'}' { return; }
-        if bytes[i] != b'"' { return; }
+        if i >= bytes.len() || bytes[i] == b'}' {
+            return;
+        }
+        if bytes[i] != b'"' {
+            return;
+        }
         i += 1;
 
         // Parse key (with \" and \\ escapes).
@@ -427,7 +457,9 @@ fn parse_ndistinct_json(text: &str, out: &mut std::collections::HashMap<String, 
                 i += 1;
             }
         }
-        if i >= bytes.len() { return; }
+        if i >= bytes.len() {
+            return;
+        }
         i += 1; // closing quote
 
         while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b':') {
@@ -436,10 +468,15 @@ fn parse_ndistinct_json(text: &str, out: &mut std::collections::HashMap<String, 
 
         // Parse integer value (may be negative in principle).
         let start = i;
-        if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') { i += 1; }
-        while i < bytes.len() && bytes[i].is_ascii_digit() { i += 1; }
+        if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
         if let Ok(s) = std::str::from_utf8(&bytes[start..i])
-            && let Ok(v) = s.parse::<i64>() {
+            && let Ok(v) = s.parse::<i64>()
+        {
             out.insert(key, v);
         }
     }
@@ -489,5 +526,106 @@ mod tests {
         // (PG default is 2, but some configs disable parallelism by setting
         // 0), clamp to 0.
         assert_eq!(recommend_agg_workers_inner(1000, 0), 0);
+    }
+
+    #[test]
+    fn parallel_divisor_matches_pg_costsize_formula() {
+        // From PG costsize.c get_parallel_divisor: leader contribution decays
+        // at 0.3 per worker. 1 worker → leader=0.7 → div=1.7; 2 → 0.4 → 2.4;
+        // 3 → 0.1 → 3.1. Past 3 workers the leader pins at 0.0.
+        assert!(
+            (parallel_divisor(0) - 1.0).abs() < 1e-9,
+            "got {}",
+            parallel_divisor(0)
+        );
+        assert!(
+            (parallel_divisor(1) - 1.7).abs() < 1e-9,
+            "got {}",
+            parallel_divisor(1)
+        );
+        assert!(
+            (parallel_divisor(2) - 2.4).abs() < 1e-9,
+            "got {}",
+            parallel_divisor(2)
+        );
+        assert!(
+            (parallel_divisor(3) - 3.1).abs() < 1e-9,
+            "got {}",
+            parallel_divisor(3)
+        );
+        // 4 workers: 1 - 1.2 = -0.2 → clamp to 0, div = 4.0.
+        assert!(
+            (parallel_divisor(4) - 4.0).abs() < 1e-9,
+            "got {}",
+            parallel_divisor(4)
+        );
+        assert!(
+            (parallel_divisor(10) - 10.0).abs() < 1e-9,
+            "got {}",
+            parallel_divisor(10)
+        );
+    }
+
+    #[test]
+    fn parse_ndistinct_json_handles_basic_shapes() {
+        let mut out = HashMap::new();
+        parse_ndistinct_json(r#"{"a":1,"b":42,"c":1234}"#, &mut out);
+        assert_eq!(out.get("a").copied(), Some(1));
+        assert_eq!(out.get("b").copied(), Some(42));
+        assert_eq!(out.get("c").copied(), Some(1234));
+
+        // Whitespace + negative + leading/trailing spaces.
+        let mut out2 = HashMap::new();
+        parse_ndistinct_json(r#"  { "x" : -7,  "y": +0 }  "#, &mut out2);
+        assert_eq!(out2.get("x").copied(), Some(-7));
+        assert_eq!(out2.get("y").copied(), Some(0));
+    }
+
+    #[test]
+    fn parse_ndistinct_json_unescapes_keys() {
+        // The writer (`catalog::json_escape`) emits `\"` and `\\` — round-trip
+        // them through the parser.
+        let mut out = HashMap::new();
+        parse_ndistinct_json(r#"{"col\"with\\quotes":5}"#, &mut out);
+        assert_eq!(out.get("col\"with\\quotes").copied(), Some(5));
+    }
+
+    #[test]
+    fn parse_ndistinct_json_tolerates_garbage() {
+        // Malformed input should never panic — caller treats an empty map as
+        // "no info, fall through to default selectivity".
+        let mut out = HashMap::new();
+        parse_ndistinct_json("", &mut out);
+        parse_ndistinct_json("null", &mut out);
+        parse_ndistinct_json("{", &mut out);
+        parse_ndistinct_json(r#"{"a":xyz}"#, &mut out);
+        // Doesn't insert "a" because the value didn't parse, and may stop at
+        // the bad token — what matters is "no crash".
+        assert_eq!(out.get("a").copied(), None);
+    }
+
+    #[test]
+    fn parse_valmap_json_basic_array() {
+        let mut out = HashMap::new();
+        parse_valmap_json(r#"{"col":["a","b","c"]}"#, &mut out);
+        assert_eq!(
+            out.get("col").cloned(),
+            Some(vec!["a".to_string(), "b".to_string(), "c".to_string()])
+        );
+
+        let mut out2 = HashMap::new();
+        parse_valmap_json(r#"{"a":[],"b":["x"]}"#, &mut out2);
+        assert_eq!(out2.get("a").cloned(), Some(Vec::<String>::new()));
+        assert_eq!(out2.get("b").cloned(), Some(vec!["x".to_string()]));
+    }
+
+    #[test]
+    fn parse_valmap_json_unescapes_quoted_values() {
+        // Writer escapes `"` and `\` in both keys and values — confirm the
+        // parser undoes both.
+        let mut out = HashMap::new();
+        parse_valmap_json(r#"{"event":["click\"ed","back\\slash"]}"#, &mut out);
+        let v = out.get("event").cloned().unwrap();
+        assert_eq!(v, vec!["click\"ed".to_string(), "back\\slash".to_string()]);
     }
 }
