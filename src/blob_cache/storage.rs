@@ -301,9 +301,7 @@ pub(super) fn get_pinned(key: &BlobCacheKey) -> Option<PinInner> {
             return None;
         }
 
-        let h = hash_key(key);
-        let shard_idx = ((h >> 8) as usize) & (n_shards - 1);
-        let bucket_idx = (h as u32) & (BUCKETS_PER_SHARD - 1);
+        let (shard_idx, bucket_idx) = hash_to_shard_bucket(key, n_shards);
 
         let lock = shard_lwlock(shard_idx);
         pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_SHARED);
@@ -353,9 +351,7 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
             return;
         }
 
-        let h = hash_key(key);
-        let shard_idx = ((h >> 8) as usize) & (n_shards - 1);
-        let bucket_idx = (h as u32) & (BUCKETS_PER_SHARD - 1);
+        let (shard_idx, bucket_idx) = hash_to_shard_bucket(key, n_shards);
         let lock = shard_lwlock(shard_idx);
 
         pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_EXCLUSIVE);
@@ -411,7 +407,7 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
             let cur = ctl.total_bytes.load(Ordering::Relaxed);
             if cur.saturating_add(needed) > max_bytes {
                 let to_free = cur.saturating_add(needed).saturating_sub(max_bytes);
-                let freed = evict_in_shard(ctl, area, shard, shard_idx, to_free);
+                let freed = evict_in_shard(ctl, area, shard, to_free);
                 if freed == 0 {
                     // Nothing to evict (empty or all pinned). v1 bails;
                     // neighbour-shard fallback is v2.
@@ -432,8 +428,7 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
                 // DSA exhausted despite soft cap saying we're OK. Free
                 // some entries and retry. Target a chunk larger than
                 // the entry so we make real progress.
-                let freed =
-                    evict_in_shard(ctl, area, shard, shard_idx, (entry_size as u64).max(4096));
+                let freed = evict_in_shard(ctl, area, shard, (entry_size as u64).max(4096));
                 if freed == 0 {
                     pg_sys::LWLockRelease(lock);
                     ctl.insert_failures_total.fetch_add(1, Ordering::Relaxed);
@@ -446,7 +441,7 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
                 pg_sys::dsa_allocate_extended(area, bytes.len(), pg_sys::DSA_ALLOC_NO_OOM as i32);
             if data_alloc == 0 {
                 pg_sys::dsa_free(area, entry_alloc);
-                let freed = evict_in_shard(ctl, area, shard, shard_idx, needed);
+                let freed = evict_in_shard(ctl, area, shard, needed);
                 if freed == 0 {
                     pg_sys::LWLockRelease(lock);
                     ctl.insert_failures_total.fetch_add(1, Ordering::Relaxed);
@@ -466,7 +461,7 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
         // Initialise the entry. dsa_allocate_extended with DSA_ALLOC_ZERO
         // already zeroed the memory, so atomics start at 0 (including
         // lru_prev / lru_next; lru_prepend overwrites them).
-        let entry = entry_ptr_mut(new_entry_dp);
+        let entry = entry_ptr(new_entry_dp);
         (*entry).key = *key;
         (*entry).data_ptr.store(data_dp, Ordering::Release);
         (*entry).data_len = bytes.len() as u32;
@@ -816,6 +811,19 @@ fn hash_key(k: &BlobCacheKey) -> u64 {
     h
 }
 
+/// Map a key to its `(shard_idx, bucket_idx)` slot. `n_shards` must be a
+/// power of two (enforced by the `MAX_SHARDS` constant + the
+/// `configured_shards()` clamp); we use the high bits of the hash for the
+/// shard index and the low bits for the bucket, so shard distribution
+/// stays independent of bucket distribution.
+#[inline]
+fn hash_to_shard_bucket(k: &BlobCacheKey, n_shards: usize) -> (usize, u32) {
+    let h = hash_key(k);
+    let shard_idx = ((h >> 8) as usize) & (n_shards - 1);
+    let bucket_idx = (h as u32) & (BUCKETS_PER_SHARD - 1);
+    (shard_idx, bucket_idx)
+}
+
 #[inline]
 unsafe fn ctl_ref() -> &'static BlobCacheCtl {
     unsafe {
@@ -840,11 +848,6 @@ unsafe fn shard_lwlock(shard_idx: usize) -> *mut pg_sys::LWLock {
 
 #[inline]
 unsafe fn entry_ptr(dp: u64) -> *mut Entry {
-    unsafe { pg_sys::dsa_get_address(dsa_area_ptr(), dp) as *mut Entry }
-}
-
-#[inline]
-unsafe fn entry_ptr_mut(dp: u64) -> *mut Entry {
     unsafe { pg_sys::dsa_get_address(dsa_area_ptr(), dp) as *mut Entry }
 }
 
@@ -966,7 +969,6 @@ unsafe fn evict_in_shard(
     ctl: &BlobCacheCtl,
     area: *mut pg_sys::dsa_area,
     shard: &Shard,
-    _shard_idx: usize,
     bytes_needed: u64,
 ) -> u64 {
     unsafe {
@@ -1015,5 +1017,112 @@ unsafe fn evict_in_shard(
             cur = prev;
         }
         freed
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use super::*;
+
+    fn mk_key(oid: u32, seg: u32, col: u16) -> BlobCacheKey {
+        BlobCacheKey {
+            companion_oid: oid,
+            segment_id: seg,
+            col_idx: col,
+            _pad: 0,
+        }
+    }
+
+    #[test]
+    fn shards_and_buckets_are_powers_of_two() {
+        // Both `& (n - 1)` slot computations in `hash_to_shard_bucket`
+        // require this. If anyone ever bumps these constants to a
+        // non-power-of-two, the slot distribution breaks silently.
+        const _: () = assert!(MAX_SHARDS.is_power_of_two());
+        const _: () = assert!(BUCKETS_PER_SHARD.is_power_of_two());
+        // Touch each at runtime so the test executes (and so a future
+        // const-eval bug surfaces as a panicking test, not a silent skip).
+        assert!(MAX_SHARDS.is_power_of_two());
+        assert!(BUCKETS_PER_SHARD.is_power_of_two());
+    }
+
+    #[test]
+    fn hash_key_is_deterministic() {
+        let k = mk_key(42, 7, 3);
+        assert_eq!(hash_key(&k), hash_key(&k));
+    }
+
+    #[test]
+    fn hash_key_distinguishes_each_field() {
+        // Changing any of the three semantically meaningful fields must
+        // produce a different hash — otherwise cache hits would alias
+        // across unrelated (oid, segment, column) triples.
+        let base = mk_key(1, 2, 3);
+        let h0 = hash_key(&base);
+        assert_ne!(h0, hash_key(&mk_key(99, 2, 3)));
+        assert_ne!(h0, hash_key(&mk_key(1, 99, 3)));
+        assert_ne!(h0, hash_key(&mk_key(1, 2, 9)));
+        // `_pad` is structurally present but semantically irrelevant —
+        // never set by `BlobCacheKey::new`. We don't assert anything
+        // about it because changing it shouldn't be a meaningful test.
+    }
+
+    #[test]
+    fn hash_to_shard_bucket_stays_in_range() {
+        // Pick a handful of keys and verify they fall into a valid
+        // (shard, bucket) slot for the smallest and a moderate shard count.
+        for n_shards in [1usize, 2, 4, 16, 64, 1024] {
+            for oid in 0..100u32 {
+                let k = mk_key(oid, oid.wrapping_mul(7), (oid & 0xff) as u16);
+                let (s, b) = hash_to_shard_bucket(&k, n_shards);
+                assert!(s < n_shards, "shard {s} not < {n_shards}");
+                assert!(b < BUCKETS_PER_SHARD);
+            }
+        }
+    }
+
+    #[test]
+    fn hash_to_shard_bucket_is_deterministic() {
+        let k = mk_key(123, 456, 7);
+        let a = hash_to_shard_bucket(&k, 64);
+        let b = hash_to_shard_bucket(&k, 64);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hash_to_shard_bucket_shard_and_bucket_use_different_bits() {
+        // Slot computation splits hash bits between shard (high) and bucket
+        // (low) so two keys can collide on one dimension without colliding
+        // on the other. Sanity-check that we observe both kinds of partial
+        // collisions across a small key universe.
+        let n_shards = 16;
+        let mut same_shard_diff_bucket = 0;
+        let mut same_bucket_diff_shard = 0;
+        let mut total_pairs = 0;
+        let keys: Vec<BlobCacheKey> = (0..64u32)
+            .map(|i| mk_key(i, i * 17, (i & 0xff) as u16))
+            .collect();
+        let slots: Vec<_> = keys
+            .iter()
+            .map(|k| hash_to_shard_bucket(k, n_shards))
+            .collect();
+        for i in 0..slots.len() {
+            for j in i + 1..slots.len() {
+                total_pairs += 1;
+                if slots[i].0 == slots[j].0 && slots[i].1 != slots[j].1 {
+                    same_shard_diff_bucket += 1;
+                }
+                if slots[i].1 == slots[j].1 && slots[i].0 != slots[j].0 {
+                    same_bucket_diff_shard += 1;
+                }
+            }
+        }
+        assert!(total_pairs > 0);
+        // Loose: across 64 keys × 16 shards × 256 buckets, partial collisions
+        // should exist in both directions. If either is exactly zero,
+        // shard and bucket are likely deriving from the same bits.
+        assert!(same_shard_diff_bucket > 0);
+        assert!(same_bucket_diff_shard > 0);
     }
 }

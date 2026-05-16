@@ -30,6 +30,61 @@ narration.
 
 ## Sessions
 
+### 2026-05-16 — `src/blob_cache/storage.rs` — TBD
+
+**Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
+The triage flagged this file as a fresh-design candidate: "Mmap-backed
+cache. Recent (just merged); add tests while the design is fresh."
+`unsafe` audit deferred — most blocks are PG FFI for DSA / LWLock /
+ShmemInitStruct that can't easily go safe.
+**LOC:** 1019 → 1022 (non-test) / 1128 total with 106 lines of tests
+added.
+**`unsafe`:** 37 → 35 (-2 from `entry_ptr_mut` removal + dropping the
+unused `_shard_idx` parameter on `evict_in_shard`).
+**Tests:** 0 → 6 (all `#[test]`, pure logic — first tests in this file).
+
+- Deleted `entry_ptr_mut`. The function body was a verbatim copy of
+  `entry_ptr` — both did `dsa_get_address(...) as *mut Entry`. Single
+  call site (`insert`) now uses `entry_ptr`.
+- Extracted `hash_to_shard_bucket(key, n_shards) -> (usize, u32)`. The
+  3-line "hash + shard mask + bucket mask" sequence was inlined in both
+  `get_pinned` and `insert`. The helper also documents the invariant —
+  shard uses high bits, bucket uses low bits, so the two slot
+  dimensions stay independent.
+- Removed unused `_shard_idx: usize` parameter from `evict_in_shard`
+  (3 call sites passed it, the body never used it).
+- Added 6 `#[test]` cases (pure logic, no PG harness — they don't touch
+  shared memory):
+  - `shards_and_buckets_are_powers_of_two` — load-bearing invariant for
+    the `& (n - 1)` slot masks; const-asserted + runtime-asserted
+  - `hash_key_is_deterministic`
+  - `hash_key_distinguishes_each_field` — bumping any of `companion_oid`,
+    `segment_id`, `col_idx` must change the hash so cache hits don't
+    alias across unrelated triples
+  - `hash_to_shard_bucket_stays_in_range` — every (key, n_shards) pair
+    lands inside `[0, n_shards) × [0, BUCKETS_PER_SHARD)`
+  - `hash_to_shard_bucket_is_deterministic`
+  - `hash_to_shard_bucket_shard_and_bucket_use_different_bits` — across
+    64 keys × 16 shards, partial collisions occur in both directions
+    (same-shard-diff-bucket and same-bucket-diff-shard). If shard and
+    bucket were derived from the same bits, one of these counts would
+    be zero — the test guards against that regression.
+- Deferred: SAFETY: comment pass on the 35 `unsafe` blocks (DSA, LWLock,
+  ShmemInitStruct, atomic loads through DSA pointers). Each is narrow
+  but the invariants (lock ownership / lifetime of DSA mappings) deserve
+  a dedicated session.
+- **Benchmarks**:
+  - ClickBench EC2 (c6a.4xlarge, 100M-row full dataset): **62.63s vs
+    prior 62.82s** (-0.3% total). Zero regressions >10%; Q10 -5.8%,
+    Q28 -3.6% (all within run-to-run noise).
+  - JSONBench EC2 (m6i.8xlarge, 100M Bluesky events): **3.633s vs prior
+    3.588s** (+1.3% total). All queries within ±3%; storage.rs only
+    contains slot-computation simplifications, so deltas are noise.
+- **Correctness:** `make correctness` 999 passed / 3 skipped / 6 xfailed
+  (matches baseline). Unit: 470 pass on PG17 and PG18 (was 464).
+  Integration: 234 pass on PG17 and PG18.
+- **Perf opportunities surfaced:** none.
+
 ### 2026-05-16 — `src/compress.rs` — 8f54e9d
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
