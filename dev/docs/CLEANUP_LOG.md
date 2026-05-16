@@ -30,6 +30,64 @@ narration.
 
 ## Sessions
 
+### 2026-05-16 — `src/scan/hook.rs` — TBD
+
+**Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
+`unsafe` audit deferred — almost all 85 blocks are PG FFI for planner
+internals (`get_namespace_name`, `get_attname`, `get_atttypetypmodcoll`,
+`list_nth`, `get_opname`, `SearchSysCache1`, `RangeVarGetRelidExtended`,
+`pg_detoast_datum`, etc.). Worth a dedicated SAFETY: comment pass.
+**LOC:** 4820 → 4642 (non-test) / 4735 total with 93 lines of tests added.
+**`unsafe`:** 84 → 85 (+1 from the new `cached_companion_for_rel` helper).
+**Tests:** 0 → 6 (all `#[test]`, pure logic — first tests in this file).
+
+- Deleted `is_pushable_qual` (~70 LOC). It was already marked
+  `#[allow(dead_code)]` and `grep -rn is_pushable_qual` confirmed zero
+  callers — leftover from an earlier qual-validation refactor.
+- Consolidated `has_segment_by` (~50 LOC) to derive from `get_meta_cols`
+  rather than running its own SPI query + `SEGMENT_BY_CACHE` thread_local.
+  The two caches stored overlapping data and ran two SPI lookups against
+  `deltax_deltatable` for the same parent OID. Now a single SPI fires
+  (via `META_COLS_CACHE`), and `has_segment_by` is a one-liner.
+- Consolidated `get_time_column_attno` similarly — it now delegates to
+  `get_meta_cols` for the SPI fetch and only caches the post-`get_attnum`
+  resolution. Saves ~40 LOC and one redundant SPI per query for parent
+  OIDs that the metadata-only fast path already touched.
+- Extracted `cached_companion_for_rel(rel_oid)`. The
+  `COMPRESSED_CACHE.with(|c| ... insert if not present ... return oid)`
+  block appeared 4 times verbatim across `deltax_set_rel_pathlist`,
+  `lookup_companion_from_subpath`, `collect_compressed_children`, and
+  `deltax_executor_start`. Now one helper.
+- Replaced two inline `unwrap_relabel` closures in
+  `deltax_create_upper_paths` and `is_pushable_qual` with the already-
+  existing named `unwrap_relabel_node` helper.
+- Added 6 `#[test]` cases (pure logic, no PG harness):
+  - `time_bounds_default_is_unbounded`
+  - `time_bounds_narrow_lo_keeps_max` — narrowing keeps the tighter bound
+  - `time_bounds_narrow_hi_keeps_min` — same on the upper side
+  - `time_bounds_combined_any` — `any()` flips on first narrow
+  - `is_minmax_meta_type_accepts_integer_float_date_timestamp` — INT2/4/8,
+    FLOAT4/8, DATE, TIMESTAMP, TIMESTAMPTZ all accepted
+  - `is_minmax_meta_type_rejects_text_bool_jsonb_numeric` — TEXT/VARCHAR/
+    BPCHAR/JSONB/BOOL/BYTEA/NUMERIC all rejected (these can't be encoded
+    as order-preserving i64 in colstats)
+- Deferred: SAFETY: comment pass on the 85 `unsafe` blocks. Nearly all
+  are PG FFI on planner internals (`PlannerInfo`, `RelOptInfo`,
+  `Aggref`, `OpExpr`, `Var` trees, syscache lookups) and can't go safe
+  without an enormous wrapper layer.
+- **Benchmarks**:
+  - ClickBench EC2 (c6a.4xlarge, 100M-row full dataset): **63.13s vs prior
+    62.95s** (+0.3% total, within session noise). Worst individual:
+    Q28 +7.7%, but cold runs match (19.66 vs 19.75) and Q28 has oscillated
+    8.07–8.69 across the last 6 sessions — fully within noise.
+  - JSONBench EC2 (m6i.8xlarge, 100M Bluesky events): **3.566s vs prior
+    3.637s** (-2.0%). Q1 came back to baseline (1.973 → 1.894); other
+    queries within ±2%.
+- **Correctness:** `make correctness` 999 passed / 3 skipped / 6 xfailed
+  (matches baseline). Unit: 434 pass on PG17 and PG18 (was 428).
+  Integration: 234 pass on PG17 and PG18.
+- **Perf opportunities surfaced:** none.
+
 ### 2026-05-16 — `src/copy.rs` — a41585d
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.

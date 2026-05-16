@@ -22,10 +22,6 @@ thread_local! {
     static TIME_COLUMN_CACHE: std::cell::RefCell<HashMap<pg_sys::Oid, i16>> =
         std::cell::RefCell::new(HashMap::new());
 
-    /// Cache of parent table OID → whether segment_by is configured.
-    static SEGMENT_BY_CACHE: std::cell::RefCell<HashMap<pg_sys::Oid, bool>> =
-        std::cell::RefCell::new(HashMap::new());
-
     /// Cache of parent table OID → (time_column_name, segment_by_names).
     /// Used by the metadata-only aggregate fast path (classify_meta_quals)
     /// so we can compare a qual's Var column name against the deltatable's
@@ -41,10 +37,24 @@ thread_local! {
 pub fn invalidate_compressed_cache() {
     COMPRESSED_CACHE.with(|cache| cache.borrow_mut().clear());
     TIME_COLUMN_CACHE.with(|cache| cache.borrow_mut().clear());
-    SEGMENT_BY_CACHE.with(|cache| cache.borrow_mut().clear());
     META_COLS_CACHE.with(|cache| cache.borrow_mut().clear());
     cost::invalidate_caches();
     super::exec::segments::invalidate_colstats_cache();
+}
+
+/// Look up the companion OID for a partition's heap OID, using
+/// `COMPRESSED_CACHE` to amortise the catalog probe across the planner's
+/// repeated calls on the same query.
+unsafe fn cached_companion_for_rel(rel_oid: pg_sys::Oid) -> pg_sys::Oid {
+    if let Some(&oid) = COMPRESSED_CACHE
+        .with(|c| c.borrow().get(&rel_oid).copied())
+        .as_ref()
+    {
+        return oid;
+    }
+    let oid = unsafe { check_compressed_partition(rel_oid) };
+    COMPRESSED_CACHE.with(|c| c.borrow_mut().insert(rel_oid, oid));
+    oid
 }
 
 /// Look up the deltatable's `(time_column, segment_by[])` configuration
@@ -114,64 +124,33 @@ pub(crate) fn set_dml_bypass(bypass: bool) {
 }
 
 /// Get the time column's attribute number for a deltatable parent table.
-/// Returns None if the table is not a deltax deltatable. Result is cached.
+/// Returns None if the table is not a deltax deltatable.
+///
+/// Caches the resolved attno separately from `META_COLS_CACHE` so the
+/// `get_attnum` catalog probe is amortised — but the SPI lookup is shared
+/// via `get_meta_cols`. `0` in `TIME_COLUMN_CACHE` is the sentinel for
+/// "not a deltatable / column not found".
 unsafe fn get_time_column_attno(parent_oid: pg_sys::Oid) -> Option<i16> {
-    let cached = TIME_COLUMN_CACHE.with(|cache| cache.borrow().get(&parent_oid).copied());
-    if let Some(attno) = cached {
+    if let Some(attno) = TIME_COLUMN_CACHE.with(|c| c.borrow().get(&parent_oid).copied()) {
         return if attno > 0 { Some(attno) } else { None };
     }
-
-    unsafe {
-        let schema_name_ptr = pg_sys::get_namespace_name(pg_sys::get_rel_namespace(parent_oid));
-        let table_name_ptr = pg_sys::get_rel_name(parent_oid);
-        if schema_name_ptr.is_null() || table_name_ptr.is_null() {
-            TIME_COLUMN_CACHE.with(|cache| cache.borrow_mut().insert(parent_oid, 0));
-            return None;
-        }
-        let schema_name = std::ffi::CStr::from_ptr(schema_name_ptr)
-            .to_string_lossy()
-            .into_owned();
-        let table_name = std::ffi::CStr::from_ptr(table_name_ptr)
-            .to_string_lossy()
-            .into_owned();
-
-        let time_col_name: Option<String> = pgrx::Spi::connect(|client| {
-            let result = client.select(
-                "SELECT time_column FROM deltax_deltatable WHERE schema_name = $1 AND table_name = $2",
-                None,
-                &[schema_name.as_str().into(), table_name.as_str().into()],
-            );
-            match result {
-                Ok(mut table) => match table.next() {
-                    Some(row) => row
-                        .get_datum_by_ordinal(1)
-                        .ok()
-                        .and_then(|d| d.value::<String>().ok())
-                        .flatten(),
-                    None => None,
-                },
-                Err(_) => None,
-            }
-        });
-
-        match time_col_name {
-            Some(col_name) => {
-                let col_cname = std::ffi::CString::new(col_name).unwrap();
-                let attno = pg_sys::get_attnum(parent_oid, col_cname.as_ptr());
-                if attno == pg_sys::InvalidAttrNumber as i16 {
-                    TIME_COLUMN_CACHE.with(|cache| cache.borrow_mut().insert(parent_oid, 0));
-                    None
-                } else {
-                    TIME_COLUMN_CACHE.with(|cache| cache.borrow_mut().insert(parent_oid, attno));
-                    Some(attno)
-                }
-            }
-            None => {
-                TIME_COLUMN_CACHE.with(|cache| cache.borrow_mut().insert(parent_oid, 0));
-                None
+    let attno = match unsafe { get_meta_cols(parent_oid) } {
+        Some((time_col, _)) => {
+            let col_cname = match std::ffi::CString::new(time_col) {
+                Ok(s) => s,
+                Err(_) => return None,
+            };
+            let a = unsafe { pg_sys::get_attnum(parent_oid, col_cname.as_ptr()) };
+            if a == pg_sys::InvalidAttrNumber as i16 {
+                0
+            } else {
+                a
             }
         }
-    }
+        None => 0,
+    };
+    TIME_COLUMN_CACHE.with(|c| c.borrow_mut().insert(parent_oid, attno));
+    if attno > 0 { Some(attno) } else { None }
 }
 
 /// Find the parent table OID for a child partition via append_rel_list.
@@ -223,51 +202,11 @@ unsafe fn find_parent_oid(
 
 /// Check whether a deltatable has segment_by configured. When segment_by is
 /// used, segments within a partition have overlapping time ranges, so we cannot
-/// advertise sorted output via pathkeys. Result is cached.
+/// advertise sorted output via pathkeys. Backed by the shared `META_COLS_CACHE`.
 unsafe fn has_segment_by(parent_oid: pg_sys::Oid) -> bool {
-    let cached = SEGMENT_BY_CACHE.with(|cache| cache.borrow().get(&parent_oid).copied());
-    if let Some(val) = cached {
-        return val;
-    }
-
-    unsafe {
-        let schema_name_ptr = pg_sys::get_namespace_name(pg_sys::get_rel_namespace(parent_oid));
-        let table_name_ptr = pg_sys::get_rel_name(parent_oid);
-        if schema_name_ptr.is_null() || table_name_ptr.is_null() {
-            SEGMENT_BY_CACHE.with(|cache| cache.borrow_mut().insert(parent_oid, false));
-            return false;
-        }
-        let schema_name = std::ffi::CStr::from_ptr(schema_name_ptr)
-            .to_string_lossy()
-            .into_owned();
-        let table_name = std::ffi::CStr::from_ptr(table_name_ptr)
-            .to_string_lossy()
-            .into_owned();
-
-        let result: bool = pgrx::Spi::connect(|client| {
-            let result = client.select(
-                "SELECT segment_by FROM deltax_deltatable WHERE schema_name = $1 AND table_name = $2",
-                None,
-                &[schema_name.as_str().into(), table_name.as_str().into()],
-            );
-            match result {
-                Ok(mut table) => match table.next() {
-                    Some(row) => row
-                        .get_datum_by_ordinal(1)
-                        .ok()
-                        .and_then(|d| d.value::<Vec<String>>().ok())
-                        .flatten()
-                        .map(|v| !v.is_empty())
-                        .unwrap_or(false),
-                    None => false,
-                },
-                Err(_) => false,
-            }
-        });
-
-        SEGMENT_BY_CACHE.with(|cache| cache.borrow_mut().insert(parent_oid, result));
-        result
-    }
+    unsafe { get_meta_cols(parent_oid) }
+        .map(|(_, sb)| !sb.is_empty())
+        .unwrap_or(false)
 }
 
 /// Check if the first query pathkey matches the time column in ASC order.
@@ -723,16 +662,7 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
         let rel_oid = (*rte).relid;
 
         // Check if this relation is a compressed partition
-        let companion_oid = COMPRESSED_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            if let Some(&oid) = cache.get(&rel_oid) {
-                return oid;
-            }
-
-            let oid = check_compressed_partition(rel_oid);
-            cache.insert(rel_oid, oid);
-            oid
-        });
+        let companion_oid = cached_companion_for_rel(rel_oid);
 
         if companion_oid == pg_sys::InvalidOid {
             return;
@@ -2699,15 +2629,6 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 }
             };
 
-            let unwrap_relabel = |n: *const pg_sys::Node| -> *const pg_sys::Node {
-                if (*n).type_ == pg_sys::NodeTag::T_RelabelType {
-                    let rlt = n as *const pg_sys::RelabelType;
-                    (*rlt).arg as *const pg_sys::Node
-                } else {
-                    n
-                }
-            };
-
             for &qn in &qual_nodes {
                 if qn.is_null() {
                     return;
@@ -2743,8 +2664,8 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             return;
                         }
 
-                        let a0 = unwrap_relabel(raw_arg0);
-                        let a1 = unwrap_relabel(raw_arg1);
+                        let a0 = unwrap_relabel_node(raw_arg0);
+                        let a1 = unwrap_relabel_node(raw_arg1);
 
                         // Resolve `(Var/chain, Const)` or `(Const, Var/chain)`
                         // — chain Exprs map to synthetic Vars whose type is
@@ -2870,7 +2791,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         if sa_arg0.is_null() || sa_arg1.is_null() {
                             return;
                         }
-                        let sa_a0 = unwrap_relabel(sa_arg0);
+                        let sa_a0 = unwrap_relabel_node(sa_arg0);
                         if (*sa_arg1).type_ != pg_sys::NodeTag::T_Const {
                             return;
                         }
@@ -4416,15 +4337,7 @@ unsafe fn lookup_companion_from_subpath(
             return None;
         }
         let child_oid = (*rte).relid;
-        let companion_oid = COMPRESSED_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            if let Some(&oid) = cache.get(&child_oid) {
-                return oid;
-            }
-            let oid = check_compressed_partition(child_oid);
-            cache.insert(child_oid, oid);
-            oid
-        });
+        let companion_oid = cached_companion_for_rel(child_oid);
         if companion_oid != pg_sys::InvalidOid {
             Some(companion_oid)
         } else {
@@ -4460,82 +4373,6 @@ unsafe fn subpath_has_data(root: *mut pg_sys::PlannerInfo, subpath: *const pg_sy
             pg_sys::RelationGetNumberOfBlocksInFork(rel, pg_sys::ForkNumber::MAIN_FORKNUM);
         pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         nblocks > 0
-    }
-}
-
-/// Check if a single qual node is pushable to DeltaXAgg's batch filter.
-///
-/// Requirements (must ALL be true):
-/// 1. Node is T_OpExpr with exactly 2 args
-/// 2. Operator is =, <>, <, <=, >, >= (not LIKE, ~~, etc.)
-/// 3. One arg is T_Var (or T_RelabelType wrapping T_Var), other is T_Const
-/// 4. The Var's type is batch-comparable (numeric, bool, date, timestamp)
-#[allow(dead_code)]
-unsafe fn is_pushable_qual(node: *const pg_sys::Node) -> bool {
-    unsafe {
-        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_OpExpr {
-            return false;
-        }
-
-        let opexpr = node as *const pg_sys::OpExpr;
-        let args = (*opexpr).args;
-        if args.is_null() || (*args).length != 2 {
-            return false;
-        }
-
-        // Check operator is a supported comparison
-        let opname_ptr = pg_sys::get_opname((*opexpr).opno);
-        if opname_ptr.is_null() {
-            return false;
-        }
-        let opname = std::ffi::CStr::from_ptr(opname_ptr).to_str().unwrap_or("");
-        if !matches!(opname, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
-            return false;
-        }
-
-        let arg0 = (*(*args).elements.add(0)).ptr_value as *const pg_sys::Node;
-        let arg1 = (*(*args).elements.add(1)).ptr_value as *const pg_sys::Node;
-        if arg0.is_null() || arg1.is_null() {
-            return false;
-        }
-
-        // Unwrap RelabelType to get the underlying node
-        let unwrap = |n: *const pg_sys::Node| -> *const pg_sys::Node {
-            if (*n).type_ == pg_sys::NodeTag::T_RelabelType {
-                let rlt = n as *const pg_sys::RelabelType;
-                (*rlt).arg as *const pg_sys::Node
-            } else {
-                n
-            }
-        };
-        let a0 = unwrap(arg0);
-        let a1 = unwrap(arg1);
-
-        // Must be Var op Const or Const op Var
-        let var_node = if (*a0).type_ == pg_sys::NodeTag::T_Var
-            && (*a1).type_ == pg_sys::NodeTag::T_Const
-        {
-            a0 as *const pg_sys::Var
-        } else if (*a0).type_ == pg_sys::NodeTag::T_Const && (*a1).type_ == pg_sys::NodeTag::T_Var {
-            a1 as *const pg_sys::Var
-        } else {
-            return false;
-        };
-
-        // Check that the Var's type is batch-comparable
-        let var_type = (*var_node).vartype;
-        matches!(
-            var_type,
-            pg_sys::INT2OID
-                | pg_sys::INT4OID
-                | pg_sys::INT8OID
-                | pg_sys::FLOAT4OID
-                | pg_sys::FLOAT8OID
-                | pg_sys::BOOLOID
-                | pg_sys::DATEOID
-                | pg_sys::TIMESTAMPOID
-                | pg_sys::TIMESTAMPTZOID
-        )
     }
 }
 
@@ -4603,15 +4440,7 @@ unsafe fn collect_compressed_children(
             let child_oid = (*child_rte).relid;
 
             // Check if this child has a compressed companion
-            let companion_oid = COMPRESSED_CACHE.with(|cache| {
-                let mut cache = cache.borrow_mut();
-                if let Some(&oid) = cache.get(&child_oid) {
-                    return oid;
-                }
-                let oid = check_compressed_partition(child_oid);
-                cache.insert(child_oid, oid);
-                oid
-            });
+            let companion_oid = cached_companion_for_rel(child_oid);
 
             if companion_oid != pg_sys::InvalidOid {
                 companion_oids.push(companion_oid);
@@ -4723,15 +4552,7 @@ pub unsafe extern "C-unwind" fn deltax_executor_start(
                 }
                 let relid = (*rte).relid;
 
-                let companion_oid = COMPRESSED_CACHE.with(|cache| {
-                    let mut cache = cache.borrow_mut();
-                    if let Some(&oid) = cache.get(&relid) {
-                        return oid;
-                    }
-                    let oid = check_compressed_partition(relid);
-                    cache.insert(relid, oid);
-                    oid
-                });
+                let companion_oid = cached_companion_for_rel(relid);
 
                 if companion_oid != pg_sys::InvalidOid {
                     let op_name = match operation {
@@ -4816,5 +4637,99 @@ pub unsafe extern "C-unwind" fn deltax_planner(
         }
 
         pstmt
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn time_bounds_default_is_unbounded() {
+        let b = TimeBounds::default();
+        assert_eq!(b.lo, None);
+        assert_eq!(b.hi, None);
+        assert!(!b.any());
+    }
+
+    #[test]
+    fn time_bounds_narrow_lo_keeps_max() {
+        let mut b = TimeBounds::default();
+        b.narrow_lo(100);
+        assert_eq!(b.lo, Some(100));
+        // narrower (higher) lo wins
+        b.narrow_lo(200);
+        assert_eq!(b.lo, Some(200));
+        // wider (lower) lo is ignored
+        b.narrow_lo(50);
+        assert_eq!(b.lo, Some(200));
+        assert!(b.any());
+    }
+
+    #[test]
+    fn time_bounds_narrow_hi_keeps_min() {
+        let mut b = TimeBounds::default();
+        b.narrow_hi(1000);
+        assert_eq!(b.hi, Some(1000));
+        // narrower (lower) hi wins
+        b.narrow_hi(500);
+        assert_eq!(b.hi, Some(500));
+        // wider (higher) hi is ignored
+        b.narrow_hi(800);
+        assert_eq!(b.hi, Some(500));
+        assert!(b.any());
+    }
+
+    #[test]
+    fn time_bounds_combined_any() {
+        let mut b = TimeBounds::default();
+        assert!(!b.any());
+        b.narrow_lo(0);
+        assert!(b.any());
+        b.narrow_hi(100);
+        assert!(b.any());
+        assert_eq!(b.lo, Some(0));
+        assert_eq!(b.hi, Some(100));
+    }
+
+    #[test]
+    fn is_minmax_meta_type_accepts_integer_float_date_timestamp() {
+        for oid in [
+            pg_sys::INT2OID,
+            pg_sys::INT4OID,
+            pg_sys::INT8OID,
+            pg_sys::FLOAT4OID,
+            pg_sys::FLOAT8OID,
+            pg_sys::DATEOID,
+            pg_sys::TIMESTAMPOID,
+            pg_sys::TIMESTAMPTZOID,
+        ] {
+            assert!(
+                is_minmax_meta_type(oid),
+                "expected oid {:?} to be meta-min/max-able",
+                oid
+            );
+        }
+    }
+
+    #[test]
+    fn is_minmax_meta_type_rejects_text_bool_jsonb_numeric() {
+        // TEXT/VARCHAR/BPCHAR/JSONB/BOOL aren't encoded as order-preserving i64 in colstats.
+        for oid in [
+            pg_sys::TEXTOID,
+            pg_sys::VARCHAROID,
+            pg_sys::BPCHAROID,
+            pg_sys::JSONBOID,
+            pg_sys::BOOLOID,
+            pg_sys::BYTEAOID,
+            pg_sys::NUMERICOID,
+        ] {
+            assert!(
+                !is_minmax_meta_type(oid),
+                "expected oid {:?} to NOT be meta-min/max-able",
+                oid
+            );
+        }
     }
 }
