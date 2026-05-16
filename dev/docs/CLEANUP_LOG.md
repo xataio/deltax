@@ -30,7 +30,7 @@ narration.
 
 ## Sessions
 
-### 2026-05-16 — `src/scan/exec/agg_wire.rs` — TBD
+### 2026-05-16 — `src/scan/exec/agg_wire.rs` — 67d2796
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
 Same triage drift as `append_wire.rs`: the file had 7 `#[pgrx::pg_test]`
