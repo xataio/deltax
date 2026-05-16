@@ -1,6 +1,58 @@
-# pg_deltax
+# DeltaX (δx) - Fast time-series extension for PostgreSQL
 
-A PostgreSQL extension for time-series data, built on native declarative partitioning with automatic partition management.
+δx is a PostgreSQL extension offering compression and columnar storage for time-series 
+data. It can be used as a pure open-source (Apache 2.0) alternative to TimescaleDB or
+as a PostgreSQL-native alternative to dedicated analytics stores like ClickHouse, when
+you'd like your data to stay in Postgres.
+
+δx stores the compressed data in regular Postgres tables. It does _not_ use its own storage 
+format on disk. The advantage of this approach is that features like physical/logical 
+replication, crash recovery, backups, and pg_dump work as for any other Postgres table.
+
+## Benchmarks
+
+### ClickBench
+
+On the [ClickBench](https://benchmark.clickhouse.com/) benchmark, which runs 43 analytical
+queries against a web analytics dataset of 100M rows x 105 columns, currently ranks lower than specialized analitcal stores like ClickHouse and DuckDB, but it is the highest ranking of all 
+the systems that are storing the data in PostgreSQL.
+
+![ClickBench combined: pg_deltax ranks in-between ClickHouse and TimescaleDB](images/clickbench-combined.png)
+
+#### Compression / storage size
+
+Looking at the **compression ratio / storage size**, δx offers compression ratio of about 7x on
+this particular dataset.
+
+![ClickBench storage size: pg_deltax compression ration is ~7x](images/clickbench-storage-size.png)
+
+#### Cold run
+
+![ClickBench cold run result](images/clickbench-cold-run.png)
+
+#### Hot run
+
+![ClickBench hot run result](images/clickbench-hot-run.png)
+
+#### Load time
+
+![ClickBench load times result](images/clickbench-load-time.png)
+
+The reason δx can load the data faster than Postgres is that it has support for backfilling data directly from Parquet files. On a more standard setup where the data is loaded into normal Postgres tables and them compressed, the load time would be similar to the PostgreSQL result + the time to compress.
+
+
+### JSONBench
+
+[JSONBench](https://jsonbench.com/) is a benchmark similar to ClickBench but for measuring performance
+on semi-structured data. 
+
+δx has support for extracting particular fields from JSONB fields and compressing them with the same columnar algorithms as the native columns. This enables the following result on JSONBench.
+
+![JSONBench hot run results](images/jsonbench-hot-run.png)
+
+## How it works
+
+## Correctness testing
 
 ## Features
 
