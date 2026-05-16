@@ -30,7 +30,56 @@ narration.
 
 ## Sessions
 
-### 2026-05-16 — `src/scan/json_extract.rs` — pending
+### 2026-05-16 — `src/scan/exec/datum_utils.rs` — pending
+
+**Scope:** read pass, simplify, tests, verify, benchmarks. `unsafe` audit
+deferred (still 54 blocks; nearly all are PG FFI for `palloc`,
+`OidInputFunctionCall`, varlena layout).
+**LOC:** 1689 → 1575   **`unsafe`:** 52 → 54 (+2 from the arena helper split,
+isolated to the new `varlena_arena_alloc`)   **Tests:** existing `mod.rs` tests
+covered the file already (the triage's "0 tests" was misleading); added 7
+focused ones below.
+
+- Added `is_null_at(bitmap, i)` private helper, used by 10 inline checks that
+  spelled `(bitmap[i / 8] >> (i % 8)) & 1 == 1`. Easier to grep, easier to
+  read, identical codegen behind `#[inline]`.
+- Added `merge_with_placeholder(matched, sel)` helper. Replaced 12 verbatim
+  copies of the "for each pass: push matched or Datum(0)" pattern in
+  `decompress_text_blob_with_{like,eq,in}_filter` and
+  `decompress_{text,jsonb}_blob_with_selection`.
+- Unified the two arena allocators (`str_slices_to_text_datums_arena` and
+  `byte_slices_to_jsonb_datums_arena`) on a single private
+  `varlena_arena_alloc(&[&[u8]])`. The text version is now a thin wrapper
+  that handles the bpchar/jsonb safety-net path; the jsonb version is a
+  one-liner. Saves ~50 LOC and consolidates the varlena layout invariants in
+  one place.
+- Added unit tests in `src/scan/exec/mod.rs`:
+  - `test_is_null_at` (pure)
+  - `test_merge_with_placeholder` (pure)
+  - `#[pg_test] test_decompress_text_eq_filter_dict` and `_ne_dict` (covers
+    Dictionary path's `parse_header` + `read_index` + empty-string fast-path)
+  - `#[pg_test] test_decompress_text_in_filter_{dict,lz4}` (covers IN set probe
+    on both codec paths)
+  - `#[pg_test] test_decompress_text_like_contains_lz4` (LIKE `%needle%` SIMD
+    `memmem` scan on LZ4)
+- Deferred: unsafe audit. Most of the 54 unsafe blocks are FFI to
+  `pg_sys::{palloc, OidInputFunctionCall, getTypeInputInfo,
+  cstring_to_text_with_len, ExecClearTuple, MemoryContextSwitchTo}` and the
+  varlena layout work in the arena helper. Pure-FFI, can't go safe without an
+  enormous wrapper layer. Worth a dedicated SAFETY: comment pass in a
+  follow-up.
+- **Benchmarks** (this file affects per-row exec, so all three):
+  - clickbench local: +2.2% total vs prior commit — noise (per-query swings of
+    -65% / +66% on small queries reflect cache state, not code).
+  - jsonbench (EC2 100m): -0.1% total, all 5 queries within ±4%.
+  - rtabench local: not run; clickbench + jsonbench cover the relevant
+    text/jsonb decompression paths.
+- **Correctness:** `make correctness` 999 passed, 3 skipped, 6 xfailed
+  (correctness preserved against vanilla PostgreSQL). Unit tests: 406 pass on
+  PG17 and PG18 (was 399). Integration: 234 pass on PG17 and PG18.
+- **Perf opportunities surfaced:** none.
+
+### 2026-05-16 — `src/scan/json_extract.rs` — 3eab8be
 
 **Scope:** read pass, simplify, tests, verify. Full `unsafe` audit deferred.
 **LOC:** 2776 → 2712   **`unsafe`** (non-test): 106 → 104   **Tests:** 1 → 7
