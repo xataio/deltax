@@ -30,7 +30,7 @@ narration.
 
 ## Sessions
 
-### 2026-05-16 — `src/scan/exec/datum_utils.rs` — pending
+### 2026-05-16 — `src/scan/exec/datum_utils.rs` — 52f5f74
 
 **Scope:** read pass, simplify, tests, verify, benchmarks. `unsafe` audit
 deferred (still 54 blocks; nearly all are PG FFI for `palloc`,
