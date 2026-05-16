@@ -130,6 +130,7 @@ pub(crate) struct DecompressState {
 }
 
 /// Wall-clock timing for the decompress scan phases.
+#[derive(Default)]
 pub(crate) struct ScanTiming {
     /// Time spent in load_metadata (SPI).
     pub(crate) metadata_us: u64,
@@ -260,6 +261,180 @@ impl ScanTiming {
     }
 }
 
+/// Compute the column indices that Phase 1 of the Top-N two-pass scan
+/// will decompress: the sort column plus any column referenced by a
+/// batch qual (text Eq/Ne/In/LIKE or numeric).
+fn compute_phase1_col_indices(
+    col_names: &[String],
+    segment_by: &[String],
+    needed_cols: &[bool],
+    batch_quals: &[BatchQual],
+    sort_col: usize,
+) -> Vec<usize> {
+    let mut out = Vec::new();
+    for (col_idx, col_name) in col_names.iter().enumerate() {
+        if !needed_cols[col_idx] && col_idx != sort_col {
+            continue;
+        }
+        let has_batch_qual = batch_quals.iter().any(|bq| bq.col_idx == col_idx);
+        if segment_by.contains(col_name) {
+            if has_batch_qual {
+                out.push(col_idx);
+            }
+        } else if has_batch_qual || col_idx == sort_col {
+            out.push(col_idx);
+        }
+    }
+    out
+}
+
+/// Map Phase 1 column indices to blob indices for `detoast_lazy_blobs_selective`.
+/// Non-`segment_by` columns are indexed densely into `compressed_blobs`.
+fn compute_phase1_blob_indices(
+    col_names: &[String],
+    segment_by: &[String],
+    phase1_col_indices: &[usize],
+) -> Vec<usize> {
+    let mut indices = Vec::new();
+    let mut bi: usize = 0;
+    for (col_idx, col_name) in col_names.iter().enumerate() {
+        if segment_by.contains(col_name) {
+            continue;
+        }
+        if phase1_col_indices.contains(&col_idx) {
+            indices.push(bi);
+        }
+        bi += 1;
+    }
+    indices
+}
+
+/// AND-merge a freshly-produced selection vector into a running one.
+/// Empty target adopts `src` wholesale; otherwise positions are AND-ed.
+/// Both vectors must have the same length when target is non-empty.
+#[inline]
+fn merge_and_selection(target: &mut Vec<bool>, src: Vec<bool>) {
+    if target.is_empty() {
+        *target = src;
+    } else {
+        for (t, s) in target.iter_mut().zip(src.iter()) {
+            *t = *t && *s;
+        }
+    }
+}
+
+/// Metadata-only pruning: returns true if the segment cannot match the
+/// query given its segment-by values and time range. Does NOT touch
+/// compressed blobs — safe to call before detoast.
+///
+/// Empty segments (`row_count == 0`) are *not* reported here; callers
+/// already check that and don't increment `segments_skipped` for them.
+fn segment_pre_pruned_by_metadata(
+    seg: &SegmentData,
+    seg_by_filters: &[(usize, String)],
+    time_min: Option<i64>,
+    time_max: Option<i64>,
+) -> bool {
+    for (svi, filter_val) in seg_by_filters {
+        match &seg.segment_values[*svi] {
+            Some(val) if val == filter_val => {}
+            _ => return true,
+        }
+    }
+    if let (Some(seg_min), Some(seg_max)) = (seg.min_time, seg.max_time) {
+        if time_min.is_some_and(|qmin| seg_max < qmin) {
+            return true;
+        }
+        if time_max.is_some_and(|qmax| seg_min > qmax) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Raw shape of the planner-emitted `custom_private` `IntList`.
+///
+/// Layout (each section optional except `header`):
+///   header_ints ... | -1 | needed_indices ... | -2 | topn_block ... | -3 | synth_indices ...
+///
+/// `header_ints` are interpreted by the caller (single companion OID for
+/// `DeltaXDecompress`, vector of OIDs for `DeltaXAppend`).
+struct ParsedCustomPrivate {
+    header: Vec<i32>,
+    needed_indices: Vec<usize>,
+    topn: Option<TopNRaw>,
+}
+
+struct TopNRaw {
+    limit: i64,
+    ascending: bool,
+    nulls_first: bool,
+    multi_col_sort: bool,
+    sort_col_attno: i32,
+}
+
+/// Walk a `custom_private` `IntList` produced by the planner. Returns the
+/// header ints (before `-1`), the needed-column indices (after `-1` and
+/// `-3` sections), and the optional Top-N block (after `-2`).
+unsafe fn parse_custom_private(list: *mut pg_sys::List) -> ParsedCustomPrivate {
+    let mut header = Vec::new();
+    let mut needed_indices = Vec::new();
+    let mut topn: Option<TopNRaw> = None;
+    if list.is_null() {
+        return ParsedCustomPrivate {
+            header,
+            needed_indices,
+            topn,
+        };
+    }
+    let len = unsafe { (*list).length };
+    let mut sec = 0u8; // 0 = header, 1 = cols, 2 = topn, 3 = synth
+    let mut i: i32 = 0;
+    while i < len {
+        let val = unsafe { pg_sys::list_nth_int(list, i) };
+        if val == -1 && sec == 0 {
+            sec = 1;
+            i += 1;
+            continue;
+        }
+        if val == -2 && sec == 1 {
+            let read = |off: i32| -> Option<i32> {
+                if i + off < len {
+                    Some(unsafe { pg_sys::list_nth_int(list, i + off) })
+                } else {
+                    None
+                }
+            };
+            topn = Some(TopNRaw {
+                limit: read(1).unwrap_or(0) as i64,
+                ascending: read(2).unwrap_or(1) != 0,
+                multi_col_sort: read(3).unwrap_or(0) != 0,
+                sort_col_attno: read(4).unwrap_or(0),
+                nulls_first: read(5).unwrap_or(0) != 0,
+            });
+            sec = 2;
+            i += 6;
+            continue;
+        }
+        if val == -3 && sec >= 1 {
+            sec = 3;
+            i += 1;
+            continue;
+        }
+        match sec {
+            0 => header.push(val),
+            1 | 3 if val >= 0 => needed_indices.push(val as usize),
+            _ => {}
+        }
+        i += 1;
+    }
+    ParsedCustomPrivate {
+        header,
+        needed_indices,
+        topn,
+    }
+}
+
 unsafe fn current_worker_slot() -> usize {
     let n = unsafe { pg_sys::ParallelWorkerNumber };
     if n < 0 {
@@ -347,59 +522,28 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
             pgrx::error!("pg_deltax: missing companion table OID in custom scan state");
         }
 
-        let companion_oid = pg_sys::Oid::from(pg_sys::list_nth_int(custom_private, 0) as u32);
-
-        // Parse needed column indices from custom_private (after sentinel -1)
-        // Also parse Top-N info after sentinel -2 and json-extract synthetic
-        // col_idx values after sentinel -3 if present.
-        let list_len = (*custom_private).length;
-        let mut needed_indices: Vec<usize> = Vec::new();
-        let mut found_sentinel = false;
-        let mut topn_limit: i64 = 0;
-        let mut topn_ascending: bool = true;
-        let mut topn_nulls_first: bool = false;
-        let mut topn_multi_col_sort: bool = false;
-        let mut topn_sort_col_attno: i32 = 0;
-        let mut in_synth_section = false;
-        let mut i: i32 = 1;
-        while i < list_len {
-            let val = pg_sys::list_nth_int(custom_private, i);
-            if val == -1 && !found_sentinel {
-                found_sentinel = true;
-                in_synth_section = false;
-                i += 1;
-                continue;
-            }
-            if val == -2 && found_sentinel && !in_synth_section {
-                // Top-N sentinel: next values are effective_limit, sort_ascending,
-                // multi_col_sort, sort_col_attno, nulls_first
-                if i + 2 < list_len {
-                    topn_limit = pg_sys::list_nth_int(custom_private, i + 1) as i64;
-                    topn_ascending = pg_sys::list_nth_int(custom_private, i + 2) != 0;
-                }
-                if i + 3 < list_len {
-                    topn_multi_col_sort = pg_sys::list_nth_int(custom_private, i + 3) != 0;
-                }
-                if i + 4 < list_len {
-                    topn_sort_col_attno = pg_sys::list_nth_int(custom_private, i + 4);
-                }
-                if i + 5 < list_len {
-                    topn_nulls_first = pg_sys::list_nth_int(custom_private, i + 5) != 0;
-                }
-                // Skip past the topn block to look for a `-3` synth section.
-                i += 6;
-                continue;
-            }
-            if val == -3 && found_sentinel {
-                in_synth_section = true;
-                i += 1;
-                continue;
-            }
-            if (found_sentinel || in_synth_section) && val >= 0 {
-                needed_indices.push(val as usize);
-            }
-            i += 1;
+        let parsed = parse_custom_private(custom_private);
+        if parsed.header.is_empty() {
+            pgrx::error!("pg_deltax: custom_private has no companion OID");
         }
+        let companion_oid = pg_sys::Oid::from(parsed.header[0] as u32);
+        let needed_indices = parsed.needed_indices;
+        let (
+            topn_limit,
+            topn_ascending,
+            topn_nulls_first,
+            topn_multi_col_sort,
+            topn_sort_col_attno,
+        ) = match &parsed.topn {
+            Some(t) => (
+                t.limit,
+                t.ascending,
+                t.nulls_first,
+                t.multi_col_sort,
+                t.sort_col_attno,
+            ),
+            None => (0i64, true, false, false, 0i32),
+        };
 
         // Get companion table name
         let companion_name = {
@@ -515,36 +659,7 @@ fn make_worker_stub_state() -> DecompressState {
         needed_cols: Vec::new(),
         needed_col_indices: Vec::new(),
         segment_mcxt: std::ptr::null_mut(),
-        timing: ScanTiming {
-            metadata_us: 0,
-            heap_scan_us: 0,
-            decompress_us: 0,
-            phase1_us: 0,
-            phase2_us: 0,
-            phase2_text_us: 0,
-            phase2_nontext_us: 0,
-            phase2_text_cols: 0,
-            phase2_nontext_cols: 0,
-            emit_us: 0,
-            rows_emitted: 0,
-            rows_filtered: 0,
-            batch_eval_us: 0,
-            rows_batch_filtered: 0,
-            segments_decompressed: 0,
-            compressed_bytes: 0,
-            segments_skipped: 0,
-            segments_minmax_skipped: 0,
-            segments_bloom_skipped: 0,
-            segments_valbitmap_skipped: 0,
-            buf_stats: super::segments::ScanBufferStats::default(),
-            phase2_skipped: 0,
-            topn_limit: 0,
-            topn_candidates: 0,
-            topn_phase2_segments: 0,
-            blob_cache_hits: 0,
-            blob_cache_misses: 0,
-            blob_cache_bytes_served: 0,
-        },
+        timing: ScanTiming::default(),
         instrument: None,
         _time_column: String::new(),
         rows_sorted_by_time: true,
@@ -594,48 +709,29 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             pgrx::error!("pg_deltax: missing companion table OIDs in DeltaXAppend state");
         }
 
-        let list_len = (*custom_private).length;
-
-        // Parse companion OIDs (before sentinel -1), needed column indices (after -1),
-        // and Top-N info (after sentinel -2) if present
-        let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
-        let mut needed_indices: Vec<usize> = Vec::new();
-        let mut found_sentinel = false;
-        let mut topn_limit: i64 = 0;
-        let mut topn_ascending: bool = true;
-        let mut topn_nulls_first: bool = false;
-        let mut topn_multi_col_sort: bool = false;
-        let mut topn_sort_col_attno: i32 = 0;
-        for i in 0..list_len {
-            let val = pg_sys::list_nth_int(custom_private, i);
-            if val == -1 && !found_sentinel {
-                found_sentinel = true;
-                continue;
-            }
-            if val == -2 && found_sentinel {
-                // Top-N sentinel: next values are effective_limit, sort_ascending,
-                // multi_col_sort, sort_col_attno, nulls_first
-                if i + 2 < list_len {
-                    topn_limit = pg_sys::list_nth_int(custom_private, i + 1) as i64;
-                    topn_ascending = pg_sys::list_nth_int(custom_private, i + 2) != 0;
-                }
-                if i + 3 < list_len {
-                    topn_multi_col_sort = pg_sys::list_nth_int(custom_private, i + 3) != 0;
-                }
-                if i + 4 < list_len {
-                    topn_sort_col_attno = pg_sys::list_nth_int(custom_private, i + 4);
-                }
-                if i + 5 < list_len {
-                    topn_nulls_first = pg_sys::list_nth_int(custom_private, i + 5) != 0;
-                }
-                break;
-            }
-            if found_sentinel && val >= 0 {
-                needed_indices.push(val as usize);
-            } else if !found_sentinel {
-                companion_oids.push(pg_sys::Oid::from(val as u32));
-            }
-        }
+        let parsed = parse_custom_private(custom_private);
+        let companion_oids: Vec<pg_sys::Oid> = parsed
+            .header
+            .iter()
+            .map(|&v| pg_sys::Oid::from(v as u32))
+            .collect();
+        let needed_indices = parsed.needed_indices;
+        let (
+            topn_limit,
+            topn_ascending,
+            topn_nulls_first,
+            topn_multi_col_sort,
+            topn_sort_col_attno,
+        ) = match &parsed.topn {
+            Some(t) => (
+                t.limit,
+                t.ascending,
+                t.nulls_first,
+                t.multi_col_sort,
+                t.sort_col_attno,
+            ),
+            None => (0i64, true, false, false, 0i32),
+        };
 
         if companion_oids.is_empty() {
             pgrx::error!("pg_deltax: DeltaXAppend has no companion tables");
@@ -819,32 +915,14 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             timing: ScanTiming {
                 metadata_us,
                 heap_scan_us,
-                decompress_us: 0,
-                phase1_us: 0,
-                phase2_us: 0,
-                phase2_text_us: 0,
-                phase2_nontext_us: 0,
-                phase2_text_cols: 0,
-                phase2_nontext_cols: 0,
-                emit_us: 0,
-                rows_emitted: 0,
-                rows_filtered: 0,
-                batch_eval_us: 0,
-                rows_batch_filtered: 0,
-                segments_decompressed: 0,
                 compressed_bytes,
                 segments_skipped: total_skipped,
                 segments_minmax_skipped: total_minmax_skipped,
                 segments_bloom_skipped: total_bloom_skipped,
                 segments_valbitmap_skipped: total_valbitmap_skipped,
                 buf_stats: total_buf_stats,
-                phase2_skipped: 0,
                 topn_limit: if topn_limit > 0 { topn_limit as u64 } else { 0 },
-                topn_candidates: 0,
-                topn_phase2_segments: 0,
-                blob_cache_hits: 0,
-                blob_cache_misses: 0,
-                blob_cache_bytes_served: 0,
+                ..Default::default()
             },
             instrument: None,
             _time_column: meta.time_column,
@@ -1034,32 +1112,13 @@ fn load_decompress_state(
         timing: ScanTiming {
             metadata_us,
             heap_scan_us,
-            decompress_us: 0,
-            phase1_us: 0,
-            phase2_us: 0,
-            phase2_text_us: 0,
-            phase2_nontext_us: 0,
-            phase2_text_cols: 0,
-            phase2_nontext_cols: 0,
-            emit_us: 0,
-            rows_emitted: 0,
-            rows_filtered: 0,
-            batch_eval_us: 0,
-            rows_batch_filtered: 0,
-            segments_decompressed: 0,
             compressed_bytes,
             segments_skipped,
             segments_minmax_skipped: minmax_skipped,
             segments_bloom_skipped: bloom_skipped,
             segments_valbitmap_skipped: valbitmap_skipped,
             buf_stats,
-            phase2_skipped: 0,
-            topn_limit: 0,
-            topn_candidates: 0,
-            topn_phase2_segments: 0,
-            blob_cache_hits: 0,
-            blob_cache_misses: 0,
-            blob_cache_bytes_served: 0,
+            ..Default::default()
         },
         instrument: None,
         _time_column: meta.time_column,
@@ -1346,39 +1405,17 @@ unsafe fn exec_topn_two_pass(
 
         // Identify which column indices are decompressed in Phase 1 (filter + sort).
         // We'll store their datums per-candidate so Phase 2 can skip them.
-        let mut phase1_col_indices: Vec<usize> = Vec::new();
-        for (col_idx, col_name) in state.col_names.iter().enumerate() {
-            if !state.needed_cols[col_idx] && col_idx != sort_col {
-                continue;
-            }
-            if state.segment_by.contains(col_name) {
-                if state.batch_quals.iter().any(|bq| bq.col_idx == col_idx) {
-                    phase1_col_indices.push(col_idx);
-                }
-            } else {
-                let has_batch_qual = state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
-                if has_batch_qual || col_idx == sort_col {
-                    phase1_col_indices.push(col_idx);
-                }
-            }
-        }
+        let phase1_col_indices = compute_phase1_col_indices(
+            &state.col_names,
+            &state.segment_by,
+            &state.needed_cols,
+            &state.batch_quals,
+            sort_col,
+        );
 
-        // Compute Phase 1 blob indices for selective detoasting.
-        // Non-segment-by columns get sequential blob indices.
-        let phase1_blob_indices: Vec<usize> = {
-            let mut indices = Vec::new();
-            let mut bi: usize = 0;
-            for (col_idx, col_name) in state.col_names.iter().enumerate() {
-                if state.segment_by.contains(col_name) {
-                    continue;
-                }
-                if phase1_col_indices.contains(&col_idx) {
-                    indices.push(bi);
-                }
-                bi += 1;
-            }
-            indices
-        };
+        // Phase 1 blob indices for selective detoasting (non-segment-by only).
+        let phase1_blob_indices =
+            compute_phase1_blob_indices(&state.col_names, &state.segment_by, &phase1_col_indices);
 
         // === Pass 1: Phase 1 with early stop ===
         // Check if sort column is the time column — time-based optimizations
@@ -1453,35 +1490,14 @@ unsafe fn exec_topn_two_pass(
                 if seg.row_count == 0 {
                     continue;
                 }
-
-                // Segment-by pruning
-                if !state.segment_by_filters.is_empty() {
-                    let mut skip = false;
-                    for &(svi, ref filter_val) in &state.segment_by_filters {
-                        match &seg.segment_values[svi] {
-                            Some(val) if val == filter_val => {}
-                            _ => {
-                                skip = true;
-                                break;
-                            }
-                        }
-                    }
-                    if skip {
-                        state.timing.segments_skipped += 1;
-                        continue;
-                    }
-                }
-
-                // Time-range pruning
-                if let (Some(seg_min), Some(seg_max)) = (seg.min_time, seg.max_time) {
-                    if state.time_min.is_some_and(|query_min| seg_max < query_min) {
-                        state.timing.segments_skipped += 1;
-                        continue;
-                    }
-                    if state.time_max.is_some_and(|query_max| seg_min > query_max) {
-                        state.timing.segments_skipped += 1;
-                        continue;
-                    }
+                if segment_pre_pruned_by_metadata(
+                    seg,
+                    &state.segment_by_filters,
+                    state.time_min,
+                    state.time_max,
+                ) {
+                    state.timing.segments_skipped += 1;
+                    continue;
                 }
             }
 
@@ -1634,14 +1650,7 @@ unsafe fn exec_topn_two_pass(
                             None => false,
                         };
                         if !matches {
-                            let fail_sel = vec![false; repeat_count];
-                            if pre_selection.is_empty() {
-                                pre_selection = fail_sel;
-                            } else {
-                                for (ps, fs) in pre_selection.iter_mut().zip(fail_sel.iter()) {
-                                    *ps = *ps && *fs;
-                                }
-                            }
+                            merge_and_selection(&mut pre_selection, vec![false; repeat_count]);
                         }
                     }
 
@@ -1670,44 +1679,26 @@ unsafe fn exec_topn_two_pass(
                     if let Some(bq) = like_qual {
                         let strat = bq.like_strategy.as_ref().unwrap();
                         let neg = bq.op == BatchCompareOp::NotLike;
-                        let (datums, like_sel) = decompress_text_blob_with_like_filter(
+                        let (datums, sel) = decompress_text_blob_with_like_filter(
                             blob, type_oid, typmod, strat, neg, cutoff_row,
                         );
                         decompressed.push(datums);
-                        if pre_selection.is_empty() {
-                            pre_selection = like_sel;
-                        } else {
-                            for (ps, ls) in pre_selection.iter_mut().zip(like_sel.iter()) {
-                                *ps = *ps && *ls;
-                            }
-                        }
+                        merge_and_selection(&mut pre_selection, sel);
                     } else if let Some(bq) = text_eq_qual {
                         let const_str = bq.text_const.as_ref().unwrap();
                         let is_ne = bq.op == BatchCompareOp::Ne;
-                        let (datums, eq_sel) = decompress_text_blob_with_eq_filter(
+                        let (datums, sel) = decompress_text_blob_with_eq_filter(
                             blob, type_oid, typmod, const_str, is_ne, cutoff_row,
                         );
                         decompressed.push(datums);
-                        if pre_selection.is_empty() {
-                            pre_selection = eq_sel;
-                        } else {
-                            for (ps, es) in pre_selection.iter_mut().zip(eq_sel.iter()) {
-                                *ps = *ps && *es;
-                            }
-                        }
+                        merge_and_selection(&mut pre_selection, sel);
                     } else if let Some(bq) = text_in_qual {
                         let strs = bq.in_list_text.as_ref().unwrap();
-                        let (datums, in_sel) = decompress_text_blob_with_in_filter(
+                        let (datums, sel) = decompress_text_blob_with_in_filter(
                             blob, type_oid, typmod, strs, /* is_not_in */ false, cutoff_row,
                         );
                         decompressed.push(datums);
-                        if pre_selection.is_empty() {
-                            pre_selection = in_sel;
-                        } else {
-                            for (ps, is_) in pre_selection.iter_mut().zip(in_sel.iter()) {
-                                *ps = *ps && *is_;
-                            }
-                        }
+                        merge_and_selection(&mut pre_selection, sel);
                     } else if has_any_batch_qual {
                         let type_name = pg_type_name(type_oid);
                         if let Some(mr) = cutoff_row {
@@ -2461,39 +2452,16 @@ unsafe fn exec_topn_text(
             state.segments_data.len(),
         );
 
-        // Identify Phase 1 columns (filter + sort)
-        let mut phase1_col_indices: Vec<usize> = Vec::new();
-        for (col_idx, col_name) in state.col_names.iter().enumerate() {
-            if !state.needed_cols[col_idx] && col_idx != sort_col {
-                continue;
-            }
-            if state.segment_by.contains(col_name) {
-                if state.batch_quals.iter().any(|bq| bq.col_idx == col_idx) {
-                    phase1_col_indices.push(col_idx);
-                }
-            } else {
-                let has_batch_qual = state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
-                if has_batch_qual || col_idx == sort_col {
-                    phase1_col_indices.push(col_idx);
-                }
-            }
-        }
-
-        // Compute Phase 1 blob indices for selective detoasting
-        let phase1_blob_indices: Vec<usize> = {
-            let mut indices = Vec::new();
-            let mut bi: usize = 0;
-            for (col_idx, col_name) in state.col_names.iter().enumerate() {
-                if state.segment_by.contains(col_name) {
-                    continue;
-                }
-                if phase1_col_indices.contains(&col_idx) {
-                    indices.push(bi);
-                }
-                bi += 1;
-            }
-            indices
-        };
+        // Identify Phase 1 columns (filter + sort) and their blob indices.
+        let phase1_col_indices = compute_phase1_col_indices(
+            &state.col_names,
+            &state.segment_by,
+            &state.needed_cols,
+            &state.batch_quals,
+            sort_col,
+        );
+        let phase1_blob_indices =
+            compute_phase1_blob_indices(&state.col_names, &state.segment_by, &phase1_col_indices);
 
         // Compute sort column's blob index
         let sort_blob_idx = col_to_blob_idx(&state.col_names, &state.segment_by, sort_col);
@@ -2507,31 +2475,14 @@ unsafe fn exec_topn_text(
             if seg.row_count == 0 {
                 continue;
             }
-            if !state.segment_by_filters.is_empty() {
-                let mut skip = false;
-                for &(svi, ref filter_val) in &state.segment_by_filters {
-                    match &seg.segment_values[svi] {
-                        Some(val) if val == filter_val => {}
-                        _ => {
-                            skip = true;
-                            break;
-                        }
-                    }
-                }
-                if skip {
-                    state.timing.segments_skipped += 1;
-                    continue;
-                }
-            }
-            if let (Some(seg_min), Some(seg_max)) = (seg.min_time, seg.max_time) {
-                if state.time_min.is_some_and(|query_min| seg_max < query_min) {
-                    state.timing.segments_skipped += 1;
-                    continue;
-                }
-                if state.time_max.is_some_and(|query_max| seg_min > query_max) {
-                    state.timing.segments_skipped += 1;
-                    continue;
-                }
+            if segment_pre_pruned_by_metadata(
+                seg,
+                &state.segment_by_filters,
+                state.time_min,
+                state.time_max,
+            ) {
+                state.timing.segments_skipped += 1;
+                continue;
             }
 
             // Detoast Phase 1 blobs (PG API — must be main thread)
@@ -2867,7 +2818,6 @@ unsafe fn exec_topn_text(
                 state,
                 instrument,
                 &phase1_col_indices,
-                &phase1_blob_indices,
                 &surviving_seg_indices,
                 sort_col,
                 effective_limit,
@@ -2881,7 +2831,6 @@ unsafe fn exec_topn_text_sequential(
     state: &mut DecompressState,
     instrument: bool,
     phase1_col_indices: &[usize],
-    _phase1_blob_indices: &[usize],
     surviving_seg_indices: &[usize],
     sort_col: usize,
     effective_limit: usize,
@@ -2961,14 +2910,7 @@ unsafe fn exec_topn_text_sequential(
                             None => false,
                         };
                         if !matches {
-                            let fail_sel = vec![false; repeat_count];
-                            if pre_selection.is_empty() {
-                                pre_selection = fail_sel;
-                            } else {
-                                for (ps, fs) in pre_selection.iter_mut().zip(fail_sel.iter()) {
-                                    *ps = *ps && *fs;
-                                }
-                            }
+                            merge_and_selection(&mut pre_selection, vec![false; repeat_count]);
                         }
                     }
 
@@ -2997,44 +2939,26 @@ unsafe fn exec_topn_text_sequential(
                     if let Some(bq) = like_qual {
                         let strat = bq.like_strategy.as_ref().unwrap();
                         let neg = bq.op == BatchCompareOp::NotLike;
-                        let (datums, like_sel) = decompress_text_blob_with_like_filter(
+                        let (datums, sel) = decompress_text_blob_with_like_filter(
                             blob, type_oid, typmod, strat, neg, None,
                         );
                         decompressed.push(datums);
-                        if pre_selection.is_empty() {
-                            pre_selection = like_sel;
-                        } else {
-                            for (ps, ls) in pre_selection.iter_mut().zip(like_sel.iter()) {
-                                *ps = *ps && *ls;
-                            }
-                        }
+                        merge_and_selection(&mut pre_selection, sel);
                     } else if let Some(bq) = text_eq_qual {
                         let const_str = bq.text_const.as_ref().unwrap();
                         let is_ne = bq.op == BatchCompareOp::Ne;
-                        let (datums, eq_sel) = decompress_text_blob_with_eq_filter(
+                        let (datums, sel) = decompress_text_blob_with_eq_filter(
                             blob, type_oid, typmod, const_str, is_ne, None,
                         );
                         decompressed.push(datums);
-                        if pre_selection.is_empty() {
-                            pre_selection = eq_sel;
-                        } else {
-                            for (ps, es) in pre_selection.iter_mut().zip(eq_sel.iter()) {
-                                *ps = *ps && *es;
-                            }
-                        }
+                        merge_and_selection(&mut pre_selection, sel);
                     } else if let Some(bq) = text_in_qual {
                         let strs = bq.in_list_text.as_ref().unwrap();
-                        let (datums, in_sel) = decompress_text_blob_with_in_filter(
+                        let (datums, sel) = decompress_text_blob_with_in_filter(
                             blob, type_oid, typmod, strs, /* is_not_in */ false, None,
                         );
                         decompressed.push(datums);
-                        if pre_selection.is_empty() {
-                            pre_selection = in_sel;
-                        } else {
-                            for (ps, is_) in pre_selection.iter_mut().zip(in_sel.iter()) {
-                                *ps = *ps && *is_;
-                            }
-                        }
+                        merge_and_selection(&mut pre_selection, sel);
                     } else if has_any_batch_qual || col_idx == sort_col {
                         let type_name = pg_type_name(type_oid);
                         let datums = decompress_blob_to_datums(blob, &type_name, type_oid, typmod);
@@ -3627,34 +3551,15 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
                 continue;
             }
 
-            // Segment-by pruning: skip if any equality filter doesn't match
-            if !state.segment_by_filters.is_empty() {
-                let mut skip = false;
-                for &(seg_val_idx, ref filter_val) in &state.segment_by_filters {
-                    match &seg.segment_values[seg_val_idx] {
-                        Some(val) if val == filter_val => {}
-                        _ => {
-                            skip = true;
-                            break;
-                        }
-                    }
-                }
-                if skip {
-                    state.timing.segments_skipped += 1;
-                    continue;
-                }
-            }
-
-            // Time-range pruning: skip if segment's time range doesn't overlap query range
-            if let (Some(seg_min), Some(seg_max)) = (seg.min_time, seg.max_time) {
-                if state.time_min.is_some_and(|query_min| seg_max < query_min) {
-                    state.timing.segments_skipped += 1;
-                    continue;
-                }
-                if state.time_max.is_some_and(|query_max| seg_min > query_max) {
-                    state.timing.segments_skipped += 1;
-                    continue;
-                }
+            // Metadata-only pruning: segment-by equality + time-range overlap.
+            if segment_pre_pruned_by_metadata(
+                seg,
+                &state.segment_by_filters,
+                state.time_min,
+                state.time_max,
+            ) {
+                state.timing.segments_skipped += 1;
+                continue;
             }
 
             // Fetch needed blobs for this segment. `begin_deltax_append` runs with
@@ -3754,45 +3659,26 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
                     if let Some(bq) = like_qual {
                         let strat = bq.like_strategy.as_ref().unwrap();
                         let neg = bq.op == BatchCompareOp::NotLike;
-                        let (datums, like_sel) = decompress_text_blob_with_like_filter(
+                        let (datums, sel) = decompress_text_blob_with_like_filter(
                             blob, type_oid, typmod, strat, neg, None,
                         );
                         decompressed.push(datums);
-                        // AND the like_sel into pre_selection
-                        if pre_selection.is_empty() {
-                            pre_selection = like_sel;
-                        } else {
-                            for (ps, ls) in pre_selection.iter_mut().zip(like_sel.iter()) {
-                                *ps = *ps && *ls;
-                            }
-                        }
+                        merge_and_selection(&mut pre_selection, sel);
                     } else if let Some(bq) = text_eq_qual {
                         let const_str = bq.text_const.as_ref().unwrap();
                         let is_ne = bq.op == BatchCompareOp::Ne;
-                        let (datums, eq_sel) = decompress_text_blob_with_eq_filter(
+                        let (datums, sel) = decompress_text_blob_with_eq_filter(
                             blob, type_oid, typmod, const_str, is_ne, None,
                         );
                         decompressed.push(datums);
-                        if pre_selection.is_empty() {
-                            pre_selection = eq_sel;
-                        } else {
-                            for (ps, es) in pre_selection.iter_mut().zip(eq_sel.iter()) {
-                                *ps = *ps && *es;
-                            }
-                        }
+                        merge_and_selection(&mut pre_selection, sel);
                     } else if let Some(bq) = text_in_qual {
                         let strs = bq.in_list_text.as_ref().unwrap();
-                        let (datums, in_sel) = decompress_text_blob_with_in_filter(
+                        let (datums, sel) = decompress_text_blob_with_in_filter(
                             blob, type_oid, typmod, strs, /* is_not_in */ false, None,
                         );
                         decompressed.push(datums);
-                        if pre_selection.is_empty() {
-                            pre_selection = in_sel;
-                        } else {
-                            for (ps, is_) in pre_selection.iter_mut().zip(in_sel.iter()) {
-                                *ps = *ps && *is_;
-                            }
-                        }
+                        merge_and_selection(&mut pre_selection, sel);
                     } else if has_any_batch_qual {
                         // Column has a non-text batch qual (int/float comparison)
                         // — must decompress in Phase 1 for evaluate_batch_quals
@@ -4252,48 +4138,13 @@ fn build_needed_cols_from_custom_private(
     let mut needed_cols = vec![false; num_cols];
     let mut needed_col_indices: Vec<usize> = Vec::new();
 
-    unsafe {
-        if !custom_private.is_null() {
-            let list_len = (*custom_private).length;
-            #[derive(PartialEq)]
-            enum Section {
-                Header,
-                Cols,
-                Topn,
-                Synth,
-            }
-            let mut sec = Section::Header;
-            for i in 0..list_len {
-                let val = pg_sys::list_nth_int(custom_private, i);
-                if val == -1 && sec == Section::Header {
-                    sec = Section::Cols;
-                    continue;
-                }
-                if val == -2 && sec == Section::Cols {
-                    sec = Section::Topn;
-                    continue;
-                }
-                if val == -3 {
-                    // json-extract synthetic col_idx sentinel. Subsequent
-                    // ints are 0-based col_idx values into col_names that
-                    // the executor must load from companion blobs.
-                    sec = Section::Synth;
-                    continue;
-                }
-                match sec {
-                    Section::Cols | Section::Synth if val >= 0 => {
-                        let idx = val as usize;
-                        if idx < num_cols && !needed_cols[idx] {
-                            needed_cols[idx] = true;
-                            needed_col_indices.push(idx);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+    let parsed = unsafe { parse_custom_private(custom_private) };
+    for idx in parsed.needed_indices {
+        if idx < num_cols && !needed_cols[idx] {
+            needed_cols[idx] = true;
+            needed_col_indices.push(idx);
         }
     }
-
     for bq in batch_quals {
         if bq.col_idx < num_cols && !needed_cols[bq.col_idx] {
             needed_cols[bq.col_idx] = true;
@@ -4362,5 +4213,290 @@ unsafe fn fill_slot(slot: *mut pg_sys::TupleTableSlot, state: &DecompressState) 
         }
 
         pg_sys::ExecStoreVirtualTuple(slot);
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn test_cmp_topn_key_ascending() {
+        // ascending: smaller first
+        assert_eq!(
+            cmp_topn_key(1, false, 2, false, /*asc*/ true, /*nf*/ false),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_topn_key(2, false, 1, false, true, false),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp_topn_key(5, false, 5, false, true, false),
+            Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn test_cmp_topn_key_descending() {
+        assert_eq!(
+            cmp_topn_key(1, false, 2, false, /*asc*/ false, /*nf*/ false),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp_topn_key(2, false, 1, false, false, false),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_cmp_topn_key_nulls() {
+        // NULL == NULL is Equal regardless of mode
+        assert_eq!(cmp_topn_key(0, true, 0, true, true, true), Ordering::Equal);
+        // nulls_first=true: NULL < non-NULL
+        assert_eq!(
+            cmp_topn_key(0, true, 42, false, true, /*nf*/ true),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_topn_key(42, false, 0, true, true, /*nf*/ true),
+            Ordering::Greater
+        );
+        // nulls_first=false: NULL > non-NULL
+        assert_eq!(
+            cmp_topn_key(0, true, 42, false, true, /*nf*/ false),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp_topn_key(42, false, 0, true, true, /*nf*/ false),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_cmp_nullable_str_byte() {
+        // Byte comparison (no collation)
+        assert_eq!(
+            cmp_nullable_str_byte(Some("aaa"), Some("bbb"), true, false),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_nullable_str_byte(Some("bbb"), Some("aaa"), true, false),
+            Ordering::Greater
+        );
+        // descending flips
+        assert_eq!(
+            cmp_nullable_str_byte(Some("aaa"), Some("bbb"), false, false),
+            Ordering::Greater
+        );
+        // NULL handling matches cmp_topn_key
+        assert_eq!(
+            cmp_nullable_str_byte(None, None, true, false),
+            Ordering::Equal
+        );
+        assert_eq!(
+            cmp_nullable_str_byte(None, Some("x"), true, /*nf*/ true),
+            Ordering::Less
+        );
+        assert_eq!(
+            cmp_nullable_str_byte(None, Some("x"), true, /*nf*/ false),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_merge_and_selection_empty_target_adopts_src() {
+        let mut target: Vec<bool> = Vec::new();
+        merge_and_selection(&mut target, vec![true, false, true]);
+        assert_eq!(target, vec![true, false, true]);
+    }
+
+    #[test]
+    fn test_merge_and_selection_ands_into_existing() {
+        let mut target = vec![true, true, false, true];
+        merge_and_selection(&mut target, vec![true, false, true, true]);
+        assert_eq!(target, vec![true, false, false, true]);
+    }
+
+    #[test]
+    fn test_col_to_blob_idx() {
+        let cols: Vec<String> = ["t", "host", "metric", "val", "tag"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let segby: Vec<String> = ["host", "tag"].iter().map(|s| (*s).to_string()).collect();
+        // segment_by columns ("host", "tag") are skipped in blob layout.
+        // Blob order is: t (0), metric (1), val (2)
+        assert_eq!(col_to_blob_idx(&cols, &segby, 0), 0); // t
+        assert_eq!(col_to_blob_idx(&cols, &segby, 2), 1); // metric
+        assert_eq!(col_to_blob_idx(&cols, &segby, 3), 2); // val
+    }
+
+    #[test]
+    fn test_compute_phase1_col_indices() {
+        let col_names: Vec<String> = ["t", "host", "metric", "val", "extra"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let segby: Vec<String> = ["host"].iter().map(|s| (*s).to_string()).collect();
+        let needed = vec![true, true, true, true, false]; // extra not needed
+        // batch qual on col 3 (val)
+        let bq = BatchQual {
+            col_idx: 3,
+            op: BatchCompareOp::Eq,
+            const_datum: pg_sys::Datum::from(0u64),
+            type_oid: pg_sys::INT8OID,
+            like_strategy: None,
+            text_const: None,
+            in_list_i64: None,
+            in_list_text: None,
+        };
+        // sort_col = 0 (t)
+        let phase1 = compute_phase1_col_indices(&col_names, &segby, &needed, &[bq], 0);
+        // Should include sort col (0) and batch-qual col (3). Not host (no qual on it).
+        // Not metric (no qual, not sort). Not extra (not needed).
+        assert_eq!(phase1, vec![0, 3]);
+    }
+
+    #[test]
+    fn test_compute_phase1_col_indices_segby_with_qual() {
+        let col_names: Vec<String> = ["t", "host", "metric"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let segby: Vec<String> = ["host"].iter().map(|s| (*s).to_string()).collect();
+        let needed = vec![true, true, true];
+        // batch qual on host (segment_by column)
+        let bq = BatchQual {
+            col_idx: 1,
+            op: BatchCompareOp::Eq,
+            const_datum: pg_sys::Datum::from(0u64),
+            type_oid: pg_sys::TEXTOID,
+            like_strategy: None,
+            text_const: Some("h1".into()),
+            in_list_i64: None,
+            in_list_text: None,
+        };
+        let phase1 = compute_phase1_col_indices(&col_names, &segby, &needed, &[bq], 0);
+        // Sort col 0 + segby col 1 (with qual). metric has no qual.
+        assert_eq!(phase1, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_compute_phase1_blob_indices() {
+        let col_names: Vec<String> = ["t", "host", "metric", "val"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let segby: Vec<String> = ["host"].iter().map(|s| (*s).to_string()).collect();
+        // Phase 1 col indices include t (0) and val (3); host is segment_by and excluded.
+        let phase1_cols = vec![0, 1, 3];
+        // Blob layout: t=0, metric=1, val=2. So phase1 blob indices = {0, 2}.
+        let blob_indices = compute_phase1_blob_indices(&col_names, &segby, &phase1_cols);
+        assert_eq!(blob_indices, vec![0, 2]);
+    }
+
+    #[test]
+    fn test_segment_pre_pruned_by_metadata_no_filters() {
+        let seg = SegmentData {
+            companion_oid: pg_sys::Oid::from(0u32),
+            segment_id: 0,
+            segment_values: vec![Some("a".into())],
+            compressed_blobs: Vec::new(),
+            text_length_blobs: Vec::new(),
+            row_count: 100,
+            min_time: Some(1_000),
+            max_time: Some(2_000),
+            col_minmax: std::collections::HashMap::new(),
+            col_sums: std::collections::HashMap::new(),
+            toast_pointers: Vec::new(),
+            cached_blob_pins: Vec::new(),
+        };
+        // No filters, no time range — never pruned.
+        assert!(!segment_pre_pruned_by_metadata(&seg, &[], None, None));
+    }
+
+    #[test]
+    fn test_segment_pre_pruned_by_segby_match() {
+        let seg = SegmentData {
+            companion_oid: pg_sys::Oid::from(0u32),
+            segment_id: 0,
+            segment_values: vec![Some("host-a".into()), Some("metric-x".into())],
+            compressed_blobs: Vec::new(),
+            text_length_blobs: Vec::new(),
+            row_count: 100,
+            min_time: None,
+            max_time: None,
+            col_minmax: std::collections::HashMap::new(),
+            col_sums: std::collections::HashMap::new(),
+            toast_pointers: Vec::new(),
+            cached_blob_pins: Vec::new(),
+        };
+        // svi=0, filter "host-a" matches
+        assert!(!segment_pre_pruned_by_metadata(
+            &seg,
+            &[(0, "host-a".into())],
+            None,
+            None
+        ));
+        // svi=0, filter "host-b" doesn't match → pruned
+        assert!(segment_pre_pruned_by_metadata(
+            &seg,
+            &[(0, "host-b".into())],
+            None,
+            None
+        ));
+        // Two filters, both match
+        assert!(!segment_pre_pruned_by_metadata(
+            &seg,
+            &[(0, "host-a".into()), (1, "metric-x".into())],
+            None,
+            None
+        ));
+        // One of two doesn't match
+        assert!(segment_pre_pruned_by_metadata(
+            &seg,
+            &[(0, "host-a".into()), (1, "metric-z".into())],
+            None,
+            None
+        ));
+    }
+
+    #[test]
+    fn test_segment_pre_pruned_by_time_range() {
+        let seg = SegmentData {
+            companion_oid: pg_sys::Oid::from(0u32),
+            segment_id: 0,
+            segment_values: Vec::new(),
+            compressed_blobs: Vec::new(),
+            text_length_blobs: Vec::new(),
+            row_count: 100,
+            min_time: Some(1_000),
+            max_time: Some(2_000),
+            col_minmax: std::collections::HashMap::new(),
+            col_sums: std::collections::HashMap::new(),
+            toast_pointers: Vec::new(),
+            cached_blob_pins: Vec::new(),
+        };
+        // Query range [3_000, ..) → seg.max_time (2_000) < 3_000, prune
+        assert!(segment_pre_pruned_by_metadata(&seg, &[], Some(3_000), None));
+        // Query range (.., 500] → seg.min_time (1_000) > 500, prune
+        assert!(segment_pre_pruned_by_metadata(&seg, &[], None, Some(500)));
+        // Overlapping range → no prune
+        assert!(!segment_pre_pruned_by_metadata(
+            &seg,
+            &[],
+            Some(1_500),
+            Some(1_800)
+        ));
+        // Range fully contained in segment → no prune
+        assert!(!segment_pre_pruned_by_metadata(
+            &seg,
+            &[],
+            Some(0),
+            Some(10_000)
+        ));
     }
 }

@@ -30,6 +30,65 @@ narration.
 
 ## Sessions
 
+### 2026-05-16 — `src/scan/exec/decompress.rs` — TBD
+
+**Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
+`unsafe` audit deferred (most of the 58 blocks are PG FFI: list_nth_int,
+palloc, MemoryContextSwitchTo, AllocSetContextCreateInternal, ParallelWorkerNumber).
+**LOC:** 4366 → 4218 (non-test) / 4502 total with 284 lines of tests added.
+**`unsafe`:** 54 → 58 (+4 from the new `parse_custom_private` helper —
+encapsulates the unsafe operations that were previously inlined in three
+separate ad-hoc parsers). **Tests:** 0 → 14 (all `#[test]`, no PG state needed).
+
+- Unified the planner-side `custom_private` parser. Three ad-hoc parsers
+  (in `begin_custom_scan`, `begin_deltax_append`, and
+  `build_needed_cols_from_custom_private`) became one `parse_custom_private`
+  that returns the header ints, the needed-column indices (across both `-1`
+  and `-3` sections), and an optional Top-N block.
+- Extracted `merge_and_selection(target, src)`. The "AND-merge into
+  `pre_selection`" pattern that previously appeared 9 times across
+  `exec_topn_two_pass`, `exec_topn_text_sequential`, and `load_next_segment`
+  is now a 6-line helper.
+- Extracted `segment_pre_pruned_by_metadata(seg, segby_filters, time_min, time_max)`.
+  The pre-decompress pruning (segment-by equality + time-range overlap)
+  appeared 3 times with the same structure; callers now just check the
+  return value and increment `segments_skipped`.
+- Extracted `compute_phase1_col_indices` and `compute_phase1_blob_indices`.
+  Both `exec_topn_two_pass` and `exec_topn_text` had identical inline
+  blocks computing these.
+- `#[derive(Default)]` on `ScanTiming`. Replaces three verbose struct
+  literals (28 `field: 0,` lines each) in `make_worker_stub_state`,
+  `begin_deltax_append`, and `load_decompress_state` with `..Default::default()`.
+- Removed unused `_phase1_blob_indices: &[usize]` parameter from
+  `exec_topn_text_sequential` (caller already passes `phase1_col_indices`,
+  and the inner function doesn't need blob indices because the parallel
+  path already detoasted Phase 1 blobs before falling through).
+- Added 14 `#[test]` cases (pure logic, no PG harness):
+  - `cmp_topn_key`: asc/desc/null handling, both `nulls_first` modes
+  - `cmp_nullable_str_byte`: byte ordering + NULL semantics
+  - `merge_and_selection`: empty target adopts src; non-empty AND-merges
+  - `col_to_blob_idx`: skips segment_by columns in blob-layout indexing
+  - `compute_phase1_col_indices`: sort col + batch-qual cols, with
+    segment_by-only-if-quallified rule
+  - `compute_phase1_blob_indices`: dense indexing of non-segment_by columns
+  - `segment_pre_pruned_by_metadata`: no-filter pass-through, segment_by
+    match/mismatch (single + multi), time-range above/below/overlap/contained
+- Deferred: `unsafe` SAFETY: comments. All 58 blocks are PG FFI
+  (list_nth_int, palloc, MemoryContextSwitchTo, AllocSetContextCreateInternal,
+  ExecStoreVirtualTuple, ParallelWorkerNumber atomics). They cannot go safe
+  without wrapping all of PG's planner-state API. Worth a dedicated pass.
+- **Benchmarks**:
+  - ClickBench EC2 (c6a.4xlarge, 100M-row full dataset): **62.43s vs prior
+    62.71s** (−0.4% total, within noise). Zero regressions >10%. Worst
+    individual: Q38 +4.8% on a 66ms query (noise floor).
+  - JSONBench EC2 (m6i.8xlarge, 100M Bluesky events): **3.55s vs prior
+    3.57s** (−0.6%). All 5 queries within ±2.5%.
+  - Local Docker benches: not separately re-run (EC2 numbers supersede).
+- **Correctness:** `make correctness` 999 passed / 3 skipped / 6 xfailed
+  (matches baseline). Unit: 419 pass on PG17 and PG18 (was 406). Integration:
+  234 pass on PG17 and PG18.
+- **Perf opportunities surfaced:** none.
+
 ### 2026-05-16 — `src/scan/exec/datum_utils.rs` — 52f5f74
 
 **Scope:** read pass, simplify, tests, verify, benchmarks. `unsafe` audit

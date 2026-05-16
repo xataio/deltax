@@ -214,26 +214,57 @@ the compression codecs), also run the correctness harness — see
 `dev/docs/CORRECTNESS_TESTING.md`. Add a new correctness case if this
 file's logic isn't already covered.
 
-For files that affect query execution (`scan/exec/*`, `compress.rs`,
-`scan/path.rs`, `scan/hook.rs`, `scan/json_extract.rs`), also run local
-benchmarks to confirm no regression:
+### 6. End-of-Session Verification
 
-```bash
-make image-fresh && make bench-clickbench-keep
-make bench-rtabench-keep
-```
+Every session ends with the same gauntlet, regardless of which file was
+touched. Run these in order; record the result in the log entry.
 
-Run JSONBench (`make -C jsonbench bench EC2=<ip>`) when the change
-plausibly affects JSON-heavy workloads — i.e. anything in
-`scan/json_extract.rs`, JSONB-related codec paths, or the planner code
-that recognizes `->`/`->>` operators. The full ClickBench / RTABench EC2
-runs are optional per-session; do them when a local run is ambiguous or
-when batching a series of cleanup sessions before a merge.
+1. **Unit tests on both PG versions:**
+   ```bash
+   make test                  # PG17
+   make test PG_MAJOR=18
+   ```
+2. **Integration tests on both PG versions:**
+   ```bash
+   make integration-test      # runs PG17 + PG18 by default
+   ```
+3. **Full correctness suite** (vanilla PostgreSQL as source of truth):
+   ```bash
+   make correctness
+   ```
+4. **ClickBench on EC2** (full 100M-row dataset; data is already loaded
+   on the instance whose IP lives in `clickbench/.env`):
+   ```bash
+   make -C clickbench deploy EC2=$(cat clickbench/.env | cut -d= -f2)
+   make -C clickbench bench  EC2=$(cat clickbench/.env | cut -d= -f2)
+   ```
+5. **JSONBench on EC2** (1B-row Bluesky dataset; data loaded on the
+   instance whose IP lives in `jsonbench/.env`):
+   ```bash
+   make -C jsonbench deploy EC2=$(cat jsonbench/.env | cut -d= -f2)
+   make -C jsonbench bench  EC2=$(cat jsonbench/.env | cut -d= -f2)
+   ```
 
-### 6. Log the session
+Each of these must come back clean before the session is done. Record
+the headline numbers in the log entry: "unit/integration: N pass on
+PG17+PG18", "correctness: X passed / Y skipped / Z xfailed", "clickbench
+EC2: <delta> total, 0 regressions >10%", "jsonbench EC2: <delta> total".
+
+Local-Docker benchmarks (`make bench-clickbench-keep`,
+`make bench-rtabench-keep`) are useful for fast iteration during the
+session but **do not substitute** for the EC2 runs at end-of-session.
+Use them while changing code; the EC2 runs are the gate to merge.
+
+RTABench EC2 is not part of the standard end-of-session gauntlet (slow
+to provision, partial query overlap with ClickBench/JSONBench). Run it
+on demand when a change plausibly affects the join-heavy or pre-aggregated
+paths it exercises.
+
+### 7. Log the session
 
 Add a row to `CLEANUP_LOG.md` (newest first). One line per file is fine; if
-something interesting came up, add a short note under it.
+something interesting came up, add a short note under it. The benchmark
+and correctness numbers from step 6 are mandatory fields.
 
 ## Triage
 
