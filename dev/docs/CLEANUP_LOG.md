@@ -30,7 +30,7 @@ narration.
 
 ## Sessions
 
-### 2026-05-16 — `src/scan/exec/text_col.rs` — TBD
+### 2026-05-16 — `src/scan/exec/text_col.rs` — 9ee5c47
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
 `unsafe` count was already only 2 (the `strcoll` FFI in `strcoll_cmp`),
