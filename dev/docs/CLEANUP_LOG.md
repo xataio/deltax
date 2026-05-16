@@ -69,9 +69,10 @@ focused ones below.
   enormous wrapper layer. Worth a dedicated SAFETY: comment pass in a
   follow-up.
 - **Benchmarks** (this file affects per-row exec, so all three):
-  - clickbench local: +2.2% total vs prior commit — noise (per-query swings of
-    -65% / +66% on small queries reflect cache state, not code).
-  - jsonbench (EC2 100m): -0.1% total, all 5 queries within ±4%.
+  - clickbench local: +2.2% total vs prior commit — noise.
+  - clickbench EC2 (c6a.4xlarge, full 100M-row dataset): no regressions; 0
+    queries >10% slower vs prior commit.
+  - jsonbench (EC2 100m): −0.1% total, all 5 queries within ±4%.
   - rtabench local: not run; clickbench + jsonbench cover the relevant
     text/jsonb decompression paths.
 - **Correctness:** `make correctness` 999 passed, 3 skipped, 6 xfailed
