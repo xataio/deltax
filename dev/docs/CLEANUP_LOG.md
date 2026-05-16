@@ -30,7 +30,7 @@ narration.
 
 ## Sessions
 
-### 2026-05-16 — `src/scan/exec/decompress.rs` — TBD
+### 2026-05-16 — `src/scan/exec/decompress.rs` — 2d4f7e7
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
 `unsafe` audit deferred (most of the 58 blocks are PG FFI: list_nth_int,
