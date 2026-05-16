@@ -21,3 +21,19 @@ __attribute__((weak)) void MemoryContextReset(void) {}
 __attribute__((weak)) void OidInputFunctionCall(void) {}
 __attribute__((weak)) void getTypeInputInfo(void) {}
 __attribute__((weak)) void pg_detoast_datum(void) {}
+
+/* DSA / LWLock symbols pulled in by blob_cache::storage. */
+__attribute__((weak)) void dsa_allocate_extended(void) {}
+__attribute__((weak)) void dsa_attach_in_place(void) {}
+__attribute__((weak)) void dsa_create_in_place(void) {}
+__attribute__((weak)) void dsa_detach(void) {}
+__attribute__((weak)) void dsa_free(void) {}
+__attribute__((weak)) void dsa_get_address(void) {}
+__attribute__((weak)) void dsa_pin(void) {}
+__attribute__((weak)) void dsa_pin_mapping(void) {}
+__attribute__((weak)) void dsa_set_size_limit(void) {}
+__attribute__((weak)) void LWLockAcquire(void) {}
+__attribute__((weak)) void LWLockInitialize(void) {}
+__attribute__((weak)) void LWLockNewTrancheId(void) {}
+__attribute__((weak)) void LWLockRegisterTranche(void) {}
+__attribute__((weak)) void LWLockRelease(void) {}
