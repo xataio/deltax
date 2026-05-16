@@ -30,6 +30,55 @@ narration.
 
 ## Sessions
 
+### 2026-05-16 — `src/scan/exec/append_wire.rs` — TBD
+
+**Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
+The triage listed 0 tests but the file actually had 3 `#[pgrx::pg_test]`
+tests for the round-trip and magic-mismatch paths. None of them touched
+PG state — they're byte-buffer manipulation that happens to use
+`pg_sys::Oid::from(...)`. Converting them to plain `#[test]` lets them
+run without the PG harness boot, which is a meaningful CI speedup.
+**LOC:** 649 → 785 (total) with 4 new tests added.
+**`unsafe`:** 17 → 21 (+4 from the new `write_name_indices` helper).
+**Tests:** 3 `#[pgrx::pg_test]` → 7 `#[test]` (4 added + 3 converted).
+
+- Extracted `write_name_indices(out, names, col_names)`. The
+  `for (k, name) in <names>.iter().enumerate() { let idx = col_names.iter().position(...).unwrap_or(0) as u32; *out.add(k) = idx; }`
+  loop was inlined twice in `serialize_into` (segment_by + order_by
+  indices). Now one helper.
+- Converted 3 `#[pgrx::pg_test]` tests to plain `#[test]`. They don't
+  touch PG state — pure byte-buffer serialise/attach/decode that happens
+  to use `pg_sys::Oid::from(...)` for type-tagging. Plain `#[test]`
+  runs without spinning up the pgrx harness.
+- Added 4 `#[test]` cases:
+  - `round_up_handles_powers_of_two` — already-aligned, off-by-one, and
+    cross-power values; the function is called inside `layout` to align
+    `SegmentEntry`s and any drift would break the compile-time `align_of`
+    asserts at run time.
+  - `encode_segment_values_len_counts` — empty, single NULL, ASCII
+    string, and a mixed UTF-8 case ("héllo" → 6 bytes for char count).
+    The decoder is byte-perfect on this; a length-fn drift here would
+    cause out-of-bounds reads on the worker side.
+  - `wire_version_mismatch_rejected` — serialise V1 then hand-corrupt
+    the version field; `attach` must return `None`. Catches a future
+    drift where someone bumps `WIRE_VERSION` and forgets the attach
+    check.
+  - `wire_segment_by_index_lookup_uses_col_name_position` — confirms
+    that `segment_by` names round-trip through the
+    "name → col_names index → name" indirection used by the new
+    `write_name_indices` helper.
+- **Benchmarks**:
+  - ClickBench EC2 (c6a.4xlarge, 100M-row full dataset): **63.22s vs
+    prior 62.38s** (+1.3% total, within session noise). Zero
+    regressions >10%; top: Q06 +6.3% at 16ms noise floor.
+  - JSONBench EC2 (m6i.8xlarge, 100M Bluesky events): **3.632s vs prior
+    3.597s** (+1.0%). Q4 +7.5% on a 0.65s query; append_wire.rs is the
+    DSM serialiser, not on Q4's read path.
+- **Correctness:** `make correctness` 999 passed / 3 skipped / 6 xfailed
+  (matches baseline). Unit: 497 pass on PG17 and PG18 (was 493).
+  Integration: 234 pass on PG17 and PG18.
+- **Perf opportunities surfaced:** none.
+
 ### 2026-05-16 — `src/scan/exec/count_minmax.rs` — 9867af0
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.

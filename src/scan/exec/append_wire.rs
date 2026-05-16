@@ -173,6 +173,26 @@ fn round_up(n: u32, align: u32) -> u32 {
     (n + align - 1) & !(align - 1)
 }
 
+/// Write the indices of each name in `names` into `col_names` at `out[0..]`.
+/// Used by `serialize_into` to emit `segment_by_indices` and
+/// `order_by_indices` — both walk the same shape over `col_names`.
+/// A name not present in `col_names` falls back to index 0; this matches
+/// the prior inline behaviour. The deserialiser tolerates this because
+/// segment_by / order_by are also serialised by index into col_names, so
+/// a stale name silently aliases column 0 — surfacing as a planner bug,
+/// not memory unsafety.
+///
+/// # Safety
+/// `out` must point at `names.len() * size_of::<u32>()` writable bytes.
+unsafe fn write_name_indices(out: *mut u32, names: &[String], col_names: &[String]) {
+    unsafe {
+        for (k, name) in names.iter().enumerate() {
+            let idx = col_names.iter().position(|c| c == name).unwrap_or(0) as u32;
+            *out.add(k) = idx;
+        }
+    }
+}
+
 fn encode_segment_values_len(values: &[Option<String>]) -> u32 {
     // [u16 count] + [u8 is_null + u32 len + bytes] × count
     let mut total: u32 = 2;
@@ -253,7 +273,9 @@ pub(crate) unsafe fn serialize_into(base: *mut u8, input: &WireInput<'_>, layout
         (*hdr).num_order_by = input.order_by.len() as u32;
         (*hdr).num_companions = input.companion_oids.len() as u32;
         (*hdr).num_segments = input.segments.len() as u32;
-        (*hdr).time_col_idx = input.col_names.iter()
+        (*hdr).time_col_idx = input
+            .col_names
+            .iter()
             .position(|c| c == input.time_column)
             .map(|i| i as u32)
             .unwrap_or(u32::MAX);
@@ -292,17 +314,11 @@ pub(crate) unsafe fn serialize_into(base: *mut u8, input: &WireInput<'_>, layout
 
         // ---------------- segment_by_indices ----------------
         let seg_by_ptr = base.add(layout.seg_by_indices_off as usize) as *mut u32;
-        for (k, name) in input.segment_by.iter().enumerate() {
-            let idx = input.col_names.iter().position(|c| c == name).unwrap_or(0) as u32;
-            *seg_by_ptr.add(k) = idx;
-        }
+        write_name_indices(seg_by_ptr, input.segment_by, input.col_names);
 
         // ---------------- order_by_indices ----------------
         let order_by_ptr = base.add(layout.order_by_indices_off as usize) as *mut u32;
-        for (k, name) in input.order_by.iter().enumerate() {
-            let idx = input.col_names.iter().position(|c| c == name).unwrap_or(0) as u32;
-            *order_by_ptr.add(k) = idx;
-        }
+        write_name_indices(order_by_ptr, input.order_by, input.col_names);
 
         // ---------------- companion_oids ----------------
         let comp_oids_ptr = base.add(layout.companion_oids_off as usize) as *mut u32;
@@ -511,9 +527,7 @@ impl DeltaXAppendView {
                         segment_values.push(None);
                     } else {
                         let bytes = std::slice::from_raw_parts(rp, len as usize);
-                        segment_values.push(Some(
-                            std::str::from_utf8_unchecked(bytes).to_owned(),
-                        ));
+                        segment_values.push(Some(std::str::from_utf8_unchecked(bytes).to_owned()));
                         rp = rp.add(len as usize);
                     }
                 }
@@ -523,8 +537,16 @@ impl DeltaXAppendView {
                 companion_oid: pg_sys::Oid::from(se.companion_oid),
                 segment_id: se.segment_id,
                 row_count: se.row_count,
-                min_time: if se.has_min_time != 0 { Some(se.min_time) } else { None },
-                max_time: if se.has_max_time != 0 { Some(se.max_time) } else { None },
+                min_time: if se.has_min_time != 0 {
+                    Some(se.min_time)
+                } else {
+                    None
+                },
+                max_time: if se.has_max_time != 0 {
+                    Some(se.max_time)
+                } else {
+                    None
+                },
                 segment_values,
             }
         }
@@ -543,7 +565,13 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    fn mk_segment(seg_id: i32, oid: u32, vals: Vec<Option<&str>>, min_t: Option<i64>, max_t: Option<i64>) -> SegmentData {
+    fn mk_segment(
+        seg_id: i32,
+        oid: u32,
+        vals: Vec<Option<&str>>,
+        min_t: Option<i64>,
+        max_t: Option<i64>,
+    ) -> SegmentData {
         SegmentData {
             companion_oid: pg_sys::Oid::from(oid),
             segment_id: seg_id,
@@ -560,8 +588,44 @@ mod tests {
         }
     }
 
-    #[pgrx::pg_test]
-    fn pg_test_wire_layout_empty_segments() {
+    #[test]
+    fn round_up_handles_powers_of_two() {
+        // Already aligned → unchanged.
+        assert_eq!(round_up(0, 4), 0);
+        assert_eq!(round_up(8, 8), 8);
+        assert_eq!(round_up(16, 8), 16);
+        // Off-by-one → next multiple.
+        assert_eq!(round_up(1, 8), 8);
+        assert_eq!(round_up(7, 8), 8);
+        assert_eq!(round_up(9, 8), 16);
+        // 4-byte align.
+        assert_eq!(round_up(13, 4), 16);
+        assert_eq!(round_up(12, 4), 12);
+    }
+
+    #[test]
+    fn encode_segment_values_len_counts() {
+        // Empty input: just the u16 count.
+        assert_eq!(encode_segment_values_len(&[]), 2);
+        // One NULL: count + (is_null + len). Body bytes only when Some.
+        assert_eq!(encode_segment_values_len(&[None]), 2 + 1 + 4);
+        // One Some("abc"): count + is_null + len + 3 bytes.
+        assert_eq!(
+            encode_segment_values_len(&[Some("abc".to_string())]),
+            2 + 1 + 4 + 3,
+        );
+        // Mixed.
+        let mixed = vec![Some("a".to_string()), None, Some("héllo".to_string())];
+        // 5 + (1+4+1) + (1+4) + (1+4+5+1bytes for é = 6)
+        // count=2, then 3 entries: a=1+4+1, none=1+4+0, héllo=1+4+6 (é=2 bytes)
+        assert_eq!(
+            encode_segment_values_len(&mixed),
+            2 + (1 + 4 + 1) + (1 + 4) + (1 + 4 + 6)
+        );
+    }
+
+    #[test]
+    fn wire_layout_empty_segments() {
         let col_names = vec!["ts".to_string(), "device".to_string(), "value".to_string()];
         let col_types = vec![pg_sys::TIMESTAMPTZOID, pg_sys::INT4OID, pg_sys::FLOAT8OID];
         let col_typmods = vec![-1i32, -1, -1];
@@ -597,8 +661,8 @@ mod tests {
         }
     }
 
-    #[pgrx::pg_test]
-    fn pg_test_wire_roundtrip() {
+    #[test]
+    fn wire_roundtrip() {
         let col_names = vec!["ts".to_string(), "device".to_string(), "value".to_string()];
         let col_types = vec![pg_sys::TIMESTAMPTZOID, pg_sys::INT4OID, pg_sys::FLOAT8OID];
         let col_typmods = vec![-1i32, -1, -1];
@@ -606,9 +670,21 @@ mod tests {
         let order_by = vec!["ts".to_string()];
         let companion_oids = vec![pg_sys::Oid::from(12345u32), pg_sys::Oid::from(67890u32)];
         let segments = vec![
-            mk_segment(0, 12345, vec![Some("42")], Some(1_000_000_000), Some(1_000_000_100)),
+            mk_segment(
+                0,
+                12345,
+                vec![Some("42")],
+                Some(1_000_000_000),
+                Some(1_000_000_100),
+            ),
             mk_segment(1, 12345, vec![None], None, None),
-            mk_segment(2, 67890, vec![Some("hello world")], Some(2_000_000_000), Some(2_000_000_500)),
+            mk_segment(
+                2,
+                67890,
+                vec![Some("hello world")],
+                Some(2_000_000_000),
+                Some(2_000_000_500),
+            ),
         ];
         let input = WireInput {
             col_names: &col_names,
@@ -638,12 +714,72 @@ mod tests {
         }
     }
 
-    #[pgrx::pg_test]
-    fn pg_test_wire_magic_mismatch_rejected() {
+    #[test]
+    fn wire_magic_mismatch_rejected() {
         let buf = vec![0u8; 256];
         unsafe {
             // All-zero bytes → magic 0 → attach returns None.
             assert!(DeltaXAppendView::attach(buf.as_ptr()).is_none());
+        }
+    }
+
+    #[test]
+    fn wire_version_mismatch_rejected() {
+        // Same magic, wrong version → attach must reject. Without this
+        // guard a future workers-load V2-layout from a leader still
+        // running V1 (or vice-versa during rolling upgrades) and read
+        // garbage. We don't ship migrations across major versions.
+        let col_names = vec!["ts".to_string()];
+        let col_types = vec![pg_sys::TIMESTAMPTZOID];
+        let col_typmods = vec![-1i32];
+        let input = WireInput {
+            col_names: &col_names,
+            col_types: &col_types,
+            col_typmods: &col_typmods,
+            segment_by: &[],
+            order_by: &[],
+            time_column: "ts",
+            companion_oids: &[],
+            segments: &[],
+        };
+        let layout = layout(&input);
+        let mut buf = vec![0u8; layout.total_size as usize];
+        unsafe {
+            serialize_into(buf.as_mut_ptr(), &input, &layout);
+            // Hand-corrupt the version field to provoke the version
+            // mismatch path on `attach`. Offset 4 bytes past `magic`.
+            let hdr = buf.as_mut_ptr() as *mut DeltaXAppendMeta;
+            (*hdr).version = WIRE_VERSION.wrapping_add(1);
+            assert!(DeltaXAppendView::attach(buf.as_ptr()).is_none());
+        }
+    }
+
+    #[test]
+    fn wire_segment_by_index_lookup_uses_col_name_position() {
+        // segment_by carries names; serialize converts them to col_names
+        // indices. Decode reverses the lookup. A name that's actually in
+        // col_names round-trips; a stale name falls back to col_names[0].
+        let col_names = vec!["ts".to_string(), "device".to_string(), "metric".to_string()];
+        let col_types = vec![pg_sys::TIMESTAMPTZOID, pg_sys::INT4OID, pg_sys::TEXTOID];
+        let col_typmods = vec![-1i32, -1, -1];
+        let segment_by = vec!["metric".to_string()];
+        let input = WireInput {
+            col_names: &col_names,
+            col_types: &col_types,
+            col_typmods: &col_typmods,
+            segment_by: &segment_by,
+            order_by: &[],
+            time_column: "ts",
+            companion_oids: &[],
+            segments: &[],
+        };
+        let layout = layout(&input);
+        let mut buf = vec![0u8; layout.total_size as usize];
+        unsafe {
+            serialize_into(buf.as_mut_ptr(), &input, &layout);
+            let view = DeltaXAppendView::attach(buf.as_ptr()).unwrap();
+            let hdr = view.decode_header();
+            assert_eq!(hdr.segment_by, vec!["metric".to_string()]);
         }
     }
 }
