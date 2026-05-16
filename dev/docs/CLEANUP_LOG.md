@@ -30,6 +30,62 @@ narration.
 
 ## Sessions
 
+### 2026-05-16 — `src/scan/path.rs` — TBD
+
+**Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
+`unsafe` audit deferred — all 48 blocks are PG FFI for planner internals
+(`palloc0`, `lappend_int`, `lappend_oid`, `nodeToString`, `makeConst`,
+`makeTargetEntry`, `pull_varattnos`, etc.).
+**LOC:** 2583 → 2714 (non-test) / 2813 total with 99 lines of tests added.
+The non-test grew (+131) because rustfmt re-wrapped a few of the
+expanded blocks; functional duplication still dropped at every site.
+**`unsafe`:** 44 → 48 (+4 from the two new wire-format helpers).
+**Tests:** 0 → 5 (all `#[test]`, pure logic — first tests in this file).
+
+- Deleted dead `is_partial` and `transtype_oid` fields from
+  `path::AggSpec`. They were written by 7 sites in `hook.rs` (always to
+  `false` / `InvalidOid`) and never read on this struct. The active
+  flag/transtype on the executor side lives on a separate
+  `exec::AggExecSpec`. Removes 14 dead lines from `hook.rs` and clears
+  the `#[allow(dead_code)]` on those fields.
+- Removed stale `#[allow(dead_code)]` on
+  `quals_reference_only_numeric_vars` — it's actively called from
+  `add_agg_partial_path`. The annotation was added when the function was
+  first introduced, before it was wired up.
+- Extracted `append_qual_list_as_bytes(list, qual_list)`. The
+  `nodeToString → lappend_int byte loop → pfree` block appeared verbatim
+  3 times (in `add_count_star_path`, `add_minmax_path`, and `plan_agg_path`).
+  Now one helper.
+- Extracted `append_oids_as_ints(list, &[Oid])`. The 5-line
+  "for &oid in companion_oids { lappend_int(list, oid as i32) }" loop
+  appeared 3 times (in `add_count_star_path`, `add_minmax_path`,
+  `build_agg_path_private`, and `plan_minmax_path`'s plan_private builder).
+- Added 5 `#[test]` cases (pure logic, first tests in this file):
+  - `meta_agg_kind_roundtrip` — every variant round-trips through the i32
+    wire encoding (executor depends on this on worker DSM hydration)
+  - `meta_agg_kind_rejects_out_of_range` — `from_i32(99)` panics
+  - `topn_sort_col_derived_sentinel_is_negative` — const-asserted, can
+    never silently collide with a real output-column index
+  - `is_partial_eligible_var_type_accepts_numerics_and_temporals` — INT2/4/8,
+    FLOAT4/8, TIMESTAMP, TIMESTAMPTZ, DATE, BOOL all accepted
+  - `is_partial_eligible_var_type_rejects_text_jsonb_numeric` — TEXT/
+    VARCHAR/BPCHAR/JSONB/BYTEA/NUMERIC rejected
+  - `parallel_compact_aggs_ok_accepts_compact_set` — Count+Sum(int4) is
+    compact-eligible
+- Deferred: SAFETY: comment pass on the 48 `unsafe` blocks. All are PG
+  FFI on planner internals and would need a wrapper layer to go safe.
+- **Benchmarks**:
+  - ClickBench EC2 (c6a.4xlarge, 100M-row full dataset): **63.19s vs prior
+    63.13s** (+0.1% total, within noise). Zero regressions >10%; worst
+    individual Q37 +7.3% on a 41ms query (noise floor).
+  - JSONBench EC2 (m6i.8xlarge, 100M Bluesky events): **3.603s vs prior
+    3.566s** (+1.0% total). Q4 +5.1% on a 0.65s query, all others within
+    ±3%. path.rs only emits plan nodes — runtime is unchanged.
+- **Correctness:** `make correctness` 999 passed / 3 skipped / 6 xfailed
+  (matches baseline). Unit: 440 pass on PG17 and PG18 (was 434).
+  Integration: 234 pass on PG17 and PG18.
+- **Perf opportunities surfaced:** none.
+
 ### 2026-05-16 — `src/scan/hook.rs` — f902f7d
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.

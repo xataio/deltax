@@ -2065,8 +2065,6 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     col_type_oid: pg_sys::InvalidOid,
                     expr_kind: AggExpr::Column,
                     const_offset: 0,
-                    is_partial: false,
-                    transtype_oid: pg_sys::InvalidOid,
                     output_transform: super::exec::OutputTransform::None,
                 });
                 all_minmax = false;
@@ -2281,8 +2279,6 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         col_type_oid: effective_col_type_oid,
                         expr_kind,
                         const_offset: agg_const_offset,
-                        is_partial: false,
-                        transtype_oid: pg_sys::InvalidOid,
                         output_transform: super::exec::OutputTransform::None,
                     });
                     all_minmax = false;
@@ -2299,8 +2295,6 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         col_type_oid: effective_col_type_oid,
                         expr_kind,
                         const_offset: agg_const_offset,
-                        is_partial: false,
-                        transtype_oid: pg_sys::InvalidOid,
                         output_transform: super::exec::OutputTransform::None,
                     });
                     all_minmax = false;
@@ -2316,8 +2310,6 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             col_type_oid: effective_col_type_oid,
                             expr_kind,
                             const_offset: agg_const_offset,
-                            is_partial: false,
-                            transtype_oid: pg_sys::InvalidOid,
                             output_transform: super::exec::OutputTransform::None,
                         });
                         all_meta_answerable = false;
@@ -2329,8 +2321,6 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                             col_type_oid: effective_col_type_oid,
                             expr_kind,
                             const_offset: agg_const_offset,
-                            is_partial: false,
-                            transtype_oid: pg_sys::InvalidOid,
                             output_transform: super::exec::OutputTransform::None,
                         });
                         if !count_meta_ok {
@@ -2348,8 +2338,6 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         col_type_oid: effective_col_type_oid,
                         expr_kind,
                         const_offset: agg_const_offset,
-                        is_partial: false,
-                        transtype_oid: pg_sys::InvalidOid,
                         output_transform: agg_output_transform,
                     });
                     if has_non_minmax {
@@ -2372,8 +2360,6 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         col_type_oid: effective_col_type_oid,
                         expr_kind,
                         const_offset: agg_const_offset,
-                        is_partial: false,
-                        transtype_oid: pg_sys::InvalidOid,
                         output_transform: agg_output_transform,
                     });
                     if has_non_minmax {
