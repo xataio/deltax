@@ -9,6 +9,7 @@
  */
 
 __attribute__((weak)) void *CurrentMemoryContext = 0;
+__attribute__((weak)) void *ErrorContext = 0;
 __attribute__((weak)) void *PG_exception_stack = 0;
 __attribute__((weak)) void *TopMemoryContext = 0;
 __attribute__((weak)) void *error_context_stack = 0;
