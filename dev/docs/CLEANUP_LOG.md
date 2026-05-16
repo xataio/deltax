@@ -30,7 +30,7 @@ narration.
 
 ## Sessions
 
-### 2026-05-16 — `src/blob_cache/storage.rs` — TBD
+### 2026-05-16 — `src/blob_cache/storage.rs` — 15eeee3
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
 The triage flagged this file as a fresh-design candidate: "Mmap-backed
