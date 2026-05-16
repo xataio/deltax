@@ -30,6 +30,67 @@ narration.
 
 ## Sessions
 
+### 2026-05-16 — `src/scan/exec/text_col.rs` — TBD
+
+**Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
+`unsafe` count was already only 2 (the `strcoll` FFI in `strcoll_cmp`),
+so this session is a pure simplification + tests pass.
+**LOC:** 516 → 539 (non-test) / 761 total with 222 lines of tests added.
+**`unsafe`:** 2 → 2 (unchanged).
+**Tests:** 0 → 12 (all `#[test]`, pure logic — first tests in this file).
+
+- Extracted `null_at(null_bitmap, row)` — the 4× repeated
+  `!null_bitmap.is_empty() && (null_bitmap[row / 8] >> (row % 8)) & 1 == 1`
+  bit-test now lives in one inlined helper.
+- Extracted `apply_via_dict(sel, row_count, row_to_entry, dict_matches)`
+  — the "if sel.is_empty / push else iter_mut + skip already-false /
+  null = false / index dict_matches" loop appeared verbatim in all 3
+  text-filter functions (Eq, In, Like). Now one place.
+- Extracted `apply_per_row(sel, row_count, pred)` — the generic
+  fallback loop for the Lz4 / SegBy / Lengths variants, also
+  duplicated 3 times.
+- The result: `apply_text_eq_filter`, `apply_text_in_filter`,
+  `apply_text_like_filter` each shrank to a single match where every
+  arm is one expression: build `dict_matches`/closure, then call one
+  of the two helpers.
+- Added 12 `#[test]` cases (pure logic, no PG harness):
+  - `null_at_handles_empty_bitmap_and_bit_layout` — bit packing
+    contract (cross-byte boundary; empty bitmap = no nulls).
+  - `seg_text_col_get_str_handles_each_variant` — Dict / Lz4 / SegBy /
+    Lengths.
+  - `seg_text_col_get_len_uses_char_count_for_bodies` — UTF-8
+    multi-byte ("héllo" = 5 chars / 6 bytes) for Dict and Lz4;
+    Lengths passes the raw stored u32 through.
+  - `seg_text_col_dict_local_id_returns_index_or_none` — Phase D
+    bitset path.
+  - `apply_text_eq_filter_dict_initial_and_anded` — confirms AND
+    semantics: pre-existing false rows stay false; is_ne flips the
+    predicate but still drops NULLs.
+  - `apply_text_eq_filter_lz4_fallback`
+  - `apply_text_eq_filter_lengths_only_resolves_empty_string` — the
+    `Lengths` shortcut for `= ''` / `<> ''`, plus the fail-safe
+    "non-empty constant against Lengths → drop all" path.
+  - `apply_text_in_filter_dict_and_lz4` — dict precompute and the
+    per-row fallback both honour NULL = false.
+  - `apply_text_like_filter_dict_with_contains_strategy` — confirms
+    each `LikeStrategy` variant routes through `matches_like`, and
+    `negate` flips the result.
+  - `strcoll_cmp_bytewise_fast_path` + `strcoll_cmp_handles_long_strings`
+    — exercises both the 512-byte stack-buffer path and the heap
+    fallback for longer inputs.
+- **Benchmarks**:
+  - ClickBench EC2 (c6a.4xlarge, 100M-row full dataset): **62.30s vs
+    prior 62.48s** (-0.3% total). Zero regressions >10%; top: Q38
+    +6.3% on a 64ms query (noise floor).
+  - JSONBench EC2 (m6i.8xlarge, 100M Bluesky events): **3.590s vs prior
+    3.588s** (+0.1%). All queries within ±3.5%.
+- **Correctness:** `make correctness` 999 passed / 3 skipped / 6 xfailed
+  (matches baseline). Unit: 512 pass on PG17 and PG18 (was 501).
+  Integration: 234 pass on PG17 and PG18.
+- **Perf opportunities surfaced:** none.
+
+This completes the entire "Next" tier of the triage.
+
 ### 2026-05-16 — `src/scan/exec/agg_wire.rs` — 67d2796
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
