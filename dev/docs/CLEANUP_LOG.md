@@ -30,7 +30,7 @@ narration.
 
 ## Sessions
 
-### 2026-05-16 — `src/scan/exec/segments.rs` — TBD
+### 2026-05-16 — `src/scan/exec/segments.rs` — fdeea74
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
 `unsafe` audit deferred — all 29 blocks are PG FFI (table_open, index_open,
