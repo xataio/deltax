@@ -30,7 +30,7 @@ narration.
 
 ## Sessions
 
-### 2026-05-16 — `src/scan/exec/append_wire.rs` — TBD
+### 2026-05-16 — `src/scan/exec/append_wire.rs` — 222d2b6
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
 The triage listed 0 tests but the file actually had 3 `#[pgrx::pg_test]`
