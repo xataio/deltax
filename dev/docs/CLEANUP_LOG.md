@@ -30,7 +30,7 @@ narration.
 
 ## Sessions
 
-### 2026-05-16 — `src/scan/exec/count_minmax.rs` — TBD
+### 2026-05-16 — `src/scan/exec/count_minmax.rs` — 9867af0
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
 `unsafe` audit deferred — all blocks are PG FFI (list_nth_int,
