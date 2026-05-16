@@ -30,6 +30,57 @@ narration.
 
 ## Sessions
 
+### 2026-05-16 — `src/scan/exec/segments.rs` — TBD
+
+**Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
+`unsafe` audit deferred — all 29 blocks are PG FFI (table_open, index_open,
+heap_getnext, pg_detoast_datum, RelationGetIndexList, etc.).
+**LOC:** 3150 → 3367 (non-test) / 3626 total with 259 lines of tests added.
+Non-test grew (+217) because rustfmt re-wrapped many of the densely-packed
+original blocks; functional duplication dropped at every site.
+**`unsafe`:** 23 → 29 (+6 from the 3 new helper functions, each marked
+`unsafe fn` because they call FFI internally).
+**Tests:** 0 → 11 (all `#[test]`, pure logic — first tests in this file).
+
+- Extracted `sibling_table_oid(meta_oid, suffix)`. The "strip `_meta` /
+  build `{partition}_<suffix>` / look up by name in same namespace" block
+  appeared 3 times verbatim across `load_text_length_sidecars`,
+  `fetch_segment_blobs`, and the colstats lookup inside `load_segments_heap`.
+- Extracted `primary_key_index_oid(rel)`. The "walk `RelationGetIndexList`,
+  open each, test `indisprimary`, close, free list" block appeared 4 times
+  in this file (inside `load_text_length_sidecars`, `fetch_segment_blobs`,
+  and twice in `load_segments_heap` for colstats and blooms scans, plus a
+  vb_rel variant). Now one helper.
+- Extracted `detoast_varlena_to_vec(varlena_ptr)`. The "pg_detoast_datum →
+  vardata_any / varsize_any_exhdr / from_raw_parts → conditional pfree"
+  block appeared 5+ times. Now a single helper consolidates the
+  ownership rule (free only when `detoasted != input`).
+- Removed stale `#[allow(dead_code)]` on `ColSum` — all fields are
+  actively read by `agg.rs` (`sum_datum`, `sum_i128`, `sum_f64`,
+  `nonnull_count`, `nonzero_count`, `type_oid`).
+- Added 11 `#[test]` cases (pure logic, no PG harness):
+  - `segment_passes_minmax_filter` matrix: Eq/Ne/Lt/Le/Gt/Ge edges, InList,
+    Like (always-true fallthrough) — 5 tests
+  - `segment_all_rows_pass`: equality on point ranges, ambiguous ranges,
+    null bounds, comparison-op ranges — 3 tests
+  - `is_zero_const` per-type matrix — 1 test
+  - `encode_datum_to_i64` identity-on-integers + None-on-text — 2 tests
+- Deferred: SAFETY: comment pass on the 29 `unsafe` blocks. All are PG
+  FFI on heap/index scans, snapshots, and TOAST.
+- **Benchmarks**:
+  - ClickBench EC2 (c6a.4xlarge, 100M-row full dataset): **62.13s vs prior
+    63.19s** (-1.7% total faster). Zero regressions >10%. Top speedup:
+    Q40 -10.5%, Q28 -6.8% (likely PK-find inlining tightening the hot path,
+    but plausibly run-to-run variance).
+  - JSONBench EC2 (m6i.8xlarge, 100M Bluesky events): **3.582s vs prior
+    3.603s** (-0.6% total). Per-query variance ±9% (Q4 -8.5%, Q3 +8.3% —
+    consistent with run noise; segments.rs reads metadata only, JSON
+    decode happens downstream).
+- **Correctness:** `make correctness` 999 passed / 3 skipped / 6 xfailed
+  (matches baseline). Unit: 451 pass on PG17 and PG18 (was 440).
+  Integration: 234 pass on PG17 and PG18.
+- **Perf opportunities surfaced:** none.
+
 ### 2026-05-16 — `src/scan/path.rs` — 426c1e8
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
