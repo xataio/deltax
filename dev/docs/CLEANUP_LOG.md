@@ -30,7 +30,7 @@ narration.
 
 ## Sessions
 
-### 2026-05-16 — `src/scan/path.rs` — TBD
+### 2026-05-16 — `src/scan/path.rs` — 426c1e8
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
 `unsafe` audit deferred — all 48 blocks are PG FFI for planner internals
