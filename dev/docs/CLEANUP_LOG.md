@@ -30,7 +30,7 @@ narration.
 
 ## Sessions
 
-### 2026-05-16 — `src/scan/exec/batch_qual.rs` — TBD
+### 2026-05-16 — `src/scan/exec/batch_qual.rs` — 41b5cc9
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
 `unsafe` audit deferred — the file only has 4 `unsafe` ops, all narrow
