@@ -30,6 +30,58 @@ narration.
 
 ## Sessions
 
+### 2026-05-16 — `src/scan/exec/count_minmax.rs` — TBD
+
+**Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.
+`unsafe` audit deferred — all blocks are PG FFI (list_nth_int,
+get_rel_name, stringToNode, SPI metadata load).
+**LOC:** 798 → 901 (non-test) / 998 total with 97 lines of tests added.
+Non-test growth (+103) is rustfmt + new helper docstrings; functional
+duplication between the two Begin callbacks dropped.
+**`unsafe`:** 20 → 28 (+8 from the 4 new helpers being `unsafe fn`).
+**Tests:** 0 → 7 (all `#[test]`, pure logic — first tests in this file).
+
+- Extracted four `unsafe fn` helpers shared by `begin_count_scan` and
+  `begin_minmax_scan`:
+  - `parse_companion_oids(custom_private, label)` — walks the
+    `[oid1, ..., -1]` prefix, asserts non-empty.
+  - `parse_trailing_qual_bytes(custom_private, idx)` — reads the
+    `[qual_bytes_len, bytes...]` trailer.
+  - `relation_name_or_error(oid)` — wraps `get_rel_name` with the
+    canonical "companion table not found" error.
+  - `rehydrate_segment_filters(qual_bytes, ...)` — bytes →
+    `stringToNode` → `extract_segment_filters`, returning the no-filter
+    triple when bytes are empty.
+- Each call site now has a 3-line wire-format header instead of a
+  ~30-line ad-hoc parser; the wire format is documented at the call
+  site via a single-line comment.
+- Added 7 `#[test]` cases (pure logic, no PG harness):
+  - `decode_encoded_to_datum_integer_identity` — INT2/4/8 round-trip
+  - `decode_encoded_to_datum_timestamp_strips_pg_epoch_offset` —
+    Unix-epoch µs → PG-epoch µs by subtracting `PG_EPOCH_OFFSET_USEC`
+  - `decode_encoded_to_datum_date_converts_usec_to_pg_days` —
+    truncating division + offset subtraction
+  - `decode_encoded_to_datum_floats_round_trip` — full f32/f64
+    round-trip through `encode_fXX_to_i64` (including ±0, ±∞, denormals)
+  - `sum_i128_to_datum_packs_into_int8`
+  - `sum_i128_to_datum_overflow_panics_for_int8_result` /
+    `_underflow_panics_for_int8_result` — pgrx::error! must fire,
+    never silently truncate (wrong sum is worse than a query failure).
+    Use bare `#[should_panic]` because the pgrx error payload isn't a
+    plain string.
+- Deferred: SAFETY: comment pass on the 28 `unsafe` blocks. All are PG
+  FFI on List nodes, syscache lookups, and SPI.
+- **Benchmarks**:
+  - ClickBench EC2 (c6a.4xlarge, 100M-row full dataset): **62.38s vs
+    prior 62.62s** (-0.4% total). Zero regressions >10%; Q38 -7.4%,
+    Q22 +3.1% all within run-to-run noise.
+  - JSONBench EC2 (m6i.8xlarge, 100M Bluesky events): **3.597s vs prior
+    3.631s** (-0.9%). All queries within ±1.5% — a stable run.
+- **Correctness:** `make correctness` 999 passed / 3 skipped / 6 xfailed
+  (matches baseline). Unit: 493 pass on PG17 and PG18 (was 486).
+  Integration: 234 pass on PG17 and PG18.
+- **Perf opportunities surfaced:** none.
+
 ### 2026-05-16 — `src/scan/exec/batch_qual.rs` — 41b5cc9
 
 **Scope:** read pass, simplify, tests, verify, full end-of-session gauntlet.

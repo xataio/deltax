@@ -1,13 +1,95 @@
+use pgrx::pg_guard;
 use pgrx::pg_sys;
 use pgrx::prelude::*;
-use pgrx::pg_guard;
 
 use std::time::Instant;
 
-use super::{DELTAX_COUNT_EXEC_METHODS, DELTAX_MINMAX_EXEC_METHODS};
-use super::segments::{load_metadata, load_segments_heap, ScanBufferStats};
 use super::datum_utils::compare_datums;
-use crate::compress::{decode_i64_to_f64, decode_i64_to_f32};
+use super::segments::{ScanBufferStats, load_metadata, load_segments_heap};
+use super::{DELTAX_COUNT_EXEC_METHODS, DELTAX_MINMAX_EXEC_METHODS};
+use crate::compress::{decode_i64_to_f32, decode_i64_to_f64};
+
+/// Parse the leading `[oid1, ..., -1]` companion-OID block from
+/// `custom_private`. Returns the OID list and the index of the first
+/// element after the `-1` sentinel. Errors out (via pgrx::error!) if the
+/// list is empty or the sentinel is missing.
+unsafe fn parse_companion_oids(
+    custom_private: *mut pg_sys::List,
+    label: &str,
+) -> (Vec<pg_sys::Oid>, i32) {
+    unsafe {
+        let list_len = (*custom_private).length;
+        let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
+        let mut idx: i32 = 0;
+        while idx < list_len {
+            let val = pg_sys::list_nth_int(custom_private, idx);
+            idx += 1;
+            if val == -1 {
+                break;
+            }
+            companion_oids.push(pg_sys::Oid::from(val as u32));
+        }
+        if companion_oids.is_empty() {
+            pgrx::error!("pg_deltax: {} has no companion tables", label);
+        }
+        (companion_oids, idx)
+    }
+}
+
+/// Read the trailing `[qual_bytes_len, byte0, byte1, ...]` block from
+/// `custom_private` starting at `idx`. Returns the raw bytes (empty when
+/// the planner emitted no quals).
+unsafe fn parse_trailing_qual_bytes(custom_private: *mut pg_sys::List, idx: i32) -> Vec<u8> {
+    unsafe {
+        let list_len = (*custom_private).length;
+        if idx >= list_len {
+            return Vec::new();
+        }
+        let qlen = pg_sys::list_nth_int(custom_private, idx);
+        let mut bytes = Vec::with_capacity(qlen.max(0) as usize);
+        for off in 0..qlen {
+            bytes.push(pg_sys::list_nth_int(custom_private, idx + 1 + off) as u8);
+        }
+        bytes
+    }
+}
+
+/// Look up a relation name by OID. Used by Begin* callbacks that derive
+/// the table-name for `load_metadata`. Errors out if PG returns NULL
+/// (relation dropped between planning and execution).
+unsafe fn relation_name_or_error(oid: pg_sys::Oid) -> String {
+    unsafe {
+        let name_ptr = pg_sys::get_rel_name(oid);
+        if name_ptr.is_null() {
+            pgrx::error!(
+                "pg_deltax: companion table not found for OID {}",
+                u32::from(oid)
+            );
+        }
+        std::ffi::CStr::from_ptr(name_ptr)
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// Decode `qual_bytes` (from `nodeToString` at plan time) back into a
+/// PG List and run `extract_segment_filters` against it. Returns the
+/// no-filter triple when the bytes are empty.
+unsafe fn rehydrate_segment_filters(
+    qual_bytes: &[u8],
+    col_names: &[String],
+    segment_by: &[String],
+    time_column: &str,
+) -> (Vec<(usize, String)>, Option<i64>, Option<i64>) {
+    if qual_bytes.is_empty() {
+        return (Vec::new(), None, None);
+    }
+    unsafe {
+        let cstr = std::ffi::CString::new(qual_bytes.to_vec()).unwrap();
+        let qual_list = pg_sys::stringToNode(cstr.as_ptr()) as *mut pg_sys::List;
+        super::segments::extract_segment_filters(qual_list, col_names, segment_by, time_column)
+    }
+}
 
 /// State for DeltaXCount (COUNT(*) pushdown).
 pub(crate) struct CountScanState {
@@ -80,32 +162,9 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
             pgrx::error!("pg_deltax: missing companion table OIDs in DeltaXCount state");
         }
 
-        let list_len = (*custom_private).length;
-
-        // Parse custom_private: [oid1, ..., -1, qual_bytes_len, bytes...]
-        let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
-        let mut qual_bytes: Vec<u8> = Vec::new();
-        let mut idx: i32 = 0;
-        while idx < list_len {
-            let val = pg_sys::list_nth_int(custom_private, idx);
-            idx += 1;
-            if val == -1 {
-                break;
-            }
-            companion_oids.push(pg_sys::Oid::from(val as u32));
-        }
-        if idx < list_len {
-            let qlen = pg_sys::list_nth_int(custom_private, idx);
-            idx += 1;
-            for _ in 0..qlen {
-                qual_bytes.push(pg_sys::list_nth_int(custom_private, idx) as u8);
-                idx += 1;
-            }
-        }
-
-        if companion_oids.is_empty() {
-            pgrx::error!("pg_deltax: DeltaXCount has no companion tables");
-        }
+        // Wire format: [oid1, ..., -1, qual_bytes_len, bytes...]
+        let (companion_oids, after_oids) = parse_companion_oids(custom_private, "DeltaXCount");
+        let qual_bytes = parse_trailing_qual_bytes(custom_private, after_oids);
 
         // Fast path: no WHERE → sum `deltax_partition.row_count` from
         // the catalog (one lookup per companion, no segment I/O).
@@ -145,18 +204,7 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
             }
         } else {
             // Fallback path: scan meta tables to sum per-segment row counts.
-            let first_name = {
-                let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
-                if name_ptr.is_null() {
-                    pgrx::error!(
-                        "pg_deltax: companion table not found for OID {}",
-                        u32::from(companion_oids[0])
-                    );
-                }
-                std::ffi::CStr::from_ptr(name_ptr)
-                    .to_string_lossy()
-                    .into_owned()
-            };
+            let first_name = relation_name_or_error(companion_oids[0]);
 
             let t_meta = Instant::now();
             let meta = Spi::connect(|client| load_metadata(client, &first_name));
@@ -165,18 +213,15 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
             let num_cols = meta.col_names.len();
             let needed_cols = vec![false; num_cols];
 
-            // If we have WHERE quals, extract time/segment-by filters
-            // so `load_segments_heap` can prune segments by
-            // `min_time`/`max_time` and `segment_values` — no decompress.
-            let (seg_filters, time_min, time_max) = if qual_bytes.is_empty() {
-                (Vec::new(), None, None)
-            } else {
-                let cstr = std::ffi::CString::new(qual_bytes.clone()).unwrap();
-                let qual_list = pg_sys::stringToNode(cstr.as_ptr()) as *mut pg_sys::List;
-                super::segments::extract_segment_filters(
-                    qual_list, &meta.col_names, &meta.segment_by, &meta.time_column,
-                )
-            };
+            // Decode trailing qual bytes back into a List + extract
+            // time-range / segment-by filters so `load_segments_heap` can
+            // prune by metadata alone (no decompress).
+            let (seg_filters, time_min, time_max) = rehydrate_segment_filters(
+                &qual_bytes,
+                &meta.col_names,
+                &meta.segment_by,
+                &meta.time_column,
+            );
 
             super::segments::reset_scan_buf_stats();
             let t1 = Instant::now();
@@ -235,7 +280,10 @@ pub(super) unsafe extern "C-unwind" fn exec_count_scan(
 
         if !state.returned {
             pg_sys::ExecClearTuple(scan_slot);
-            (*scan_slot).tts_values.add(0).write(pg_sys::Datum::from(state.total_count as usize));
+            (*scan_slot)
+                .tts_values
+                .add(0)
+                .write(pg_sys::Datum::from(state.total_count as usize));
             (*scan_slot).tts_isnull.add(0).write(false);
             pg_sys::ExecStoreVirtualTuple(scan_slot);
             state.returned = true;
@@ -250,9 +298,7 @@ pub(super) unsafe extern "C-unwind" fn exec_count_scan(
 
 /// EndCustomScan callback for DeltaXCount: cleanup state.
 #[pg_guard]
-pub(super) unsafe extern "C-unwind" fn end_count_scan(
-    node: *mut pg_sys::CustomScanState,
-) {
+pub(super) unsafe extern "C-unwind" fn end_count_scan(node: *mut pg_sys::CustomScanState) {
     unsafe {
         let state_ptr = (*node).custom_ps as *mut CountScanState;
         if !state_ptr.is_null() {
@@ -274,9 +320,7 @@ pub(super) unsafe extern "C-unwind" fn end_count_scan(
 
 /// ReScanCustomScan callback for DeltaXCount: reset returned flag.
 #[pg_guard]
-pub(super) unsafe extern "C-unwind" fn rescan_count_scan(
-    node: *mut pg_sys::CustomScanState,
-) {
+pub(super) unsafe extern "C-unwind" fn rescan_count_scan(node: *mut pg_sys::CustomScanState) {
     unsafe {
         let state = &mut *((*node).custom_ps as *mut CountScanState);
         state.returned = false;
@@ -330,26 +374,14 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
             pgrx::error!("pg_deltax: missing companion table OIDs in DeltaXMinMax state");
         }
 
-        let list_len = (*custom_private).length;
+        // Wire format: [oid1, ..., -1, num_aggs,
+        //               kind, varattno, result_type, col_type, typlen, typbyval,
+        //               const_offset_lo, const_offset_hi  (×num_aggs),
+        //               qual_bytes_len, qual_byte0, ...]
+        let (companion_oids, after_oids) = parse_companion_oids(custom_private, "DeltaXMinMax");
 
-        // Parse custom_private: [oid1, ..., -1, num_aggs,
-        //                        kind, varattno, result_type, col_type, typlen, typbyval (×num_aggs),
-        //                        qual_bytes_len, qual_byte0, ...]
-        let mut companion_oids: Vec<pg_sys::Oid> = Vec::new();
         let mut agg_specs: Vec<ExecAggSpec> = Vec::new();
-        let mut qual_bytes: Vec<u8> = Vec::new();
-        let mut idx: i32 = 0;
-
-        // Companion OIDs until -1 sentinel.
-        while idx < list_len {
-            let val = pg_sys::list_nth_int(custom_private, idx);
-            idx += 1;
-            if val == -1 {
-                break;
-            }
-            companion_oids.push(pg_sys::Oid::from(val as u32));
-        }
-
+        let mut idx = after_oids;
         let num_aggs = pg_sys::list_nth_int(custom_private, idx);
         idx += 1;
         for _ in 0..num_aggs {
@@ -358,8 +390,7 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                 .collect();
             idx += 8;
             // Reassemble i64 const_offset from two i32 halves (low, high).
-            let const_offset = (fields[6] as u32 as i64)
-                | ((fields[7] as i64) << 32);
+            let const_offset = (fields[6] as u32 as i64) | ((fields[7] as i64) << 32);
             agg_specs.push(ExecAggSpec {
                 kind: crate::scan::path::MetaAggKind::from_i32(fields[0]),
                 varattno: fields[1],
@@ -370,32 +401,10 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                 const_offset,
             });
         }
-        if idx < list_len {
-            let qlen = pg_sys::list_nth_int(custom_private, idx);
-            idx += 1;
-            for _ in 0..qlen {
-                qual_bytes.push(pg_sys::list_nth_int(custom_private, idx) as u8);
-                idx += 1;
-            }
-        }
-
-        if companion_oids.is_empty() {
-            pgrx::error!("pg_deltax: DeltaXMinMax has no companion tables");
-        }
+        let qual_bytes = parse_trailing_qual_bytes(custom_private, idx);
 
         // Get first companion table name for metadata
-        let first_name = {
-            let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
-            if name_ptr.is_null() {
-                pgrx::error!(
-                    "pg_deltax: companion table not found for OID {}",
-                    u32::from(companion_oids[0])
-                );
-            }
-            std::ffi::CStr::from_ptr(name_ptr)
-                .to_string_lossy()
-                .into_owned()
-        };
+        let first_name = relation_name_or_error(companion_oids[0]);
 
         // Load metadata via SPI from first companion table
         let t0 = Instant::now();
@@ -415,7 +424,10 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                 if idx < meta.col_names.len() {
                     Some(meta.col_names[idx].clone())
                 } else {
-                    pgrx::error!("pg_deltax: DeltaXMinMax varattno {} out of range", spec.varattno);
+                    pgrx::error!(
+                        "pg_deltax: DeltaXMinMax varattno {} out of range",
+                        spec.varattno
+                    );
                 }
             })
             .collect();
@@ -427,29 +439,34 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
 
         // Re-hydrate optional qual list for segment pruning (time-range
         // and segment-by equality). Empty bytes = no WHERE.
-        let (seg_filters, time_min, time_max) = if qual_bytes.is_empty() {
-            (Vec::new(), None, None)
-        } else {
-            let cstr = std::ffi::CString::new(qual_bytes.clone()).unwrap();
-            let qual_list = pg_sys::stringToNode(cstr.as_ptr()) as *mut pg_sys::List;
-            super::segments::extract_segment_filters(
-                qual_list, &meta.col_names, &meta.segment_by, &meta.time_column,
-            )
-        };
+        let (seg_filters, time_min, time_max) = rehydrate_segment_filters(
+            &qual_bytes,
+            &meta.col_names,
+            &meta.segment_by,
+            &meta.time_column,
+        );
 
         // List of cols we need `col_minmax` / `col_sums` populated for.
-        let minmax_cols: Vec<String> = agg_specs.iter().zip(agg_col_names.iter())
+        let minmax_cols: Vec<String> = agg_specs
+            .iter()
+            .zip(agg_col_names.iter())
             .filter_map(|(spec, name)| {
                 if matches!(spec.kind, MetaAggKind::Min | MetaAggKind::Max) {
                     name.clone()
-                } else { None }
+                } else {
+                    None
+                }
             })
             .collect();
-        let stats_cols: Vec<String> = agg_specs.iter().zip(agg_col_names.iter())
+        let stats_cols: Vec<String> = agg_specs
+            .iter()
+            .zip(agg_col_names.iter())
             .filter_map(|(spec, name)| {
                 if matches!(spec.kind, MetaAggKind::Sum | MetaAggKind::CountCol) {
                     name.clone()
-                } else { None }
+                } else {
+                    None
+                }
             })
             .collect();
         super::segments::reset_scan_buf_stats();
@@ -457,35 +474,62 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
 
         // Per-spec accumulators. Indices match `agg_specs`.
         enum Acc {
-            MinMax { datum: pg_sys::Datum, null: bool, type_oid: pg_sys::Oid, is_min: bool },
+            MinMax {
+                datum: pg_sys::Datum,
+                null: bool,
+                type_oid: pg_sys::Oid,
+                is_min: bool,
+            },
             // `nonnull` tracks total non-null input rows for the offset-finalize
             // step (`sum(col + N) = sum(col) + N * nonnull`). Stays 0 for plain
             // SUM(col) since const_offset is 0 then — multiplication is a no-op.
-            SumI128 { acc: i128, nonnull: i64, seen: bool, result_oid: pg_sys::Oid, const_offset: i64 },
-            SumF64  { acc: f64, nonnull: i64, seen: bool, result_oid: pg_sys::Oid, const_offset: i64 },
-            Count { acc: i64 },
+            SumI128 {
+                acc: i128,
+                nonnull: i64,
+                seen: bool,
+                result_oid: pg_sys::Oid,
+                const_offset: i64,
+            },
+            SumF64 {
+                acc: f64,
+                nonnull: i64,
+                seen: bool,
+                result_oid: pg_sys::Oid,
+                const_offset: i64,
+            },
+            Count {
+                acc: i64,
+            },
         }
         let mut accs: Vec<Acc> = agg_specs
             .iter()
             .map(|spec| match spec.kind {
                 MetaAggKind::Min => Acc::MinMax {
-                    datum: pg_sys::Datum::from(0usize), null: true,
-                    type_oid: pg_sys::InvalidOid, is_min: true,
+                    datum: pg_sys::Datum::from(0usize),
+                    null: true,
+                    type_oid: pg_sys::InvalidOid,
+                    is_min: true,
                 },
                 MetaAggKind::Max => Acc::MinMax {
-                    datum: pg_sys::Datum::from(0usize), null: true,
-                    type_oid: pg_sys::InvalidOid, is_min: false,
+                    datum: pg_sys::Datum::from(0usize),
+                    null: true,
+                    type_oid: pg_sys::InvalidOid,
+                    is_min: false,
                 },
                 MetaAggKind::Sum => {
                     if matches!(spec.col_type_oid, pg_sys::FLOAT4OID | pg_sys::FLOAT8OID) {
                         Acc::SumF64 {
-                            acc: 0.0, nonnull: 0, seen: false,
+                            acc: 0.0,
+                            nonnull: 0,
+                            seen: false,
                             result_oid: spec.result_type_oid,
                             const_offset: spec.const_offset,
                         }
                     } else {
                         Acc::SumI128 {
-                            acc: 0, nonnull: 0, seen: false,
+                            acc: 0,
+                            nonnull: 0,
+                            seen: false,
                             result_oid: spec.result_type_oid,
                             const_offset: spec.const_offset,
                         }
@@ -517,17 +561,32 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
             for seg in &segs {
                 for (spec_idx, spec) in agg_specs.iter().enumerate() {
                     match &mut accs[spec_idx] {
-                        Acc::MinMax { datum, null, type_oid, is_min } => {
+                        Acc::MinMax {
+                            datum,
+                            null,
+                            type_oid,
+                            is_min,
+                        } => {
                             let col_name = match &agg_col_names[spec_idx] {
-                                Some(n) => n, None => continue,
+                                Some(n) => n,
+                                None => continue,
                             };
                             let cm = match seg.col_minmax.get(col_name) {
-                                Some(c) => c, None => continue,
+                                Some(c) => c,
+                                None => continue,
                             };
-                            let seg_encoded = if *is_min { cm.min_encoded } else { cm.max_encoded };
+                            let seg_encoded = if *is_min {
+                                cm.min_encoded
+                            } else {
+                                cm.max_encoded
+                            };
                             let seg_null = if *is_min { cm.min_null } else { cm.max_null };
-                            if seg_null { continue; }
-                            if *type_oid == pg_sys::InvalidOid { *type_oid = cm.type_oid; }
+                            if seg_null {
+                                continue;
+                            }
+                            if *type_oid == pg_sys::InvalidOid {
+                                *type_oid = cm.type_oid;
+                            }
                             let seg_datum = decode_encoded_to_datum(seg_encoded, cm.type_oid);
                             if *null {
                                 *datum = seg_datum;
@@ -539,12 +598,17 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                                 } else {
                                     cmp == std::cmp::Ordering::Greater
                                 };
-                                if dominated { *datum = seg_datum; }
+                                if dominated {
+                                    *datum = seg_datum;
+                                }
                             }
                         }
-                        Acc::SumI128 { acc, nonnull, seen, .. } => {
+                        Acc::SumI128 {
+                            acc, nonnull, seen, ..
+                        } => {
                             let col_name = match &agg_col_names[spec_idx] {
-                                Some(n) => n, None => continue,
+                                Some(n) => n,
+                                None => continue,
                             };
                             if let Some(cs) = seg.col_sums.get(col_name)
                                 && let Some(v) = cs.sum_i128
@@ -554,9 +618,12 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                                 *seen = true;
                             }
                         }
-                        Acc::SumF64 { acc, nonnull, seen, .. } => {
+                        Acc::SumF64 {
+                            acc, nonnull, seen, ..
+                        } => {
                             let col_name = match &agg_col_names[spec_idx] {
-                                Some(n) => n, None => continue,
+                                Some(n) => n,
+                                None => continue,
                             };
                             if let Some(cs) = seg.col_sums.get(col_name)
                                 && let Some(v) = cs.sum_f64
@@ -566,20 +633,19 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                                 *seen = true;
                             }
                         }
-                        Acc::Count { acc } => {
-                            match spec.kind {
-                                MetaAggKind::CountStar => *acc += seg.row_count as i64,
-                                MetaAggKind::CountCol => {
-                                    let col_name = match &agg_col_names[spec_idx] {
-                                        Some(n) => n, None => continue,
-                                    };
-                                    if let Some(cs) = seg.col_sums.get(col_name) {
-                                        *acc += cs.nonnull_count;
-                                    }
+                        Acc::Count { acc } => match spec.kind {
+                            MetaAggKind::CountStar => *acc += seg.row_count as i64,
+                            MetaAggKind::CountCol => {
+                                let col_name = match &agg_col_names[spec_idx] {
+                                    Some(n) => n,
+                                    None => continue,
+                                };
+                                if let Some(cs) = seg.col_sums.get(col_name) {
+                                    *acc += cs.nonnull_count;
                                 }
-                                _ => unreachable!(),
                             }
-                        }
+                            _ => unreachable!(),
+                        },
                     }
                 }
             }
@@ -590,22 +656,40 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
         // Convert accumulators into the legacy `MinMaxResult` row shape
         // expected by `exec_minmax_scan`. Emit one entry per spec in
         // target-list order; result tuple construction happens there.
-        let results: Vec<MinMaxResult> = accs.into_iter()
+        let results: Vec<MinMaxResult> = accs
+            .into_iter()
             .zip(agg_specs.iter())
             .zip(agg_col_names.iter())
             .map(|((acc, spec), col_name)| {
                 let col_name_str = col_name.clone().unwrap_or_else(|| "*".to_string());
                 let kind = spec.kind;
                 match acc {
-                    Acc::MinMax { datum, null, type_oid, .. } => MinMaxResult {
-                        datum, is_null: null, col_name: col_name_str,
-                        kind, type_oid,
+                    Acc::MinMax {
+                        datum,
+                        null,
+                        type_oid,
+                        ..
+                    } => MinMaxResult {
+                        datum,
+                        is_null: null,
+                        col_name: col_name_str,
+                        kind,
+                        type_oid,
                     },
-                    Acc::SumI128 { acc, nonnull, seen, result_oid, const_offset } => {
+                    Acc::SumI128 {
+                        acc,
+                        nonnull,
+                        seen,
+                        result_oid,
+                        const_offset,
+                    } => {
                         if !seen {
                             MinMaxResult {
-                                datum: pg_sys::Datum::from(0usize), is_null: true,
-                                col_name: col_name_str, kind, type_oid: result_oid,
+                                datum: pg_sys::Datum::from(0usize),
+                                is_null: true,
+                                col_name: col_name_str,
+                                kind,
+                                type_oid: result_oid,
                             }
                         } else {
                             // `sum(col + N) = sum(col) + N * nonnull`. const_offset
@@ -615,16 +699,28 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                             );
                             let datum = sum_i128_to_datum(shifted, result_oid, spec.col_type_oid);
                             MinMaxResult {
-                                datum, is_null: false, col_name: col_name_str,
-                                kind, type_oid: result_oid,
+                                datum,
+                                is_null: false,
+                                col_name: col_name_str,
+                                kind,
+                                type_oid: result_oid,
                             }
                         }
                     }
-                    Acc::SumF64 { acc, nonnull, seen, result_oid, const_offset } => {
+                    Acc::SumF64 {
+                        acc,
+                        nonnull,
+                        seen,
+                        result_oid,
+                        const_offset,
+                    } => {
                         if !seen {
                             MinMaxResult {
-                                datum: pg_sys::Datum::from(0usize), is_null: true,
-                                col_name: col_name_str, kind, type_oid: result_oid,
+                                datum: pg_sys::Datum::from(0usize),
+                                is_null: true,
+                                col_name: col_name_str,
+                                kind,
+                                type_oid: result_oid,
                             }
                         } else {
                             // Same offset shift as the i128 path, in f64. Float
@@ -641,14 +737,20 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                                 _ => pg_sys::Datum::from(shifted.to_bits() as usize),
                             };
                             MinMaxResult {
-                                datum, is_null: false, col_name: col_name_str,
-                                kind, type_oid: result_oid,
+                                datum,
+                                is_null: false,
+                                col_name: col_name_str,
+                                kind,
+                                type_oid: result_oid,
                             }
                         }
                     }
                     Acc::Count { acc } => MinMaxResult {
-                        datum: pg_sys::Datum::from(acc as usize), is_null: false,
-                        col_name: col_name_str, kind, type_oid: pg_sys::INT8OID,
+                        datum: pg_sys::Datum::from(acc as usize),
+                        is_null: false,
+                        col_name: col_name_str,
+                        kind,
+                        type_oid: pg_sys::INT8OID,
                     },
                 }
             })
@@ -698,25 +800,27 @@ pub(super) unsafe extern "C-unwind" fn exec_minmax_scan(
 
 /// EndCustomScan callback for DeltaXMinMax: cleanup state.
 #[pg_guard]
-pub(super) unsafe extern "C-unwind" fn end_minmax_scan(
-    node: *mut pg_sys::CustomScanState,
-) {
+pub(super) unsafe extern "C-unwind" fn end_minmax_scan(node: *mut pg_sys::CustomScanState) {
     unsafe {
         let state_ptr = (*node).custom_ps as *mut MinMaxScanState;
         if !state_ptr.is_null() {
             let state = Box::from_raw(state_ptr);
             let total_us = state.metadata_us + state.heap_scan_us;
             use crate::scan::path::MetaAggKind;
-            let agg_parts: Vec<String> = state.results.iter().map(|r| {
-                let agg_name = match r.kind {
-                    MetaAggKind::Min => "MIN",
-                    MetaAggKind::Max => "MAX",
-                    MetaAggKind::Sum => "SUM",
-                    MetaAggKind::CountCol => "COUNT",
-                    MetaAggKind::CountStar => "COUNT*",
-                };
-                format!("{}({})=null={}", agg_name, r.col_name, r.is_null)
-            }).collect();
+            let agg_parts: Vec<String> = state
+                .results
+                .iter()
+                .map(|r| {
+                    let agg_name = match r.kind {
+                        MetaAggKind::Min => "MIN",
+                        MetaAggKind::Max => "MAX",
+                        MetaAggKind::Sum => "SUM",
+                        MetaAggKind::CountCol => "COUNT",
+                        MetaAggKind::CountStar => "COUNT*",
+                    };
+                    format!("{}({})=null={}", agg_name, r.col_name, r.is_null)
+                })
+                .collect();
             pgrx::log!(
                 "pg_deltax DeltaXMinMax timing: total={:.1}ms  metadata={:.1}ms  heap_scan={:.1}ms  | \
                  {} segments={}",
@@ -733,9 +837,7 @@ pub(super) unsafe extern "C-unwind" fn end_minmax_scan(
 
 /// ReScanCustomScan callback for DeltaXMinMax: reset returned flag.
 #[pg_guard]
-pub(super) unsafe extern "C-unwind" fn rescan_minmax_scan(
-    node: *mut pg_sys::CustomScanState,
-) {
+pub(super) unsafe extern "C-unwind" fn rescan_minmax_scan(node: *mut pg_sys::CustomScanState) {
     unsafe {
         let state = &mut *((*node).custom_ps as *mut MinMaxScanState);
         state.returned = false;
@@ -794,5 +896,103 @@ fn sum_i128_to_datum(acc: i128, result_oid: pg_sys::Oid, _col_oid: pg_sys::Oid) 
             pg_sys::Datum::from(acc as i64 as usize)
         }
         _ => pg_sys::Datum::from(acc as i64 as usize),
+    }
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use super::*;
+    use crate::compress::{
+        PG_EPOCH_OFFSET_DAYS, PG_EPOCH_OFFSET_USEC, encode_f32_to_i64, encode_f64_to_i64,
+    };
+
+    #[test]
+    fn decode_encoded_to_datum_integer_identity() {
+        // Integer-family OIDs round-trip without offset: storage matches
+        // PG's native datum representation, so the encode is identity.
+        for oid in [pg_sys::INT2OID, pg_sys::INT4OID, pg_sys::INT8OID] {
+            let d = decode_encoded_to_datum(42, oid);
+            assert_eq!(d.value() as i64, 42, "oid {:?}", oid);
+
+            let d = decode_encoded_to_datum(-7, oid);
+            // Cast back through i64 to interpret the unsigned datum as signed.
+            assert_eq!(d.value() as i64, -7, "negative for oid {:?}", oid);
+        }
+    }
+
+    #[test]
+    fn decode_encoded_to_datum_timestamp_strips_pg_epoch_offset() {
+        // Stored as Unix-epoch µs; PG datum expects PG-epoch µs.
+        // `decode(unix_usec) = unix_usec - PG_EPOCH_OFFSET_USEC`.
+        let unix_usec = PG_EPOCH_OFFSET_USEC + 1_000_000_000;
+        let d = decode_encoded_to_datum(unix_usec, pg_sys::TIMESTAMPOID);
+        assert_eq!(d.value() as i64, 1_000_000_000);
+
+        let d = decode_encoded_to_datum(unix_usec, pg_sys::TIMESTAMPTZOID);
+        assert_eq!(d.value() as i64, 1_000_000_000);
+
+        // PG-epoch zero corresponds to Unix-epoch + PG_EPOCH_OFFSET_USEC.
+        let d = decode_encoded_to_datum(PG_EPOCH_OFFSET_USEC, pg_sys::TIMESTAMPOID);
+        assert_eq!(d.value() as i64, 0);
+    }
+
+    #[test]
+    fn decode_encoded_to_datum_date_converts_usec_to_pg_days() {
+        // `encoded` is Unix-epoch µs; `decode` returns PG-epoch days
+        // (truncating, since DATE has no sub-day precision).
+        let one_day_usec: i64 = 86_400_000_000;
+
+        // Unix day 10_958 = PG day 1.
+        let unix_day = PG_EPOCH_OFFSET_DAYS + 1;
+        let d = decode_encoded_to_datum(unix_day * one_day_usec, pg_sys::DATEOID);
+        assert_eq!(d.value() as i32, 1);
+
+        // The PG epoch itself.
+        let d = decode_encoded_to_datum(PG_EPOCH_OFFSET_DAYS * one_day_usec, pg_sys::DATEOID);
+        assert_eq!(d.value() as i32, 0);
+    }
+
+    #[test]
+    fn decode_encoded_to_datum_floats_round_trip() {
+        // Round-trip: encode_fXX_to_i64 → decode_encoded_to_datum → bit-pattern check.
+        for f in [1.5f64, -2.5, 0.0, 1e-9, 1e9, f64::INFINITY] {
+            let enc = encode_f64_to_i64(f);
+            let datum = decode_encoded_to_datum(enc, pg_sys::FLOAT8OID);
+            let back = f64::from_bits(datum.value() as u64);
+            assert_eq!(back.to_bits(), f.to_bits(), "f64 round trip {}", f);
+        }
+        for f in [1.5f32, -3.25, 0.0, 1e-9, 1e9, f32::INFINITY] {
+            let enc = encode_f32_to_i64(f);
+            let datum = decode_encoded_to_datum(enc, pg_sys::FLOAT4OID);
+            let back = f32::from_bits(datum.value() as u32);
+            assert_eq!(back.to_bits(), f.to_bits(), "f32 round trip {}", f);
+        }
+    }
+
+    #[test]
+    fn sum_i128_to_datum_packs_into_int8() {
+        // SUM(int2)/SUM(int4) → int8. Datum is the i64 bit-pattern.
+        let d = sum_i128_to_datum(42, pg_sys::INT8OID, pg_sys::INT4OID);
+        assert_eq!(d.value() as i64, 42);
+
+        let d = sum_i128_to_datum(-1_234_567_890_123i128, pg_sys::INT8OID, pg_sys::INT8OID);
+        assert_eq!(d.value() as i64, -1_234_567_890_123);
+    }
+
+    #[test]
+    #[should_panic] // pgrx::error! payload isn't a plain string; just confirm it panics.
+    fn sum_i128_to_datum_overflow_panics_for_int8_result() {
+        // Anything beyond i64::MAX must surface as an error rather than
+        // silently truncate — wrong sum is worse than a query failure.
+        let too_big: i128 = (i64::MAX as i128) + 1;
+        let _ = sum_i128_to_datum(too_big, pg_sys::INT8OID, pg_sys::INT8OID);
+    }
+
+    #[test]
+    #[should_panic]
+    fn sum_i128_to_datum_underflow_panics_for_int8_result() {
+        let too_small: i128 = (i64::MIN as i128) - 1;
+        let _ = sum_i128_to_datum(too_small, pg_sys::INT8OID, pg_sys::INT8OID);
     }
 }
