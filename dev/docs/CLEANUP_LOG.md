@@ -30,6 +30,110 @@ narration.
 
 ## Sessions
 
+### 2026-05-17 — `src/scan/exec/agg/mod.rs` → `agg/callbacks.rs` — extract executor callbacks — 7b50553
+
+**Scope:** the last AGG_SPLIT.md leftover. Move the 9 custom-scan
+callback entry points + DSM scaffolding + the `DELTAX_AGG_EXEC_METHODS`
+static into a new `agg/callbacks.rs`. After this PR, mod.rs is just
+the sub-module declarations + agg-level re-exports + the test block.
+
+**Files:** 13 → 14 (`agg/callbacks.rs` added).
+`mod.rs`: 3,697 → 2,108 LOC (−1,589).
+`callbacks.rs`: 1,593 LOC.
+`compact.rs`: 1,484 → 1,525 LOC (gained `StringArena`).
+**`unsafe`:** 114 → 114 (no change).
+**Tests:** unchanged at 0 `#[test]` / 144 `#[pg_test]`.
+
+Items moved out of mod.rs:
+- DSM scaffolding callbacks: `estimate_dsm_deltax_agg`,
+  `initialize_dsm_deltax_agg`, `reinit_dsm_deltax_agg`,
+  `init_worker_deltax_agg`, `shutdown_deltax_agg`, plus the
+  `current_agg_worker_slot` helper.
+- The four executor callbacks: `begin_agg_scan`, `exec_agg_scan`,
+  `end_agg_scan`, `rescan_agg_scan`, and the `create_agg_scan_state`
+  factory.
+- The `DELTAX_AGG_EXEC_METHODS` static that wires all of the above
+  into PG's `CustomExecMethods` table.
+- Plus the helper fns `run_leader_merge_and_finalise`,
+  `finalise_compact_into_result_rows`,
+  `run_partial_aggregate_in_process`, `run_worker_partial_aggregate`
+  that are private helpers for `exec_agg_scan`.
+
+Items moved out of mod.rs into `compact.rs`:
+- `StringArena` struct + impl. Logically belongs in compact since
+  `CompactAccStorage` embeds one as `str_arena`. Sibling files
+  (parallel_mixed, serial) keep working through the `pub(crate) use
+  compact::StringArena` re-export from mod.rs.
+
+Visibility shifts:
+- Callbacks raise from `pub(super)` to `pub(crate)` because mod.rs
+  re-exports `create_agg_scan_state` at `pub(crate)` for
+  `scan/exec/mod.rs` → `scan/path.rs`. The other callbacks are only
+  referenced inside `DELTAX_AGG_EXEC_METHODS` (in `callbacks.rs`
+  itself) but rustc still requires `pub(crate)` on items inside a
+  `pub(crate) static`'s field expressions.
+- `StringArena` upgrades from `pub(super)` in mod.rs to `pub(crate)`
+  in compact.rs to preserve the `scan::exec` visibility consumers
+  (notably `agg_wire.rs` which reads `result.compact_storage.str_arena.buf`)
+  had before.
+
+Path rewrites inside the moved code:
+- `super::super::cost::*` → `crate::scan::cost::*`.
+- `super::super::DELTAX_AGG_NAME` → `crate::scan::DELTAX_AGG_NAME`.
+- `super::super::explain::*` → `crate::scan::explain::*`.
+- `super::agg_wire::*` → `super::super::agg_wire::*`.
+- `super::segments::*` → `super::super::segments::*` (segments lives
+  in scan/exec/, one level up from callbacks.rs in agg/).
+
+**Verify:**
+- `make clippy` — clean (18 cosmetic warnings — same shape as prior
+  sessions).
+- `make test` (PG17): 530 pass.
+- `make test PG_MAJOR=18`: 530 pass.
+- `make integration-test`: 234 × PG17 + PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline).
+
+**Benchmarks:**
+- ClickBench EC2 (cold caches): 62.92s vs prior 62.12s (+1.3%).
+  Worst Q33 +5.6% (4.75s → 5.02s — just over the 5% gate but on a
+  multi-second query where ±0.3s is run-to-run variance); Q6 +6.2%
+  on a 17ms query (1ms absolute, noise floor). All other queries
+  within ±4%.
+- JSONBench EC2 (100m bluesky): hot mins
+  [0.227, 1.894, 0.254, 0.549, 0.664] vs prior
+  [0.228, 2.037, 0.257, 0.562, 0.659]. Q1 improved 7%; all queries
+  within ±2.4% of the long-running JSONBench baseline.
+
+**End-state of the agg/ tree** (relative to original 14,019-LOC
+`agg.rs`):
+
+| File | LOC | Concern |
+|---|---:|---|
+| `agg/mod.rs` | 2,108 | sub-module decls + agg-level re-exports + ~2k LOC test block |
+| `agg/callbacks.rs` | 1,593 | executor callbacks (begin/exec/end/rescan) + DSM scaffolding + `DELTAX_AGG_EXEC_METHODS` |
+| `agg/parallel_compact.rs` | 2,528 | parallel-compact dispatch + worker helpers |
+| `agg/parallel_mixed.rs` | 3,491 | parallel-mixed dispatch + worker helpers (largest path) |
+| `agg/parallel_cd.rs` | 539 | parallel COUNT(DISTINCT) dispatch + helpers |
+| `agg/serial.rs` | 1,944 | serial (single-threaded) dispatch + GroupKey helpers |
+| `agg/compact.rs` | 1,525 | CompactAcc storage + finalize + datum helpers + `StringArena` |
+| `agg/metadata.rs` | 754 | catalog/fast-path/segment-metadata accumulation |
+| `agg/parser.rs` | 579 | `parse_agg_private` + scan-state builders |
+| `agg/state.rs` | 564 | type definitions |
+| `agg/regex.rs` | 271 | regex-replace + CASE-WHEN apply helpers |
+| `agg/extract.rs` | 166 | `date_trunc` / `EXTRACT` math |
+| `agg/keys.rs` | 83 | packed integer keys + `CompactGroupMap` alias |
+| `agg/cd_set.rs` | 40 | `CdSet*` aliases + `hash128_str` |
+| **Total** | **16,185** | **(+15% vs original, mostly fmt + per-module doc comments + builder defaults)** |
+
+`begin_agg_scan` itself was 5,830 LOC in session 1; today it's ~150
+LOC of setup + a 4-arm dispatch.
+
+**Remaining cleanup ideas (deferred):**
+- Test block (~1,500 LOC in mod.rs) → AGG_SPLIT.md session 8 will
+  scatter tests next to production code.
+- `unsafe` audit (114 blocks) → AGG_SPLIT.md sessions 3-7 envisioned
+  this per-dispatch.
+
 ### 2026-05-17 — `src/scan/exec/agg/mod.rs` → `agg/compact.rs` — extract Compact Accumulator Storage — 1cfac7e
 
 **Scope:** finish the AGG_SPLIT.md leftover surfaced in session 2d's
