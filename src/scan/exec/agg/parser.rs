@@ -10,9 +10,7 @@
 use pgrx::pg_sys;
 
 use super::super::batch_qual::extract_batch_quals;
-use super::super::segments::{
-    ScanBufferStats, SegmentData, extract_segment_filters, load_segments_heap,
-};
+use super::super::segments::{SegmentData, extract_segment_filters, load_segments_heap};
 use super::extract::date_trunc_unit_to_usecs;
 use super::metadata::load_agg_metadata_from_plan;
 use super::state::{
@@ -30,42 +28,11 @@ use super::state::{
 #[allow(dead_code)] // Phase C.1; activated by `begin_agg_scan` short-circuit.
 pub(super) fn build_minimal_worker_state() -> AggScanState {
     AggScanState {
-        _agg_specs: Vec::new(),
-        _group_specs: Vec::new(),
-        result_rows: Vec::new(),
-        result_idx: 0,
-        _num_result_cols: 0,
-        metadata_us: 0,
-        heap_scan_us: 0,
-        detoast_us: 0,
-        blob_cache_hits: 0,
-        blob_cache_misses: 0,
-        blob_cache_bytes_served: 0,
-        decompress_us: 0,
-        agg_us: 0,
-        total_segments: 0,
-        total_rows_processed: 0,
-        batch_quals_count: 0,
         where_quals_null: true,
-        segments_metadata_resolved: 0,
-        segments_decompressed: 0,
-        regex_cache_size: 0,
-        regex_cache_calls: 0,
-        topn_limit: 0,
         topn_sort_col: -1,
         topn_ascending: true,
-        pre_topn_groups: 0,
-        merge_us: 0,
-        finalize_us: 0,
-        topn_select_us: 0,
-        n_workers: 0,
-        bare_limit: 0,
-        wall_us: 0,
-        buf_stats: ScanBufferStats::default(),
-        f8_preselected: 0,
-        pscan: std::ptr::null_mut(),
         is_parallel_worker: true,
-        exec_ctx: None,
+        ..AggScanState::default()
     }
 }
 
@@ -193,42 +160,14 @@ pub(super) unsafe fn build_agg_exec_context_from_plan(plan: ParsedAggPlan) -> Ag
 #[allow(dead_code)] // wired by C.2.d / C.2.e
 pub(super) fn build_deferred_agg_state(ctx: AggExecContext, is_worker: bool) -> AggScanState {
     AggScanState {
-        _agg_specs: Vec::new(),
-        _group_specs: Vec::new(),
-        result_rows: Vec::new(),
-        result_idx: 0,
         _num_result_cols: ctx.num_result_cols,
-        metadata_us: 0,
-        heap_scan_us: 0,
-        detoast_us: 0,
-        blob_cache_hits: 0,
-        blob_cache_misses: 0,
-        blob_cache_bytes_served: 0,
-        decompress_us: 0,
-        agg_us: 0,
-        total_segments: 0,
-        total_rows_processed: 0,
         batch_quals_count: ctx.batch_quals.len(),
         where_quals_null: ctx.batch_quals.is_empty() && ctx.seg_filters.is_empty(),
-        segments_metadata_resolved: 0,
-        segments_decompressed: 0,
-        regex_cache_size: 0,
-        regex_cache_calls: 0,
-        topn_limit: 0,
         topn_sort_col: -1,
         topn_ascending: true,
-        pre_topn_groups: 0,
-        merge_us: 0,
-        finalize_us: 0,
-        topn_select_us: 0,
-        n_workers: 0,
-        bare_limit: 0,
-        wall_us: 0,
-        buf_stats: ScanBufferStats::default(),
-        f8_preselected: 0,
-        pscan: std::ptr::null_mut(),
         is_parallel_worker: is_worker,
         exec_ctx: Some(Box::new(ctx)),
+        ..AggScanState::default()
     }
 }
 

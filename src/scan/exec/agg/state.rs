@@ -317,6 +317,12 @@ pub(crate) struct HavingFilter {
 }
 
 /// State for DeltaXAgg (aggregate pushdown).
+///
+/// `Default` returns the canonical "all-zero / null-pointer / empty-Vec"
+/// baseline. Construction sites use `..Default::default()` to fill in
+/// the dozens of zero-by-default fields, keeping the explicit
+/// initialisers focused on whatever the path actually computes.
+#[derive(Default)]
 pub(crate) struct AggScanState {
     pub(crate) _agg_specs: Vec<AggExecSpec>,
     pub(crate) _group_specs: Vec<GroupByColSpec>,
