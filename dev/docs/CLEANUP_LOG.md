@@ -30,6 +30,76 @@ narration.
 
 ## Sessions
 
+### 2026-05-17 — `src/scan/exec/agg/serial.rs` → `agg/state.rs` — relocate GroupKey types — 293fb61
+
+**Scope:** finish the `agg/state.rs` consolidation. The serial dispatch
+defined `GroupKey`/`GroupKeyRef`/`GroupKeyVal`, the `hash_group_key*` +
+`keys_match` helpers, the `GroupMap` type alias — but mod.rs's test
+block needed them at `pub(super)`, forcing a cfg-gated
+`use serial::{GroupKey, …}` from a sibling module. Cleaner home is
+`state.rs`, the type-definitions module.
+
+**Files:** unchanged at 14.
+`state.rs`: 564 → 702 LOC (+138).
+`serial.rs`: 1,944 → 1,807 LOC (−137).
+**`unsafe`:** 114 → 114 (no change).
+**Tests:** unchanged at 0 `#[test]` / 144 `#[pg_test]`.
+
+Items moved out of serial.rs into state.rs:
+- `GroupKeyVal` enum (Int / Null / Str variants).
+- `GroupKey` enum (Single / Multi) + `as_slice` impl.
+- `GroupKeyRef` enum (Int / Null / Str(&str)) + `from_str` / `resolve` /
+  `matches_owned` impls.
+- `hash_key_component` (private to state.rs), `hash_ref_component`
+  (private), `hash_group_key` (`pub(super)`), `hash_group_key_ref`
+  (`pub(super)`), `keys_match` (`pub(super)`).
+- `GroupMap` type alias (`pub(super)`).
+
+After the move:
+- `mod.rs`'s cfg-gated test imports collapse from two `use` lines
+  (`use serial::{GroupKey, …}` + `use state::{AggAccumulator, …}`)
+  to a single `use state::{…}` block.
+- `serial.rs` picks up a `use super::state::{GroupKey, …}` import.
+- `std::hash::{Hash, Hasher}` no longer needed in serial.rs (only
+  used by `hash_key_component` which moved); kept `BuildHasherDefault`
+  for the `compact_group_map` construction at line 137.
+
+**Verify:**
+- `make clippy` — clean (18 pre-existing cosmetic warnings, same shape;
+  pre-change baseline was 20).
+- `make test` (PG17): 530 pass.
+- `make test PG_MAJOR=18`: 530 pass.
+- `make integration-test`: 234 × PG17 + PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline).
+
+**Benchmarks:**
+- ClickBench EC2 (cold caches): 62.66s vs prior 62.92s (−0.4%). All
+  43 queries within ±6% of prior commit; Q6 −5.9% on a 17ms query
+  (1ms absolute, noise floor). No real regressions.
+- JSONBench EC2 (100m bluesky): 3.57s vs prior 3.59s (−0.5%). All
+  5 queries within ±5%.
+
+**End-state of the agg/ tree** (relative to original 14,019-LOC
+`agg.rs`):
+
+| File | LOC | Concern |
+|---|---:|---|
+| `agg/mod.rs` | 2,112 | sub-module decls + agg-level re-exports + ~2k LOC test block |
+| `agg/callbacks.rs` | 1,593 | executor callbacks (begin/exec/end/rescan) + DSM scaffolding |
+| `agg/parallel_compact.rs` | 2,528 | parallel-compact dispatch + worker helpers |
+| `agg/parallel_mixed.rs` | 3,491 | parallel-mixed dispatch + worker helpers |
+| `agg/parallel_cd.rs` | 539 | parallel COUNT(DISTINCT) dispatch + helpers |
+| `agg/serial.rs` | 1,807 | serial dispatch (GroupKey defs moved to state.rs) |
+| `agg/compact.rs` | 1,525 | CompactAcc storage + finalize + datum helpers + `StringArena` |
+| `agg/metadata.rs` | 754 | catalog/fast-path/segment-metadata accumulation |
+| `agg/state.rs` | 702 | type definitions + GroupKey types |
+| `agg/parser.rs` | 579 | `parse_agg_private` + scan-state builders |
+| `agg/regex.rs` | 271 | regex-replace + CASE-WHEN apply helpers |
+| `agg/extract.rs` | 166 | `date_trunc` / `EXTRACT` math |
+| `agg/keys.rs` | 83 | packed integer keys + `CompactGroupMap` alias |
+| `agg/cd_set.rs` | 40 | `CdSet*` aliases + `hash128_str` |
+| **Total** | **16,190** | |
+
 ### 2026-05-17 — `src/scan/exec/agg/mod.rs` → `agg/callbacks.rs` — extract executor callbacks — 7b50553
 
 **Scope:** the last AGG_SPLIT.md leftover. Move the 9 custom-scan
