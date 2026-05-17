@@ -17,9 +17,31 @@ use pgrx::pg_sys;
 
 use super::super::datum_utils::string_to_datum;
 use super::super::segments::SegmentData;
-use super::StringArena;
 use super::keys::CompactGroupMap;
 use super::state::{AggAccumulator, AggExecSpec, AggType, OutputTransform};
+
+/// String arena: all group key strings packed into one `Vec<u8>`.
+/// One deallocation instead of 275K individual String deallocations.
+pub(crate) struct StringArena {
+    pub(crate) buf: Vec<u8>,
+}
+
+impl StringArena {
+    pub(crate) fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    pub(crate) fn alloc(&mut self, s: &str) -> (u32, u32) {
+        let off = self.buf.len() as u32;
+        let len = s.len() as u32;
+        self.buf.extend_from_slice(s.as_bytes());
+        (off, len)
+    }
+
+    pub(crate) fn get(&self, off: u32, len: u32) -> &str {
+        std::str::from_utf8(&self.buf[off as usize..off as usize + len as usize]).unwrap_or("")
+    }
+}
 
 /// Convert a datum to i128 for SUM accumulation.
 pub(crate) fn datum_to_i128(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> i128 {
