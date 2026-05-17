@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-pg_deltax is a PostgreSQL extension written in Rust (using pgrx 0.17) that provides time-series data management on top of native PostgreSQL declarative partitioning. It supports PostgreSQL 14–18 (default: 17).
+pg_deltax is a PostgreSQL extension written in Rust (using pgrx 0.17) that provides time-series data management on top of native PostgreSQL declarative partitioning. It supports PostgreSQL 17 and 18 (default: 17).
 
 ## Build & Test Commands
 
