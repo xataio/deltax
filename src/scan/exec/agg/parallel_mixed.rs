@@ -1277,7 +1277,7 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
     bare_limit: i64,
     derived_minmax_topn: Option<(usize, usize)>,
     meta: &MetadataInfo,
-    all_segments: &mut Vec<SegmentData>,
+    all_segments: &mut [SegmentData],
     needed_cols: &[bool],
     batch_quals: &[BatchQual],
     seg_filters: &[(usize, String)],
@@ -1467,12 +1467,12 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
         {
             try_build_preselected(
                 bare_limit as usize,
-                &all_segments,
+                all_segments,
                 &group_specs,
                 &meta.col_names,
                 &meta.col_types,
                 &meta.segment_by,
-                &needed_cols,
+                needed_cols,
                 &text_group_col_flags,
                 /* max_probe_segments */ 4,
             )
@@ -1487,7 +1487,7 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
         // strings into HashSet<u128>. Specs not in the map fall back to
         // the existing HashSet path. Sequential today — see
         // `build_dict_distinct_remaps` for the cost/threshold logic.
-        let dict_distinct_remaps = build_dict_distinct_remaps(&all_segments, &agg_specs);
+        let dict_distinct_remaps = build_dict_distinct_remaps(all_segments, &agg_specs);
 
         let config = ParallelMixedConfig {
             agg_specs: &agg_specs,
@@ -1495,9 +1495,9 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             col_names: &meta.col_names,
             col_types: &meta.col_types,
             segment_by: &meta.segment_by,
-            needed_cols: &needed_cols,
-            batch_quals: &batch_quals,
-            seg_filters: &seg_filters,
+            needed_cols,
+            batch_quals,
+            seg_filters,
             time_min,
             time_max,
             topn_spec,
@@ -3456,7 +3456,7 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
         };
         let finalize_us = t_finalize.elapsed().as_micros() as u64;
 
-        let state = AggScanState {
+        AggScanState {
             _agg_specs: agg_specs,
             _group_specs: group_specs,
             result_rows,
@@ -3484,8 +3484,6 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             wall_us: t_wall.elapsed().as_micros() as u64,
             buf_stats: take_scan_buf_stats(),
             ..AggScanState::default()
-        };
-
-        return state;
+        }
     }
 }

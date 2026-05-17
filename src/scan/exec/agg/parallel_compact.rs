@@ -954,7 +954,7 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
     topn_ascending: bool,
     bare_limit: i64,
     meta: &MetadataInfo,
-    all_segments: &mut Vec<SegmentData>,
+    all_segments: &mut [SegmentData],
     needed_cols: &[bool],
     batch_quals: &[BatchQual],
     seg_filters: &[(usize, String)],
@@ -1002,9 +1002,9 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
             col_names: &meta.col_names,
             col_types: &meta.col_types,
             segment_by: &meta.segment_by,
-            needed_cols: &needed_cols,
-            batch_quals: &batch_quals,
-            seg_filters: &seg_filters,
+            needed_cols,
+            batch_quals,
+            seg_filters,
             time_min,
             time_max,
             topn_spec,
@@ -2493,7 +2493,7 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
         };
         let finalize_us = t_finalize.elapsed().as_micros() as u64;
 
-        let state = AggScanState {
+        AggScanState {
             _agg_specs: agg_specs,
             _group_specs: group_specs,
             result_rows,
@@ -2521,8 +2521,6 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
             wall_us: t_wall.elapsed().as_micros() as u64,
             buf_stats: take_scan_buf_stats(),
             ..AggScanState::default()
-        };
-
-        return state;
+        }
     }
 }

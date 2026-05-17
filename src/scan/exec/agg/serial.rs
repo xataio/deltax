@@ -77,7 +77,7 @@ pub(super) unsafe fn dispatch_serial_path(
     bare_limit: i64,
     _derived_minmax_topn: Option<(usize, usize)>,
     meta: &MetadataInfo,
-    all_segments: &mut Vec<SegmentData>,
+    all_segments: &mut [SegmentData],
     needed_cols: &[bool],
     batch_quals: &[BatchQual],
     seg_filters: &[(usize, String)],
@@ -242,7 +242,7 @@ pub(super) unsafe fn dispatch_serial_path(
 
             // Dictionary-based LIKE pruning: skip segment if no dict entry matches
             if segment_skippable_by_dict(
-                &batch_quals,
+                batch_quals,
                 &meta.col_names,
                 &meta.segment_by,
                 &seg.compressed_blobs,
@@ -276,7 +276,7 @@ pub(super) unsafe fn dispatch_serial_path(
                         col_idx,
                         &group_specs,
                         &const_group_keys,
-                        &batch_quals,
+                        batch_quals,
                         &agg_specs,
                     )
                 })
@@ -634,7 +634,7 @@ pub(super) unsafe fn dispatch_serial_path(
                         } else {
                             // Non-dictionary: fall back to existing path
                             let (strings, sel) =
-                                decompress_text_blob_to_raw_strings(blob, &batch_quals, col_idx);
+                                decompress_text_blob_to_raw_strings(blob, batch_quals, col_idx);
                             let datums: Vec<(pg_sys::Datum, bool)> = strings
                                 .iter()
                                 .map(|s| match s {
@@ -872,7 +872,7 @@ pub(super) unsafe fn dispatch_serial_path(
             // filtered by LIKE during decompression are skipped (their dummy
             // datums are never dereferenced).
             let selection =
-                evaluate_batch_quals(&decompressed, row_count, &batch_quals, pre_selection);
+                evaluate_batch_quals(&decompressed, row_count, batch_quals, pre_selection);
 
             // Pre-compute CaseWhen GROUP BY columns into SegTextColumn
             let case_when_seg_cols: Vec<Option<SegTextColumn>> = group_specs
@@ -1772,7 +1772,7 @@ pub(super) unsafe fn dispatch_serial_path(
             pg_sys::MemoryContextDelete(segment_mcxt);
         }
 
-        let state = AggScanState {
+        AggScanState {
             _agg_specs: agg_specs,
             _group_specs: group_specs,
             result_rows,
@@ -1800,8 +1800,6 @@ pub(super) unsafe fn dispatch_serial_path(
             wall_us: t_wall.elapsed().as_micros() as u64,
             buf_stats: take_scan_buf_stats(),
             ..AggScanState::default()
-        };
-
-        return state;
+        }
     }
 }
