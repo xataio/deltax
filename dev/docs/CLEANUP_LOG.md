@@ -30,6 +30,110 @@ narration.
 
 ## Sessions
 
+### 2026-05-17 — `src/scan/exec/agg/mod.rs` — session 2d (serial dispatch + helpers) — cef70d7
+
+**Scope:** [`AGG_SPLIT.md`](./AGG_SPLIT.md) session 2 finished. Extract
+the SINGLE-THREADED PATH (the fall-through dispatch — runs when none
+of the three parallel dispatches fire) into a new
+`agg/serial.rs`. With this session done, `begin_agg_scan` is now
+gate + setup + 4-arm dispatch (catalog/metadata fast paths, parallel
+compact, parallel mixed, parallel count-distinct, serial). The
+playbook's session 2 end-state is reached.
+
+**Files:** 11 → 12 (`agg/serial.rs` added).
+`mod.rs`: 6,987 → 5,150 LOC (−1,837).
+`serial.rs`: 1,955 LOC.
+**`unsafe`:** 114 → 114 (no change).
+**Tests:** unchanged at 0 `#[test]` / 144 `#[pg_test]`.
+
+Items moved:
+- The full SERIAL path body (lines 1135–2760 pre-2d): outer
+  detoast-all-segments-eagerly preamble, per-segment iteration with
+  COMPACT vs GENERIC sub-paths, top-N selection, result_rows builder,
+  and the final `AggScanState` emit. The single emit tail rewritten
+  to `return state;`.
+- Helper types/fns that were only-used-by-serial:
+  `RegexpGroupInfo` struct (was a fn-local struct inside
+  `begin_agg_scan`),
+  `GroupKeyVal` / `GroupKey` / `GroupKeyRef`,
+  `hash_key_component`, `hash_ref_component`, `hash_group_key`,
+  `hash_group_key_ref`, `keys_match`, `GroupMap` type alias.
+- Setup-phase locals that were only consumed by serial:
+  `segment_mcxt` creation (via `AllocSetContextCreateInternal`),
+  `prototype_accumulators`, `global_accumulators`, `group_map`,
+  `string_arena`, `flat_accs`, `compact_group_map`, `cd_sidecar`,
+  `regex_cache`, `regex_cache_calls`, `regexp_group_infos`,
+  `raw_string_cols` (incl. the compact MIN/MAX text extension).
+  All now initialised inside `dispatch_serial_path`'s body so they're
+  not paid by the parallel dispatches (which create their own
+  worker-local copies anyway).
+
+Visibility shifts:
+- Items in `agg/serial.rs` that the `mod.rs` test block still
+  references stay `pub(super)`: `GroupKey`, `GroupKeyVal`,
+  `GroupKeyRef`, `hash_group_key`, `hash_group_key_ref`,
+  `keys_match`, plus the `from_str` / `as_slice` / `resolve` /
+  `matches_owned` methods. mod.rs re-imports them cfg-gated on
+  `test`/`pg_test`.
+- The big mod.rs import block at the top shrank significantly: many
+  imports (`hash128_str`, `constant_extract_key_for_segment`,
+  `pack_int_key_*`, `evaluate_batch_quals`, all `decompress_text_*`,
+  `collation_strcmp`, `detoast_lazy_blobs`, etc.) are no longer
+  needed by what remains in mod.rs.
+
+Behavior preserved:
+- The dispatch consumes `agg_specs` / `group_specs` / `output_map`
+  by value and returns a fully-populated `AggScanState`. Caller
+  boxes it and assigns to `(*node).custom_ps` — same shape as 2a/2b/2c.
+- Setup-phase deletion in mod.rs removed ~120 lines that built state
+  only the serial dispatch read.
+
+**Verify:**
+- `make clippy` — clean (18 cosmetic warnings only, same shape as 2c).
+- `make test` (PG17): 530 pass.
+- `make test PG_MAJOR=18`: 530 pass.
+- `make integration-test`: 234 × PG17 + PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline).
+
+**Benchmarks:**
+- ClickBench EC2 (cold caches): 62.55s vs prior 62.40s (+0.2%, flat).
+  Worst Q28 +2.8%. Zero queries regressing >5%.
+- JSONBench EC2 (100m bluesky): hot mins
+  [0.227, 1.927, 0.254, 0.588, 0.649] vs prior
+  [0.230, 1.903, 0.255, 0.551, 0.662]. Worst Q3 +6.7% (single-digit %
+  on a sub-second query); all under 10% gate. Total within ±1%.
+
+**End-of-session-2 totals:** original `agg.rs` was 14,019 LOC. After
+2a + 2b + 2c + 2d:
+- `agg/mod.rs`: 5,150 LOC (the DSM scaffolding callbacks,
+  `exec_agg_scan` / `end_agg_scan` / `rescan_agg_scan`, the
+  Compact Accumulator Storage section, `finalize_accumulator`, the
+  utility datum-conversion helpers, and the test block — total ~3k
+  LOC of code + ~2k LOC of tests).
+- 11 sibling files: `cd_set` (37), `extract` (166), `keys` (83),
+  `metadata` (806), `parallel_cd` (555), `parallel_compact` (2,578),
+  `parallel_mixed` (3,549), `parser` (640), `regex` (271),
+  `serial` (1,955), `state` (558).
+- Original 5800-LOC `begin_agg_scan` is now ~150 LOC of setup + a
+  4-arm dispatch (catalog shortcut, metadata fast path, then four
+  `if eligible { dispatch_*(...); return; }` branches).
+
+**Refactoring opportunities surfaced (deferred):**
+- The duplicated `AggScanState { …40 fields… }` construction sites
+  across `parallel_cd` (1×), `parallel_compact` (5×),
+  `parallel_mixed` (6×), `serial` (1×), and `metadata` (2×) — total
+  15 sites — are an obvious target for a `make_agg_scan_state(...)`
+  helper. Out of scope per "no behaviour change during module-split"
+  rule; will follow up.
+- The remaining Compact Accumulator Storage section in `mod.rs`
+  (lines ~2900–4700 pre-this-session — `CompactAccKind`,
+  `CompactAccLayout`, `CompactAccStorage`, `Bitset`,
+  `DictDistinctRemap`, `build_dict_distinct_remaps`,
+  `CountDistinctSideCar`, `compact_finalize`, `compact_emit_partial`)
+  is the largest cohesive chunk still in `mod.rs`. A future session
+  could extract it to `agg/compact.rs` per the original AGG_SPLIT.md
+  plan.
+
 ### 2026-05-17 — `src/scan/exec/agg/mod.rs` — session 2c (parallel mixed dispatch + helpers) — d78bd42
 
 **Scope:** [`AGG_SPLIT.md`](./AGG_SPLIT.md) session 2 continued. Extract
