@@ -1,3 +1,10 @@
+<p align="center">
+  <a href="https://github.com/xataio/xata/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-green" alt="License - Apache 2.0"></a>&nbsp;
+  <a href="https://twitter.com/xata"><img src="https://img.shields.io/badge/@xata-6c47ff?label=Follow&logo=x" alt="X (formerly Twitter) Follow" /></a>&nbsp;
+  <a href="https://bsky.app/profile/xata.io"><img src="https://img.shields.io/badge/@xata-6c47ff?label=Follow&logo=bluesky" alt="Bluesky Follow" /></a>&nbsp;
+  <a href="https://www.youtube.com/@xataio"><img src="https://img.shields.io/badge/@xataio-6c47ff?label=Youtube&logo=youtube" alt="Youtube Subscribe" /></a>&nbsp;
+</p>
+
 # DeltaX (δx) - Fast time-series extension for PostgreSQL
 
 δx is a PostgreSQL extension offering compression and columnar storage for time-series 
@@ -284,3 +291,6 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the developer guide. We recommend get
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the full text.
+
+<br>
+<p align="right">Made with 💜 by <a href="https://xata.io">Xata 🦋</a></p>
