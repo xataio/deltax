@@ -147,33 +147,6 @@ Current features include:
 - Background worker: drains the default partition into proper ones, pre-creates future partitions, compresses partitions past `compress_after`, drops partitions past `drop_after`.
 - PostgreSQL 17 and 18 supported.
 
-## Development
-
-Requires Docker.
-
-```sh
-make test                      # run pgrx tests
-make build                     # compile the extension
-make clippy                    # run clippy
-make cargo CMD="fmt --check"   # arbitrary cargo command
-```
-
-## Manual testing
-
-```sh
-make run    # start postgres with the extension (port 5432)
-make psql   # connect to the running instance
-```
-
-## Integration tests
-
-```sh
-make integration-test                   # runs against PG 17 and 18
-make integration-test PG_VERSIONS=17    # single version
-```
-
-A Python virtualenv (`.venv/`) is created automatically on first run.
-
 ## Quick start
 
 ```sh
@@ -280,6 +253,26 @@ All settings are PostgreSQL GUCs and follow the usual scoping rules (`SET`, `ALT
 | GUC | Default | Context | Description |
 |---|---|---|---|
 | `pg_deltax.mock_now` | (empty) | suset | Override current time with a `timestamptz` literal. Empty string = use real wall-clock time. Used by the test suite to drive deterministic time-based behavior in the background worker and partition-creation paths. |
+
+
+## Contributing
+
+At the moment, the best way to contribute to this project is to:
+- Spread the word: star the repo, post about it on social media, tell your friends.
+- If you have a use-case in your company where δx would be beneficial, please get in touch and we'll evaluate if δx is ready for it, or what it would take to make it ready.
+- Ask your Postgres cloud provider to add support for δx. We'd like to explicitely encourage other Postgres cloud providers to adopt it.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the developer guide. We recommend getting in touch before contributing new features.
+
+```sh
+make dev-image         # one-time: build the development image
+make build             # compile the extension
+make test              # pgrx unit tests
+make integration-test  # Python integration tests against PG 17 and 18
+make clippy            # Rust linter
+make run               # start PostgreSQL with the extension on port 5432
+make psql              # psql shell into the running instance
+```
 
 ## License
 
