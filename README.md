@@ -29,7 +29,7 @@ all the systems that are storing the data in PostgreSQL.
 #### Compression / storage size
 
 Looking at the **compression ratio / storage size**, δx offers a compression ratio of about 7× on
-this particular dataset. Compression ratios varies considerably by data charasteristics.
+this particular dataset. Compression ratios vary considerably by data characteristics.
 
 <img src="images/clickbench-storage-size.png" width="800" alt="ClickBench storage size: pg_deltax compression ratio is ~7x">
 
@@ -47,13 +47,13 @@ this particular dataset. Compression ratios varies considerably by data charaste
 
 The reason δx can load the data faster than Postgres is that it has support for backfilling data directly
 from Parquet files. On a more standard setup where the data is loaded into normal Postgres tables and
-then compressed, the load time would be similar to the PostgreSQL result plust the compression time.
+then compressed, the load time would be similar to the PostgreSQL result plus the compression time.
 
 
 ### JSONBench
 
 [JSONBench](https://jsonbench.com/) is a benchmark similar to ClickBench but for measuring performance
-on semi-structured data. The dataset contains BlueSky firehose data exported as ndjson.
+on semi-structured data. The dataset contains Bluesky firehose data exported as ndjson.
 
 δx has support for extracting particular fields from JSONB columns and compressing them with the same
 columnar algorithms as the native columns. This enables the following results on JSONBench.
@@ -63,7 +63,7 @@ columnar algorithms as the native columns. This enables the following results on
 ## How it works
 
 Let's start with an example time-series table partitioned by a timestamp column. The data itself can be metrics, 
-logs, events, etc. Anything that contains a timestamp. PostgreSQL has built in partitioning, so it's very common
+logs, events, etc. Anything that contains a timestamp. PostgreSQL has built-in partitioning, so it's very common
 to partition time-series data in fixed-interval partitions (e.g. daily, weekly, or monthly). In our example, let's
 assume monthly. The partitioned table might look something like this:
 
@@ -117,7 +117,7 @@ An important design trade-off of δx is that compressed partitions become read-o
 
 ## Correctness testing
 
-The main correctness invariant in the test suite is: δx must always respond with the same results as plain Postgres returns from the uncompressed version of the table. Whenever the response is different, it is a bug. There are cases where this condition is relaxed: for example, on a `LIMIT 10` query, if the 10th rows has ties, any of them is accepted. We have the following comparison policies:
+The main correctness invariant in the test suite is: δx must always respond with the same results as plain Postgres returns from the uncompressed version of the table. Whenever the response is different, it is a bug. There are cases where this condition is relaxed: for example, on a `LIMIT 10` query, if the 10th row has ties, any of them is accepted. We have the following comparison policies:
 
 - `ordered_exact` — rows and row order must match exactly.
 - `unordered_exact` — row multiset must match, order is ignored.
