@@ -30,6 +30,87 @@ narration.
 
 ## Sessions
 
+### 2026-05-17 — `src/scan/exec/agg/mod.rs` → `agg/compact.rs` — extract Compact Accumulator Storage — 1cfac7e
+
+**Scope:** finish the AGG_SPLIT.md leftover surfaced in session 2d's
+log. Move the entire "Compact Accumulator Storage" section plus the
+shared finalize machinery and datum-conversion helpers into a new
+`agg/compact.rs`.
+
+**Files:** 12 → 13 (`agg/compact.rs` added).
+`mod.rs`: 5,150 → 3,697 LOC (−1,453).
+`compact.rs`: 1,482 LOC.
+**`unsafe`:** 114 → 114 (no change).
+**Tests:** unchanged at 0 `#[test]` / 144 `#[pg_test]`.
+
+Items moved:
+- `CompactAccKind`, `CompactAccLayout`, `Bitset`,
+  `DictDistinctRemap`, `CountDistinctSideCar`, `CdKind`, `CdEntry`,
+  `CompactAccStorage` (struct + all methods).
+- `build_dict_distinct_remaps`, `can_use_compact_accs`,
+  `compact_topn_select`, `compact_finalize`, `compact_emit_partial`.
+- Datum-conversion helpers used by `compact_finalize` and other
+  finalize paths: `datum_to_i128`, `datum_to_f64`,
+  `i128_to_numeric_datum`, plus `finalize_accumulator` itself.
+
+Visibility shifts:
+- The items used by sibling agg modules (parallel_compact,
+  parallel_mixed, parallel_cd, serial, metadata) stay accessible via
+  `super::X` paths thanks to a `pub(crate) use compact::{…}`
+  re-export from `mod.rs`.
+- The items consumed cross-module (notably `CompactAccLayout`,
+  `CompactAccStorage`, `CountDistinctSideCar`, `CompactAccKind` used
+  by `scan/exec/agg_wire.rs`) had to be raised to `pub(crate)` —
+  before the move they were `pub(super)` in mod.rs, which already
+  exposed them to `scan::exec`; `pub(crate)` is the closest
+  equivalent now that they're nested a level deeper.
+- `CdEntry` fields elevated to `pub(crate)` because
+  `CountDistinctSideCar.entries` is now `pub(crate)` and the
+  parallel/serial paths read its inner fields directly.
+
+**Verify:**
+- `make clippy` — clean (18 cosmetic warnings, same shape as prior
+  sessions).
+- `make test` (PG17): 530 pass.
+- `make test PG_MAJOR=18`: 530 pass.
+- `make integration-test`: 234 × PG17 + PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline).
+
+**Benchmarks:**
+- ClickBench EC2 (cold caches): 62.12s vs prior 62.99s (−1.4%,
+  faster). Q34/Q33/Q22 all improved (−5.7% / −4.9% / −4.7%). Worst
+  Q40 +5.3% at 76→80ms (4ms absolute, noise floor); no other queries
+  > 5%.
+- JSONBench EC2 (100m bluesky): hot mins
+  [0.228, 2.037, 0.257, 0.562, 0.659] vs prior
+  [0.226, 1.923, 0.254, 0.563, 0.640]. Worst Q1 +5.9% (under 10%
+  gate); total within ±3%.
+
+**End-state of the agg split** (relative to original `agg.rs`,
+14,019 LOC):
+- `agg/mod.rs`: 3,697 LOC — DSM scaffolding callbacks,
+  `exec_agg_scan` / `end_agg_scan` / `rescan_agg_scan`, the
+  `StringArena` + `GroupMap` type aliases (test-shared), and the
+  ~2k-LOC test block.
+- 12 sibling files: `cd_set` (40), `compact` (1,482),
+  `extract` (166), `keys` (83), `metadata` (754), `parallel_cd` (539),
+  `parallel_compact` (2,528), `parallel_mixed` (3,491), `parser` (579),
+  `regex` (271), `serial` (1,944), `state` (564).
+- Total agg/ LOC: 16,138 (mod.rs + 12 siblings). The increase over
+  the original 14k is fmt-driven re-wrapping + per-module doc
+  comments + the `..AggScanState::default()` baseline.
+
+**Remaining cleanup ideas (deferred):**
+- `agg/mod.rs` still has the executor-callback boilerplate
+  (DSM scaffolding + `exec_agg_scan` / `end_agg_scan` /
+  `rescan_agg_scan` — ~1,000 LOC). Could extract into
+  `agg/callbacks.rs` per the original AGG_SPLIT.md plan.
+- `StringArena` is in `agg/mod.rs` but only used by `compact` (via
+  `CompactAccStorage`) and `serial` / `parallel_mixed`. Could move
+  into `state.rs` or `compact.rs`.
+- Test block (~1,500 LOC) eventually moves next to production code
+  per AGG_SPLIT.md session 8 — but that's a multi-PR effort.
+
 ### 2026-05-17 — `src/scan/exec/agg/*.rs` — dedupe `AggScanState` construction sites — 1fc6175
 
 **Scope:** post-session-2 cleanup surfaced in the 2a–2d logs. Replace
