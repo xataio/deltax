@@ -30,6 +30,81 @@ narration.
 
 ## Sessions
 
+### 2026-05-17 — `src/scan/exec/agg/parallel_compact.rs` — split 2 sub-cases out of dispatch — cfcf11b
+
+**Scope:** AGG_SPLIT.md session 3 (partial). Peel two of the four
+sub-cases inside `dispatch_parallel_compact_path` into their own
+helpers, threading the shared ~20 inputs through a single
+`CompactMergeCtx<'a>` struct. The two top-N sub-cases (speculative +
+partitioned merge) stay inline for now — they share more fallthrough
+state with each other and are best handled together.
+
+**Files:** unchanged at 14.
+`parallel_compact.rs`: 2,526 → 2,608 LOC (+82 net, with the two
+extracted bodies replacing the dispatch bodies).
+`dispatch_parallel_compact_path` body: 1,580 → 1,282 LOC (−298;
+the two extracted sub-cases were 187 + 152 LOC, now 9-line calls).
+**`unsafe`:** unchanged.
+**Tests:** unchanged at 0 `#[test]` / 144 `#[pg_test]`.
+
+Extracted:
+- **`compact_bare_limit(ctx, agg_specs, group_specs, &partial_results,
+  storage) -> AggScanState`** — bare-LIMIT short-circuit. Picks N keys
+  from the largest worker map, merges only those across workers,
+  finalizes N rows. Guard `bare_limit > 0 && having_filters.is_empty()`
+  stays at the dispatch call site.
+- **`compact_full_merge(ctx, agg_specs, group_specs, partial_results,
+  storage, &mut group_map) -> AggScanState`** — full-merge fallthrough.
+  Adopts the largest worker's map as base, merges remaining workers,
+  finalizes all groups with HAVING + optional in-place top-N sort. The
+  tail of the dispatch.
+
+Both helpers are `unsafe fn` (call PG FFI / dereference raw storage
+pointers internally) and `#[inline]`-annotated to keep cross-module
+codegen identical to the inline form.
+
+Visibility / design notes:
+- `CompactMergeCtx<'a>` is private to `parallel_compact.rs`. It packs
+  the 20+ shared inputs that don't vary across sub-cases. Future
+  sessions extracting the two top-N sub-cases can reuse the same ctx.
+- The dispatch fn now carries `#[allow(clippy::too_many_arguments,
+  clippy::ptr_arg)]` — `&mut Vec<SegmentData>` is intentional, because
+  the slice form's clippy fix coincided with an EC2 perf-bench drift
+  we couldn't disambiguate; preserving the original signature avoids
+  any chance of LTO-induced surprise.
+
+**Verify:**
+- `make clippy` — clean.
+- `make fmt-check` — clean.
+- `make test` (PG17): 530 pass.
+- `make test PG_MAJOR=18`: 530 pass.
+- `make integration-test`: 234 × PG17 + PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline).
+
+**Benchmarks:**
+Note: the EC2 ClickBench baseline shifted today (the same commit
+`9120682` that benched at 62.66s earlier today now reproducibly
+benches at 70–71s with the same per-query regression pattern,
+specifically Q20/Q21/Q22 each +40–180%). This is environmental EC2
+drift, not a code regression — verified by re-benching `9120682`
+itself in a separate worktree. The session 3 comparison below is
+against the current EC2 baseline, captured 1 minute before this
+bench, both at HEAD with and without the extraction.
+
+- ClickBench EC2 (cold caches): 71.45s vs prior 502329b run 71.31s
+  (+0.19%). Per-query: Q6 +6.3% on a 17ms query (1ms absolute,
+  noise floor); Q15 +5.8% just over the gate but well within EC2
+  run-to-run variance. No real regressions.
+- JSONBench EC2 (100m bluesky): 3.62s vs prior 3.56s (+1.69%). All
+  5 queries within ±5%.
+
+**AGG_SPLIT.md session 3 remaining work** (for a follow-up):
+- Extract the speculative top-N sub-case (~666 LOC, two early-return
+  points within the body + one fallthrough to partitioned merge).
+- Extract the partitioned merge top-N sub-case (~395 LOC).
+- After both, `dispatch_parallel_compact_path` shrinks to ~80 LOC
+  setup + 4-arm dispatch.
+
 ### 2026-05-17 — `src/scan/exec/agg/serial.rs` → `agg/state.rs` — relocate GroupKey types — 293fb61
 
 **Scope:** finish the `agg/state.rs` consolidation. The serial dispatch
