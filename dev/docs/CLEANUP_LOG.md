@@ -30,7 +30,93 @@ narration.
 
 ## Sessions
 
-### 2026-05-17 — `src/scan/exec/agg/mod.rs` — session 2a (parallel count-distinct dispatch) — <SHA>
+### 2026-05-17 — `src/scan/exec/agg/mod.rs` — session 2b (parallel compact dispatch + helpers) — 2865a71
+
+**Scope:** [`AGG_SPLIT.md`](./AGG_SPLIT.md) session 2 continued. Extract
+the PARALLEL COMPACT path (the largest of the five dispatches at
+~1660 LOC + 5 emit sites) into a new `agg/parallel_compact.rs`. The
+"Parallel Compact Aggregation" helper section moves with it because
+the dispatch is the only consumer.
+
+**Files:** 9 → 10 (`agg/parallel_compact.rs` added).
+`mod.rs`: 12,957 → 10,482 LOC (−2,475).
+`parallel_compact.rs`: 2,578 LOC.
+**`unsafe`:** 114 → 114 (no change).
+**Tests:** unchanged at 0 `#[test]` / 144 `#[pg_test]`.
+
+Items moved:
+- The full PARALLEL COMPACT dispatch body (lines 933–2592 pre-2b),
+  with the 5 inline `AggScanState{ … }`/`Box::new`/`custom_ps`/`return`
+  emit tails rewritten to `return state;` so the new function returns
+  `AggScanState` directly.
+- All worker helpers under the "Parallel Compact Aggregation" banner:
+  `decompress_numeric_blob`, `decompress_numeric_no_nulls`,
+  `decompress_numeric_nn_datums`, `is_numeric_type`,
+  `all_needed_cols_numeric`, `batch_quals_all_numeric`,
+  `ParallelCompactConfig`, `ParallelCompactResult`,
+  `process_segments_compact`, `parse_string_to_datum`,
+  `merge_compact_results`.
+- The 7-condition gate, lifted into `parallel_compact_eligible`
+  (mirrors session 2a's pattern).
+- `compact_group_map` initialisation, which was a setup-phase local
+  used only by this dispatch, moves inside the function.
+
+Visibility shifts in `mod.rs` to support the move:
+- `datum_to_i128`, `datum_to_f64`, `i128_to_numeric_datum`,
+  `compact_finalize` elevated to `pub(super)` so the new module can
+  call them via `super::`.
+- `ParallelCompactResult` elevated to `pub(crate)` and re-exported as
+  `pub(crate) use parallel_compact::ParallelCompactResult` so
+  `agg_wire::serialize_into` / `deserialize` keep working unchanged.
+- Helper functions used by the remaining `begin_agg_scan` body
+  (PARALLEL MIXED path, etc.) and by `exec_agg_scan` are `pub(super)`
+  in the new module and re-imported in `mod.rs`.
+
+Behavior preserved:
+- The dispatch consumes `agg_specs` / `group_specs` /
+  `compact_storage: Option<CompactAccStorage>` by value, returning a
+  fully-populated `AggScanState`. Caller boxes it and assigns to
+  `(*node).custom_ps`.
+- Caller's `total_detoast_us` / `total_cache_*` accumulators pass in
+  by value as `mut` parameters; the dispatch's local mutations land in
+  the returned `AggScanState`.
+- The old `let can_parallel = …` gate in `begin_agg_scan` is gone;
+  the downstream `!can_parallel` reference in the
+  `can_parallel_mixed_flag` computation simplifies to just the mixed
+  preconditions (we only reach that line if the compact dispatch
+  declined, by construction).
+
+**Verify:**
+- `make clippy` — clean.
+- `make test` (PG17): 530 pass (unchanged).
+- `make test PG_MAJOR=18`: 530 pass (unchanged).
+- `make integration-test`: 234 × PG17 + PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline).
+
+**Benchmarks:**
+- ClickBench EC2 (cold caches per session 2a's protocol): 63.25s vs
+  prior 62.92s (+0.5%). Worst Q6 +6.2% (16ms → 17ms, +1ms absolute
+  at the noise floor); Q33/Q34 NOT in the worst-10 (the 2a regression
+  on those did not compound). 1 query > 5% but at noise-floor
+  magnitude.
+- JSONBench EC2 (100m bluesky): hot mins
+  [0.227, 1.943, 0.255, 0.551, 0.653] vs prior
+  [0.227, 2.007, 0.258, 0.551, 0.633]. All within ±3%.
+
+**Refactoring opportunity surfaced (deferred):** the dispatch body
+still has 5 nearly-identical `AggScanState{ …40 fields… }`
+construction sites (lines 1518, 1748, 1965, 2378, 2549 pre-extraction).
+Same observation as the count-distinct extract — a helper
+`make_agg_scan_state(common_fields, path_specific_fields)` would
+collapse them. Out of scope for the split sessions; will revisit
+after the split is complete.
+
+**Deferred (remaining `AGG_SPLIT.md` session 2 sub-PRs):**
+- 2c — `dispatch_parallel_mixed_path` (~2400 LOC, 7 emit sites)
+- 2d — `dispatch_serial_compact_path` + `dispatch_serial_generic_path`
+  together (they share the AggScanState-build epilogue).
+
+### 2026-05-17 — `src/scan/exec/agg/mod.rs` — session 2a (parallel count-distinct dispatch) — 6354a7c
 
 **Scope:** [`AGG_SPLIT.md`](./AGG_SPLIT.md) session 2 (smallest of the
 five dispatches first). Extract the PARALLEL COUNT(DISTINCT) path
