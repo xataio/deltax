@@ -398,7 +398,10 @@ pub fn parse_raw_field_and_append(
             // This is the fast path — no String allocation
             if memchr::memchr(b'\\', raw).is_none() {
                 let s = std::str::from_utf8(raw).unwrap_or_else(|_| {
-                    panic!("pg_deltax: invalid UTF-8 in COPY field at line {}", line_number)
+                    panic!(
+                        "pg_deltax: invalid UTF-8 in COPY field at line {}",
+                        line_number
+                    )
                 });
                 parse_str_and_append(s, kind, typed_col, col_idx, line_number)
             } else {
@@ -916,10 +919,7 @@ mod tests {
     #[test]
     fn test_split_fields_empty_fields() {
         let fields = split_fields(b"\t\t", b'\t');
-        assert_eq!(
-            fields,
-            vec![b"".as_slice(), b"".as_slice(), b"".as_slice()]
-        );
+        assert_eq!(fields, vec![b"".as_slice(), b"".as_slice(), b"".as_slice()]);
     }
 
     // ===== NULL Detection + Unescape Tests =====
@@ -952,10 +952,7 @@ mod tests {
     #[test]
     fn test_unescape_custom_null() {
         assert_eq!(unescape_field(b"NULL", b"NULL"), None);
-        assert_eq!(
-            unescape_field(b"hello", b"NULL"),
-            Some("hello".to_string())
-        );
+        assert_eq!(unescape_field(b"hello", b"NULL"), Some("hello".to_string()));
     }
 
     #[test]
@@ -971,20 +968,11 @@ mod tests {
     #[test]
     fn test_unescape_octal() {
         // \0 → 0x00
-        assert_eq!(
-            unescape_field(b"\\0", b"\\N"),
-            Some("\x00".to_string())
-        );
+        assert_eq!(unescape_field(b"\\0", b"\\N"), Some("\x00".to_string()));
         // \7 → 0x07
-        assert_eq!(
-            unescape_field(b"\\7", b"\\N"),
-            Some("\x07".to_string())
-        );
+        assert_eq!(unescape_field(b"\\7", b"\\N"), Some("\x07".to_string()));
         // \77 → 0x3F = '?'
-        assert_eq!(
-            unescape_field(b"\\77", b"\\N"),
-            Some("?".to_string())
-        );
+        assert_eq!(unescape_field(b"\\77", b"\\N"), Some("?".to_string()));
         // \377 → 0xFF — but 0xFF is not valid UTF-8 alone.
         // PG allows this for bytea but for text it would be questionable.
         // Skip this edge case in our text parser.
@@ -993,15 +981,9 @@ mod tests {
     #[test]
     fn test_unescape_hex() {
         // \x41 → 'A'
-        assert_eq!(
-            unescape_field(b"\\x41", b"\\N"),
-            Some("A".to_string())
-        );
+        assert_eq!(unescape_field(b"\\x41", b"\\N"), Some("A".to_string()));
         // \xG → literal "xG" (G is not hex)
-        assert_eq!(
-            unescape_field(b"\\xG", b"\\N"),
-            Some("xG".to_string())
-        );
+        assert_eq!(unescape_field(b"\\xG", b"\\N"), Some("xG".to_string()));
     }
 
     #[test]
@@ -1020,10 +1002,7 @@ mod tests {
 
     #[test]
     fn test_unescape_backslash_backslash() {
-        assert_eq!(
-            unescape_field(b"\\\\", b"\\N"),
-            Some("\\".to_string())
-        );
+        assert_eq!(unescape_field(b"\\\\", b"\\N"), Some("\\".to_string()));
     }
 
     // ===== Type Conversion Tests =====
@@ -1278,14 +1257,7 @@ mod tests {
 
         for (i, (field, kind)) in fields.iter().zip(kinds.iter()).enumerate() {
             let unescaped = unescape_field(field, null_string);
-            parse_and_append(
-                unescaped.as_deref(),
-                *kind,
-                &mut cols[i],
-                i,
-                1,
-            )
-            .unwrap();
+            parse_and_append(unescaped.as_deref(), *kind, &mut cols[i], i, 1).unwrap();
         }
 
         if let TypedColumn::Int32(v) = &cols[0] {

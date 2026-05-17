@@ -46,15 +46,15 @@ pub(crate) fn read_row_group_columns(
     num_rows: usize,
     num_pg_columns: usize,
 ) -> Result<Vec<TypedColumn>, String> {
-    let mut result: Vec<TypedColumn> = kinds.iter().map(|k| crate::compress::new_typed_column(*k)).collect();
+    let mut result: Vec<TypedColumn> = kinds
+        .iter()
+        .map(|k| crate::compress::new_typed_column(*k))
+        .collect();
     debug_assert_eq!(result.len(), num_pg_columns);
 
     for &(pq_idx, pg_idx) in col_mapping {
         let kind = kinds[pg_idx];
-        let col_descr = rg_reader
-            .metadata()
-            .column(pq_idx)
-            .column_descr();
+        let col_descr = rg_reader.metadata().column(pq_idx).column_descr();
         let mut col_reader = rg_reader
             .get_column_reader(pq_idx)
             .map_err(|e| format!("pg_deltax: failed to read parquet column {}: {}", pq_idx, e))?;
@@ -135,9 +135,9 @@ fn read_column(
                 .map_err(|e| format!("pg_deltax: parquet read error: {}", e))?;
             let unpacked = unpack_nullable(&values, &def_levels, num_rows, num_values);
             Ok(match kind {
-                ColumnKind::Float64 => {
-                    TypedColumn::Float64(unpacked.into_iter().map(|v| v.map(|x| x as f64)).collect())
-                }
+                ColumnKind::Float64 => TypedColumn::Float64(
+                    unpacked.into_iter().map(|v| v.map(|x| x as f64)).collect(),
+                ),
                 _ => TypedColumn::Float32(unpacked),
             })
         }
@@ -149,9 +149,9 @@ fn read_column(
                 .map_err(|e| format!("pg_deltax: parquet read error: {}", e))?;
             let unpacked = unpack_nullable(&values, &def_levels, num_rows, num_values);
             Ok(match kind {
-                ColumnKind::Float32 => {
-                    TypedColumn::Float32(unpacked.into_iter().map(|v| v.map(|x| x as f32)).collect())
-                }
+                ColumnKind::Float32 => TypedColumn::Float32(
+                    unpacked.into_iter().map(|v| v.map(|x| x as f32)).collect(),
+                ),
                 _ => TypedColumn::Float64(unpacked),
             })
         }
@@ -178,7 +178,8 @@ fn read_column(
             let (_records, num_values, _levels) = r
                 .read_records(num_rows, Some(&mut def_levels), None, &mut values)
                 .map_err(|e| format!("pg_deltax: parquet read error: {}", e))?;
-            let unpacked = unpack_nullable_fixed_byte_array(&values, &def_levels, num_rows, num_values)?;
+            let unpacked =
+                unpack_nullable_fixed_byte_array(&values, &def_levels, num_rows, num_values)?;
             Ok(TypedColumn::Text(unpacked))
         }
         ColumnReader::Int96ColumnReader(r) => {
@@ -241,10 +242,9 @@ fn unpack_nullable_byte_array(
     for &dl in def_levels.iter().take(num_rows) {
         if dl > 0 {
             let bytes = values[val_idx].data();
-            result.push(Some(
-                String::from_utf8(bytes.to_vec())
-                    .map_err(|_| "pg_deltax: invalid UTF-8 in parquet byte array".to_string())?,
-            ));
+            result.push(Some(String::from_utf8(bytes.to_vec()).map_err(|_| {
+                "pg_deltax: invalid UTF-8 in parquet byte array".to_string()
+            })?));
             val_idx += 1;
         } else {
             result.push(None);
@@ -275,10 +275,9 @@ fn unpack_nullable_fixed_byte_array(
     for &dl in def_levels.iter().take(num_rows) {
         if dl > 0 {
             let bytes = values[val_idx].data();
-            result.push(Some(
-                String::from_utf8(bytes.to_vec())
-                    .map_err(|_| "pg_deltax: invalid UTF-8 in parquet fixed-len column".to_string())?,
-            ));
+            result.push(Some(String::from_utf8(bytes.to_vec()).map_err(|_| {
+                "pg_deltax: invalid UTF-8 in parquet fixed-len column".to_string()
+            })?));
             val_idx += 1;
         } else {
             result.push(None);
@@ -424,7 +423,10 @@ mod tests {
     #[test]
     fn test_convert_timestamp_seconds() {
         let ts = 1_372_000_000; // ~2013-06-23
-        assert_eq!(convert_timestamp(ts, &TimestampUnit::Seconds), ts * 1_000_000);
+        assert_eq!(
+            convert_timestamp(ts, &TimestampUnit::Seconds),
+            ts * 1_000_000
+        );
     }
 
     #[test]

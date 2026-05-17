@@ -45,7 +45,11 @@ fn pack_bits_u32(values: &[u32], bits: u8) -> Vec<u8> {
             let bit_offset = (bp % 8) as u8;
             let space = 8 - bit_offset;
             let to_write = remaining.min(space);
-            let mask = if to_write == 32 { u32::MAX } else { (1u32 << to_write) - 1 };
+            let mask = if to_write == 32 {
+                u32::MAX
+            } else {
+                (1u32 << to_write) - 1
+            };
             buf[byte_idx] |= ((val & mask) as u8) << bit_offset;
             val >>= to_write;
             remaining -= to_write;
@@ -96,7 +100,11 @@ fn unpack_bits_u32(data: &[u8], count: usize, bits: u8) -> Vec<u32> {
             let bit_offset = (bp % 8) as u8;
             let space = 8 - bit_offset;
             let to_read = remaining.min(space);
-            let mask = if to_read == 8 { 0xFF } else { (1u8 << to_read) - 1 };
+            let mask = if to_read == 8 {
+                0xFF
+            } else {
+                (1u8 << to_read) - 1
+            };
             let bits_val = (data[byte_idx] >> bit_offset) & mask;
             val |= (bits_val as u32) << shift;
             remaining -= to_read;
@@ -127,7 +135,11 @@ fn pack_bits_u64(values: &[u64], bits: u8) -> Vec<u8> {
             let bit_offset = (bp % 8) as u8;
             let space = 8 - bit_offset;
             let to_write = remaining.min(space);
-            let mask = if to_write == 64 { u64::MAX } else { (1u64 << to_write) - 1 };
+            let mask = if to_write == 64 {
+                u64::MAX
+            } else {
+                (1u64 << to_write) - 1
+            };
             buf[byte_idx] |= ((val & mask) as u8) << bit_offset;
             val >>= to_write;
             remaining -= to_write;
@@ -190,7 +202,11 @@ fn unpack_bits_u64(data: &[u8], count: usize, bits: u8) -> Vec<u64> {
             let bit_offset = (bp % 8) as u8;
             let space = 8 - bit_offset;
             let to_read = remaining.min(space);
-            let mask = if to_read == 8 { 0xFF } else { (1u8 << to_read) - 1 };
+            let mask = if to_read == 8 {
+                0xFF
+            } else {
+                (1u8 << to_read) - 1
+            };
             let bits_val = (data[byte_idx] >> bit_offset) & mask;
             val |= (bits_val as u64) << shift;
             remaining -= to_read;

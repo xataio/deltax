@@ -146,8 +146,9 @@ pub fn decode_blocked(data: &[u8], count: usize) -> Vec<String> {
     for i in 0..num_blocks {
         let off_start = block_offset(data, i);
         let off_end = block_offset(data, i + 1);
-        let (uncomp_size, compressed) = lz4_flex::block::uncompressed_size(&data[off_start..off_end])
-            .expect("invalid LZ4 block header");
+        let (uncomp_size, compressed) =
+            lz4_flex::block::uncompressed_size(&data[off_start..off_end])
+                .expect("invalid LZ4 block header");
         lz4_flex::decompress_into(compressed, &mut raw[buf_pos..buf_pos + uncomp_size])
             .expect("LZ4 block decompression failed");
         buf_pos += uncomp_size;

@@ -325,8 +325,7 @@ pub fn normalize_lz4(data: &[u8]) -> Vec<u8> {
     let index_width = data[4];
     let empty_string_idx_bytes = &data[5..7];
 
-    let lz4_blob_len =
-        u32::from_le_bytes(data[7..11].try_into().unwrap()) as usize;
+    let lz4_blob_len = u32::from_le_bytes(data[7..11].try_into().unwrap()) as usize;
 
     let decompressed = if lz4_blob_len > 0 {
         lz4_flex::decompress_size_prepended(&data[11..11 + lz4_blob_len])
@@ -422,7 +421,11 @@ mod tests {
         assert_eq!(decoded, expected);
 
         let ratio = raw_size as f64 / encoded.len() as f64;
-        assert!(ratio > 5.0, "low-cardinality text should compress >5x, got {:.1}x", ratio);
+        assert!(
+            ratio > 5.0,
+            "low-cardinality text should compress >5x, got {:.1}x",
+            ratio
+        );
     }
 
     #[test]

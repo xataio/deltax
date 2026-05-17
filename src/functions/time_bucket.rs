@@ -25,8 +25,7 @@ fn time_bucket(
 
     let bucketed = floor_div(ts_usec, width_usec) * width_usec;
 
-    TimestampWithTimeZone::try_from(bucketed)
-        .expect("time_bucket result out of range")
+    TimestampWithTimeZone::try_from(bucketed).expect("time_bucket result out of range")
 }
 
 /// Time bucket with an offset.
@@ -51,8 +50,7 @@ fn time_bucket_offset(
     let shifted = ts_usec - offset_usec;
     let bucketed = floor_div(shifted, width_usec) * width_usec + offset_usec;
 
-    TimestampWithTimeZone::try_from(bucketed)
-        .expect("time_bucket result out of range")
+    TimestampWithTimeZone::try_from(bucketed).expect("time_bucket result out of range")
 }
 
 /// Convert a pgrx Interval to microseconds.
@@ -90,11 +88,7 @@ fn interval_to_usec(interval: &pgrx::datum::Interval) -> i64 {
 fn floor_div(a: i64, b: i64) -> i64 {
     let d = a / b;
     let r = a % b;
-    if (r != 0) && ((r ^ b) < 0) {
-        d - 1
-    } else {
-        d
-    }
+    if (r != 0) && ((r ^ b) < 0) { d - 1 } else { d }
 }
 
 #[cfg(any(test, feature = "pg_test"))]

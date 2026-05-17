@@ -26,8 +26,7 @@ mod worker;
 
 pg_module_magic!();
 
-pub(crate) static MOCK_NOW: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
+pub(crate) static MOCK_NOW: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
 pub(crate) static PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(0);
 
@@ -35,14 +34,12 @@ pub(crate) static PARALLEL_REGEX: GucSetting<bool> = GucSetting::<bool>::new(tru
 
 pub(crate) static BLOOM_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(true);
 
-pub(crate) static MAX_PARALLEL_WORKERS_PER_SCAN: GucSetting<i32> =
-    GucSetting::<i32>::new(-1);
+pub(crate) static MAX_PARALLEL_WORKERS_PER_SCAN: GucSetting<i32> = GucSetting::<i32>::new(-1);
 
 /// When true, the hook skips `DeltaXCount`/`DeltaXMinMax` fast paths for
 /// queries with WHERE clauses. Used by tests and operators to force the
 /// generic `DeltaXAgg` path for A/B correctness comparisons.
-pub(crate) static DISABLE_META_AGG_FASTPATH: GucSetting<bool> =
-    GucSetting::<bool>::new(false);
+pub(crate) static DISABLE_META_AGG_FASTPATH: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// When true, `add_agg_partial_path` returns early and the planner only
 /// sees the complete CustomScan DeltaXAgg path. Escape hatch for the
@@ -51,8 +48,7 @@ pub(crate) static DISABLE_META_AGG_FASTPATH: GucSetting<bool> =
 /// partial path or comparing the two paths' end-to-end timings on the
 /// same query. The complete path's internal-rayon parallelism still
 /// runs — this only disables the PG-level partial-path activation.
-pub(crate) static DISABLE_PARALLEL_AGG: GucSetting<bool> =
-    GucSetting::<bool>::new(false);
+pub(crate) static DISABLE_PARALLEL_AGG: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// Controls how COPY ... FORMAT deltax_compress extracts JSON paths into
 /// extra columnar columns alongside the original JSONB, and whether the
@@ -119,7 +115,10 @@ pub(crate) enum JsonExtractMode {
 #[allow(dead_code)] // Wired up incrementally across the json-extract feature.
 pub(crate) fn get_json_extract_mode() -> JsonExtractMode {
     let raw = JSON_EXTRACT_MODE.get();
-    let s = raw.as_ref().and_then(|c| c.to_str().ok()).unwrap_or("fields");
+    let s = raw
+        .as_ref()
+        .and_then(|c| c.to_str().ok())
+        .unwrap_or("fields");
     match s {
         "none" => JsonExtractMode::None,
         "fields" => JsonExtractMode::Fields,
@@ -279,9 +278,15 @@ pub extern "C-unwind" fn _PG_init() {
     );
     blob_cache::register_hooks();
     worker::register_bgworker();
-    unsafe { scan::register_hook(); }
-    unsafe { scan::register_executor_start_hook(); }
-    unsafe { copy::register_process_utility_hook(); }
+    unsafe {
+        scan::register_hook();
+    }
+    unsafe {
+        scan::register_executor_start_hook();
+    }
+    unsafe {
+        copy::register_process_utility_hook();
+    }
 }
 
 #[cfg(any(test, feature = "pg_test"))]

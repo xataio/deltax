@@ -117,8 +117,8 @@ mod tests {
         )
         .expect("setup failed");
 
-        let result = Spi::get_one::<f64>("SELECT first(val, ts) FROM test_fl")
-            .expect("query failed");
+        let result =
+            Spi::get_one::<f64>("SELECT first(val, ts) FROM test_fl").expect("query failed");
         assert_eq!(
             result,
             Some(2.0),
@@ -137,8 +137,8 @@ mod tests {
         )
         .expect("setup failed");
 
-        let result = Spi::get_one::<f64>("SELECT last(val, ts) FROM test_fl2")
-            .expect("query failed");
+        let result =
+            Spi::get_one::<f64>("SELECT last(val, ts) FROM test_fl2").expect("query failed");
         assert_eq!(
             result,
             Some(3.0),
