@@ -9,6 +9,10 @@ you'd like your data to stay in Postgres.
 format on disk. The advantage of this approach is that features like physical/logical 
 replication, crash recovery, backups, and pg_dump work as for any other Postgres table.
 
+δx is currently developed and maintained by the [Xata](https://xata.io) team. We hope other
+Postgres providers will offer it as an extension (see the [How can I help](#how-can-i-help)
+section).
+
 ## Benchmarks
 
 These results are as of May 16th, 2026.
@@ -16,15 +20,16 @@ These results are as of May 16th, 2026.
 ### ClickBench
 
 On the [ClickBench](https://benchmark.clickhouse.com/) benchmark, which runs 43 analytical
-queries against a web analytics dataset of 100M rows x 105 columns, currently ranks lower than specialized analitcal stores like ClickHouse and DuckDB, but it is the highest ranking of all 
-the systems that are storing the data in PostgreSQL.
+queries against a web analytics dataset of 100M rows × 105 columns, δx currently ranks lower than 
+specialized analytical stores like ClickHouse and DuckDB, but it is the highest-ranking of 
+all the systems that are storing the data in PostgreSQL.
 
 <img src="images/clickbench-combined.png" width="800" alt="ClickBench combined: pg_deltax ranks in-between ClickHouse and TimescaleDB">
 
 #### Compression / storage size
 
-Looking at the **compression ratio / storage size**, δx offers compression ratio of about 7x on
-this particular dataset.
+Looking at the **compression ratio / storage size**, δx offers a compression ratio of about 7× on
+this particular dataset. Compression ratios varies considerably by data charasteristics.
 
 <img src="images/clickbench-storage-size.png" width="800" alt="ClickBench storage size: pg_deltax compression ratio is ~7x">
 
@@ -40,46 +45,56 @@ this particular dataset.
 
 <img src="images/clickbench-load-time.png" width="800" alt="ClickBench load times result">
 
-The reason δx can load the data faster than Postgres is that it has support for backfilling data directly from Parquet files. On a more standard setup where the data is loaded into normal Postgres tables and them compressed, the load time would be similar to the PostgreSQL result + the time to compress.
+The reason δx can load the data faster than Postgres is that it has support for backfilling data directly
+from Parquet files. On a more standard setup where the data is loaded into normal Postgres tables and
+then compressed, the load time would be similar to the PostgreSQL result plust the compression time.
 
 
 ### JSONBench
 
 [JSONBench](https://jsonbench.com/) is a benchmark similar to ClickBench but for measuring performance
-on semi-structured data. 
+on semi-structured data. The dataset contains BlueSky firehose data exported as ndjson.
 
-δx has support for extracting particular fields from JSONB fields and compressing them with the same columnar algorithms as the native columns. This enables the following result on JSONBench.
+δx has support for extracting particular fields from JSONB columns and compressing them with the same
+columnar algorithms as the native columns. This enables the following results on JSONBench.
 
 <img src="images/jsonbench-hot-run.png" width="800" alt="JSONBench hot run results">
 
 ## How it works
 
-Let's start with an example time-series table partitioned by a timestamp column. The data itself can be metrics, logs, events, etc. Anything that contains a timestamp. PostgreSQL has built in partitioning, so it's very common to partition time-series data in fixed interval partitions (e.g. daily, weekly, or monthly). In our example, let's asume monthly. The partitioned table might look something like this:
+Let's start with an example time-series table partitioned by a timestamp column. The data itself can be metrics, 
+logs, events, etc. Anything that contains a timestamp. PostgreSQL has built in partitioning, so it's very common
+to partition time-series data in fixed-interval partitions (e.g. daily, weekly, or monthly). In our example, let's
+assume monthly. The partitioned table might look something like this:
 
 <img src="images/deltax-partitioned-table.png" width="800" alt="PostgreSQL partitioned table">
 
-Under normal operations, only the last partition (the current month) receives writes. The rest typically only receive reads. Based of this observation, the idea is that we can compressed older partitions so that they take less space.
+Under typical time-series workloads, only the last partition (the current month) receives writes. The rest typically
+only receive reads. Based on this observation, the idea is that we can compress older partitions so that they take 
+less space.
 
 <img src="images/deltax-compressed-partitions.png" width="800" alt="Compressed partitions">
 
-A naive way to do this is to compress all the data in a given partition with a single algorithm (say, LZ4). However, it turns out that compressing column by column has two important advantages:
-- we can use type specific compression algorithms which can be a lot more efficient in compression.
-- if all the values of a given column are stored together one by one, it makes filtering by that column (finding the matching values) very efficient. This is the advantage of columnar stores over row-oriented stores when it comes to analytics.
+A naive way to do this is to compress all the data in a given partition with a single algorithm (say, LZ4). However,
+it turns out that compressing column by column has two important advantages:
+- we can use type-specific compression algorithms which can be a lot more efficient in compression.
+- if all the values of a given column are stored together one by one, filtering by that column becomes very efficient.
 
-<img src="images/deltax-columnar-compress.png" width="800" alt="Switching to columnar-oriented storage during compression">
+<img src="images/deltax-columnar-compress.png" width="400" alt="Switching to columnar-oriented storage during compression">
 
+In other words, during the compression process, we also switch from row-oriented to column-oriented storage. This is 
+done on a per-segment basis, meaning that each partition is split into segments of roughly equal size (by default, 30K rows)
+and compressed segment by segment.
 
-Basically, during the compression process, we also switch from a row-oriented storage to a column-oriented storage. This is done on a per segment basis, meaning that each partition is split into segments of roughly equal sizes (by default, 30K rows) and compressed segment by segment.
+δx is currently using the following algorithms to compress the data of columns of given types:
 
-DeltaX is currently using the following algorithms to compress the data of columns of given types:
-
-- **Integers** (`int2`, `int4`, `int8`): tries three encodings — Constant (single repeated value), Frame-of-Reference + bit-packing (small range around a base), and Delta-Varint (variable-length encoded deltas between consecutive values) — and picks whichever produces the smallest blob per segment.
+- **Integers** (`int2`, `int4`, `int8`): tries three encodings, Constant (single repeated value), Frame-of-Reference + bit-packing (small range around a base), and Delta-Varint (variable-length encoded deltas between consecutive values), and picks whichever produces the smallest blob per segment.
 - **Floats** (`float4`, `float8`): Gorilla XOR encoding (the scheme from Facebook's Gorilla paper), which exploits the fact that consecutive floats in time-series data tend to share most of their binary representation.
 - **Timestamps and dates** (`timestamp`, `timestamptz`, `date`): Gorilla delta-of-delta encoding, very compact when timestamps are evenly or near-evenly spaced.
-- **Booleans** (`bool`): bitmap encoding — 1 bit per value.
+- **Booleans** (`bool`): bitmap encoding, 1 bit per value.
 - **Text with low cardinality** (`text`, `varchar`, `bpchar`): dictionary encoding when cardinality is &lt; 50% of rows and &lt; 65,536 distinct values, with the dictionary indices optionally further LZ4-compressed.
 - **Text with high cardinality** (`text`, `varchar`, `bpchar`): block-LZ4 over the raw strings.
-- **JSONB** (`jsonb`): the raw JSONB bytes go through the same pipeline as text (dictionary or block-LZ4). In addition, when compression is enabled you can pass a `json_extract` spec to pull selected fields out of a JSONB column into synthetic columns of a chosen type (`text`, `bigint`, `timestamptz`, etc.) at compression time — these synthetic columns are then compressed with the matching type-specific codec above, just like native columns, and can be filtered, ordered, and aggregated on directly. This is what JSONBench above exercises.
+- **JSONB** (`jsonb`): the raw JSONB bytes go through the same pipeline as text (dictionary or block-LZ4). In addition, when compression is enabled you can pass a `json_extract` spec to pull selected fields out of a JSONB column into synthetic columns of a chosen type (`text`, `bigint`, `timestamptz`, etc.) at compression time. These synthetic columns are then compressed with the matching type-specific codec above, just like native columns, and can be filtered, ordered, and aggregated on directly.
 
 Across all of these, NULLs are extracted into a separate null bitmap before compression, so the codec only sees non-null values.
 
@@ -87,22 +102,22 @@ During compression, δx also collects metadata about the values in each segment:
 
 - Time bounds and row count per segment.
 - Per-column min, max, sum, non-null count, and non-zero count.
-- Per-column distinct-value count
+- Per-column distinct-value count.
 - Bloom filters for numeric, date, and timestamp columns.
 - Value-presence bitmaps for low-cardinality (≤32 distinct values per partition) text columns.
 - Per-row text-length sidecars: an LZ4-compressed array of character counts for every text column.
 
 This metadata can be used during planning and execution to speed up queries, either by skipping segments that can't contribute to the result, or by answering queries directly from the metadata without touching the compressed blobs at all.
 
-The compressed data and the metadata are stored in companion tables for each partition, with a layout carefully chosen to minimize IO for the usual access patterns. The companion tables are normal Postgres tables, meaning that they benefit the Postgres infrastructure for replication, crash recovery, ACID compliance, etc. They are used transparently by the Postgres planner and executor hooks to speed up queries.
+The compressed data and the metadata are stored in companion tables for each partition, with a layout carefully chosen to minimize IO for the usual access patterns. The companion tables are normal Postgres tables, meaning that they benefit from the Postgres infrastructure for replication and crash recovery. They are used transparently by the Postgres planner and executor hooks to speed up queries.
 
 <img src="images/deltax-compressed-columnar-partitions.png" width="800" alt="DeltaX compressed columnar partitions">
 
-An important design trade-off of δx is that compressed partitions become read-only. INSERTs and UPDATEs to them are rejected and the only way to update them is to decompress and re-compress.
+An important design trade-off of δx is that compressed partitions become read-only. Writes to them are rejected and the only way to update individual rows is to decompress and re-compress the whole partition.
 
 ## Correctness testing
 
-The main correctness invariant in the test suite is: δx must always respond with the same results as plain Postgres responds from the uncompressed version of the table. Whenever the response is different, it is a bug. There are cases where this condition is relaxed: for example, on a `LIMIT 10` query, if on the 10th result there are multiple equal rows, any of them is accepted. We have the following comparison policies:
+The main correctness invariant in the test suite is: δx must always respond with the same results as plain Postgres returns from the uncompressed version of the table. Whenever the response is different, it is a bug. There are cases where this condition is relaxed: for example, on a `LIMIT 10` query, if the 10th rows has ties, any of them is accepted. We have the following comparison policies:
 
 - `ordered_exact` — rows and row order must match exactly.
 - `unordered_exact` — row multiset must match, order is ignored.
@@ -113,7 +128,7 @@ We have four layers of automated tests:
 
 - Rust unit tests (`make test`)
 - Integration tests (`make integration-test`): end-to-end tests against a running PostgreSQL with the extension loaded, run against both PG 17 and 18. They cover partitioning, compression / decompression round-trips, the background worker, parallel scans, parquet loading, JSONB field extraction, the blob cache, value bitmaps, meta-only aggregation, and more.
-- Plain-PG-vs-δx correctness harness (`make correctness`): the implementation of the invariant above. Loads identical logical data into a regular PostgreSQL table and a δx table, runs the same query against both, and compares the results. The csuite covers aggregates, ordering, predicates, codec round-trips via direct backfill, planner-mode coverage, partition / segment edges, joins with uncompressed tables.
+- Plain-PG-vs-δx correctness harness (`make correctness`): the implementation of the invariant above. Loads identical logical data into a regular PostgreSQL table and a δx table, runs the same query against both, and compares the results. The suite covers aggregates, ordering, predicates, codec round-trips via direct backfill, planner-mode coverage, partition / segment edges, joins with uncompressed tables.
 - Benchmark correctness (e.g. `make -C clickbench verify`). The benchmark harnesses also act as cross-implementation parity checks, so a query that benchmarks fast but returns wrong results fails the run.
     
 ## Features
@@ -137,9 +152,10 @@ Current features include:
 - Shared-memory blob cache: cross-backend DSA-backed cache of detoasted compressed blobs, so hot-cache scans don't pay TOAST cost.
 - Text-length sidecar fast path: `length(col)` / `col = ''` / `col <> ''` queries read a few-KB sidecar instead of detoasting the multi-MB text blob.
 
-**JSON field extraction**:
-- Select JSONB field extraction: pull selected JSON paths out of a JSONB column into synthetic typed columns at compression time and compress them with the matching native codec.
-- Automatic query rewrite: to use use the extracted JSON colums.
+**JSON field extraction**
+
+- Selective JSONB field extraction: pull selected JSON paths out of a JSONB column into synthetic typed columns at compression time and compress them with the matching native codec.
+- Automatic query rewrite: queries written against the original JSONB column (`data->>'field'`-style chains) are transparently rewritten to read from the synthetic columns.
 
 **Ingest & operations**
 
@@ -255,24 +271,15 @@ All settings are PostgreSQL GUCs and follow the usual scoping rules (`SET`, `ALT
 | `pg_deltax.mock_now` | (empty) | suset | Override current time with a `timestamptz` literal. Empty string = use real wall-clock time. Used by the test suite to drive deterministic time-based behavior in the background worker and partition-creation paths. |
 
 
-## Contributing
+## How can I help
 
 At the moment, the best way to contribute to this project is to:
+
 - Spread the word: star the repo, post about it on social media, tell your friends.
-- If you have a use-case in your company where δx would be beneficial, please get in touch and we'll evaluate if δx is ready for it, or what it would take to make it ready.
-- Ask your Postgres cloud provider to add support for δx. We'd like to explicitely encourage other Postgres cloud providers to adopt it.
+- If you have a use-case in your company where δx would be beneficial, please [get in touch](mailto:info@xata.io) and we'll evaluate if δx is ready for it, or what it would take to make it ready.
+- Ask your Postgres cloud provider to add support for δx. We'd like to explicitly encourage other Postgres cloud providers to adopt it.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the developer guide. We recommend getting in touch before contributing new features.
-
-```sh
-make dev-image         # one-time: build the development image
-make build             # compile the extension
-make test              # pgrx unit tests
-make integration-test  # Python integration tests against PG 17 and 18
-make clippy            # Rust linter
-make run               # start PostgreSQL with the extension on port 5432
-make psql              # psql shell into the running instance
-```
 
 ## License
 
