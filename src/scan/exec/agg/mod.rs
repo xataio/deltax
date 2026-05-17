@@ -40,9 +40,10 @@ use metadata::{try_catalog_shortcut, try_metadata_fast_path};
 #[cfg(any(test, feature = "pg_test"))]
 use parser::parse_agg_private;
 #[cfg(any(test, feature = "pg_test"))]
-use serial::{GroupKey, GroupKeyRef, GroupKeyVal, hash_group_key, hash_group_key_ref, keys_match};
-#[cfg(any(test, feature = "pg_test"))]
-use state::{AggAccumulator, OutputEntry, ParsedAggPlan};
+use state::{
+    AggAccumulator, GroupKey, GroupKeyRef, GroupKeyVal, OutputEntry, ParsedAggPlan, hash_group_key,
+    hash_group_key_ref, keys_match,
+};
 #[cfg(any(test, feature = "pg_test"))]
 use std::collections::HashMap;
 

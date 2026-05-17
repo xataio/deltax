@@ -14,7 +14,7 @@
 //! as part of `AGG_SPLIT.md` session 2d.
 
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::hash::BuildHasherDefault;
 use std::time::Instant;
 
 use pgrx::pg_sys;
@@ -37,7 +37,8 @@ use super::parallel_mixed::{is_text_group_col, numeric_col_used_only_by_constant
 use super::regex::apply_case_when_to_seg_col;
 use super::state::{
     AggAccumulator, AggExecSpec, AggExpr, AggScanState, AggType, GroupByColSpec, GroupByExpr,
-    HavingFilter, HavingOp, OutputEntry,
+    GroupKey, GroupKeyRef, GroupKeyVal, GroupMap, HavingFilter, HavingOp, OutputEntry,
+    hash_group_key, hash_group_key_ref, keys_match,
 };
 use super::{
     CompactAccKind, CompactAccStorage, CountDistinctSideCar, StringArena, compact_finalize,
@@ -54,144 +55,6 @@ pub(super) struct RegexpGroupInfo {
     pub(super) pattern_datum: pg_sys::Datum,
     pub(super) replacement_datum: pg_sys::Datum,
 }
-
-/// Group key value for HashMap key (owned).
-/// Str variant stores (offset, len) into a StringArena.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum GroupKeyVal {
-    Null,
-    Int(i64),
-    Str(u32, u32), // (offset, len) into StringArena
-}
-
-/// Group key that avoids heap allocation for the common single-column case.
-/// For high-cardinality GROUP BY (275K+ groups), eliminating per-key Vec
-/// allocation saves ~130ms of cleanup overhead when the HashMap is dropped.
-pub(super) enum GroupKey {
-    Single(GroupKeyVal),
-    Multi(Box<[GroupKeyVal]>),
-}
-
-impl GroupKey {
-    pub(super) fn as_slice(&self) -> &[GroupKeyVal] {
-        match self {
-            GroupKey::Single(v) => std::slice::from_ref(v),
-            GroupKey::Multi(v) => v,
-        }
-    }
-}
-
-/// Borrowed version of GroupKeyVal for hash lookups without allocation.
-#[derive(Debug, Clone, Copy)]
-/// Borrowed group key component without lifetime parameter.
-/// Uses raw pointer for strings to avoid borrow-checker conflicts when reusing
-/// the key buffer across loop iterations while mutating regex_results.
-/// SAFETY: The pointed-to str data must outlive the current row iteration
-/// (guaranteed by seg_text_columns and regex_results living across the loop).
-pub(super) enum GroupKeyRef {
-    Null,
-    Int(i64),
-    Str(*const str),
-}
-
-impl GroupKeyRef {
-    /// Create a Str variant from a &str. The caller must ensure the str outlives this GroupKeyRef.
-    pub(super) fn from_str(s: &str) -> Self {
-        GroupKeyRef::Str(s as *const str)
-    }
-
-    pub(super) fn resolve(&self, arena: &mut StringArena) -> GroupKeyVal {
-        match self {
-            GroupKeyRef::Null => GroupKeyVal::Null,
-            GroupKeyRef::Int(v) => GroupKeyVal::Int(*v),
-            GroupKeyRef::Str(p) => {
-                // SAFETY: pointer is valid for the current row iteration
-                let s = unsafe { &**p };
-                let (off, len) = arena.alloc(s);
-                GroupKeyVal::Str(off, len)
-            }
-        }
-    }
-
-    pub(super) fn matches_owned(&self, owned: &GroupKeyVal, arena: &StringArena) -> bool {
-        match (self, owned) {
-            (GroupKeyRef::Null, GroupKeyVal::Null) => true,
-            (GroupKeyRef::Int(a), GroupKeyVal::Int(b)) => a == b,
-            (GroupKeyRef::Str(p), GroupKeyVal::Str(off, len)) => {
-                // SAFETY: pointer is valid for the current row iteration
-                let s = unsafe { &**p };
-                s == arena.get(*off, *len)
-            }
-            _ => false,
-        }
-    }
-}
-
-/// Hash a group key component into a Hasher with a type discriminant.
-fn hash_key_component<H: Hasher>(h: &mut H, val: &GroupKeyVal, arena: &StringArena) {
-    match val {
-        GroupKeyVal::Null => 0u8.hash(h),
-        GroupKeyVal::Int(v) => {
-            1u8.hash(h);
-            v.hash(h);
-        }
-        GroupKeyVal::Str(off, len) => {
-            2u8.hash(h);
-            arena.get(*off, *len).hash(h);
-        }
-    }
-}
-
-fn hash_ref_component<H: Hasher>(h: &mut H, val: &GroupKeyRef) {
-    match val {
-        GroupKeyRef::Null => 0u8.hash(h),
-        GroupKeyRef::Int(v) => {
-            1u8.hash(h);
-            v.hash(h);
-        }
-        GroupKeyRef::Str(p) => {
-            // SAFETY: pointer is valid for the current row iteration
-            let s = unsafe { &**p };
-            2u8.hash(h);
-            s.hash(h);
-        }
-    }
-}
-
-/// Compute hash for an owned GroupKey (needs arena to resolve strings).
-pub(super) fn hash_group_key(key: &GroupKey, arena: &StringArena) -> u64 {
-    let mut hasher = ahash::AHasher::default();
-    for val in key.as_slice() {
-        hash_key_component(&mut hasher, val, arena);
-    }
-    hasher.finish()
-}
-
-/// Compute hash for a borrowed group key slice (no allocation).
-pub(super) fn hash_group_key_ref(key: &[GroupKeyRef]) -> u64 {
-    let mut hasher = ahash::AHasher::default();
-    for val in key {
-        hash_ref_component(&mut hasher, val);
-    }
-    hasher.finish()
-}
-
-/// Check if a stored owned key matches a temporary borrowed key.
-pub(super) fn keys_match(stored: &GroupKey, temp: &[GroupKeyRef], arena: &StringArena) -> bool {
-    let s = stored.as_slice();
-    s.len() == temp.len()
-        && s.iter()
-            .zip(temp.iter())
-            .all(|(s, t)| t.matches_owned(s, arena))
-}
-
-// SegTextColumn is now in text_col.rs
-
-/// Type alias for the group map using hashbrown with raw_entry support.
-/// Maps group keys to indices into flat accumulator storage.
-/// Using u32 index instead of Vec<AggAccumulator> eliminates per-group heap allocation
-/// for accumulators, saving ~130ms cleanup for 275K groups.
-type GroupMap = hashbrown::HashMap<GroupKey, u32, BuildHasherDefault<ahash::AHasher>>;
 
 /// Serial dispatch — the fall-through that runs when no parallel
 /// dispatch fires. Caller boxes the returned `AggScanState` and
