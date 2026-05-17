@@ -30,7 +30,84 @@ narration.
 
 ## Sessions
 
-### 2026-05-17 — `src/scan/exec/agg/mod.rs` — session 1b (state + parser + metadata) — <SHA>
+### 2026-05-17 — `src/scan/exec/agg/mod.rs` — session 2a (parallel count-distinct dispatch) — <SHA>
+
+**Scope:** [`AGG_SPLIT.md`](./AGG_SPLIT.md) session 2 (smallest of the
+five dispatches first). Extract the PARALLEL COUNT(DISTINCT) path
+(banner line ~4987 pre-split) into a new `agg/parallel_cd.rs`.
+Eligibility check (`parallel_count_distinct_eligible`) stays in the
+caller so spec ownership transfers cleanly into the dispatch on the
+hot path.
+
+**Files:** 8 → 9 (`agg/parallel_cd.rs` added).
+`mod.rs`: 13,435 → 12,957 LOC (−478).
+`parallel_cd.rs`: 556 LOC.
+**`unsafe`:** 114 → 114 (no change; the new `unsafe fn` wrapper just
+moves existing FFI from `begin_agg_scan` into a named fn).
+**Tests:** unchanged at 0 `#[test]` / 144 `#[pg_test]`.
+
+Items moved:
+- `struct ParallelCdConfig<'a>` (with `Send` / `Sync` impls)
+- `struct ParallelCdResult`
+- `fn process_cd_segments` — the per-worker accumulator loop
+- `fn cd_part_int` / `fn cd_part_str` — partitioned-merge hash helpers
+- `const CD_MERGE_PARTITIONS = 16`
+- The 6-condition gate, lifted to `parallel_count_distinct_eligible`
+- The full body of the original `if all_count_distinct { … return; }`,
+  lifted to `unsafe fn dispatch_parallel_count_distinct_path`
+
+Visibility: dispatch + eligibility are `pub(super)`. The dispatch is
+`unsafe fn` because it calls `detoast_lazy_blobs` (PG FFI); the SAFETY
+contract is documented inline.
+
+**Verify:**
+- `make clippy` — clean.
+- `make test` (PG17): pass (unchanged).
+- `make test PG_MAJOR=18`: pass (unchanged).
+- `make integration-test`: 234 × PG17 + 234 × PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline). First run hit 14 setup
+  errors from concurrent Docker pressure (same pattern as session 1b);
+  reran cleanly.
+
+**Benchmarks:**
+- JSONBench EC2 (100m bluesky): hot mins
+  [0.227, 2.007, 0.258, 0.551, 0.633] vs prior session 1b
+  [0.229, 1.979, 0.258, 0.551, 0.648]. Within ±2%, all under 10% gate.
+- ClickBench EC2 (full 100M-row dataset):
+  - First post-deploy run (warm PG, warm OS cache): 63.15s vs prior
+    62.43s (+1.1%); Q33 +6.8%, Q34 +6.0%, all others within noise.
+  - Two follow-up runs (same code, no redeploy, no PG restart):
+    69.85s and 70.49s — Q21 +144%/+169%, Q20 +38%/+44%. Investigation
+    showed EC2 OS page cache had dropped from 4.4 Gi to 241 Mi
+    between runs (Hits dataset doesn't fit in 30 Gi RAM with full
+    cache thrash). Dropping caches + restarting PG explicitly and
+    re-benching produced: 62.92s vs 62.43s (+0.8%); Q33 +5.4%
+    (just over 5% gate), Q34 +4.6% (under), everything else within
+    noise.
+- Comparing the cold cache run against session 1a's bench (62.38s):
+  total +0.9%, Q33 +3.3%, Q34 +2.8% — i.e., session 1b's bench was a
+  lucky low-end run; session 2a sits within typical session-to-session
+  variance once cache state is controlled.
+
+**Learning for future sessions:** the ClickBench EC2 (m6i/c6a class,
+30 Gi RAM, 100M-row Hits dataset ≈ 70 Gi) has hot/cold cache effects
+that dominate session-level perf signals. Always restart PG +
+`echo 3 > /proc/sys/vm/drop_caches` before each authoritative bench
+run; consider adding a `bench-cold` make target.
+
+**Deferred (remaining `AGG_SPLIT.md` session 2 sub-PRs):**
+- 2b — `dispatch_parallel_compact_path` (~1660 LOC, 5 emit sites)
+- 2c — `dispatch_parallel_mixed_path` (~2400 LOC, 7 emit sites)
+- 2d — `dispatch_serial_compact_path` + `dispatch_serial_generic_path`
+  together (they share the AggScanState-build epilogue)
+
+Out-of-scope but noted: each parallel path has 1–7 nearly-identical
+`AggScanState { …40 fields… }` construction sites. The pattern is ripe
+for a helper like `make_agg_scan_state(common_fields, path_specific_fields)`,
+but per "no behaviour change during module-split sessions" rule we'll
+do that in a separate refactor PR after the split is finished.
+
+### 2026-05-17 — `src/scan/exec/agg/mod.rs` — session 1b (state + parser + metadata) — 26198ee
 
 **Scope:** [`AGG_SPLIT.md`](./AGG_SPLIT.md) session 1 continued. Took
 the entire "front matter" of `agg/mod.rs` (everything before
