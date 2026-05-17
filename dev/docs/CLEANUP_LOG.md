@@ -30,6 +30,85 @@ narration.
 
 ## Sessions
 
+### 2026-05-17 — `src/scan/exec/agg/mod.rs` — session 2c (parallel mixed dispatch + helpers) — d78bd42
+
+**Scope:** [`AGG_SPLIT.md`](./AGG_SPLIT.md) session 2 continued. Extract
+the PARALLEL MIXED path (~2400 LOC body, 6 emit sites — the largest
+single dispatch in `begin_agg_scan`) plus its "Parallel Mixed
+(int + string) Aggregation" helper section into
+`agg/parallel_mixed.rs`. The setup that builds `rust_regex_infos`,
+`mixed_col_not_null`, and the `can_parallel_mixed_flag` gate stays in
+`mod.rs` (it's short and hands compiled-regex + spec Vecs to the
+dispatch by value).
+
+**Files:** 10 → 11 (`agg/parallel_mixed.rs` added).
+`mod.rs`: 10,482 → 6,987 LOC (−3,495).
+`parallel_mixed.rs`: 3,615 LOC.
+**`unsafe`:** 114 → 114 (no change).
+**Tests:** unchanged at 0 `#[test]` / 144 `#[pg_test]`.
+
+Items moved:
+- The full PARALLEL MIXED dispatch body, with 6 inline
+  `AggScanState{ … }`/`Box::new`/`custom_ps`/`return` emit tails
+  rewritten to `return state;`.
+- All worker helpers under the "Parallel Mixed (int + string)
+  Aggregation" banner: `hash_mixed_key`, `MixedKeyVal`,
+  `MixedKeyStorage`, `is_text_group_col`,
+  `case_when_references_col`,
+  `numeric_col_used_only_by_constant_group_keys`,
+  `ParallelMixedConfig`, `ParallelMixedResult`, `can_parallel_mixed`,
+  `try_build_preselected`, `process_segments_mixed`.
+- `compact_group_map` initialisation, moved inside the function
+  (same pattern as 2b).
+
+Visibility shifts in `mod.rs`:
+- `can_use_compact_accs` and `compact_topn_select` elevated to
+  `pub(super)` so the new module can call them via `super::`.
+- The helpers `is_text_group_col`, `numeric_col_used_only_by_constant_group_keys`,
+  and `can_parallel_mixed` need to be `pub(super)` because the
+  `mod.rs` setup phase and the serial paths still call them.
+
+Behavior preserved:
+- The dispatch consumes `agg_specs` / `group_specs` /
+  `compact_storage: Option<CompactAccStorage>` /
+  `rust_regex_infos: Vec<RustRegexInfo>` by value, returning a
+  fully-populated `AggScanState`.
+- Caller passes `total_detoast_us` / `total_cache_*` accumulators by
+  value as `mut` parameters; the dispatch's local mutations land in
+  the returned `AggScanState`.
+- Per-row mutable state (`compact_group_map`, `cd_sidecar`, etc.) is
+  recreated inside the dispatch (same as 2b).
+
+**Verify:**
+- `make clippy` — 12 cosmetic warnings (`needless_borrow`,
+  `ptr_arg` on `&mut Vec<SegmentData>`, `needless_return`), all
+  pre-existing-style or carried over from 2b's `parallel_compact.rs`.
+  Build itself is clean.
+- `make test` (PG17): 530 pass.
+- `make test PG_MAJOR=18`: 530 pass.
+- `make integration-test`: 234 × PG17 + PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline).
+
+**Benchmarks:**
+- ClickBench EC2 (cold caches): 62.40s vs prior 63.25s (−1.4%, faster).
+  Zero queries regressing >5%. Q33/Q34 (the 2a/2b marginal outliers)
+  improved by ~3% each — confirming those were noise that's now back
+  inside the cluster.
+- JSONBench EC2 (100m bluesky): hot mins
+  [0.230, 1.903, 0.255, 0.551, 0.662] vs prior
+  [0.227, 1.943, 0.255, 0.551, 0.653]. All within ±2%.
+
+**Refactoring opportunity surfaced (deferred):** the dispatch body
+still has 6 nearly-identical `AggScanState{ …40 fields… }`
+construction sites. Same observation as 2a + 2b. The
+helper-factory cleanup will land after session 2 finishes.
+
+**Deferred (remaining `AGG_SPLIT.md` session 2 sub-PR):**
+- 2d — `dispatch_serial_compact_path` + `dispatch_serial_generic_path`
+  together (they share the AggScanState-build epilogue). These are
+  the last two dispatches; after 2d, `begin_agg_scan` is just gate +
+  setup + 5-arm dispatch as the playbook envisioned.
+
 ### 2026-05-17 — `src/scan/exec/agg/mod.rs` — session 2b (parallel compact dispatch + helpers) — 2865a71
 
 **Scope:** [`AGG_SPLIT.md`](./AGG_SPLIT.md) session 2 continued. Extract
