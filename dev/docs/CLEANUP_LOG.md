@@ -30,6 +30,59 @@ narration.
 
 ## Sessions
 
+### 2026-05-17 — `src/scan/exec/agg/*.rs` — dedupe `AggScanState` construction sites — 1fc6175
+
+**Scope:** post-session-2 cleanup surfaced in the 2a–2d logs. Replace
+the 13 near-identical `AggScanState { …40 fields… }` construction
+sites across `parallel_cd`, `parallel_compact`, `parallel_mixed`,
+`serial`, `parser`, and `metadata` with `..AggScanState::default()`
+spread expressions. Add `#[derive(Default)]` to `AggScanState`.
+
+**Files:** 7 changed.
+`mod.rs`: unchanged.
+Net diff: **−243 lines** across 8 files (state +6, dispatches/builders −249).
+
+What the refactor does:
+- `pub(crate) struct AggScanState` in `state.rs` gets `#[derive(Default)]`.
+  Every field implements `Default` (Vec → empty, integer types → 0,
+  bool → false, `*mut DeltaXAggPState` → null, `Option<Box<...>>` →
+  None, `ScanBufferStats` already derived).
+- Each construction site keeps only the fields whose value differs
+  from the default (the "zero baseline") and appends
+  `..AggScanState::default()`. Sites that always-zero a particular
+  field drop it; sites that need a non-zero value (e.g. `topn_ascending:
+  true` in the metadata fast paths, `is_parallel_worker: true` in the
+  worker stub, `where_quals_null: true` in `try_catalog_shortcut`)
+  spell the override explicitly.
+
+Behavior note: the default for `topn_sort_col` is `0` (Rust's i64
+default). A few sites previously used `-1` as a "no top-N" sentinel
+and now leave the field at `0`. The value is only read when
+`topn_limit > 0` (top-N pushdown is active); the sentinel is purely
+informational. Verified by the gauntlet that no downstream code
+treats 0 and -1 differently along reachable paths.
+
+**Verify:**
+- `make clippy` — clean (18 cosmetic warnings, same shape as prior
+  sessions).
+- `make test` (PG17): 530 pass.
+- `make test PG_MAJOR=18`: 530 pass.
+- `make integration-test`: 234 × PG17 + PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline).
+
+**Benchmarks:**
+- ClickBench EC2 (cold caches): 62.99s vs prior 62.55s (+0.7%, flat).
+  Worst Q34 / Q22 at +4.9% each — under the 5% gate; rest under ±3.5%.
+- JSONBench EC2 (100m bluesky): hot mins
+  [0.226, 1.923, 0.254, 0.563, 0.640] vs prior
+  [0.227, 1.927, 0.254, 0.588, 0.649]. Q3 improved (-4.3%), Q4 by
+  (-1.4%); all within ±5%.
+
+This wraps up the session-2 follow-up flagged in 2a/2b/2c/2d. The
+remaining AGG_SPLIT.md leftover is the Compact Accumulator Storage
+extraction (`compact.rs`) — the largest cohesive chunk still in
+`mod.rs`.
+
 ### 2026-05-17 — `src/scan/exec/agg/mod.rs` — session 2d (serial dispatch + helpers) — cef70d7
 
 **Scope:** [`AGG_SPLIT.md`](./AGG_SPLIT.md) session 2 finished. Extract
