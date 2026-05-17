@@ -63,12 +63,12 @@ pub(super) unsafe fn exec_qual(
 }
 
 // ============================================================================
-// TupleDesc attribute access (PG14–17 vs PG18)
+// TupleDesc attribute access (PG17 vs PG18)
 // ============================================================================
 
 /// Get a pointer to the i-th `FormData_pg_attribute` from a TupleDesc.
-/// PG14–17 store attrs directly; PG18 stores CompactAttribute first, then attrs.
-#[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+/// PG17 stores attrs directly; PG18 stores CompactAttribute first, then attrs.
+#[cfg(feature = "pg17")]
 #[inline]
 pub(in crate::scan) unsafe fn tupdesc_get_attr(
     tupdesc: pg_sys::TupleDesc,

@@ -189,7 +189,7 @@ unsafe fn lookup_segments_by_minmax_index(
                 pg_sys::Datum::from(value as usize),
             );
 
-            #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+            #[cfg(feature = "pg17")]
             let scan = pg_sys::index_beginscan(cs_rel, idx_rel, snapshot, 2, 0);
             #[cfg(feature = "pg18")]
             let scan =
@@ -2024,12 +2024,7 @@ pub(super) unsafe fn load_segments_heap(
                                     pg_sys::Datum::from(col_idx_val),
                                 );
 
-                                #[cfg(any(
-                                    feature = "pg14",
-                                    feature = "pg15",
-                                    feature = "pg16",
-                                    feature = "pg17"
-                                ))]
+                                #[cfg(feature = "pg17")]
                                 let scan =
                                     pg_sys::index_beginscan(cs_rel, idx_rel, cs_snapshot, 1, 0);
                                 #[cfg(feature = "pg18")]
@@ -2245,12 +2240,7 @@ pub(super) unsafe fn load_segments_heap(
                             pg_sys::Datum::from(bc.col_idx as i16),
                         );
 
-                        #[cfg(any(
-                            feature = "pg14",
-                            feature = "pg15",
-                            feature = "pg16",
-                            feature = "pg17"
-                        ))]
+                        #[cfg(feature = "pg17")]
                         let scan = pg_sys::index_beginscan(blooms_rel, idx_rel, snapshot, 1, 0);
                         #[cfg(feature = "pg18")]
                         let scan = pg_sys::index_beginscan(
@@ -2428,12 +2418,7 @@ pub(super) unsafe fn load_segments_heap(
                                 pg_sys::Datum::from(vc.col_idx as i16),
                             );
 
-                            #[cfg(any(
-                                feature = "pg14",
-                                feature = "pg15",
-                                feature = "pg16",
-                                feature = "pg17"
-                            ))]
+                            #[cfg(feature = "pg17")]
                             let scan = pg_sys::index_beginscan(vb_rel, idx_rel, snapshot, 1, 0);
                             #[cfg(feature = "pg18")]
                             let scan = pg_sys::index_beginscan(
@@ -2618,12 +2603,7 @@ pub(super) unsafe fn load_segments_heap(
                             pg_sys::Datum::from(col_idx as i16),
                         );
 
-                        #[cfg(any(
-                            feature = "pg14",
-                            feature = "pg15",
-                            feature = "pg16",
-                            feature = "pg17"
-                        ))]
+                        #[cfg(feature = "pg17")]
                         let scan = pg_sys::index_beginscan(blob_rel, idx_rel, snapshot, 1, 0);
                         #[cfg(feature = "pg18")]
                         let scan = pg_sys::index_beginscan(
@@ -2917,7 +2897,7 @@ pub(super) unsafe fn load_text_length_sidecars(
                     pg_sys::Datum::from(col_idx as i16),
                 );
 
-                #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+                #[cfg(feature = "pg17")]
                 let scan = pg_sys::index_beginscan(rel, idx_rel, snapshot, 1, 0);
                 #[cfg(feature = "pg18")]
                 let scan =
@@ -3075,7 +3055,7 @@ pub(super) unsafe fn fetch_segment_blobs(
                 pg_sys::Datum::from(segment_id),
             );
 
-            #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+            #[cfg(feature = "pg17")]
             let scan = pg_sys::index_beginscan(blob_rel, idx_rel, snapshot, 2, 0);
             #[cfg(feature = "pg18")]
             let scan =

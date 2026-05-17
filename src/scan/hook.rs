@@ -233,7 +233,7 @@ unsafe fn check_time_pathkey(
             return (std::ptr::null_mut(), true);
         }
 
-        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+        #[cfg(feature = "pg17")]
         let is_asc = (*first_pk).pk_strategy == pg_sys::BTLessStrategyNumber as i32;
         #[cfg(feature = "pg18")]
         let is_asc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_LT;
@@ -443,12 +443,12 @@ unsafe fn extract_topn_info(
             return (0, true, false, false);
         }
 
-        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+        #[cfg(feature = "pg17")]
         let is_asc = (*first_pk).pk_strategy == pg_sys::BTLessStrategyNumber as i32;
         #[cfg(feature = "pg18")]
         let is_asc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_LT;
 
-        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+        #[cfg(feature = "pg17")]
         let is_desc = (*first_pk).pk_strategy == pg_sys::BTGreaterStrategyNumber as i32;
         #[cfg(feature = "pg18")]
         let is_desc = (*first_pk).pk_cmptype == pg_sys::CompareType::COMPARE_GT;

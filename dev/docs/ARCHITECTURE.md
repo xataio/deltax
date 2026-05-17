@@ -530,7 +530,7 @@ Key dependencies:
 - `hashbrown 0.15` + `ahash 0.8` - Fast hash maps for GROUP BY
 - `serde` / `serde_json` - Serialization for aggregate states
 
-Feature flags: `pg14` through `pg18` for version-specific compilation. Release profile uses full LTO and opt-level 3.
+Feature flags: `pg17` and `pg18` for version-specific compilation. Release profile uses full LTO and opt-level 3.
 
 ---
 

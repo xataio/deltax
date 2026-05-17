@@ -582,22 +582,14 @@ pub(super) fn register_hooks() {
     }
 
     unsafe {
-        #[cfg(feature = "pg14")]
-        {
-            pg_sys::RequestAddinShmemSpace(reservation_total_bytes(shards));
-        }
-        #[cfg(not(feature = "pg14"))]
-        {
-            let _ = PREV_SHMEM_REQUEST_HOOK.set(pg_sys::shmem_request_hook);
-            pg_sys::shmem_request_hook = Some(my_shmem_request_hook);
-        }
+        let _ = PREV_SHMEM_REQUEST_HOOK.set(pg_sys::shmem_request_hook);
+        pg_sys::shmem_request_hook = Some(my_shmem_request_hook);
 
         let _ = PREV_SHMEM_STARTUP_HOOK.set(pg_sys::shmem_startup_hook);
         pg_sys::shmem_startup_hook = Some(my_shmem_startup_hook);
     }
 }
 
-#[cfg(not(feature = "pg14"))]
 unsafe extern "C-unwind" fn my_shmem_request_hook() {
     unsafe {
         if let Some(Some(prev)) = PREV_SHMEM_REQUEST_HOOK.get() {
