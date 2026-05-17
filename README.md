@@ -170,6 +170,14 @@ Current features include:
 - Background worker: drains the default partition into proper ones, pre-creates future partitions, compresses partitions past `compress_after`, drops partitions past `drop_after`.
 - PostgreSQL 17 and 18 supported.
 
+## Limitations
+
+- Compressed partitions are read-only. Writes are rejected; whole-partition operations (`DROP`, `TRUNCATE`) still work. If you need to update individual rows in an old partition, you must decompress, modify, and re-compress.
+- No schema changes affecting column layout (`ADD` / `DROP` / `ALTER COLUMN`) on a deltatable while it has compressed partitions — you need to decompress them first, alter, and re-compress.
+- No continuous (auto-refreshed) materialized aggregates yet. It is on our roadmap.
+- No offloading of old partitions to S3. Data tiering is on our roadmap.
+- Postgres 17 and 18 only.
+
 ## Quick start
 
 ```sh
