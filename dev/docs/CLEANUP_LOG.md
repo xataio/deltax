@@ -30,7 +30,116 @@ narration.
 
 ## Sessions
 
-### 2026-05-18 — `src/scan/exec/agg/serial.rs` — split COMPACT + GENERIC row loops — 45f72de
+### 2026-05-18 — `src/scan/exec/agg/mod.rs` — test reorganisation + `#[pg_test]` → `#[test]` — 59c37c7
+
+**Scope:** AGG_SPLIT.md session 8. Move every test out of `mod.rs`'s
+single 2,058-line `mod tests` block into per-file test blocks next to
+the production code they cover. Convert tests that don't actually
+need a live PG backend from `#[pg_test]` to plain `#[test]` so they
+skip the pgrx test harness.
+
+**Files:** 14 → 15 (new `agg/test_utils.rs` for shared helpers).
+`mod.rs`: 2,112 → 32 LOC (−2,080; now just sub-module declarations
++ agg-level re-exports — no tests, no helpers, no cfg-gated imports).
+Test-bearing files grew by their share of the 144 tests:
+`extract.rs` 167 → 394, `regex.rs` 271 → 399, `state.rs` 702 → 1,063,
+`compact.rs` 1,525 → 1,818, `parser.rs` 579 → 1,007, `metadata.rs`
+754 → 1,351, new `test_utils.rs` 107.
+**`unsafe`:** unchanged at 131.
+**Tests:** 0 `#[test]` + 144 `#[pg_test]` → **79 `#[test]` + 65
+`#[pg_test]`** (same 144 fns, 55% no longer need PG backend).
+
+Distribution after the move:
+
+| File | Tests | `#[test]` | `#[pg_test]` |
+|---|---:|---:|---:|
+| `extract.rs`  | 21  | 21 | 0  |
+| `regex.rs`    | 15  | 9  | 6  |
+| `state.rs`    | 38  | 38 | 0  |
+| `compact.rs`  | 26  | 11 | 15 |
+| `parser.rs`   | 15  | 0  | 15 |
+| `metadata.rs` | 29  | 0  | 29 |
+| `mod.rs`      | 0   | 0  | 0  |
+| **Total**     | **144** | **79** | **65** |
+
+What stayed `#[pg_test]` and why:
+- `parser.rs` — every test builds a `pg_sys::List` via
+  `pg_sys::lappend_int` (palloc-backed).
+- `metadata.rs` — `try_catalog_shortcut` / `try_metadata_fast_path`
+  read `pg_sys` OIDs and dispatch through PG numeric code on some
+  paths.
+- `compact.rs` finalize tests — `finalize_accumulator` allocates
+  NUMERIC datums on the SumInt(int8) and Avg(int) branches and the
+  test bodies verify via `pg_sys::OidOutputFunctionCall`.
+- `regex.rs` six `try_compile_*` / `clickbench_regex` / `rust_regex`
+  tests — `try_compile_rust_regex` calls `crate::get_parallel_regex()`
+  which reads the `pg_deltax.parallel_regex` GUC via `pgrx::guc`,
+  which panics outside a PG backend ("postgres FFI may not be called
+  from multiple threads"). Caught during the first `make test` run;
+  reverted those 6 from `#[test]` → `#[pg_test]`.
+
+What flipped to `#[test]` cleanly:
+- `extract.rs` — all 21 date_trunc / extract math /
+  extract_subday / constant_extract_key_for_segment tests are pure
+  arithmetic on Rust types.
+- `state.rs` — `GroupKey` / `GroupKeyRef` / `hash_group_key` /
+  `keys_match` / `AggAccumulator::new_for` / `clone_fresh` are all
+  struct/hash operations; no FFI.
+- `regex.rs` `has_posix_classes` / `convert_pg_replacement` /
+  `pg_pattern_to_rust` — pure string transforms on the Rust side.
+- `compact.rs` `StringArena` + `datum_to_{i128,f64}` — arena is
+  pure Rust; `datum_to_*` is a pointer transmute on
+  `pg_sys::Datum::from(int as usize)` values constructed in-test.
+
+Shared helpers — `build_int_list`, `make_meta`, `make_plan`,
+`make_agg_spec`, `make_empty_segment` — moved into a new
+`#[cfg(any(test, feature = "pg_test"))] mod test_utils;` keyed off
+`agg/mod.rs`. `pub(super)` so each test block reaches them via
+`super::super::test_utils::*` / `super::test_utils::*`. The earlier
+in-mod-tests `unsafe fn build_int_list` now has a `// SAFETY:` doc
+noting palloc + active-transaction requirements.
+
+Move mechanics:
+- Each module file gets an `#[cfg(any(test, feature = "pg_test"))]
+  mod tests { ... }` block appended at end. Only `parser.rs` and
+  `metadata.rs` need `#[pgrx::pg_schema]` (per pgrx convention for
+  modules containing `#[pg_test]`); `regex.rs` and `compact.rs` also
+  carry it because they mix `#[test]` and `#[pg_test]`. Pure-`#[test]`
+  files (`extract.rs`, `state.rs`) skip it.
+- Imports in each test block are explicit (`use super::{X, Y}` etc.)
+  rather than `use super::*;` because the parent modules don't
+  `pub use` the items needed by tests — glob would silently miss them.
+- The `cfg(any(test, feature = "pg_test"))` gating on `mod test_utils;`
+  preserves the original "test-only compilation cost" property.
+
+**Verify:**
+- `make clippy` — clean (after dropping 4 unused-import warnings that
+  fell out of the move: `AggExecSpec` + `HashMap` in `metadata.rs`'s
+  test imports, `OutputTransform` + `pgrx::pg_sys` in `parser.rs`'s).
+- `make fmt-check` — clean.
+- `make test` (PG17): 530 pass (initial run failed 4 regex tests on
+  GUC access — fixed by reverting to `#[pg_test]`).
+- `make test PG_MAJOR=18`: 530 pass.
+- `make integration-test`: 234 × PG17 + PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline).
+
+**Benchmarks** (after the same `agg.rs` stale-file cleanup on both
+EC2 boxes — same rsync-without-`--delete` issue as session 6):
+- ClickBench EC2 (best-of-3 sum): 63.44s vs prior 63.36s (+0.14%).
+  Only two queries past the 5% gate, both on small-time queries:
+  Q6 −5.9% (1ms absolute), Q38 −7.2% (5ms absolute). No real
+  regressions.
+- JSONBench EC2 (best-of-3 sum, 100m bluesky): 3.64s vs prior 3.61s
+  (+0.75%). All 5 queries within ±2%.
+
+**AGG_SPLIT.md remaining sessions:**
+- Session 5 (parallel_cd drill-down) — still optional (240-LOC body).
+- Session 9: standalone big-function splits
+  (`build_dict_distinct_remaps` 642 LOC, `extract_subday_from_bigint_scaled`
+  426 LOC, etc.).
+- Cross-cutting: `unsafe` audit (still at 131 vs ~70 target).
+
+### 2026-05-18 — `src/scan/exec/agg/serial.rs` — split COMPACT + GENERIC row loops — <pending>
 
 **Scope:** AGG_SPLIT.md session 6. Peel the two inner row loops
 (COMPACT — packed u128 keys + flat byte-buffer accs; GENERIC —

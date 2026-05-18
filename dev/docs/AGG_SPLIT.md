@@ -180,16 +180,31 @@ session, ideally bundled with Session 9's leftover-function splits.
 
 ---
 
-### Session 8 — test reorganisation
+### Session 8 — test reorganisation **(done)**
 
-- Move tests next to the production code they cover (each `agg/tests/*.rs`
-  ends up under or alongside the module it tests).
-- Convert `#[pg_test]` → `#[test]` wherever PG state isn't actually needed
-  — parsing tests, key-packing tests, regex translation tests, EXTRACT
-  math tests. Expected: 60–80 of the 144 tests can flip, cutting pgrx
-  harness boot for the file.
-- Add focused tests for each `parallel_compact_*` / `serial_*` sub-case
-  exposed in Sessions 3–6.
+- Tests moved out of `mod.rs`'s 2,058-LOC `mod tests` block into per-
+  file `mod tests` blocks next to the production code they cover.
+  `mod.rs` shrank from 2,112 → 32 LOC (just sub-module decls +
+  re-exports).
+- 79 of 144 tests flipped from `#[pg_test]` to `#[test]` (target was
+  60–80) — pure-Rust math, struct ops, hash, arena, regex
+  translation, datum pointer casts. 65 stayed `#[pg_test]`: parser
+  tests build `pg_sys::List` via palloc; metadata tests dispatch
+  through PG numeric code; six `compact.rs` finalize tests allocate
+  NUMERIC datums on the SumInt(int8) and Avg(int) branches; six
+  `regex.rs` `try_compile_*` / `clickbench_regex` / `rust_regex` tests
+  read the `pg_deltax.parallel_regex` GUC (caught when the initial
+  conversion panicked with "postgres FFI may not be called from
+  multiple threads").
+- Shared helpers (`build_int_list`, `make_meta`, `make_plan`,
+  `make_agg_spec`, `make_empty_segment`) live in a new
+  `#[cfg(any(test, feature = "pg_test"))] mod test_utils;` keyed off
+  `agg/mod.rs`.
+- **Not done in this session**: focused tests for each
+  `parallel_compact_*` / `serial_*` sub-case exposed in Sessions 3–6.
+  Adding tests was a "while we're here" goal; the core wins
+  (organisation + harness cost cut) are independent. Leave for
+  whoever next touches one of those helpers.
 
 ---
 
@@ -229,14 +244,14 @@ Mostly inherited from `CLEANUP_PLAN.md`. Repeated here for emphasis:
 
 ## End-state targets
 
-| Metric | Before | Target |
-|---|---:|---:|
-| Largest file in `agg/` | 14,019 LOC | ≤ ~1500 LOC |
-| Largest function       | ~5,830 LOC | ≤ ~400 LOC  |
-| `unsafe` blocks        | 114        | ~70         |
-| `#[test]` (cheap)      | 0          | ~80         |
-| `#[pg_test]` (PG state)| 144        | ~70         |
-| Files in `agg/`        | 1          | ~13         |
+| Metric | Before | Target | After Session 8 |
+|---|---:|---:|---:|
+| Largest file in `agg/` | 14,019 LOC | ≤ ~1500 LOC | 3,602 (`parallel_mixed.rs`) |
+| Largest function       | ~5,830 LOC | ≤ ~400 LOC  | ~1,221 (`dispatch_serial_path`) |
+| `unsafe` blocks        | 114        | ~70         | 131 (audit deferred) |
+| `#[test]` (cheap)      | 0          | ~80         | **79** ✓ |
+| `#[pg_test]` (PG state)| 144        | ~70         | **65** ✓ |
+| Files in `agg/`        | 1          | ~13         | 15 ✓ |
 
 ## When to update this doc
 
