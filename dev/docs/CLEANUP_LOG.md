@@ -30,6 +30,75 @@ narration.
 
 ## Sessions
 
+### 2026-05-18 — `src/scan/exec/agg/parallel_compact.rs` — split top-N sub-cases — 15eecdf
+
+**Scope:** finish AGG_SPLIT.md session 3. Peel the two top-N sub-cases
+(speculative + partitioned merge) out of `dispatch_parallel_compact_path`.
+With this and the prior bare_limit + full_merge extraction (cfcf11b),
+all four merge-phase sub-cases now live in their own helpers and the
+dispatch is purely setup + the worker scope + 4 dispatching calls.
+
+**Files:** unchanged at 14.
+`parallel_compact.rs`: 2,608 → 2,612 LOC (+4 net).
+`dispatch_parallel_compact_path` body: 1,282 → 234 LOC (−1,048).
+Target was ≤ ~80 LOC for a dispatch fn; the residual is the 4-arm
+dispatch + the worker scope (lazy detoast, parallel scope thread::scope
+loop) which is the path-specific glue and stays in the dispatch.
+**`unsafe`:** unchanged.
+**Tests:** unchanged at 0 `#[test]` / 144 `#[pg_test]`.
+
+Extracted:
+- **`compact_speculative_topn(ctx, &agg_specs, &group_specs,
+  &partial_results, &mut storage) -> Option<CompactMergeOutcome>`** —
+  speculative top-N using pre-computed top-K candidates. Returns
+  `Some(outcome)` on successful speculation or when all candidates tie
+  at the Nth value; returns `None` on the fallthrough cases (not
+  eligible, phase-2 too expensive, or speculation failed without ties)
+  so the caller proceeds to the partitioned/full merge.
+- **`compact_partitioned_topn(ctx, &agg_specs, &group_specs,
+  &partial_results) -> CompactMergeOutcome`** — partitioned parallel
+  merge + top-N. Caller already gates `topn_limit > 0` so the helper
+  always returns. The thread::scope partition workers stay inside.
+
+The two new helpers share the AggScanState assembly with a small
+`build_topn_agg_scan_state(ctx, agg_specs, group_specs, outcome)`
+builder that wraps a `CompactMergeOutcome` (the 5 fields that differ
+between the top-N paths — `result_rows`, `pre_topn_groups`, `merge_us`,
+`finalize_us`, `topn_select_us`) into a final `AggScanState` with the
+shared ctx-derived metadata. Speccs/group_specs move into the builder
+at the dispatch site; the helpers take them by `&[..]` since they only
+need read access.
+
+Drive-by cleanup: dropped the unused `_has_any_cd_agg` binding inside
+the speculative block (dead, the leading underscore was already a
+giveaway).
+
+Both helpers are `#[inline]` to preserve cross-module codegen behaviour.
+
+**Verify:**
+- `make clippy` — clean.
+- `make fmt-check` — clean.
+- `make test` (PG17): 530 pass.
+- `make test PG_MAJOR=18`: 530 pass.
+- `make integration-test`: 234 × PG17 + PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline).
+
+**Benchmarks:**
+- ClickBench EC2 (cold caches): 71.50s vs prior 71.45s (+0.07%).
+  Per-query: Q3 +7.4% (29ms), Q6 −5.9% (16ms), Q35 +5.4% (1.79s),
+  Q36 +6.1% (87ms), Q39 +6.4% (199ms) — all on small-time queries
+  within EC2 run-to-run variance.
+- JSONBench EC2 (100m bluesky): 3.59s vs prior 3.62s (−0.80%). All
+  5 queries within ±5%.
+
+**AGG_SPLIT.md remaining sessions:**
+- Session 4–7: same drill-down for `dispatch_parallel_mixed_path`
+  (3,489 LOC), `dispatch_parallel_cd_path`, and `dispatch_serial_path`.
+- Session 8: test reorganisation (`#[pg_test]` → `#[test]` for pure
+  logic; move tests next to production code).
+- Session 9: standalone big-function splits (`build_dict_distinct_remaps`
+  642 LOC, `extract_subday_from_bigint_scaled` 426 LOC, etc.).
+
 ### 2026-05-17 — `src/scan/exec/agg/parallel_compact.rs` — split 2 sub-cases out of dispatch — cfcf11b
 
 **Scope:** AGG_SPLIT.md session 3 (partial). Peel two of the four
