@@ -30,6 +30,86 @@ narration.
 
 ## Sessions
 
+### 2026-05-18 — `src/scan/exec/agg/parallel_mixed.rs` — split top-N sub-cases — 4e111bf
+
+**Scope:** finish AGG_SPLIT.md session 4 (mixed dispatch). Peel the
+three top-N sub-cases (derived MIN/MAX-diff, speculative, partitioned
+merge) out of `dispatch_parallel_mixed_path`. Together with the
+bare_limit + full_merge extraction (f6f2bf8), all five merge-phase
+sub-cases now live in their own helpers.
+
+**Files:** unchanged at 14.
+`parallel_mixed.rs`: 3,578 → 3,612 LOC (+34 net).
+`dispatch_parallel_mixed_path` body: 1,658 → 398 LOC (−1,260; three
+extracted sub-cases were ~330 + ~520 + ~440 LOC, now 10-line and
+9-line calls). Body is now the setup + worker scope + 5-arm dispatch.
+**`unsafe`:** unchanged.
+**Tests:** unchanged at 0 `#[test]` / 144 `#[pg_test]`.
+
+Extracted:
+- **`mixed_derived_minmax_topn(ctx, agg_specs, group_specs,
+  &partial_results, &mut storage, max_slot, min_slot) -> AggScanState`**
+  — JSONBench Q4 shape. Sort by `storage[max_slot] - storage[min_slot]`;
+  workers produce partial MAX/MIN per group, one pass combines partials
+  into per-key global MAX/MIN, applies a top-K heap, then merges only
+  the K winners' full accumulators. Terminal (sets `topn_sort_col=-3`
+  sentinel for explain.rs); caller already destructured the
+  `(max_slot, min_slot)` from `derived_minmax_topn`.
+- **`mixed_speculative_topn(ctx, &agg_specs, &group_specs,
+  &partial_results, &mut storage) -> Option<MixedMergeOutcome>`** —
+  speculative top-N using per-worker pre-computed top-K candidates.
+  Returns `Some(outcome)` on success / all-tied; `None` on
+  fallthrough (not eligible / phase-2 too expensive / speculation
+  failed without ties).
+- **`mixed_partitioned_topn(ctx, &agg_specs, &group_specs,
+  &partial_results) -> MixedMergeOutcome`** — partitioned parallel
+  merge + top-N. The `thread::scope` partition workers stay inside;
+  helper always returns since the caller has already gated
+  `topn_limit > 0`. Does not need the dispatch-level
+  `&mut CompactAccStorage`.
+
+The speculative + partitioned helpers share a `MixedMergeOutcome`
+struct (5 fields: `result_rows`, `pre_topn_groups`, `merge_us`,
+`finalize_us`, `topn_select_us`) and a
+`build_mixed_topn_agg_scan_state(ctx, agg_specs, group_specs, outcome)`
+builder that assembles the final `AggScanState` from
+context-derived metadata + the outcome. Specs move into the builder
+at the dispatch call site.
+
+`derived_minmax_topn` keeps its own bespoke `AggScanState`
+construction because the `topn_sort_col: -3` sentinel field doesn't
+match the shared shape that `build_mixed_topn_agg_scan_state`
+produces.
+
+All three helpers are `#[inline]`. Speculative + partitioned take
+specs by `&[..]` to support the fallthrough on the speculative path;
+derived_minmax takes by value (terminal). Drive-by: removed a
+no-op `drop(partial_results)` in the partitioned body (`partial_results`
+is now `&[T]`, so `drop` on a reference is a clippy warning).
+
+**Verify:**
+- `make clippy` — clean.
+- `make fmt-check` — clean.
+- `make test` (PG17): 530 pass.
+- `make test PG_MAJOR=18`: 530 pass.
+- `make integration-test`: 234 × PG17 + PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline). One transient failure
+  retried clean — same docker-state issue seen during session 4a.
+
+**Benchmarks:**
+- ClickBench EC2 (cold caches): 71.08s vs prior 71.53s (−0.62%).
+  Per-query: Q6 −5.9% on a 17ms query, Q40 +11.6% on a 77ms query
+  (8ms absolute, within noise). No real regressions.
+- JSONBench EC2 (100m bluesky): 3.60s vs prior 3.61s (−0.42%). All
+  5 queries within ±5%.
+
+**AGG_SPLIT.md remaining sessions:**
+- Session 5: same drill-down for `dispatch_parallel_cd_path`
+  (539 LOC file; smaller).
+- Session 6: same for `dispatch_serial_path` (1,807 LOC file).
+- Session 8: test reorganisation.
+- Session 9: standalone big-function splits.
+
 ### 2026-05-18 — `src/scan/exec/agg/parallel_mixed.rs` — split 2 sub-cases out of dispatch — f6f2bf8
 
 **Scope:** start AGG_SPLIT.md session 4 (mixed dispatch). Same pattern
