@@ -180,12 +180,6 @@ Current features include:
 
 ## Quick start
 
-```sh
-make run
-# in another terminal:
-psql -h localhost -U postgres -c "CREATE EXTENSION pg_deltax;"
-```
-
 ```sql
 CREATE TABLE metrics (ts TIMESTAMPTZ NOT NULL, device TEXT, value FLOAT8);
 SELECT deltax_create_table('metrics', 'ts', '1 day');
@@ -204,6 +198,40 @@ SELECT * FROM deltax_compression_stats('metrics');
 -- Size reporting (accounts for compressed storage)
 SELECT pg_size_pretty(deltax_table_size('metrics'));
 ```
+
+## Installation from deb file
+
+Download the `.deb` matching your PG major version and architecture from the [latest release](https://github.com/xataio/pg_deltax/releases/latest), then:
+
+```sh
+apt-get install -y ./pg-deltax-pg17_<version>_amd64.deb
+```
+
+δx registers a background worker from `_PG_init`, so it must be in `shared_preload_libraries`:
+
+```sh
+echo "shared_preload_libraries = 'pg_deltax'" >> $PGDATA/postgresql.conf
+# restart PostgreSQL, then:
+psql -c "CREATE EXTENSION pg_deltax;"
+```
+
+## Installation from source
+
+Requires a Rust toolchain, the PostgreSQL server dev headers (`postgresql-server-dev-17` or `-18` on Debian / Ubuntu), and `cargo-pgrx` matching the `pgrx` version in `Cargo.toml`:
+
+```sh
+cargo install cargo-pgrx --version 0.17.0 --locked
+cargo pgrx init --pg17=$(which pg_config)
+```
+
+Then build and install the extension into the PostgreSQL instance pointed at by `pg_config`:
+
+```sh
+cargo pgrx install --release --pg-config $(which pg_config) \
+    --features pg17 --no-default-features
+```
+
+Replace `pg17` with `pg18` to target PostgreSQL 18. Then add `pg_deltax` to `shared_preload_libraries`, restart PostgreSQL, and `CREATE EXTENSION pg_deltax;` as above.
 
 ## Function reference
 
