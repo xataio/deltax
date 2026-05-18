@@ -30,6 +30,72 @@ narration.
 
 ## Sessions
 
+### 2026-05-18 — `src/scan/exec/agg/parallel_mixed.rs` — split 2 sub-cases out of dispatch — f6f2bf8
+
+**Scope:** start AGG_SPLIT.md session 4 (mixed dispatch). Same pattern
+as the compact session (cfcf11b): peel the bare_limit and full_merge
+tails out as standalone helpers, threading the ~22 shared inputs
+through a new `MixedMergeCtx<'a>` struct. Leaves the 3 top-N sub-cases
+(derived_minmax, speculative, partitioned) inline for a follow-up.
+
+**Files:** unchanged at 14.
+`parallel_mixed.rs`: 3,489 → 3,578 LOC (+89 net — helper signatures +
+ctx struct).
+`dispatch_parallel_mixed_path` body: ~2,290 → 1,658 LOC (−632; two
+extracted sub-cases were ~245 + ~330 LOC, now 4-line and 9-line calls).
+**`unsafe`:** unchanged.
+**Tests:** unchanged at 0 `#[test]` / 144 `#[pg_test]`.
+
+Extracted:
+- **`mixed_bare_limit(ctx, agg_specs, group_specs, &partial_results)
+  -> AggScanState`** — bare-LIMIT short-circuit. Picks N keys from
+  the largest worker, copies their key bytes into a fresh
+  `MixedKeyStorage`, targeted-merges each key's accumulators across
+  workers, finalizes only N rows. Guarded by `bare_limit > 0 &&
+  having_filters.is_empty()` at the dispatch call site.
+- **`mixed_full_merge(ctx, agg_specs, group_specs, partial_results,
+  &mut storage, &mut group_map) -> AggScanState`** — full-merge
+  fallthrough. Adopts the largest worker's map as base, merges
+  remaining workers (with string keys via `MixedKeyStorage` rather
+  than packed u128), finalizes all groups with HAVING + optional
+  in-place top-N sort.
+
+`MixedMergeCtx<'a>` is analogous to `CompactMergeCtx<'a>` but adds
+`preselected_count: u64` — the size of the bare-limit pre-selected
+key set, used by `mixed_bare_limit` for the `f8_preselected` debug
+field. Built once after the worker scope finishes (timing fields
+frozen) by the dispatch fn just before the first sub-case.
+
+Both helpers are `unsafe fn` + `#[inline]`. They take specs by value
+(terminal calls); `mixed_full_merge` also takes `partial_results`
+by value to consume worker data, while `mixed_bare_limit` borrows.
+
+Implementation notes:
+- Replaced the original `let storage = compact_storage.as_mut().unwrap();`
+  alias with `let storage = &mut *compact_storage;` reborrow — the
+  helper takes `&mut CompactAccStorage` directly (no Option wrapper).
+- `for (_, &group_idx) in &compact_group_map` becomes
+  `compact_group_map.iter()` because `compact_group_map` is now a
+  helper parameter `&mut CompactGroupMap`; `&` on it would give
+  `&&mut HashMap` which doesn't iterate.
+
+**Verify:**
+- `make clippy` — clean.
+- `make fmt-check` — clean.
+- `make test` (PG17): 530 pass.
+- `make test PG_MAJOR=18`: 530 pass.
+- `make integration-test`: 234 × PG17 + PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline). One earlier run showed
+  transient errors that disappeared on retry — appeared to be a
+  stale docker container from a parallel benchmark; not reproducible.
+
+**Benchmarks:**
+- ClickBench EC2 (cold caches): 71.53s vs prior 71.50s (+0.04%).
+  Per-query: Q6 +6.3% on a 17ms query (1ms absolute), Q39 −7.0%
+  (185ms), Q40 −9.2% (69ms) — all within EC2 run-to-run variance.
+- JSONBench EC2 (100m bluesky): 3.61s vs prior 3.59s (+0.75%). All
+  5 queries within ±5%.
+
 ### 2026-05-18 — `src/scan/exec/agg/parallel_compact.rs` — split top-N sub-cases — 15eecdf
 
 **Scope:** finish AGG_SPLIT.md session 3. Peel the two top-N sub-cases
