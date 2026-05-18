@@ -1323,239 +1323,97 @@ unsafe fn compact_full_merge(
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::ptr_arg)]
-pub(super) unsafe fn dispatch_parallel_compact_path(
+/// Result of one of the two top-N merge sub-paths inside
+/// `dispatch_parallel_compact_path`. The dispatch fn assembles a final
+/// `AggScanState` from this via `build_topn_agg_scan_state`.
+struct CompactMergeOutcome {
+    result_rows: Vec<Vec<(pg_sys::Datum, bool)>>,
+    pre_topn_groups: u64,
+    merge_us: u64,
+    finalize_us: u64,
+    topn_select_us: u64,
+}
+
+#[inline]
+fn build_topn_agg_scan_state(
+    ctx: &CompactMergeCtx<'_>,
     agg_specs: Vec<AggExecSpec>,
     group_specs: Vec<GroupByColSpec>,
-    output_map: &[OutputEntry],
-    having_filters: &[HavingFilter],
-    where_quals: *mut pg_sys::List,
-    topn_limit: i64,
-    topn_sort_col: usize,
-    topn_ascending: bool,
-    bare_limit: i64,
-    meta: &MetadataInfo,
-    all_segments: &mut [SegmentData],
-    needed_cols: &[bool],
-    batch_quals: &[BatchQual],
-    seg_filters: &[(usize, String)],
-    time_min: Option<i64>,
-    time_max: Option<i64>,
-    n_workers: usize,
-    use_lazy: bool,
-    num_result_cols: usize,
-    metadata_us: u64,
-    heap_scan_us: u64,
-    t_wall: Instant,
-    mut compact_storage: Option<CompactAccStorage>,
-    mut total_detoast_us: u64,
-    mut total_cache_hits: u64,
-    mut total_cache_misses: u64,
-    mut total_cache_bytes_served: u64,
+    outcome: CompactMergeOutcome,
 ) -> AggScanState {
-    let has_group_by = !group_specs.is_empty();
-    #[allow(unused_assignments)] // overwritten by `largest.compact_map` on the merge branch
-    let mut compact_group_map: CompactGroupMap =
-        CompactGroupMap::with_hasher(BuildHasherDefault::default());
+    AggScanState {
+        _agg_specs: agg_specs,
+        _group_specs: group_specs,
+        result_rows: outcome.result_rows,
+        _num_result_cols: ctx.num_result_cols,
+        metadata_us: ctx.metadata_us,
+        heap_scan_us: ctx.heap_scan_us,
+        detoast_us: ctx.total_detoast_us,
+        blob_cache_hits: ctx.total_cache_hits,
+        blob_cache_misses: ctx.total_cache_misses,
+        blob_cache_bytes_served: ctx.total_cache_bytes_served,
+        decompress_us: ctx.decompress_us,
+        agg_us: ctx.agg_us,
+        total_segments: ctx.total_segments,
+        total_rows_processed: ctx.total_rows_processed,
+        batch_quals_count: ctx.batch_quals.len(),
+        where_quals_null: ctx.where_quals.is_null(),
+        topn_limit: ctx.topn_limit as u64,
+        topn_sort_col: ctx.topn_sort_col as i64,
+        topn_ascending: ctx.topn_ascending,
+        pre_topn_groups: outcome.pre_topn_groups,
+        merge_us: outcome.merge_us,
+        finalize_us: outcome.finalize_us,
+        topn_select_us: outcome.topn_select_us,
+        n_workers: ctx.n_workers as u64,
+        wall_us: ctx.t_wall.elapsed().as_micros() as u64,
+        buf_stats: take_scan_buf_stats(),
+        ..AggScanState::default()
+    }
+}
+
+/// Speculative top-N for the compact path. Uses per-worker pre-computed
+/// top-K candidates (built while data was cache-hot), merges only those
+/// candidates, and verifies no missed key could beat the Nth result.
+///
+/// Returns:
+/// - `Some(outcome)` on a successful speculation (Nth result provably
+///   beats every key not in the candidate set) or when every candidate
+///   tied at the Nth value (any N are valid).
+/// - `None` on fallthrough: not eligible (no top-N, HAVING active,
+///   sort is COUNT(DISTINCT) or AVG), Phase 2 too expensive, or
+///   speculation failed and ties don't apply. Caller falls through to
+///   the partitioned merge or full merge path.
+#[inline]
+unsafe fn compact_speculative_topn(
+    ctx: &CompactMergeCtx<'_>,
+    agg_specs: &[AggExecSpec],
+    group_specs: &[GroupByColSpec],
+    partial_results: &[ParallelCompactResult],
+    compact_storage: &mut CompactAccStorage,
+) -> Option<CompactMergeOutcome> {
     unsafe {
-        let t2 = Instant::now();
-        // If top-N is active with no HAVING, tell workers to compute
-        // top-K candidates while their data is still cache-hot.
-        let topn_spec = if topn_limit > 0 && having_filters.is_empty() {
-            let sort_slot = match output_map[topn_sort_col] {
-                OutputEntry::Agg(ai) => ai,
-                _ => unreachable!(),
-            };
-            // AVG sort can't use raw sum for speculative top-K pruning
-            if agg_specs[sort_slot].agg_type == AggType::Avg {
-                None
-            } else {
-                let k = (topn_limit as usize).max(1000);
-                Some((sort_slot, k, topn_ascending))
-            }
-        } else {
-            None
-        };
-
-        let config = ParallelCompactConfig {
-            agg_specs: &agg_specs,
-            group_specs: &group_specs,
-            col_names: &meta.col_names,
-            col_types: &meta.col_types,
-            segment_by: &meta.segment_by,
-            needed_cols,
-            batch_quals,
-            seg_filters,
-            time_min,
-            time_max,
-            topn_spec,
-        };
-
-        // Pipeline detoast with parallel processing when enough segments
-        // to amortize thread::scope overhead; otherwise single scope.
-        let use_pipeline = use_lazy && all_segments.len() >= n_workers * 16;
-
-        if use_lazy {
-            let t_detoast = Instant::now();
-            if use_pipeline {
-                // Detoast only the first batch; rest overlaps with workers
-                let n_batches = (n_workers * 2).max(2).min(all_segments.len());
-                let batch_size = all_segments.len().div_ceil(n_batches);
-                let first_end = batch_size.min(all_segments.len());
-                for seg in &mut all_segments[..first_end] {
-                    let dl = detoast_lazy_blobs(seg);
-                    total_cache_hits += dl.cache_hits;
-                    total_cache_misses += dl.cache_misses;
-                    total_cache_bytes_served += dl.cache_bytes_served;
-                }
-            } else {
-                // Few segments — detoast all upfront, single scope below
-                for seg in all_segments.iter_mut() {
-                    let dl = detoast_lazy_blobs(seg);
-                    total_cache_hits += dl.cache_hits;
-                    total_cache_misses += dl.cache_misses;
-                    total_cache_bytes_served += dl.cache_bytes_served;
-                }
-            }
-            total_detoast_us += t_detoast.elapsed().as_micros() as u64;
-        }
-
-        let mut pipeline_detoast_us: u64 = 0;
-        let partial_results: Vec<ParallelCompactResult> = if use_pipeline {
-            let n_batches = (n_workers * 2).max(2).min(all_segments.len());
-            let batch_size = all_segments.len().div_ceil(n_batches);
-            let mut results: Vec<ParallelCompactResult> = Vec::new();
-            let mut batch_start = 0;
-            let total_segs = all_segments.len();
-
-            while batch_start < total_segs {
-                let batch_end = (batch_start + batch_size).min(total_segs);
-                let next_end = (batch_end + batch_size).min(total_segs);
-
-                let (done, pending) = all_segments.split_at_mut(batch_end);
-                let current_batch = &done[batch_start..];
-
-                std::thread::scope(|s| {
-                    let chunk_size = current_batch.len().div_ceil(n_workers);
-                    let handles: Vec<_> = current_batch
-                        .chunks(chunk_size)
-                        .map(|chunk| {
-                            let cfg = &config;
-                            s.spawn(move || process_segments_compact(chunk, cfg))
-                        })
-                        .collect();
-
-                    // Main thread detoasts next batch while workers run
-                    if batch_end < total_segs {
-                        let t_pd = Instant::now();
-                        for seg in &mut pending[..next_end - batch_end] {
-                            let dl = detoast_lazy_blobs(seg);
-                            total_cache_hits += dl.cache_hits;
-                            total_cache_misses += dl.cache_misses;
-                            total_cache_bytes_served += dl.cache_bytes_served;
-                        }
-                        pipeline_detoast_us += t_pd.elapsed().as_micros() as u64;
-                    }
-
-                    for h in handles {
-                        results.push(h.join().unwrap());
-                    }
-                });
-
-                batch_start = batch_end;
-            }
-            results
-        } else {
-            // Single scope — original path (or lazy already detoasted above)
-            let chunk_size = all_segments.len().div_ceil(n_workers);
-            std::thread::scope(|s| {
-                let handles: Vec<_> = all_segments
-                    .chunks(chunk_size)
-                    .map(|chunk| {
-                        let cfg = &config;
-                        s.spawn(move || process_segments_compact(chunk, cfg))
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            })
-        };
-
-        // Accumulate stats from all workers
-        let scan_wall_us = t2.elapsed().as_micros() as u64;
-        let mut total_segments: u64 = 0;
-        let mut total_rows_processed: u64 = 0;
-        let mut decompress_us: u64 = 0;
-        for result in &partial_results {
-            total_segments += result.segments_processed;
-            total_rows_processed += result.rows_processed;
-            decompress_us = decompress_us.max(result.decompress_us);
-        }
-        total_detoast_us += pipeline_detoast_us;
-        let agg_us = scan_wall_us.saturating_sub(decompress_us + pipeline_detoast_us);
-
-        let merge_ctx = CompactMergeCtx {
-            output_map,
-            having_filters,
-            where_quals,
-            topn_limit,
-            topn_sort_col,
-            topn_ascending,
-            bare_limit,
-            batch_quals,
-            n_workers,
-            num_result_cols,
-            has_group_by,
-            metadata_us,
-            heap_scan_us,
-            total_detoast_us,
-            total_cache_hits,
-            total_cache_misses,
-            total_cache_bytes_served,
-            decompress_us,
-            agg_us,
-            total_segments,
-            total_rows_processed,
-            t_wall,
-        };
-
         // ----------------------------------------------------------
-        // Speculative top-N: use pre-computed top-K candidates from
-        // each worker (computed while data was cache-hot), merge only
-        // those, and verify no missed key could beat the Nth result.
-        // ----------------------------------------------------------
-        let sort_slot_for_compact_spec = match output_map[topn_sort_col] {
+        let sort_slot_for_compact_spec = match ctx.output_map[ctx.topn_sort_col] {
             OutputEntry::Agg(ai) => ai,
             _ => 0,
         };
-        let compact_sort_is_cd = topn_limit > 0
+        let compact_sort_is_cd = ctx.topn_limit > 0
             && matches!(
-                compact_storage.as_ref().unwrap().layout.slots[sort_slot_for_compact_spec].1,
+                compact_storage.layout.slots[sort_slot_for_compact_spec].1,
                 CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr
             );
-        let _has_any_cd_agg =
-            compact_storage
-                .as_ref()
-                .unwrap()
-                .layout
-                .slots
-                .iter()
-                .any(|(_, k)| {
-                    matches!(
-                        k,
-                        CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr
-                    )
-                });
         let compact_sort_is_avg =
-            topn_limit > 0 && agg_specs[sort_slot_for_compact_spec].agg_type == AggType::Avg;
-        if topn_limit > 0
-            && having_filters.is_empty()
+            ctx.topn_limit > 0 && agg_specs[sort_slot_for_compact_spec].agg_type == AggType::Avg;
+        if ctx.topn_limit > 0
+            && ctx.having_filters.is_empty()
             && !compact_sort_is_cd
             && !compact_sort_is_avg
         {
             let sort_slot = sort_slot_for_compact_spec;
-            let (_, sort_kind) = compact_storage.as_ref().unwrap().layout.slots[sort_slot];
-            let limit = topn_limit as usize;
-            let k = (topn_limit as usize).max(1000);
+            let (_, sort_kind) = compact_storage.layout.slots[sort_slot];
+            let limit = ctx.topn_limit as usize;
+            let k = (ctx.topn_limit as usize).max(1000);
 
             let read_sort = |storage: &CompactAccStorage, group_idx: u32| -> i64 {
                 match sort_kind {
@@ -1579,7 +1437,7 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                     BuildHasherDefault::default(),
                 );
             let mut floor_sum: i64 = 0;
-            for result in &partial_results {
+            for result in partial_results {
                 if let Some((keys, floor)) = &result.topk {
                     floor_sum = floor_sum.saturating_add(*floor);
                     for &key in keys {
@@ -1606,7 +1464,7 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                 let mut merged: Vec<(i64, u128)> = Vec::with_capacity(candidate_set.len());
                 for &key in &candidate_set {
                     let mut total: i64 = 0;
-                    for result in &partial_results {
+                    for result in partial_results {
                         if let Some(&gidx) = result.compact_map.get(&key) {
                             total = total.saturating_add(read_sort(&result.compact_storage, gidx));
                         }
@@ -1615,7 +1473,7 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                 }
 
                 // Phase 3: Sort and take top-N
-                if !topn_ascending {
+                if !ctx.topn_ascending {
                     merged.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
                 } else {
                     merged.sort_unstable_by_key(|a| a.0);
@@ -1625,7 +1483,7 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                 // Phase 4: Correctness check — can any missed key beat the Nth result?
                 let speculative_ok = if merged.len() >= limit {
                     let nth_value = merged[limit - 1].0;
-                    if !topn_ascending {
+                    if !ctx.topn_ascending {
                         nth_value > floor_sum // missed key total ≤ floor_sum
                     } else {
                         nth_value < floor_sum // missed key total ≥ floor_sum
@@ -1649,7 +1507,7 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                     // Q9-style queries (top-10 GROUP BY with a
                     // COUNT(DISTINCT) over a ~million-distinct column).
                     let t_fin = Instant::now();
-                    let storage = compact_storage.as_mut().unwrap();
+                    let storage = compact_storage;
                     let num_group_keys = group_specs.len();
                     let n_winners = merged.len();
 
@@ -1915,8 +1773,8 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                         }
                         let keys = unpack_int_keys(packed_key, num_group_keys);
                         let mut row: Vec<(pg_sys::Datum, bool)> =
-                            Vec::with_capacity(num_result_cols);
-                        for entry in output_map {
+                            Vec::with_capacity(ctx.num_result_cols);
+                        for entry in ctx.output_map {
                             match entry {
                                 OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
                                 OutputEntry::Group(gi) => {
@@ -1943,42 +1801,18 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                     let pre_topn_groups: usize =
                         partial_results.iter().map(|r| r.compact_map.len()).sum();
 
-                    let state = AggScanState {
-                        _agg_specs: agg_specs,
-                        _group_specs: group_specs,
+                    return Some(CompactMergeOutcome {
                         result_rows,
-                        _num_result_cols: num_result_cols,
-                        metadata_us,
-                        heap_scan_us,
-                        detoast_us: total_detoast_us,
-                        blob_cache_hits: total_cache_hits,
-                        blob_cache_misses: total_cache_misses,
-                        blob_cache_bytes_served: total_cache_bytes_served,
-                        decompress_us,
-                        agg_us,
-                        total_segments,
-                        total_rows_processed,
-                        batch_quals_count: batch_quals.len(),
-                        where_quals_null: where_quals.is_null(),
-                        topn_limit: topn_limit as u64,
-                        topn_sort_col: topn_sort_col as i64,
-                        topn_ascending,
                         pre_topn_groups: pre_topn_groups as u64,
                         merge_us,
                         finalize_us,
                         topn_select_us,
-                        n_workers: n_workers as u64,
-                        wall_us: t_wall.elapsed().as_micros() as u64,
-                        buf_stats: take_scan_buf_stats(),
-                        ..AggScanState::default()
-                    };
-
-                    return state;
+                    });
                 }
                 // Speculation failed — check if all candidates are tied.
                 // When nth_value == all merged candidates' values (e.g. COUNT on unique keys
                 // where every group has count=1), any N groups are valid — skip the expensive
-                // partitioned merge and use the bare_limit-style shortcut.
+                // partitioned merge and use the ctx.bare_limit-style shortcut.
                 let nth_value = merged
                     .get(limit.saturating_sub(1))
                     .map(|x| x.0)
@@ -2002,16 +1836,16 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                     merged.truncate(limit);
 
                     let t_fin = Instant::now();
-                    let storage = compact_storage.as_mut().unwrap();
+                    let storage = compact_storage;
                     let num_group_keys = group_specs.len();
                     let mut result_rows = Vec::with_capacity(merged.len());
-                    let mut spec_cd_sidecar = CountDistinctSideCar::new(&agg_specs);
+                    let mut spec_cd_sidecar = CountDistinctSideCar::new(agg_specs);
 
                     for &(_, packed_key) in &merged {
                         let global_idx = storage.alloc_group();
                         spec_cd_sidecar.alloc_group();
 
-                        for result in &partial_results {
+                        for result in partial_results {
                             if let Some(&worker_idx) = result.compact_map.get(&packed_key) {
                                 for (slot_idx, _) in agg_specs.iter().enumerate() {
                                     let (_, kind) = storage.layout.slots[slot_idx];
@@ -2125,8 +1959,8 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                         }
                         let keys = unpack_int_keys(packed_key, num_group_keys);
                         let mut row: Vec<(pg_sys::Datum, bool)> =
-                            Vec::with_capacity(num_result_cols);
-                        for entry in output_map {
+                            Vec::with_capacity(ctx.num_result_cols);
+                        for entry in ctx.output_map {
                             match entry {
                                 OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
                                 OutputEntry::Group(gi) => {
@@ -2152,38 +1986,599 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                     let pre_topn_groups: usize =
                         partial_results.iter().map(|r| r.compact_map.len()).sum();
 
-                    let state = AggScanState {
-                        _agg_specs: agg_specs,
-                        _group_specs: group_specs,
+                    return Some(CompactMergeOutcome {
                         result_rows,
-                        _num_result_cols: num_result_cols,
-                        metadata_us,
-                        heap_scan_us,
-                        detoast_us: total_detoast_us,
-                        blob_cache_hits: total_cache_hits,
-                        blob_cache_misses: total_cache_misses,
-                        blob_cache_bytes_served: total_cache_bytes_served,
-                        decompress_us,
-                        agg_us,
-                        total_segments,
-                        total_rows_processed,
-                        batch_quals_count: batch_quals.len(),
-                        where_quals_null: where_quals.is_null(),
-                        topn_limit: topn_limit as u64,
-                        topn_sort_col: topn_sort_col as i64,
-                        topn_ascending,
                         pre_topn_groups: pre_topn_groups as u64,
+                        merge_us: 0,
                         finalize_us,
                         topn_select_us: spec_fail_us,
-                        n_workers: n_workers as u64,
-                        wall_us: t_wall.elapsed().as_micros() as u64,
-                        buf_stats: take_scan_buf_stats(),
-                        ..AggScanState::default()
-                    };
-
-                    return state;
+                    });
                 }
             } // end else (phase2 cost guard)
+        }
+        None
+    }
+}
+
+/// Partitioned parallel merge + top-N for the compact path. Partitions
+/// the key space across `n_workers` threads; each merges its slice,
+/// finds local top-N, then a final merge picks the global top-N.
+///
+/// Caller has already gated `topn_limit > 0`.
+#[inline]
+unsafe fn compact_partitioned_topn(
+    ctx: &CompactMergeCtx<'_>,
+    agg_specs: &[AggExecSpec],
+    group_specs: &[GroupByColSpec],
+    partial_results: &[ParallelCompactResult],
+) -> CompactMergeOutcome {
+    unsafe {
+        let t_merge = Instant::now();
+        let limit = ctx.topn_limit as usize;
+        let sort_slot = match ctx.output_map[ctx.topn_sort_col] {
+            OutputEntry::Agg(ai) => ai,
+            _ => unreachable!(),
+        };
+        let n_partitions = ctx.n_workers;
+
+        let pre_topn_groups: usize = partial_results.iter().map(|r| r.compact_map.len()).sum();
+
+        // Each partition thread: merge its slice, find local top-N,
+        // copy winners to mini storage, drop the rest.
+        #[allow(clippy::type_complexity)]
+        let partition_results: Vec<(CompactAccStorage, Vec<(i64, u128, u32)>)> =
+            std::thread::scope(|s| {
+                let workers = partial_results;
+                let specs = &agg_specs;
+                let np = n_partitions;
+                let ascending = ctx.topn_ascending;
+                let hfilters = ctx.having_filters;
+
+                let handles: Vec<_> = (0..np)
+                    .map(|p| {
+                        s.spawn(move || {
+                            let layout = CompactAccLayout::new(specs);
+                            let n_slots = layout.slots.len();
+                            let mut map: CompactGroupMap =
+                                CompactGroupMap::with_hasher(Default::default());
+                            let mut storage = CompactAccStorage::new(layout);
+                            let mut cd_sidecar = CountDistinctSideCar::new(specs);
+
+                            // Merge entries from all workers belonging to this partition
+                            for worker in workers {
+                                for (&key, &wgidx) in &worker.compact_map {
+                                    if ((key as u64) ^ ((key >> 64) as u64)) as usize % np != p {
+                                        continue;
+                                    }
+                                    let gidx = match map.entry(key) {
+                                        hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
+                                        hashbrown::hash_map::Entry::Vacant(e) => {
+                                            let idx = storage.alloc_group();
+                                            cd_sidecar.alloc_group();
+                                            e.insert(idx);
+                                            idx
+                                        }
+                                    };
+                                    for slot_idx in 0..n_slots {
+                                        let (_, kind) = storage.layout.slots[slot_idx];
+                                        match kind {
+                                            CompactAccKind::Count => {
+                                                let wc = worker
+                                                    .compact_storage
+                                                    .read_count(wgidx, slot_idx);
+                                                *storage.count_mut(gidx, slot_idx) += wc;
+                                            }
+                                            CompactAccKind::SumInt => {
+                                                let (ws, wc) = worker
+                                                    .compact_storage
+                                                    .read_sum_int(wgidx, slot_idx);
+                                                let (gs, gc) = storage.sum_int_mut(gidx, slot_idx);
+                                                *gs += ws;
+                                                *gc += wc;
+                                            }
+                                            CompactAccKind::SumIntNarrow => {
+                                                let (ws, wc) = worker
+                                                    .compact_storage
+                                                    .read_sum_int_narrow(wgidx, slot_idx);
+                                                let (gs, gc) =
+                                                    storage.sum_int_narrow_mut(gidx, slot_idx);
+                                                *gs += ws;
+                                                *gc += wc;
+                                            }
+                                            CompactAccKind::SumFloat => {
+                                                let (ws, wc) = worker
+                                                    .compact_storage
+                                                    .read_sum_float(wgidx, slot_idx);
+                                                let (gs, gc) =
+                                                    storage.sum_float_mut(gidx, slot_idx);
+                                                *gs += ws;
+                                                *gc += wc;
+                                            }
+                                            CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                                                let (w_off, w_len) = worker
+                                                    .compact_storage
+                                                    .read_min_max_str(wgidx, slot_idx);
+                                                if w_off != u32::MAX {
+                                                    let w_str = worker
+                                                        .compact_storage
+                                                        .str_arena
+                                                        .get(w_off, w_len);
+                                                    let (g_off, g_len) =
+                                                        storage.read_min_max_str(gidx, slot_idx);
+                                                    let should_update = if g_off == u32::MAX {
+                                                        true
+                                                    } else {
+                                                        let g_str =
+                                                            storage.str_arena.get(g_off, g_len);
+                                                        let cmp = strcoll_cmp(w_str, g_str);
+                                                        match kind {
+                                                            CompactAccKind::MinStr => {
+                                                                cmp == std::cmp::Ordering::Less
+                                                            }
+                                                            _ => cmp == std::cmp::Ordering::Greater,
+                                                        }
+                                                    };
+                                                    if should_update {
+                                                        let w_str = worker
+                                                            .compact_storage
+                                                            .str_arena
+                                                            .get(w_off, w_len);
+                                                        let (new_off, new_len) =
+                                                            storage.str_arena.alloc(w_str);
+                                                        storage.write_min_max_str(
+                                                            gidx, slot_idx, new_off, new_len,
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            CompactAccKind::MinInt => {
+                                                let (w_val, w_has) = worker
+                                                    .compact_storage
+                                                    .read_min_max_int(wgidx, slot_idx);
+                                                if w_has {
+                                                    storage.update_min_int(gidx, slot_idx, w_val);
+                                                }
+                                            }
+                                            CompactAccKind::MaxInt => {
+                                                let (w_val, w_has) = worker
+                                                    .compact_storage
+                                                    .read_min_max_int(wgidx, slot_idx);
+                                                if w_has {
+                                                    storage.update_max_int(gidx, slot_idx, w_val);
+                                                }
+                                            }
+                                            CompactAccKind::CountDistinctInt
+                                            | CompactAccKind::CountDistinctStr => {
+                                                cd_sidecar.union_from(
+                                                    slot_idx,
+                                                    gidx,
+                                                    &worker.cd_sidecar,
+                                                    wgidx,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Write CD counts into storage before top-N selection
+                            cd_sidecar.write_counts_to_storage(&mut storage, &map);
+
+                            // Local top-N selection using a heap
+                            let (_, sort_kind) = storage.layout.slots[sort_slot];
+                            let sort_is_avg = specs[sort_slot].agg_type == AggType::Avg;
+                            let read_val = |gidx: u32| -> i64 {
+                                if sort_is_avg {
+                                    let avg = match sort_kind {
+                                        CompactAccKind::SumIntNarrow => {
+                                            let (s, c) =
+                                                storage.read_sum_int_narrow(gidx, sort_slot);
+                                            if c > 0 { s as f64 / c as f64 } else { 0.0 }
+                                        }
+                                        CompactAccKind::SumFloat => {
+                                            let (s, c) = storage.read_sum_float(gidx, sort_slot);
+                                            if c > 0 { s / c as f64 } else { 0.0 }
+                                        }
+                                        _ => storage.read_count(gidx, sort_slot) as f64,
+                                    };
+                                    let bits = avg.to_bits() as i64;
+                                    if bits >= 0 { bits } else { bits ^ i64::MAX }
+                                } else {
+                                    match sort_kind {
+                                        CompactAccKind::Count => {
+                                            storage.read_count(gidx, sort_slot)
+                                        }
+                                        CompactAccKind::SumIntNarrow => {
+                                            storage.read_sum_int_narrow(gidx, sort_slot).0
+                                        }
+                                        CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+                                            storage.read_min_max_int(gidx, sort_slot).0
+                                        }
+                                        _ => storage.read_count(gidx, sort_slot),
+                                    }
+                                }
+                            };
+
+                            let having_read_val = |gidx: u32, slot: usize| -> i64 {
+                                let (_, kind) = storage.layout.slots[slot];
+                                match kind {
+                                    CompactAccKind::Count => storage.read_count(gidx, slot),
+                                    CompactAccKind::SumIntNarrow => {
+                                        storage.read_sum_int_narrow(gidx, slot).0
+                                    }
+                                    _ => storage.read_count(gidx, slot),
+                                }
+                            };
+
+                            let winners: Vec<(i64, u128, u32)> = if ascending {
+                                // Keep smallest N: max-heap evicts largest
+                                let mut heap: BinaryHeap<(i64, u128, u32)> =
+                                    BinaryHeap::with_capacity(limit + 1);
+                                for (&key, &gidx) in &map {
+                                    let mut passes = true;
+                                    for hf in hfilters {
+                                        let val = having_read_val(gidx, hf.agg_idx);
+                                        let ok = match hf.op {
+                                            HavingOp::Gt => val > hf.const_val,
+                                            HavingOp::Lt => val < hf.const_val,
+                                            HavingOp::Ge => val >= hf.const_val,
+                                            HavingOp::Le => val <= hf.const_val,
+                                            HavingOp::Eq => val == hf.const_val,
+                                            HavingOp::Ne => val != hf.const_val,
+                                        };
+                                        if !ok {
+                                            passes = false;
+                                            break;
+                                        }
+                                    }
+                                    if !passes {
+                                        continue;
+                                    }
+                                    let val = read_val(gidx);
+                                    heap.push((val, key, gidx));
+                                    if heap.len() > limit {
+                                        heap.pop();
+                                    }
+                                }
+                                heap.into_vec()
+                            } else {
+                                // Keep largest N: min-heap (Reverse) evicts smallest
+                                let mut heap: BinaryHeap<Reverse<(i64, u128, u32)>> =
+                                    BinaryHeap::with_capacity(limit + 1);
+                                for (&key, &gidx) in &map {
+                                    let mut passes = true;
+                                    for hf in hfilters {
+                                        let val = having_read_val(gidx, hf.agg_idx);
+                                        let ok = match hf.op {
+                                            HavingOp::Gt => val > hf.const_val,
+                                            HavingOp::Lt => val < hf.const_val,
+                                            HavingOp::Ge => val >= hf.const_val,
+                                            HavingOp::Le => val <= hf.const_val,
+                                            HavingOp::Eq => val == hf.const_val,
+                                            HavingOp::Ne => val != hf.const_val,
+                                        };
+                                        if !ok {
+                                            passes = false;
+                                            break;
+                                        }
+                                    }
+                                    if !passes {
+                                        continue;
+                                    }
+                                    let val = read_val(gidx);
+                                    heap.push(Reverse((val, key, gidx)));
+                                    if heap.len() > limit {
+                                        heap.pop();
+                                    }
+                                }
+                                heap.into_iter().map(|Reverse(x)| x).collect()
+                            };
+
+                            drop(map); // free partition map (~250MB)
+
+                            // Copy winning groups to tiny mini-storage
+                            let layout2 = CompactAccLayout::new(specs);
+                            let stride = storage.layout.group_stride;
+                            let mut mini = CompactAccStorage::new(layout2);
+                            let mut top_entries = Vec::with_capacity(winners.len());
+
+                            for (sort_val, key, old_gidx) in winners {
+                                let new_gidx = mini.alloc_group();
+                                let src = old_gidx as usize * stride;
+                                let dst = new_gidx as usize * stride;
+                                mini.buf[dst..dst + stride]
+                                    .copy_from_slice(&storage.buf[src..src + stride]);
+                                // Remap MinStr/MaxStr arena references
+                                for slot_idx in 0..n_slots {
+                                    let (_, kind) = storage.layout.slots[slot_idx];
+                                    if kind == CompactAccKind::MinStr
+                                        || kind == CompactAccKind::MaxStr
+                                    {
+                                        let (off, len) =
+                                            storage.read_min_max_str(old_gidx, slot_idx);
+                                        if off != u32::MAX {
+                                            let val_str = storage.str_arena.get(off, len);
+                                            let (no, nl) = mini.str_arena.alloc(val_str);
+                                            mini.write_min_max_str(new_gidx, slot_idx, no, nl);
+                                        }
+                                    }
+                                }
+                                top_entries.push((sort_val, key, new_gidx));
+                            }
+
+                            drop(storage); // free full partition storage
+
+                            (mini, top_entries)
+                        })
+                    })
+                    .collect();
+
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+
+        let merge_us = t_merge.elapsed().as_micros() as u64;
+
+        // Merge all partition top entries, select global top-N
+        let t_finalize = Instant::now();
+        let mut all_candidates: Vec<(i64, u128, u32, usize)> = Vec::new();
+        for (pi, (_, entries)) in partition_results.iter().enumerate() {
+            for &(sort_val, key, gidx) in entries {
+                all_candidates.push((sort_val, key, gidx, pi));
+            }
+        }
+        if ctx.topn_ascending {
+            all_candidates.sort_unstable_by_key(|a| a.0);
+        } else {
+            all_candidates.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
+        }
+        all_candidates.truncate(limit);
+
+        let num_group_keys = group_specs.len();
+        let mut result_rows = Vec::with_capacity(limit);
+        for &(_sort_val, key, mini_gidx, pi) in &all_candidates {
+            let storage = &partition_results[pi].0;
+            let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
+            for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                agg_results.push(compact_finalize(storage, mini_gidx, spec_idx, spec));
+            }
+            let keys = unpack_int_keys(key, num_group_keys);
+            let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(ctx.num_result_cols);
+            for entry in ctx.output_map {
+                match entry {
+                    OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
+                    OutputEntry::Group(gi) => {
+                        let v = keys[*gi];
+                        if matches!(group_specs[*gi].expr, GroupByExpr::Extract { .. }) {
+                            row.push((i128_to_numeric_datum(v as i128), false));
+                        } else {
+                            row.push((pg_sys::Datum::from(v as usize), false));
+                        }
+                    }
+                    OutputEntry::DerivedGroup { base_gi, delta } => {
+                        let v = keys[*base_gi] + delta;
+                        row.push((pg_sys::Datum::from(v as usize), false));
+                    }
+                    OutputEntry::Const(d, n) => row.push((*d, *n)),
+                }
+            }
+            result_rows.push(row);
+        }
+        let finalize_us = t_finalize.elapsed().as_micros() as u64;
+
+        CompactMergeOutcome {
+            result_rows,
+            pre_topn_groups: pre_topn_groups as u64,
+            merge_us,
+            finalize_us,
+            topn_select_us: 0,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::ptr_arg)]
+pub(super) unsafe fn dispatch_parallel_compact_path(
+    agg_specs: Vec<AggExecSpec>,
+    group_specs: Vec<GroupByColSpec>,
+    output_map: &[OutputEntry],
+    having_filters: &[HavingFilter],
+    where_quals: *mut pg_sys::List,
+    topn_limit: i64,
+    topn_sort_col: usize,
+    topn_ascending: bool,
+    bare_limit: i64,
+    meta: &MetadataInfo,
+    all_segments: &mut [SegmentData],
+    needed_cols: &[bool],
+    batch_quals: &[BatchQual],
+    seg_filters: &[(usize, String)],
+    time_min: Option<i64>,
+    time_max: Option<i64>,
+    n_workers: usize,
+    use_lazy: bool,
+    num_result_cols: usize,
+    metadata_us: u64,
+    heap_scan_us: u64,
+    t_wall: Instant,
+    mut compact_storage: Option<CompactAccStorage>,
+    mut total_detoast_us: u64,
+    mut total_cache_hits: u64,
+    mut total_cache_misses: u64,
+    mut total_cache_bytes_served: u64,
+) -> AggScanState {
+    let has_group_by = !group_specs.is_empty();
+    #[allow(unused_assignments)] // overwritten by `largest.compact_map` on the merge branch
+    let mut compact_group_map: CompactGroupMap =
+        CompactGroupMap::with_hasher(BuildHasherDefault::default());
+    unsafe {
+        let t2 = Instant::now();
+        // If top-N is active with no HAVING, tell workers to compute
+        // top-K candidates while their data is still cache-hot.
+        let topn_spec = if topn_limit > 0 && having_filters.is_empty() {
+            let sort_slot = match output_map[topn_sort_col] {
+                OutputEntry::Agg(ai) => ai,
+                _ => unreachable!(),
+            };
+            // AVG sort can't use raw sum for speculative top-K pruning
+            if agg_specs[sort_slot].agg_type == AggType::Avg {
+                None
+            } else {
+                let k = (topn_limit as usize).max(1000);
+                Some((sort_slot, k, topn_ascending))
+            }
+        } else {
+            None
+        };
+
+        let config = ParallelCompactConfig {
+            agg_specs: &agg_specs,
+            group_specs: &group_specs,
+            col_names: &meta.col_names,
+            col_types: &meta.col_types,
+            segment_by: &meta.segment_by,
+            needed_cols,
+            batch_quals,
+            seg_filters,
+            time_min,
+            time_max,
+            topn_spec,
+        };
+
+        // Pipeline detoast with parallel processing when enough segments
+        // to amortize thread::scope overhead; otherwise single scope.
+        let use_pipeline = use_lazy && all_segments.len() >= n_workers * 16;
+
+        if use_lazy {
+            let t_detoast = Instant::now();
+            if use_pipeline {
+                // Detoast only the first batch; rest overlaps with workers
+                let n_batches = (n_workers * 2).max(2).min(all_segments.len());
+                let batch_size = all_segments.len().div_ceil(n_batches);
+                let first_end = batch_size.min(all_segments.len());
+                for seg in &mut all_segments[..first_end] {
+                    let dl = detoast_lazy_blobs(seg);
+                    total_cache_hits += dl.cache_hits;
+                    total_cache_misses += dl.cache_misses;
+                    total_cache_bytes_served += dl.cache_bytes_served;
+                }
+            } else {
+                // Few segments — detoast all upfront, single scope below
+                for seg in all_segments.iter_mut() {
+                    let dl = detoast_lazy_blobs(seg);
+                    total_cache_hits += dl.cache_hits;
+                    total_cache_misses += dl.cache_misses;
+                    total_cache_bytes_served += dl.cache_bytes_served;
+                }
+            }
+            total_detoast_us += t_detoast.elapsed().as_micros() as u64;
+        }
+
+        let mut pipeline_detoast_us: u64 = 0;
+        let partial_results: Vec<ParallelCompactResult> = if use_pipeline {
+            let n_batches = (n_workers * 2).max(2).min(all_segments.len());
+            let batch_size = all_segments.len().div_ceil(n_batches);
+            let mut results: Vec<ParallelCompactResult> = Vec::new();
+            let mut batch_start = 0;
+            let total_segs = all_segments.len();
+
+            while batch_start < total_segs {
+                let batch_end = (batch_start + batch_size).min(total_segs);
+                let next_end = (batch_end + batch_size).min(total_segs);
+
+                let (done, pending) = all_segments.split_at_mut(batch_end);
+                let current_batch = &done[batch_start..];
+
+                std::thread::scope(|s| {
+                    let chunk_size = current_batch.len().div_ceil(n_workers);
+                    let handles: Vec<_> = current_batch
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            let cfg = &config;
+                            s.spawn(move || process_segments_compact(chunk, cfg))
+                        })
+                        .collect();
+
+                    // Main thread detoasts next batch while workers run
+                    if batch_end < total_segs {
+                        let t_pd = Instant::now();
+                        for seg in &mut pending[..next_end - batch_end] {
+                            let dl = detoast_lazy_blobs(seg);
+                            total_cache_hits += dl.cache_hits;
+                            total_cache_misses += dl.cache_misses;
+                            total_cache_bytes_served += dl.cache_bytes_served;
+                        }
+                        pipeline_detoast_us += t_pd.elapsed().as_micros() as u64;
+                    }
+
+                    for h in handles {
+                        results.push(h.join().unwrap());
+                    }
+                });
+
+                batch_start = batch_end;
+            }
+            results
+        } else {
+            // Single scope — original path (or lazy already detoasted above)
+            let chunk_size = all_segments.len().div_ceil(n_workers);
+            std::thread::scope(|s| {
+                let handles: Vec<_> = all_segments
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        let cfg = &config;
+                        s.spawn(move || process_segments_compact(chunk, cfg))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            })
+        };
+
+        // Accumulate stats from all workers
+        let scan_wall_us = t2.elapsed().as_micros() as u64;
+        let mut total_segments: u64 = 0;
+        let mut total_rows_processed: u64 = 0;
+        let mut decompress_us: u64 = 0;
+        for result in &partial_results {
+            total_segments += result.segments_processed;
+            total_rows_processed += result.rows_processed;
+            decompress_us = decompress_us.max(result.decompress_us);
+        }
+        total_detoast_us += pipeline_detoast_us;
+        let agg_us = scan_wall_us.saturating_sub(decompress_us + pipeline_detoast_us);
+
+        let merge_ctx = CompactMergeCtx {
+            output_map,
+            having_filters,
+            where_quals,
+            topn_limit,
+            topn_sort_col,
+            topn_ascending,
+            bare_limit,
+            batch_quals,
+            n_workers,
+            num_result_cols,
+            has_group_by,
+            metadata_us,
+            heap_scan_us,
+            total_detoast_us,
+            total_cache_hits,
+            total_cache_misses,
+            total_cache_bytes_served,
+            decompress_us,
+            agg_us,
+            total_segments,
+            total_rows_processed,
+            t_wall,
+        };
+
+        // Speculative top-N — see `compact_speculative_topn`.
+        if let Some(outcome) = compact_speculative_topn(
+            &merge_ctx,
+            &agg_specs,
+            &group_specs,
+            &partial_results,
+            compact_storage.as_mut().unwrap(),
+        ) {
+            return build_topn_agg_scan_state(&merge_ctx, agg_specs, group_specs, outcome);
         }
 
         // Bare LIMIT short-circuit for compact path — see `compact_bare_limit`.
@@ -2197,402 +2592,11 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
             );
         }
 
-        // ----------------------------------------------------------
-        // Partitioned parallel merge + top-N: partition key space
-        // across threads, each merges its slice and finds local
-        // top-N, then merge the local results.
-        // ----------------------------------------------------------
+        // Partitioned parallel merge + top-N — see `compact_partitioned_topn`.
         if topn_limit > 0 {
-            let t_merge = Instant::now();
-            let limit = topn_limit as usize;
-            let sort_slot = match output_map[topn_sort_col] {
-                OutputEntry::Agg(ai) => ai,
-                _ => unreachable!(),
-            };
-            let n_partitions = n_workers;
-
-            let pre_topn_groups: usize = partial_results.iter().map(|r| r.compact_map.len()).sum();
-
-            // Each partition thread: merge its slice, find local top-N,
-            // copy winners to mini storage, drop the rest.
-            #[allow(clippy::type_complexity)]
-            let partition_results: Vec<(CompactAccStorage, Vec<(i64, u128, u32)>)> =
-                std::thread::scope(|s| {
-                    let workers = &partial_results;
-                    let specs = &agg_specs;
-                    let np = n_partitions;
-                    let ascending = topn_ascending;
-                    let hfilters = having_filters;
-
-                    let handles: Vec<_> = (0..np)
-                        .map(|p| {
-                            s.spawn(move || {
-                                let layout = CompactAccLayout::new(specs);
-                                let n_slots = layout.slots.len();
-                                let mut map: CompactGroupMap =
-                                    CompactGroupMap::with_hasher(Default::default());
-                                let mut storage = CompactAccStorage::new(layout);
-                                let mut cd_sidecar = CountDistinctSideCar::new(specs);
-
-                                // Merge entries from all workers belonging to this partition
-                                for worker in workers {
-                                    for (&key, &wgidx) in &worker.compact_map {
-                                        if ((key as u64) ^ ((key >> 64) as u64)) as usize % np != p
-                                        {
-                                            continue;
-                                        }
-                                        let gidx = match map.entry(key) {
-                                            hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
-                                            hashbrown::hash_map::Entry::Vacant(e) => {
-                                                let idx = storage.alloc_group();
-                                                cd_sidecar.alloc_group();
-                                                e.insert(idx);
-                                                idx
-                                            }
-                                        };
-                                        for slot_idx in 0..n_slots {
-                                            let (_, kind) = storage.layout.slots[slot_idx];
-                                            match kind {
-                                                CompactAccKind::Count => {
-                                                    let wc = worker
-                                                        .compact_storage
-                                                        .read_count(wgidx, slot_idx);
-                                                    *storage.count_mut(gidx, slot_idx) += wc;
-                                                }
-                                                CompactAccKind::SumInt => {
-                                                    let (ws, wc) = worker
-                                                        .compact_storage
-                                                        .read_sum_int(wgidx, slot_idx);
-                                                    let (gs, gc) =
-                                                        storage.sum_int_mut(gidx, slot_idx);
-                                                    *gs += ws;
-                                                    *gc += wc;
-                                                }
-                                                CompactAccKind::SumIntNarrow => {
-                                                    let (ws, wc) = worker
-                                                        .compact_storage
-                                                        .read_sum_int_narrow(wgidx, slot_idx);
-                                                    let (gs, gc) =
-                                                        storage.sum_int_narrow_mut(gidx, slot_idx);
-                                                    *gs += ws;
-                                                    *gc += wc;
-                                                }
-                                                CompactAccKind::SumFloat => {
-                                                    let (ws, wc) = worker
-                                                        .compact_storage
-                                                        .read_sum_float(wgidx, slot_idx);
-                                                    let (gs, gc) =
-                                                        storage.sum_float_mut(gidx, slot_idx);
-                                                    *gs += ws;
-                                                    *gc += wc;
-                                                }
-                                                CompactAccKind::MinStr | CompactAccKind::MaxStr => {
-                                                    let (w_off, w_len) = worker
-                                                        .compact_storage
-                                                        .read_min_max_str(wgidx, slot_idx);
-                                                    if w_off != u32::MAX {
-                                                        let w_str = worker
-                                                            .compact_storage
-                                                            .str_arena
-                                                            .get(w_off, w_len);
-                                                        let (g_off, g_len) = storage
-                                                            .read_min_max_str(gidx, slot_idx);
-                                                        let should_update = if g_off == u32::MAX {
-                                                            true
-                                                        } else {
-                                                            let g_str =
-                                                                storage.str_arena.get(g_off, g_len);
-                                                            let cmp = strcoll_cmp(w_str, g_str);
-                                                            match kind {
-                                                                CompactAccKind::MinStr => {
-                                                                    cmp == std::cmp::Ordering::Less
-                                                                }
-                                                                _ => cmp
-                                                                    == std::cmp::Ordering::Greater,
-                                                            }
-                                                        };
-                                                        if should_update {
-                                                            let w_str = worker
-                                                                .compact_storage
-                                                                .str_arena
-                                                                .get(w_off, w_len);
-                                                            let (new_off, new_len) =
-                                                                storage.str_arena.alloc(w_str);
-                                                            storage.write_min_max_str(
-                                                                gidx, slot_idx, new_off, new_len,
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                CompactAccKind::MinInt => {
-                                                    let (w_val, w_has) = worker
-                                                        .compact_storage
-                                                        .read_min_max_int(wgidx, slot_idx);
-                                                    if w_has {
-                                                        storage
-                                                            .update_min_int(gidx, slot_idx, w_val);
-                                                    }
-                                                }
-                                                CompactAccKind::MaxInt => {
-                                                    let (w_val, w_has) = worker
-                                                        .compact_storage
-                                                        .read_min_max_int(wgidx, slot_idx);
-                                                    if w_has {
-                                                        storage
-                                                            .update_max_int(gidx, slot_idx, w_val);
-                                                    }
-                                                }
-                                                CompactAccKind::CountDistinctInt
-                                                | CompactAccKind::CountDistinctStr => {
-                                                    cd_sidecar.union_from(
-                                                        slot_idx,
-                                                        gidx,
-                                                        &worker.cd_sidecar,
-                                                        wgidx,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Write CD counts into storage before top-N selection
-                                cd_sidecar.write_counts_to_storage(&mut storage, &map);
-
-                                // Local top-N selection using a heap
-                                let (_, sort_kind) = storage.layout.slots[sort_slot];
-                                let sort_is_avg = specs[sort_slot].agg_type == AggType::Avg;
-                                let read_val = |gidx: u32| -> i64 {
-                                    if sort_is_avg {
-                                        let avg = match sort_kind {
-                                            CompactAccKind::SumIntNarrow => {
-                                                let (s, c) =
-                                                    storage.read_sum_int_narrow(gidx, sort_slot);
-                                                if c > 0 { s as f64 / c as f64 } else { 0.0 }
-                                            }
-                                            CompactAccKind::SumFloat => {
-                                                let (s, c) =
-                                                    storage.read_sum_float(gidx, sort_slot);
-                                                if c > 0 { s / c as f64 } else { 0.0 }
-                                            }
-                                            _ => storage.read_count(gidx, sort_slot) as f64,
-                                        };
-                                        let bits = avg.to_bits() as i64;
-                                        if bits >= 0 { bits } else { bits ^ i64::MAX }
-                                    } else {
-                                        match sort_kind {
-                                            CompactAccKind::Count => {
-                                                storage.read_count(gidx, sort_slot)
-                                            }
-                                            CompactAccKind::SumIntNarrow => {
-                                                storage.read_sum_int_narrow(gidx, sort_slot).0
-                                            }
-                                            CompactAccKind::MinInt | CompactAccKind::MaxInt => {
-                                                storage.read_min_max_int(gidx, sort_slot).0
-                                            }
-                                            _ => storage.read_count(gidx, sort_slot),
-                                        }
-                                    }
-                                };
-
-                                let having_read_val = |gidx: u32, slot: usize| -> i64 {
-                                    let (_, kind) = storage.layout.slots[slot];
-                                    match kind {
-                                        CompactAccKind::Count => storage.read_count(gidx, slot),
-                                        CompactAccKind::SumIntNarrow => {
-                                            storage.read_sum_int_narrow(gidx, slot).0
-                                        }
-                                        _ => storage.read_count(gidx, slot),
-                                    }
-                                };
-
-                                let winners: Vec<(i64, u128, u32)> = if ascending {
-                                    // Keep smallest N: max-heap evicts largest
-                                    let mut heap: BinaryHeap<(i64, u128, u32)> =
-                                        BinaryHeap::with_capacity(limit + 1);
-                                    for (&key, &gidx) in &map {
-                                        let mut passes = true;
-                                        for hf in hfilters {
-                                            let val = having_read_val(gidx, hf.agg_idx);
-                                            let ok = match hf.op {
-                                                HavingOp::Gt => val > hf.const_val,
-                                                HavingOp::Lt => val < hf.const_val,
-                                                HavingOp::Ge => val >= hf.const_val,
-                                                HavingOp::Le => val <= hf.const_val,
-                                                HavingOp::Eq => val == hf.const_val,
-                                                HavingOp::Ne => val != hf.const_val,
-                                            };
-                                            if !ok {
-                                                passes = false;
-                                                break;
-                                            }
-                                        }
-                                        if !passes {
-                                            continue;
-                                        }
-                                        let val = read_val(gidx);
-                                        heap.push((val, key, gidx));
-                                        if heap.len() > limit {
-                                            heap.pop();
-                                        }
-                                    }
-                                    heap.into_vec()
-                                } else {
-                                    // Keep largest N: min-heap (Reverse) evicts smallest
-                                    let mut heap: BinaryHeap<Reverse<(i64, u128, u32)>> =
-                                        BinaryHeap::with_capacity(limit + 1);
-                                    for (&key, &gidx) in &map {
-                                        let mut passes = true;
-                                        for hf in hfilters {
-                                            let val = having_read_val(gidx, hf.agg_idx);
-                                            let ok = match hf.op {
-                                                HavingOp::Gt => val > hf.const_val,
-                                                HavingOp::Lt => val < hf.const_val,
-                                                HavingOp::Ge => val >= hf.const_val,
-                                                HavingOp::Le => val <= hf.const_val,
-                                                HavingOp::Eq => val == hf.const_val,
-                                                HavingOp::Ne => val != hf.const_val,
-                                            };
-                                            if !ok {
-                                                passes = false;
-                                                break;
-                                            }
-                                        }
-                                        if !passes {
-                                            continue;
-                                        }
-                                        let val = read_val(gidx);
-                                        heap.push(Reverse((val, key, gidx)));
-                                        if heap.len() > limit {
-                                            heap.pop();
-                                        }
-                                    }
-                                    heap.into_iter().map(|Reverse(x)| x).collect()
-                                };
-
-                                drop(map); // free partition map (~250MB)
-
-                                // Copy winning groups to tiny mini-storage
-                                let layout2 = CompactAccLayout::new(specs);
-                                let stride = storage.layout.group_stride;
-                                let mut mini = CompactAccStorage::new(layout2);
-                                let mut top_entries = Vec::with_capacity(winners.len());
-
-                                for (sort_val, key, old_gidx) in winners {
-                                    let new_gidx = mini.alloc_group();
-                                    let src = old_gidx as usize * stride;
-                                    let dst = new_gidx as usize * stride;
-                                    mini.buf[dst..dst + stride]
-                                        .copy_from_slice(&storage.buf[src..src + stride]);
-                                    // Remap MinStr/MaxStr arena references
-                                    for slot_idx in 0..n_slots {
-                                        let (_, kind) = storage.layout.slots[slot_idx];
-                                        if kind == CompactAccKind::MinStr
-                                            || kind == CompactAccKind::MaxStr
-                                        {
-                                            let (off, len) =
-                                                storage.read_min_max_str(old_gidx, slot_idx);
-                                            if off != u32::MAX {
-                                                let val_str = storage.str_arena.get(off, len);
-                                                let (no, nl) = mini.str_arena.alloc(val_str);
-                                                mini.write_min_max_str(new_gidx, slot_idx, no, nl);
-                                            }
-                                        }
-                                    }
-                                    top_entries.push((sort_val, key, new_gidx));
-                                }
-
-                                drop(storage); // free full partition storage
-
-                                (mini, top_entries)
-                            })
-                        })
-                        .collect();
-
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
-                });
-
-            drop(partial_results); // free all worker data
-
-            let merge_us = t_merge.elapsed().as_micros() as u64;
-
-            // Merge all partition top entries, select global top-N
-            let t_finalize = Instant::now();
-            let mut all_candidates: Vec<(i64, u128, u32, usize)> = Vec::new();
-            for (pi, (_, entries)) in partition_results.iter().enumerate() {
-                for &(sort_val, key, gidx) in entries {
-                    all_candidates.push((sort_val, key, gidx, pi));
-                }
-            }
-            if topn_ascending {
-                all_candidates.sort_unstable_by_key(|a| a.0);
-            } else {
-                all_candidates.sort_unstable_by_key(|b| std::cmp::Reverse(b.0));
-            }
-            all_candidates.truncate(limit);
-
-            let num_group_keys = group_specs.len();
-            let mut result_rows = Vec::with_capacity(limit);
-            for &(_sort_val, key, mini_gidx, pi) in &all_candidates {
-                let storage = &partition_results[pi].0;
-                let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
-                for (spec_idx, spec) in agg_specs.iter().enumerate() {
-                    agg_results.push(compact_finalize(storage, mini_gidx, spec_idx, spec));
-                }
-                let keys = unpack_int_keys(key, num_group_keys);
-                let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
-                for entry in output_map {
-                    match entry {
-                        OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
-                        OutputEntry::Group(gi) => {
-                            let v = keys[*gi];
-                            if matches!(group_specs[*gi].expr, GroupByExpr::Extract { .. }) {
-                                row.push((i128_to_numeric_datum(v as i128), false));
-                            } else {
-                                row.push((pg_sys::Datum::from(v as usize), false));
-                            }
-                        }
-                        OutputEntry::DerivedGroup { base_gi, delta } => {
-                            let v = keys[*base_gi] + delta;
-                            row.push((pg_sys::Datum::from(v as usize), false));
-                        }
-                        OutputEntry::Const(d, n) => row.push((*d, *n)),
-                    }
-                }
-                result_rows.push(row);
-            }
-            let finalize_us = t_finalize.elapsed().as_micros() as u64;
-
-            let state = AggScanState {
-                _agg_specs: agg_specs,
-                _group_specs: group_specs,
-                result_rows,
-                _num_result_cols: num_result_cols,
-                metadata_us,
-                heap_scan_us,
-                detoast_us: total_detoast_us,
-                blob_cache_hits: total_cache_hits,
-                blob_cache_misses: total_cache_misses,
-                blob_cache_bytes_served: total_cache_bytes_served,
-                decompress_us,
-                agg_us,
-                total_segments,
-                total_rows_processed,
-                batch_quals_count: batch_quals.len(),
-                where_quals_null: where_quals.is_null(),
-                topn_limit: topn_limit as u64,
-                topn_sort_col: topn_sort_col as i64,
-                topn_ascending,
-                pre_topn_groups: pre_topn_groups as u64,
-                merge_us,
-                finalize_us,
-                n_workers: n_workers as u64,
-                wall_us: t_wall.elapsed().as_micros() as u64,
-                buf_stats: take_scan_buf_stats(),
-                ..AggScanState::default()
-            };
-
-            return state;
+            let outcome =
+                compact_partitioned_topn(&merge_ctx, &agg_specs, &group_specs, &partial_results);
+            return build_topn_agg_scan_state(&merge_ctx, agg_specs, group_specs, outcome);
         }
 
         // Fallthrough: full merge path — see `compact_full_merge`.
