@@ -114,16 +114,19 @@ helper usually closes the gap.
 
 ---
 
-### Session 2 — split `begin_agg_scan` into 5 dispatch functions
+### Session 2 — split `begin_agg_scan` into 4 dispatch functions
 
-Inside `agg/callbacks.rs`, extract one fn per banner section:
+Inside `agg/callbacks.rs`, extract one fn per parallel banner section
+plus one combined serial fn (the two single-threaded banners share
+all of their per-segment setup, so they collapse to one dispatch with
+a 2-arm row-loop branch inside — Session 6 then peels that branch
+out as helpers):
 
 ```rust
-fn dispatch_parallel_compact(ctx: &mut ExecCtx, …) -> AccumResults { … }
-fn dispatch_parallel_mixed(ctx: &mut ExecCtx, …) -> AccumResults { … }
-fn dispatch_parallel_count_distinct(ctx: &mut ExecCtx, …) -> AccumResults { … }
-fn dispatch_serial_compact(ctx: &mut ExecCtx, …) -> AccumResults { … }
-fn dispatch_serial_generic(ctx: &mut ExecCtx, …) -> AccumResults { … }
+fn dispatch_parallel_compact_path(ctx: &mut ExecCtx, …) -> AccumResults { … }
+fn dispatch_parallel_mixed_path(ctx: &mut ExecCtx, …) -> AccumResults { … }
+fn dispatch_parallel_count_distinct_path(ctx: &mut ExecCtx, …) -> AccumResults { … }
+fn dispatch_serial_path(ctx: &mut ExecCtx, …) -> AccumResults { … }
 ```
 
 Each body is verbatim — this is purely lifting. The hard part is figuring
@@ -132,14 +135,14 @@ what it needs without dragging in 30 unrelated locals. Start by counting
 the live-at-banner variable set at each banner line.
 
 After this session:
-- `begin_agg_scan` is the gate + setup + a 5-arm match (<500 lines).
+- `begin_agg_scan` is the gate + setup + a 4-arm match (<500 lines).
 - Each `dispatch_*` lives in its own file (400–2000 lines apiece).
 
 ---
 
-### Sessions 3–7 — drill into each dispatch (one session per path)
+### Sessions 3–6 — drill into each dispatch (one session per path)
 
-For each `dispatch_*` function, peel its four inner sub-cases out:
+For each `dispatch_*` function, peel its inner sub-cases out:
 
 ```rust
 fn parallel_compact_topn_speculative(…)
@@ -149,8 +152,13 @@ fn parallel_compact_full_merge(…)
 fn parallel_compact_derived_minmax_topn(…)
 ```
 
-…and the equivalent set for `parallel_mixed`, `parallel_count_distinct`,
-`serial_compact`, `serial_generic`.
+…and the equivalent set for `parallel_mixed`. For `serial`, the
+extracted helpers are the two inner row-loops (`serial_compact_row_loop`
++ `serial_generic_row_loop`) since both COMPACT and GENERIC sub-paths
+share the per-segment decompression/fast-path setup. For
+`parallel_count_distinct`, the dispatch was already ~240 LOC after
+Session 2 so no drill-down is needed — Session 5 in the original plan
+is skipped.
 
 Each sub-case ends up as a 100–400-line function.
 
@@ -164,7 +172,11 @@ through a raw pointer when a `&[T]` is in scope). For each block:
 2. If unsafe must stay, can the block shrink to just the FFI op?
 3. Does it have a `// SAFETY:` comment naming the invariant? If not, add one.
 
-Realistic target: 114 → ~70 unsafe blocks.
+Realistic target: 114 → ~70 unsafe blocks. **Status after Session 6**:
+extractions drifted the count *up* to 131 (each helper added an
+outer `unsafe { … }` block to absorb its callees' SAFETY contracts).
+The audit hasn't been run in any session — it will need its own
+session, ideally bundled with Session 9's leftover-function splits.
 
 ---
 
@@ -177,7 +189,7 @@ Realistic target: 114 → ~70 unsafe blocks.
   math tests. Expected: 60–80 of the 144 tests can flip, cutting pgrx
   harness boot for the file.
 - Add focused tests for each `parallel_compact_*` / `serial_*` sub-case
-  exposed in Sessions 3–7.
+  exposed in Sessions 3–6.
 
 ---
 

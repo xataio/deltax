@@ -30,6 +30,99 @@ narration.
 
 ## Sessions
 
+### 2026-05-18 — `src/scan/exec/agg/serial.rs` — split COMPACT + GENERIC row loops — 45f72de
+
+**Scope:** AGG_SPLIT.md session 6. Peel the two inner row loops
+(COMPACT — packed u128 keys + flat byte-buffer accs; GENERIC —
+`GroupKey` + `AggAccumulator` Vec) out of `dispatch_serial_path` into
+private helpers. Pure code movement: every line of logic is verbatim.
+
+**Files:** unchanged at 14.
+`serial.rs`: 1,805 → 1,871 LOC (+66 net — helper signatures + a few
+fmt rewraps).
+`dispatch_serial_path` body: 1,739 → 1,221 LOC (−518; the two
+extracted bodies were ~195 + ~360 LOC, now 12-line and 25-line calls).
+The dispatch is now setup + per-segment decompression/fast-paths + a
+2-arm row-loop dispatch + finalize.
+**`unsafe`:** 129 → 131 (+2 — one per helper; the inner bodies had no
+unsafe blocks themselves).
+**Tests:** unchanged at 0 `#[test]` / 144 `#[pg_test]`.
+
+Extracted (both private, `unsafe fn`, `#[inline]`,
+`#[allow(clippy::too_many_arguments)]`):
+- **`serial_compact_row_loop(agg_specs, group_specs, decompressed,
+  raw_strings, selection, row_count, storage, compact_group_map,
+  cd_sidecar, total_rows_processed)`** — packed u128 key build →
+  `compact_group_map` lookup/insert (with the >32M capacity-growth
+  cap) → per-spec compact-accumulator update covering Count /
+  SumInt/SumIntNarrow/SumFloat / MinStr-MaxStr / MinInt-MaxInt /
+  CountDistinctInt-Str. Receives `&mut CompactAccStorage` directly
+  (caller's `compact_storage.as_mut().unwrap()`).
+- **`serial_generic_row_loop(agg_specs, group_specs,
+  prototype_accumulators, regexp_group_infos, raw_string_cols,
+  const_group_keys, decompressed, raw_strings, seg_text_columns,
+  case_when_seg_cols, selection, row_count, has_group_by,
+  has_regexp_group, is_single_group_key, group_map, flat_accs,
+  string_arena, global_accumulators, regex_cache, regex_cache_calls,
+  total_rows_processed)`** — regex pre-fill → key_ref build (CaseWhen
+  / const / RegexpReplace / DateTrunc / Extract / AddConst / Column,
+  including text seg-column lookup) → hashbrown raw_entry insert
+  with `is_single_group_key` resolution → per-spec generic-accumulator
+  update covering all `AggType` variants. The two reusable buffers
+  (`key_ref`, `regex_results`) are declared inside the helper (pure
+  code movement — they were per-segment locals before too).
+
+Implementation notes:
+- `global_accumulators` flows as `&mut Option<Vec<AggAccumulator>>`
+  so the helper preserves the original `.as_mut().unwrap().as_mut_slice()`
+  shape in the `else` branch (vs passing `Option<&mut Vec<_>>` which
+  is `!Copy` and consumes after first unwrap).
+- `regex_cache_calls` flows as `&mut u64` so the
+  `or_insert_with` closure can do `*regex_cache_calls += 1`.
+- Both helpers borrow disjoint state from the dispatch — no overlap
+  with the post-segment-loop finalize (which only re-borrows
+  `compact_storage` / `cd_sidecar` / `compact_group_map` / `group_map`
+  / `flat_accs` after the row-loop call has returned).
+
+The `let n_agg_specs = agg_specs.len();` / `let _ = n_agg_specs;` pair
+at the dispatch top stays put — `n_agg_specs` is still used by the
+finalize block (`&flat_accs[group_idx * n_agg_specs..]` etc.).
+
+**Verify:**
+- `make clippy` — clean.
+- `make fmt-check` — clean (one auto-rewrap applied; `make fmt`
+  produced no manual edits to revisit).
+- `make test` (PG17): 530 pass.
+- `make test PG_MAJOR=18`: 530 pass.
+- `make integration-test`: 234 × PG17 + PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline).
+
+**Benchmarks** (after deleting the stale `agg.rs` left on both EC2
+boxes from a pre-module-split deploy; `make deploy` rsync doesn't
+`--delete`):
+- ClickBench EC2 (best-of-3 sum): 63.36s vs prior 71.08s (−10.87%).
+  Per-query: Q20 −30.9%, Q21 −64.2%, Q22 −37.0%, Q33 −8.2%, Q34
+  −9.9%. The single >5% regression is Q6 +6.3% on a 17ms query
+  (1ms absolute, noise). The Q20/Q21/Q22 numbers are within the
+  EC2 baseline-drift envelope previous sessions documented (the
+  same commit reproducibly varies from ~62s to ~71s on this
+  instance) — no real regressions, possibly a minor inlining win,
+  but not load-bearing.
+- JSONBench EC2 (best-of-3 sum, 100m bluesky): 3.61s vs prior 3.60s
+  (+0.42%). All 5 queries within ±7%; Q3 −6.6%, Q4 +6.3%.
+
+**AGG_SPLIT.md remaining sessions:**
+- Session 5 (parallel_cd drill-down): `dispatch_parallel_count_distinct_path`
+  is ~240 LOC — small enough to defer or skip; updated AGG_SPLIT.md
+  to call this out.
+- Session 8: test reorganisation (`#[pg_test]` → `#[test]` for pure
+  logic; move tests next to production code).
+- Session 9: standalone big-function splits
+  (`build_dict_distinct_remaps` 642 LOC, `extract_subday_from_bigint_scaled`
+  426 LOC, etc.).
+- Cross-cutting: `unsafe` audit (now at 131 blocks vs original 114;
+  target was ~70). Never run.
+
 ### 2026-05-18 — `src/scan/exec/agg/parallel_mixed.rs` — split top-N sub-cases — 4e111bf
 
 **Scope:** finish AGG_SPLIT.md session 4 (mixed dispatch). Peel the
