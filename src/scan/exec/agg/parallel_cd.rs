@@ -1,4 +1,4 @@
-//! Parallel COUNT(DISTINCT)-only path lifted out of `begin_agg_scan`.
+//! Parallel COUNT(DISTINCT)-only path.
 //!
 //! Activates when the query is ungrouped, has no WHERE-clause batch quals,
 //! and every aggregate is `COUNT(DISTINCT ...)`. Each worker walks a chunk

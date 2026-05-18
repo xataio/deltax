@@ -1,7 +1,6 @@
 //! PARALLEL MIXED path — multi-threaded segment processing for grouped
 //! aggregates with text or mixed-type GROUP BY keys (where the COMPACT
 //! path's "all-numeric needed cols" precondition doesn't hold).
-//! Lifted out of `begin_agg_scan` as part of `AGG_SPLIT.md` session 2c.
 //!
 //! Two pieces live here together because the dispatch body is the only
 //! consumer of the helper section:

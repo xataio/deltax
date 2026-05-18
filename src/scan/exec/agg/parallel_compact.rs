@@ -1,6 +1,5 @@
 //! PARALLEL COMPACT path — multi-threaded segment processing for ungrouped
 //! and integer-key-grouped aggregates where every needed column is numeric.
-//! Lifted out of `begin_agg_scan` as part of `AGG_SPLIT.md` session 2b.
 //!
 //! Two pieces live here together because the dispatch body is the only
 //! consumer of the helper section:

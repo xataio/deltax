@@ -10,8 +10,7 @@
 //! - **GENERIC** sub-path: original `GroupKey` + `AggAccumulator` Vec.
 //!
 //! Both sub-paths share the result_rows builder + AggScanState
-//! epilogue at the end of the function. Lifted out of `begin_agg_scan`
-//! as part of `AGG_SPLIT.md` session 2d.
+//! epilogue at the end of the function.
 
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
@@ -1287,9 +1286,7 @@ pub(super) unsafe fn dispatch_serial_path(
 }
 
 /// Inner row loop for the COMPACT serial sub-path (packed u128 keys +
-/// flat byte-buffer accumulators). Verbatim lift of the
-/// `if use_compact_keys && use_compact_accs` block inside
-/// `dispatch_serial_path`'s per-segment loop.
+/// flat byte-buffer accumulators).
 ///
 /// SAFETY: dereferences raw datum pointers in `decompressed` via
 /// `datum_to_i128` / `datum_to_f64`. Caller must ensure those datums
@@ -1488,8 +1485,7 @@ unsafe fn serial_compact_row_loop(
 }
 
 /// Inner row loop for the GENERIC serial sub-path (original `GroupKey` +
-/// `AggAccumulator` Vec). Verbatim lift of the `else` branch (after
-/// COMPACT) inside `dispatch_serial_path`'s per-segment loop.
+/// `AggAccumulator` Vec).
 ///
 /// SAFETY: calls PG FFI (`OidFunctionCall3Coll`, `text_to_cstring`,
 /// `pfree`, `cstring_to_text_with_len`). Must run inside an active PG

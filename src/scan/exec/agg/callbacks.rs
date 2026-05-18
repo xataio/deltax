@@ -5,10 +5,6 @@
 //! `init_worker_deltax_agg`, `shutdown_deltax_agg`) and the
 //! `DELTAX_AGG_EXEC_METHODS` static that wires them all into PG's
 //! custom scan API.
-//!
-//! Lifted out of `agg/mod.rs` once the per-path dispatches
-//! (parallel_compact / parallel_mixed / parallel_cd / serial) had
-//! their own homes. mod.rs is now imports + the test block.
 
 use std::sync::atomic::Ordering;
 use std::time::Instant;

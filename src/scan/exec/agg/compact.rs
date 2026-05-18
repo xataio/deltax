@@ -5,9 +5,6 @@
 //! and the small datum-conversion helpers
 //! (`datum_to_i128`, `datum_to_f64`, `i128_to_numeric_datum`) that all
 //! the dispatches share.
-//!
-//! Lifted from `agg/mod.rs` to keep the remaining mod.rs focused on
-//! `begin_agg_scan` + the executor callbacks + tests.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
