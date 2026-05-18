@@ -63,6 +63,11 @@ pub(crate) fn datum_to_f64(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> f64 {
 ///
 /// For values fitting in i64, uses the fast `int8_numeric` path.
 /// For larger values, converts via string representation.
+///
+/// # Safety
+///
+/// Must run inside an active PG transaction. The returned datum is
+/// palloc'd in `CurrentMemoryContext`; lifetime is up to PG.
 pub(crate) unsafe fn i128_to_numeric_datum(val: i128) -> pg_sys::Datum {
     unsafe {
         if val >= i64::MIN as i128 && val <= i64::MAX as i128 {
@@ -85,6 +90,11 @@ pub(crate) unsafe fn i128_to_numeric_datum(val: i128) -> pg_sys::Datum {
 }
 
 /// Finalize an accumulator into a (Datum, is_null) result pair.
+///
+/// # Safety
+///
+/// Must run inside an active PG transaction — some branches (SumInt
+/// → NUMERIC, Avg, MinStr/MaxStr) allocate datums via PG FFI.
 pub(crate) unsafe fn finalize_accumulator(
     acc: &AggAccumulator,
     spec: &AggExecSpec,
@@ -880,6 +890,38 @@ impl CountDistinctSideCar {
 }
 
 /// Flat byte buffer holding compact accumulators for all groups.
+///
+/// Layout: groups packed as `[group_stride × num_groups]` bytes; within
+/// each group, slot `i` lives at byte offset `layout.slots[i].0` and
+/// has size/kind dictated by `layout.slots[i].1`. Field alignment is
+/// enforced by `CompactAccLayout::new()`.
+///
+/// # Safety of accessor methods
+///
+/// All `unsafe fn` accessor methods below (`count_mut`, `sum_int_mut`,
+/// `read_count`, etc.) share the same preconditions:
+///
+/// 1. `group_idx < (buf.len() / layout.group_stride)` — the group must
+///    have been allocated via [`alloc_group`].
+/// 2. `slot < layout.slots.len()` — guaranteed by the layout shape
+///    `agg_specs.len()` returned from [`CompactAccLayout::new`].
+/// 3. The slot's `CompactAccKind` must match the access type the
+///    caller is invoking (e.g. `count_mut` only on `Count` slots,
+///    `sum_int_mut` only on `SumInt`). Mixing types is undefined
+///    behaviour because they reinterpret raw bytes through different
+///    pointer casts.
+///
+/// (1) is bounds-checkable in debug builds; (2) panics on out-of-range
+/// `slots` indexing; (3) is a runtime contract enforced by the
+/// dispatch logic, which inspects `layout.slots[slot].1` before
+/// choosing which accessor to call.
+///
+/// The methods are `unsafe fn` rather than safe-with-internal-asserts
+/// because they sit on the hot accumulator path (called per-row,
+/// per-spec, millions of times per query) and the safe equivalents
+/// (`from_le_bytes`/`to_le_bytes` value-semantics setters) cost real
+/// time at this depth. A future redesign that backs the buffer with
+/// typed storage could lift the unsafe — left for a separate session.
 pub(crate) struct CompactAccStorage {
     pub(crate) buf: Vec<u8>,
     pub(crate) layout: CompactAccLayout,
@@ -1206,6 +1248,13 @@ pub(crate) fn can_use_compact_accs(agg_specs: &[AggExecSpec]) -> bool {
 /// from compact storage, without full finalization.
 ///
 /// Uses a BinaryHeap of size `limit` to find the top-N in O(n log limit) time.
+///
+/// # Safety
+///
+/// Forwards the `CompactAccStorage` accessor preconditions (see the
+/// struct's safety section): every `group_idx` in `map` must have been
+/// allocated, `sort_slot` must be in range, and the slot's kind must
+/// match one of the `read_*` calls dispatched on `kind` below.
 pub(crate) unsafe fn compact_topn_select(
     map: &CompactGroupMap,
     storage: &CompactAccStorage,
@@ -1277,6 +1326,12 @@ pub(crate) unsafe fn compact_topn_select(
 }
 
 /// Finalize a compact accumulator slot into a (Datum, is_null) pair.
+///
+/// # Safety
+///
+/// Inherits the `CompactAccStorage` accessor contract (see the
+/// struct's safety section). Also must run inside an active PG
+/// transaction — NUMERIC paths palloc via PG FFI.
 pub(crate) unsafe fn compact_finalize(
     storage: &CompactAccStorage,
     group_idx: u32,
@@ -1427,6 +1482,11 @@ pub(crate) unsafe fn compact_finalize(
 /// `unreachable!` in the unsupported branches is the bug-catcher: if planner
 /// gating drifts and we land here at runtime, we'd produce silently-wrong
 /// results otherwise.
+///
+/// # Safety
+///
+/// Inherits the `CompactAccStorage` accessor contract. Must run inside
+/// an active PG transaction for the NUMERIC sum-int8 path.
 #[allow(dead_code)] // wired by the C.2 activation planner code in path.rs
 pub(crate) unsafe fn compact_emit_partial(
     storage: &CompactAccStorage,

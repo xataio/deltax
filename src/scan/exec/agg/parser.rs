@@ -172,6 +172,11 @@ pub(super) fn build_deferred_agg_state(ctx: AggExecContext, is_worker: bool) -> 
 }
 
 /// Deserialize a CaseWhenValue from a custom_private integer list.
+///
+/// # Safety
+///
+/// `list` must be a valid `*mut pg_sys::List`; `*idx` must be within
+/// `list.length`. Calls `pg_sys::list_nth_int` (PG FFI).
 unsafe fn deserialize_case_when_value_inline(
     list: *mut pg_sys::List,
     idx: &mut i32,
@@ -209,6 +214,13 @@ unsafe fn deserialize_case_when_value_inline(
 ///
 /// String values (regexp patterns, date_trunc units, WHERE clause) are encoded as
 /// (length, byte0, byte1, ...) sequences within the integer list.
+///
+/// # Safety
+///
+/// `custom_private` must be a valid `*mut pg_sys::List` produced by
+/// the planner's `serialize_agg_private`; reads `(*custom_private).length`
+/// and calls `pg_sys::list_nth_int` repeatedly. Must run inside an active
+/// PG transaction (`BeginCustomScan` invariant).
 pub(super) unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> ParsedAggPlan {
     unsafe {
         let list_len = (*custom_private).length;

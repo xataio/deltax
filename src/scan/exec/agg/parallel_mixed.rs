@@ -1288,6 +1288,11 @@ struct MixedMergeCtx<'a> {
 /// Bare-LIMIT short-circuit for the mixed path. Picks N groups from the
 /// largest worker, copies their key bytes into a fresh `MixedKeyStorage`,
 /// targeted-merges each key's accumulators across workers, finalizes.
+///
+/// # Safety
+///
+/// Inherits the `CompactAccStorage` accessor contract. Must run inside
+/// an active PG transaction (finalize allocates datums).
 #[inline]
 unsafe fn mixed_bare_limit(
     ctx: &MixedMergeCtx<'_>,
@@ -1538,6 +1543,11 @@ unsafe fn mixed_bare_limit(
 /// `MixedKeyStorage` rather than packed u128), finalizes every group
 /// with HAVING filtering. If top-N is active without a dedicated
 /// optimization path, sorts the finalized rows in place and truncates.
+///
+/// # Safety
+///
+/// Inherits the `CompactAccStorage` accessor contract. Must run inside
+/// an active PG transaction (finalize allocates datums).
 #[inline]
 unsafe fn mixed_full_merge(
     ctx: &MixedMergeCtx<'_>,
@@ -1964,6 +1974,11 @@ fn build_mixed_topn_agg_scan_state(
 ///
 /// Caller has already checked `derived_minmax_topn.is_some()` and
 /// destructured the slot indices.
+///
+/// # Safety
+///
+/// Inherits the `CompactAccStorage` accessor contract. Must run inside
+/// an active PG transaction (finalize allocates datums).
 #[inline]
 unsafe fn mixed_derived_minmax_topn(
     ctx: &MixedMergeCtx<'_>,
@@ -2300,6 +2315,11 @@ unsafe fn mixed_derived_minmax_topn(
 /// Returns `Some(outcome)` on success or all-tied; `None` on fallthrough
 /// (not eligible / phase-2 too expensive / speculation failed without
 /// ties). Caller falls through to partitioned/full merge.
+///
+/// # Safety
+///
+/// Inherits the `CompactAccStorage` accessor contract. Must run inside
+/// an active PG transaction.
 #[inline]
 unsafe fn mixed_speculative_topn(
     ctx: &MixedMergeCtx<'_>,
@@ -2787,6 +2807,11 @@ unsafe fn mixed_speculative_topn(
 /// finds local top-N, then a final merge picks the global top-N.
 ///
 /// Caller has already gated `topn_limit > 0`.
+///
+/// # Safety
+///
+/// Inherits the `CompactAccStorage` accessor contract. Must run inside
+/// an active PG transaction (finalize allocates datums).
 #[inline]
 unsafe fn mixed_partitioned_topn(
     ctx: &MixedMergeCtx<'_>,

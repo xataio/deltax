@@ -573,6 +573,11 @@ pub(super) fn accumulate_segment_metadata(
 }
 
 /// Decompress an ambiguous segment, apply batch quals, and accumulate agg results.
+///
+/// # Safety
+///
+/// Calls `decompress_blob_to_datums` which uses PG palloc-backed
+/// memory for datums. Must run inside an active PG transaction.
 pub(super) unsafe fn accumulate_segment_decompressed(
     accumulators: &mut [AggAccumulator],
     seg: &SegmentData,
@@ -727,6 +732,11 @@ pub(super) unsafe fn accumulate_segment_decompressed(
 /// (`col_names`, `col_types`, `col_typmods`, `segment_by`, `time_column`)
 /// is what Phase C's `init_worker_deltax_agg` will hydrate from
 /// `append_wire` instead of running SPI a second time per worker.
+///
+/// # Safety
+///
+/// Calls `load_metadata` which runs SPI queries against PG catalogs.
+/// Must run inside an active PG transaction with SPI initialised.
 pub(super) unsafe fn load_agg_metadata_from_plan(
     companion_oids: &[pg_sys::Oid],
 ) -> (MetadataInfo, u64) {

@@ -218,6 +218,11 @@ pub(crate) unsafe extern "C-unwind" fn shutdown_deltax_agg(node: *mut pg_sys::Cu
 
 /// Returns the DSM slot index for the current process. Slot 0 is the
 /// leader; worker N (0-indexed in PG) gets slot N+1.
+///
+/// # Safety
+///
+/// Reads `pg_sys::ParallelWorkerNumber` (extern static). Must run
+/// inside an active PG executor callback.
 #[allow(dead_code)] // Phase C.1; widely used in C.2.
 unsafe fn current_agg_worker_slot() -> usize {
     unsafe {
@@ -1142,6 +1147,13 @@ pub(crate) unsafe extern "C-unwind" fn exec_agg_scan(
 /// flag with `Acquire`, deserialise each populated slab, merge into the
 /// leader's global accumulator, finalise into `result_rows`, mark
 /// `ctx.merged = true`. Subsequent exec calls emit cached rows.
+///
+/// # Safety
+///
+/// Dereferences `state.pscan` (raw `*const DeltaXAggPState`); reads
+/// DSM slab bytes via raw pointer arithmetic. Caller must hold a live
+/// reference to the parallel-coordinator state for the duration of
+/// the call. Must run inside an active PG executor callback.
 unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
     unsafe {
         if state.pscan.is_null() {
@@ -1298,6 +1310,11 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
 /// via `compact_emit_partial` (returning the PG `aggtranstype` value) instead
 /// of the user-visible final value — a Final Aggregate node above DeltaXAgg
 /// then combines the partials via `aggcombinefn`.
+///
+/// # Safety
+///
+/// Inherits the `CompactAccStorage` accessor contract. Must run inside
+/// an active PG transaction (finalize allocates datums).
 unsafe fn finalise_compact_into_result_rows(
     global_map: &CompactGroupMap,
     global_storage: &CompactAccStorage,
@@ -1358,6 +1375,11 @@ unsafe fn finalise_compact_into_result_rows(
 /// writing to DSM) and `run_leader_merge_and_finalise` (complete-mode
 /// leader merging worker DSM slabs) — neither is invoked in partial mode
 /// because there's no inter-process DSM merge step.
+///
+/// # Safety
+///
+/// Dereferences `state.pscan` and inherits the `CompactAccStorage`
+/// accessor contract. Must run inside an active PG executor callback.
 unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
     unsafe {
         if state.pscan.is_null() {
@@ -1450,6 +1472,12 @@ unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
 /// `shutdown_deltax_agg` later writes `worker_timings[slot].populated = 1`
 /// (also Release). The leader's `Acquire` load on `populated` synchronises
 /// with both writes in program order.
+///
+/// # Safety
+///
+/// Dereferences `state.pscan` and writes into DSM via raw pointers.
+/// Inherits the `CompactAccStorage` accessor contract. Must run inside
+/// an active PG worker executor callback.
 unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
     unsafe {
         const CHUNK: u64 = 4;

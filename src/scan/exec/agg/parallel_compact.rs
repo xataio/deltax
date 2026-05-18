@@ -972,6 +972,12 @@ struct CompactMergeCtx<'a> {
 /// Bare-LIMIT short-circuit for the compact path. Pick N groups from the
 /// largest worker, merge only those keys across workers, finalize only
 /// those rows. Skips the global merge entirely.
+///
+/// # Safety
+///
+/// Inherits the `CompactAccStorage` accessor contract and calls
+/// `finalize_accumulator` / `i128_to_numeric_datum` internally — must
+/// run inside an active PG transaction.
 #[inline]
 unsafe fn compact_bare_limit(
     ctx: &CompactMergeCtx<'_>,
@@ -1165,6 +1171,11 @@ unsafe fn compact_bare_limit(
 /// map as the base, merges all other workers' entries, then finalizes
 /// every group with HAVING filtering. If a top-N is active without a
 /// dedicated optimization path, sorts the finalized rows and truncates.
+///
+/// # Safety
+///
+/// Inherits the `CompactAccStorage` accessor contract. Must run
+/// inside an active PG transaction (finalize allocates NUMERIC datums).
 #[inline]
 unsafe fn compact_full_merge(
     ctx: &CompactMergeCtx<'_>,
@@ -1383,6 +1394,11 @@ fn build_topn_agg_scan_state(
 ///   sort is COUNT(DISTINCT) or AVG), Phase 2 too expensive, or
 ///   speculation failed and ties don't apply. Caller falls through to
 ///   the partitioned merge or full merge path.
+///
+/// # Safety
+///
+/// Inherits the `CompactAccStorage` accessor contract. Must run
+/// inside an active PG transaction for the build-time finalize step.
 #[inline]
 unsafe fn compact_speculative_topn(
     ctx: &CompactMergeCtx<'_>,
@@ -2004,6 +2020,11 @@ unsafe fn compact_speculative_topn(
 /// finds local top-N, then a final merge picks the global top-N.
 ///
 /// Caller has already gated `topn_limit > 0`.
+///
+/// # Safety
+///
+/// Inherits the `CompactAccStorage` accessor contract. Must run
+/// inside an active PG transaction (final finalize allocates datums).
 #[inline]
 unsafe fn compact_partitioned_topn(
     ctx: &CompactMergeCtx<'_>,
@@ -2374,6 +2395,16 @@ unsafe fn compact_partitioned_topn(
     }
 }
 
+/// Dispatch entry for the parallel-compact path. Spawns a worker scope
+/// to populate per-worker `ParallelCompactResult` partials, then runs
+/// the appropriate merge phase (bare-LIMIT / speculative-topN /
+/// partitioned-topN / full-merge).
+///
+/// # Safety
+///
+/// Inherits the `CompactAccStorage` accessor contract. Calls
+/// `detoast_lazy_blobs` and PG FFI inside the worker scope. Must run
+/// inside an active PG transaction (`BeginCustomScan` invariant).
 #[allow(clippy::too_many_arguments, clippy::ptr_arg)]
 pub(super) unsafe fn dispatch_parallel_compact_path(
     agg_specs: Vec<AggExecSpec>,

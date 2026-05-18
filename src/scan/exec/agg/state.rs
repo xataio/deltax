@@ -504,8 +504,13 @@ pub(crate) struct DeltaXAggPState {
 }
 
 impl DeltaXAggPState {
-    /// Pointer to slot `slot_idx`'s slab. Caller must ensure the DSM
-    /// region was sized for this slot count.
+    /// Pointer to slot `slot_idx`'s slab.
+    ///
+    /// # Safety
+    ///
+    /// `slot_idx < n_worker_slots` (the DSM region must have been
+    /// sized to include that slot's slab). `&self` must point into a
+    /// live `DeltaXAggPState` mapped by `initialize_dsm_deltax_agg`.
     #[allow(dead_code)] // Phase C.2.
     #[inline]
     pub(crate) unsafe fn slab_ptr(&self, slot_idx: usize) -> *mut u8 {
