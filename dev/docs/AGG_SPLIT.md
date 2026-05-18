@@ -172,11 +172,16 @@ through a raw pointer when a `&[T]` is in scope). For each block:
 2. If unsafe must stay, can the block shrink to just the FFI op?
 3. Does it have a `// SAFETY:` comment naming the invariant? If not, add one.
 
-Realistic target: 114 → ~70 unsafe blocks. **Status after Session 6**:
-extractions drifted the count *up* to 131 (each helper added an
-outer `unsafe { … }` block to absorb its callees' SAFETY contracts).
-The audit hasn't been run in any session — it will need its own
-session, ideally bundled with Session 9's leftover-function splits.
+Realistic target: 114 → ~70 unsafe blocks. **Status after the audit
+(2026-05-18 / `ccc5864`)**: 131 → 85 (-35%). The 14 hot-path
+`CompactAccStorage` accessor methods moved to a safe
+`from_le_bytes`/`to_le_bytes` API; `compact_topn_select` and
+`compact_emit_partial` lost their `unsafe` keyword. Every remaining
+`unsafe fn` boundary has a `# Safety` doc block. The remaining 85
+blocks are concentrated in genuine FFI (PG list ops, SPI catalog
+reads, NUMERIC datum allocation, DSM raw-pointer writes) — no
+further easy wins without a deeper redesign of segment loading or
+catalog access.
 
 ---
 
@@ -248,7 +253,7 @@ Mostly inherited from `CLEANUP_PLAN.md`. Repeated here for emphasis:
 |---|---:|---:|---:|
 | Largest file in `agg/` | 14,019 LOC | ≤ ~1500 LOC | 3,602 (`parallel_mixed.rs`) |
 | Largest function       | ~5,830 LOC | ≤ ~400 LOC  | ~1,221 (`dispatch_serial_path`) |
-| `unsafe` blocks        | 114        | ~70         | 131 (audit deferred) |
+| `unsafe` blocks        | 114        | ~70         | 85 (audit done; FFI bottom) |
 | `#[test]` (cheap)      | 0          | ~80         | **79** ✓ |
 | `#[pg_test]` (PG state)| 144        | ~70         | **65** ✓ |
 | Files in `agg/`        | 1          | ~13         | 15 ✓ |

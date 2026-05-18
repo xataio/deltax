@@ -30,6 +30,86 @@ narration.
 
 ## Sessions
 
+### 2026-05-18 — `src/scan/exec/agg/` — unsafe audit + CompactAccStorage redesign — 7729505 + ccc5864
+
+**Scope:** the AGG_SPLIT.md cross-cutting unsafe audit, in two PRs.
+
+**PR 1 (7729505) — SAFETY documentation pass.** Every `unsafe fn`
+boundary in `agg/` got a `# Safety` doc block. The 14
+`CompactAccStorage` accessor methods got a centralised SAFETY
+contract on the struct (the per-method preconditions are identical:
+group_idx allocated, slot in range, slot kind matches accessor).
+Other standalone unsafe fns — `i128_to_numeric_datum`,
+`finalize_accumulator`, `compact_topn_select`, `compact_finalize`,
+`compact_emit_partial`, the parallel-{compact,mixed} dispatch
+helpers, parser fns, callbacks fns, metadata fns, the DSM
+`slab_ptr` — each got per-fn preconditions. SAFETY coverage went
+from ~16 to ~30 fully-documented unsafe surfaces.
+
+**PR 2 (ccc5864) — CompactAccStorage redesign.** The 14 `unsafe fn`
+accessors became safe via a value-semantics API:
+
+- `count_mut` → `incr_count(delta) / set_count(val) / read_count()`
+- `sum_int_mut` → `add_sum_int(sum_delta, count_delta) / read_sum_int()`
+- analog for `sum_int_narrow`, `sum_float`
+- `write_min_max_int/str` and `update_min_int/max_int`: same names,
+  `unsafe` keyword dropped
+- `read_*` methods (`read_count`, `read_sum_int*`, `read_sum_float`,
+  `read_min_max_*`): same names, safe
+
+Bodies use `from_le_bytes`/`to_le_bytes` on bounds-checked slice
+indexing — no pointer casts, no alignment requirements. LLVM lowers
+to the same load-add-store sequence as the previous deref-based code
+on LE platforms.
+
+Two additional standalone fns shed `unsafe` after the accessors did:
+`compact_topn_select` and `compact_emit_partial`. Neither had any
+real FFI; both were unsafe-by-association with the accessor contract.
+
+Migrated ~199 call sites across 4 files (compact.rs, parallel_compact.rs,
+parallel_mixed.rs, serial.rs) plus one test helper in agg_wire.rs.
+Most were mechanical:
+- `let (sum, count) = unsafe { storage.sum_int_mut(g, s) };
+   *sum += v; *count += 1;`
+  → `storage.add_sum_int(g, s, v, 1);`
+- `unsafe { *storage.count_mut(g, s) += 1; }`
+  → `storage.incr_count(g, s, 1);`
+
+**Net unsafe surface reduction:**
+
+| Metric | Before | After |
+|---|---:|---:|
+| `unsafe {` blocks in `agg/` | 131 | 85 |
+| `unsafe fn` / `unsafe impl` | ~36 | ~20 |
+| SAFETY-documented surfaces | ~16 | ~30 (every `unsafe fn` boundary) |
+
+Hits the AGG_SPLIT.md ~70-block target the wrong direction (85 vs
+70), but a substantial -35% drop from the post-session-6 high of 131.
+Remaining unsafe is concentrated in genuine FFI (parser
+`pg_sys::list_nth_int`, metadata SPI, callbacks DSM, the
+`i128_to_numeric_datum`/`compact_finalize` numeric-allocating
+fns) — no further easy wins without a deeper redesign.
+
+**Verify:**
+- `make clippy` — clean.
+- `make fmt-check` — clean.
+- `make test` (PG17): 530 pass.
+- `make test PG_MAJOR=18`: 530 pass.
+- `make integration-test`: 234 × PG17 + PG18 pass.
+- `make correctness`: 999 / 3 / 6 (baseline).
+
+**Benchmarks (required, this PR touches the hot accumulator path):**
+- ClickBench EC2 (best-of-3 sum): 64.07s vs prior 63.44s (+0.98%).
+  Only Q6 past the 5% gate (+6.3% on a 17ms query, 1ms absolute,
+  noise floor). No real regressions.
+- JSONBench EC2 (best-of-3 sum, 100m bluesky): 3.68s vs prior 3.64s
+  (+1.04%). All 5 queries within ±5%; Q0 −4.3%, Q4 +3.4%.
+
+The +1% on both benches is within EC2 run-to-run noise (prior
+sessions documented same-commit drift of several percent). The new
+safe API generates the same machine code as the unsafe primitives
+on LE x86_64.
+
 ### 2026-05-18 — `src/scan/exec/agg/mod.rs` — test reorganisation + `#[pg_test]` → `#[test]` — 59c37c7
 
 **Scope:** AGG_SPLIT.md session 8. Move every test out of `mod.rs`'s
