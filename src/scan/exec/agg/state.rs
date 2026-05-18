@@ -700,3 +700,364 @@ pub(super) fn keys_match(stored: &GroupKey, temp: &[GroupKeyRef], arena: &String
 /// Using u32 index instead of Vec<AggAccumulator> eliminates per-group heap allocation
 /// for accumulators, saving ~130ms cleanup for 275K groups.
 pub(super) type GroupMap = hashbrown::HashMap<GroupKey, u32, BuildHasherDefault<ahash::AHasher>>;
+
+#[cfg(any(test, feature = "pg_test"))]
+mod tests {
+    use super::super::cd_set::new_cd_set_int;
+    use super::super::compact::StringArena;
+    use super::{
+        AggAccumulator, AggType, GroupKey, GroupKeyRef, GroupKeyVal, hash_group_key,
+        hash_group_key_ref, keys_match,
+    };
+    use pgrx::pg_sys;
+
+    // -------------------------------------------------------------------
+    // AggAccumulator::new_for tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_accumulator_new_sum_int() {
+        let acc = AggAccumulator::new_for(AggType::Sum, pg_sys::INT4OID);
+        assert!(matches!(acc, AggAccumulator::SumInt { sum: 0, count: 0 }));
+    }
+
+    #[test]
+    fn test_accumulator_new_sum_float() {
+        let acc = AggAccumulator::new_for(AggType::Sum, pg_sys::FLOAT8OID);
+        assert!(matches!(acc, AggAccumulator::SumFloat { .. }));
+    }
+
+    #[test]
+    fn test_accumulator_new_avg_float4() {
+        let acc = AggAccumulator::new_for(AggType::Avg, pg_sys::FLOAT4OID);
+        assert!(matches!(acc, AggAccumulator::SumFloat { .. }));
+    }
+
+    #[test]
+    fn test_accumulator_new_avg_int() {
+        let acc = AggAccumulator::new_for(AggType::Avg, pg_sys::INT8OID);
+        assert!(matches!(acc, AggAccumulator::SumInt { .. }));
+    }
+
+    #[test]
+    fn test_accumulator_new_count() {
+        let acc = AggAccumulator::new_for(AggType::Count, pg_sys::INT4OID);
+        assert!(matches!(acc, AggAccumulator::Count { count: 0 }));
+    }
+
+    #[test]
+    fn test_accumulator_new_count_star() {
+        let acc = AggAccumulator::new_for(AggType::CountStar, pg_sys::Oid::from(0u32));
+        assert!(matches!(acc, AggAccumulator::Count { count: 0 }));
+    }
+
+    #[test]
+    fn test_accumulator_new_count_distinct_text() {
+        let acc = AggAccumulator::new_for(AggType::CountDistinct, pg_sys::TEXTOID);
+        assert!(matches!(acc, AggAccumulator::CountDistinctStr { .. }));
+    }
+
+    #[test]
+    fn test_accumulator_new_count_distinct_int() {
+        let acc = AggAccumulator::new_for(AggType::CountDistinct, pg_sys::INT4OID);
+        assert!(matches!(acc, AggAccumulator::CountDistinctInt { .. }));
+    }
+
+    #[test]
+    fn test_accumulator_new_min_text() {
+        let acc = AggAccumulator::new_for(AggType::Min, pg_sys::TEXTOID);
+        assert!(matches!(acc, AggAccumulator::MinStr { val: None }));
+    }
+
+    #[test]
+    fn test_accumulator_new_min_float() {
+        let acc = AggAccumulator::new_for(AggType::Min, pg_sys::FLOAT8OID);
+        assert!(matches!(acc, AggAccumulator::MinFloat { val: None }));
+    }
+
+    #[test]
+    fn test_accumulator_new_min_int() {
+        let acc = AggAccumulator::new_for(AggType::Min, pg_sys::INT4OID);
+        assert!(matches!(acc, AggAccumulator::MinInt { val: None }));
+    }
+
+    #[test]
+    fn test_accumulator_new_max_varchar() {
+        let acc = AggAccumulator::new_for(AggType::Max, pg_sys::VARCHAROID);
+        assert!(matches!(acc, AggAccumulator::MaxStr { val: None }));
+    }
+
+    #[test]
+    fn test_accumulator_new_max_float4() {
+        let acc = AggAccumulator::new_for(AggType::Max, pg_sys::FLOAT4OID);
+        assert!(matches!(acc, AggAccumulator::MaxFloat { val: None }));
+    }
+
+    #[test]
+    fn test_accumulator_new_max_int() {
+        let acc = AggAccumulator::new_for(AggType::Max, pg_sys::INT8OID);
+        assert!(matches!(acc, AggAccumulator::MaxInt { val: None }));
+    }
+
+    // -------------------------------------------------------------------
+    // AggAccumulator::clone_fresh tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_clone_fresh_sum_int_resets() {
+        let acc = AggAccumulator::SumInt {
+            sum: 999,
+            count: 50,
+        };
+        let fresh = acc.clone_fresh();
+        assert!(matches!(fresh, AggAccumulator::SumInt { sum: 0, count: 0 }));
+    }
+
+    #[test]
+    fn test_clone_fresh_sum_float_resets() {
+        let acc = AggAccumulator::SumFloat {
+            sum: 1.5,
+            count: 10,
+        };
+        let fresh = acc.clone_fresh();
+        assert!(
+            matches!(fresh, AggAccumulator::SumFloat { sum, count } if sum == 0.0 && count == 0)
+        );
+    }
+
+    #[test]
+    fn test_clone_fresh_count_resets() {
+        let acc = AggAccumulator::Count { count: 42 };
+        let fresh = acc.clone_fresh();
+        assert!(matches!(fresh, AggAccumulator::Count { count: 0 }));
+    }
+
+    #[test]
+    fn test_clone_fresh_min_int_resets() {
+        let acc = AggAccumulator::MinInt { val: Some(7) };
+        let fresh = acc.clone_fresh();
+        assert!(matches!(fresh, AggAccumulator::MinInt { val: None }));
+    }
+
+    #[test]
+    fn test_clone_fresh_count_distinct_int_resets() {
+        let mut seen = new_cd_set_int();
+        seen.insert(1i64);
+        seen.insert(2);
+        let acc = AggAccumulator::CountDistinctInt { seen };
+        let fresh = acc.clone_fresh();
+        if let AggAccumulator::CountDistinctInt { seen } = fresh {
+            assert!(seen.is_empty());
+        } else {
+            panic!("wrong variant");
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // GroupKeyRef / GroupKeyVal / GroupKey tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_group_key_ref_resolve_null() {
+        let mut arena = StringArena::new();
+        let r = GroupKeyRef::Null;
+        assert_eq!(r.resolve(&mut arena), GroupKeyVal::Null);
+    }
+
+    #[test]
+    fn test_group_key_ref_resolve_int() {
+        let mut arena = StringArena::new();
+        let r = GroupKeyRef::Int(42);
+        assert_eq!(r.resolve(&mut arena), GroupKeyVal::Int(42));
+    }
+
+    #[test]
+    fn test_group_key_ref_resolve_str() {
+        let mut arena = StringArena::new();
+        let s = "hello";
+        let r = GroupKeyRef::from_str(s);
+        let val = r.resolve(&mut arena);
+        if let GroupKeyVal::Str(off, len) = val {
+            assert_eq!(arena.get(off, len), "hello");
+        } else {
+            panic!("expected Str variant");
+        }
+    }
+
+    #[test]
+    fn test_group_key_ref_matches_owned_null() {
+        let arena = StringArena::new();
+        assert!(GroupKeyRef::Null.matches_owned(&GroupKeyVal::Null, &arena));
+        assert!(!GroupKeyRef::Null.matches_owned(&GroupKeyVal::Int(0), &arena));
+    }
+
+    #[test]
+    fn test_group_key_ref_matches_owned_int() {
+        let arena = StringArena::new();
+        assert!(GroupKeyRef::Int(5).matches_owned(&GroupKeyVal::Int(5), &arena));
+        assert!(!GroupKeyRef::Int(5).matches_owned(&GroupKeyVal::Int(6), &arena));
+        assert!(!GroupKeyRef::Int(5).matches_owned(&GroupKeyVal::Null, &arena));
+    }
+
+    #[test]
+    fn test_group_key_ref_matches_owned_str() {
+        let mut arena = StringArena::new();
+        let (off, len) = arena.alloc("test");
+        let s = "test";
+        let r = GroupKeyRef::from_str(s);
+        assert!(r.matches_owned(&GroupKeyVal::Str(off, len), &arena));
+        let s2 = "other";
+        let r2 = GroupKeyRef::from_str(s2);
+        assert!(!r2.matches_owned(&GroupKeyVal::Str(off, len), &arena));
+    }
+
+    #[test]
+    fn test_group_key_single_as_slice() {
+        let key = GroupKey::Single(GroupKeyVal::Int(7));
+        assert_eq!(key.as_slice().len(), 1);
+        assert_eq!(key.as_slice()[0], GroupKeyVal::Int(7));
+    }
+
+    #[test]
+    fn test_group_key_multi_as_slice() {
+        let key = GroupKey::Multi(vec![GroupKeyVal::Int(1), GroupKeyVal::Null].into_boxed_slice());
+        assert_eq!(key.as_slice().len(), 2);
+        assert_eq!(key.as_slice()[0], GroupKeyVal::Int(1));
+        assert_eq!(key.as_slice()[1], GroupKeyVal::Null);
+    }
+
+    // -------------------------------------------------------------------
+    // hash_group_key / hash_group_key_ref / keys_match tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_hash_consistency_int() {
+        // hash_group_key and hash_group_key_ref must produce the same hash
+        // for equivalent keys
+        let mut arena = StringArena::new();
+        let owned = GroupKey::Single(GroupKeyVal::Int(42));
+        let borrowed = [GroupKeyRef::Int(42)];
+        let _ = &mut arena; // arena unused for int keys, but needed for API
+        assert_eq!(
+            hash_group_key(&owned, &arena),
+            hash_group_key_ref(&borrowed)
+        );
+    }
+
+    #[test]
+    fn test_hash_consistency_null() {
+        let arena = StringArena::new();
+        let owned = GroupKey::Single(GroupKeyVal::Null);
+        let borrowed = [GroupKeyRef::Null];
+        assert_eq!(
+            hash_group_key(&owned, &arena),
+            hash_group_key_ref(&borrowed)
+        );
+    }
+
+    #[test]
+    fn test_hash_consistency_str() {
+        let mut arena = StringArena::new();
+        let (off, len) = arena.alloc("hello");
+        let owned = GroupKey::Single(GroupKeyVal::Str(off, len));
+        let s = "hello";
+        let borrowed = [GroupKeyRef::from_str(s)];
+        assert_eq!(
+            hash_group_key(&owned, &arena),
+            hash_group_key_ref(&borrowed)
+        );
+    }
+
+    #[test]
+    fn test_hash_consistency_multi() {
+        let mut arena = StringArena::new();
+        let (off, len) = arena.alloc("world");
+        let owned = GroupKey::Multi(
+            vec![
+                GroupKeyVal::Int(1),
+                GroupKeyVal::Str(off, len),
+                GroupKeyVal::Null,
+            ]
+            .into_boxed_slice(),
+        );
+        let s = "world";
+        let borrowed = [
+            GroupKeyRef::Int(1),
+            GroupKeyRef::from_str(s),
+            GroupKeyRef::Null,
+        ];
+        assert_eq!(
+            hash_group_key(&owned, &arena),
+            hash_group_key_ref(&borrowed)
+        );
+    }
+
+    #[test]
+    fn test_hash_different_values_differ() {
+        let arena = StringArena::new();
+        let k1 = GroupKey::Single(GroupKeyVal::Int(1));
+        let k2 = GroupKey::Single(GroupKeyVal::Int(2));
+        assert_ne!(hash_group_key(&k1, &arena), hash_group_key(&k2, &arena));
+    }
+
+    #[test]
+    fn test_hash_different_types_differ() {
+        // Int(0) vs Null should hash differently (different discriminant)
+        let arena = StringArena::new();
+        let k1 = GroupKey::Single(GroupKeyVal::Int(0));
+        let k2 = GroupKey::Single(GroupKeyVal::Null);
+        assert_ne!(hash_group_key(&k1, &arena), hash_group_key(&k2, &arena));
+    }
+
+    #[test]
+    fn test_keys_match_single_int() {
+        let arena = StringArena::new();
+        let owned = GroupKey::Single(GroupKeyVal::Int(42));
+        let temp = [GroupKeyRef::Int(42)];
+        assert!(keys_match(&owned, &temp, &arena));
+    }
+
+    #[test]
+    fn test_keys_match_single_mismatch() {
+        let arena = StringArena::new();
+        let owned = GroupKey::Single(GroupKeyVal::Int(42));
+        let temp = [GroupKeyRef::Int(99)];
+        assert!(!keys_match(&owned, &temp, &arena));
+    }
+
+    #[test]
+    fn test_keys_match_length_mismatch() {
+        let arena = StringArena::new();
+        let owned = GroupKey::Single(GroupKeyVal::Int(42));
+        let temp = [GroupKeyRef::Int(42), GroupKeyRef::Null];
+        assert!(!keys_match(&owned, &temp, &arena));
+    }
+
+    #[test]
+    fn test_keys_match_multi_str() {
+        let mut arena = StringArena::new();
+        let (o1, l1) = arena.alloc("abc");
+        let (o2, l2) = arena.alloc("xyz");
+        let owned = GroupKey::Multi(
+            vec![GroupKeyVal::Str(o1, l1), GroupKeyVal::Str(o2, l2)].into_boxed_slice(),
+        );
+        let s1 = "abc";
+        let s2 = "xyz";
+        let temp = [GroupKeyRef::from_str(s1), GroupKeyRef::from_str(s2)];
+        assert!(keys_match(&owned, &temp, &arena));
+    }
+
+    #[test]
+    fn test_keys_match_multi_str_mismatch() {
+        let mut arena = StringArena::new();
+        let (o1, l1) = arena.alloc("abc");
+        let (o2, l2) = arena.alloc("xyz");
+        let owned = GroupKey::Multi(
+            vec![GroupKeyVal::Str(o1, l1), GroupKeyVal::Str(o2, l2)].into_boxed_slice(),
+        );
+        let s1 = "abc";
+        let s2 = "DIFFERENT";
+        let temp = [GroupKeyRef::from_str(s1), GroupKeyRef::from_str(s2)];
+        assert!(!keys_match(&owned, &temp, &arena));
+    }
+}

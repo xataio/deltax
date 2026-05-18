@@ -269,3 +269,131 @@ pub(super) fn apply_regex_to_seg_col(
         }
     }
 }
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use super::*;
+    use pgrx::prelude::*;
+
+    #[test]
+    fn test_has_posix_classes_alpha() {
+        assert!(has_posix_classes("[[:alpha:]]"));
+    }
+
+    #[test]
+    fn test_has_posix_classes_digit() {
+        assert!(has_posix_classes("[[:digit:]]"));
+    }
+
+    #[test]
+    fn test_has_posix_classes_plain_range() {
+        assert!(!has_posix_classes("[a-z]"));
+    }
+
+    #[test]
+    fn test_has_posix_classes_no_brackets() {
+        assert!(!has_posix_classes("abc.*def"));
+    }
+
+    #[test]
+    fn test_convert_pg_replacement_capture_groups() {
+        assert_eq!(convert_pg_replacement(r"\1"), "$1");
+        assert_eq!(convert_pg_replacement(r"foo\1bar\2"), "foo$1bar$2");
+    }
+
+    #[test]
+    fn test_convert_pg_replacement_whole_match() {
+        assert_eq!(convert_pg_replacement(r"\&"), "$0");
+    }
+
+    #[test]
+    fn test_convert_pg_replacement_literal_backslash() {
+        assert_eq!(convert_pg_replacement(r"\\"), "\\");
+    }
+
+    #[test]
+    fn test_convert_pg_replacement_no_escapes() {
+        assert_eq!(convert_pg_replacement("plain text"), "plain text");
+    }
+
+    // `try_compile_rust_regex` reads the `pg_deltax.parallel_regex` GUC
+    // (via `crate::get_parallel_regex`), so the tests below need a live
+    // PG backend and stay `#[pg_test]`.
+
+    #[pg_test]
+    fn test_try_compile_safe_clickbench_pattern() {
+        // The ClickBench Q29 pattern
+        let re = try_compile_rust_regex(r"^https?://(?:www\.)?([^/]+)/.*");
+        assert!(re.is_some());
+    }
+
+    #[pg_test]
+    fn test_try_compile_posix_class_fallback() {
+        let re = try_compile_rust_regex("[[:alpha:]]+");
+        assert!(re.is_none());
+    }
+
+    #[pg_test]
+    fn test_try_compile_backreference_fallback() {
+        // Backreferences are not supported by Rust regex
+        let re = try_compile_rust_regex(r"(abc)\1");
+        assert!(re.is_none());
+    }
+
+    #[pg_test]
+    fn test_try_compile_lookahead_fallback() {
+        let re = try_compile_rust_regex(r"foo(?=bar)");
+        assert!(re.is_none());
+    }
+
+    #[pg_test]
+    fn test_clickbench_regex_replacement() {
+        // Use try_compile_rust_regex which applies pg_pattern_to_rust internally
+        let re = try_compile_rust_regex(r"^https?://(?:www\.)?([^/]+)/.*$").unwrap();
+        let replacement = convert_pg_replacement(r"\1");
+        assert_eq!(replacement, "$1");
+
+        let url = "https://www.example.com/path/to/page";
+        let result = re.replace(url, replacement.as_str());
+        assert_eq!(result, "example.com");
+
+        let url2 = "http://subdomain.test.org/index.html";
+        let result2 = re.replace(url2, replacement.as_str());
+        assert_eq!(result2, "subdomain.test.org");
+
+        let url3 = "https://bare-domain.io/";
+        let result3 = re.replace(url3, replacement.as_str());
+        assert_eq!(result3, "bare-domain.io");
+
+        // Trailing newline: PG's .* matches \n, so the whole string matches
+        // and the domain is extracted. Our (?s) + \z conversion ensures same behavior.
+        let url4 = "http://example.com/path\n";
+        let result4 = re.replace(url4, replacement.as_str());
+        assert_eq!(result4, "example.com"); // .* consumes \n, \z matches at end
+    }
+
+    #[test]
+    fn test_pg_pattern_to_rust_conversions() {
+        // (?s) prefix for dot-all mode + $ → \z conversion
+        assert_eq!(pg_pattern_to_rust("foo$"), "(?s)foo\\z");
+        assert_eq!(pg_pattern_to_rust("foo\\$"), "(?s)foo\\$"); // escaped $ — no \z
+        assert_eq!(pg_pattern_to_rust("foo\\\\$"), "(?s)foo\\\\\\z"); // \\$ → $ is unescaped
+        assert_eq!(pg_pattern_to_rust("foo"), "(?s)foo"); // no $ — just (?s) prefix
+    }
+
+    #[pg_test]
+    fn test_rust_regex_dot_matches_newline() {
+        // PG's . matches \n by default; our (?s) prefix ensures Rust regex does too
+        let re = try_compile_rust_regex("^http://([^/]+)/.*$").unwrap();
+        let replacement = convert_pg_replacement(r"\1");
+        // URL with embedded \n — PG's .* matches across it
+        let url = "http://example.com/path\nmore";
+        let result = re.replace(url, replacement.as_str());
+        assert_eq!(result, "example.com");
+        // URL with embedded \r\n
+        let url2 = "http://example.com/path\r\nmore";
+        let result2 = re.replace(url2, replacement.as_str());
+        assert_eq!(result2, "example.com");
+    }
+}

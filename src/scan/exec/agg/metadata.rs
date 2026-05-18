@@ -752,3 +752,600 @@ pub(super) unsafe fn load_agg_metadata_from_plan(
         (meta, metadata_us)
     }
 }
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use super::super::super::segments::{ColMinMax, ColSum};
+    use super::super::state::{
+        AggExpr, AggType, GroupByColSpec, GroupByExpr, HavingFilter, HavingOp,
+    };
+    use super::super::test_utils::{make_agg_spec, make_empty_segment, make_meta, make_plan};
+    use super::{try_catalog_shortcut, try_metadata_fast_path};
+    use pgrx::pg_sys;
+    use pgrx::prelude::*;
+
+    // -------------------------------------------------------------------
+    // try_catalog_shortcut tests
+    // -------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_catalog_shortcut_rejects_group_by() {
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::CountStar, -1, 23)],
+            vec![GroupByColSpec {
+                col_idx: 0,
+                type_oid: pg_sys::Oid::from(23u32),
+                expr: GroupByExpr::Column,
+            }],
+            Vec::new(),
+            true,
+        );
+        assert!(try_catalog_shortcut(&plan, &meta, &[], 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_catalog_shortcut_rejects_where() {
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::CountStar, -1, 23)],
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        assert!(try_catalog_shortcut(&plan, &meta, &[], 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_catalog_shortcut_rejects_having() {
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::CountStar, -1, 23)],
+            Vec::new(),
+            vec![HavingFilter {
+                agg_idx: 0,
+                op: HavingOp::Gt,
+                const_val: 10,
+            }],
+            true,
+        );
+        assert!(try_catalog_shortcut(&plan, &meta, &[], 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_catalog_shortcut_rejects_sum() {
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Sum, 1, 23)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        assert!(try_catalog_shortcut(&plan, &meta, &[Some(100)], 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_catalog_shortcut_rejects_avg() {
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Avg, 1, 23)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        assert!(try_catalog_shortcut(&plan, &meta, &[Some(100)], 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_catalog_shortcut_rejects_min_max() {
+        let meta = make_meta(&["ts", "value"]);
+        for agg_type in [AggType::Min, AggType::Max] {
+            let plan = make_plan(
+                vec![make_agg_spec(agg_type, 1, 23)],
+                Vec::new(),
+                Vec::new(),
+                true,
+            );
+            assert!(try_catalog_shortcut(&plan, &meta, &[Some(100)], 0).is_none());
+        }
+    }
+
+    #[pg_test]
+    fn test_catalog_shortcut_count_star_single_partition() {
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::CountStar, -1, 23)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let state = try_catalog_shortcut(&plan, &meta, &[Some(42_000)], 0).unwrap();
+        assert_eq!(state.result_rows.len(), 1);
+        assert_eq!(state.result_rows[0][0].0.value(), 42_000usize);
+        assert!(!state.result_rows[0][0].1); // not null
+    }
+
+    #[pg_test]
+    fn test_catalog_shortcut_count_star_multi_partition() {
+        let meta = make_meta(&["ts", "value"]);
+        let mut plan = make_plan(
+            vec![make_agg_spec(AggType::CountStar, -1, 23)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        plan.companion_oids = vec![
+            pg_sys::Oid::from(1u32),
+            pg_sys::Oid::from(2u32),
+            pg_sys::Oid::from(3u32),
+        ];
+        let state =
+            try_catalog_shortcut(&plan, &meta, &[Some(100), Some(200), Some(300)], 0).unwrap();
+        assert_eq!(state.result_rows[0][0].0.value(), 600usize);
+    }
+
+    #[pg_test]
+    fn test_catalog_shortcut_count_star_missing_row_count() {
+        // If any partition's row count is None, the shortcut fails
+        let meta = make_meta(&["ts", "value"]);
+        let mut plan = make_plan(
+            vec![make_agg_spec(AggType::CountStar, -1, 23)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        plan.companion_oids = vec![pg_sys::Oid::from(1u32), pg_sys::Oid::from(2u32)];
+        assert!(try_catalog_shortcut(&plan, &meta, &[Some(100), None], 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_catalog_shortcut_count_distinct_falls_through() {
+        // CountDistinct is no longer a catalog shortcut — always falls through
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::CountDistinct, 1, 23)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        assert!(try_catalog_shortcut(&plan, &meta, &[Some(1000)], 0).is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // try_metadata_fast_path tests
+    // -------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_metadata_fast_path_rejects_group_by() {
+        let meta = make_meta(&["ts", "value"]);
+        let mut plan = make_plan(
+            vec![make_agg_spec(AggType::Sum, 1, 23)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        plan.group_specs = vec![GroupByColSpec {
+            col_idx: 0,
+            type_oid: pg_sys::Oid::from(23u32),
+            expr: GroupByExpr::Column,
+        }];
+        assert!(try_metadata_fast_path(&plan, &meta, &[], &[], 0, 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_rejects_where() {
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Sum, 1, 23)],
+            Vec::new(),
+            Vec::new(),
+            false,
+        );
+        assert!(try_metadata_fast_path(&plan, &meta, &[], &[], 0, 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_rejects_having() {
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Sum, 1, 23)],
+            Vec::new(),
+            vec![HavingFilter {
+                agg_idx: 0,
+                op: HavingOp::Gt,
+                const_val: 5,
+            }],
+            true,
+        );
+        assert!(try_metadata_fast_path(&plan, &meta, &[], &[], 0, 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_rejects_count_distinct() {
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::CountDistinct, 1, 23)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        assert!(try_metadata_fast_path(&plan, &meta, &[], &[], 0, 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_rejects_text_sum() {
+        let meta = make_meta(&["ts", "name"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Sum, 1, 25)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        ); // TEXTOID=25
+        assert!(try_metadata_fast_path(&plan, &meta, &[], &[], 0, 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_rejects_length_of_sum() {
+        let meta = make_meta(&["ts", "name"]);
+        let mut plan = make_plan(
+            vec![make_agg_spec(AggType::Sum, 1, 23)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        plan.agg_specs[0].expr_kind = AggExpr::LengthOf;
+        assert!(try_metadata_fast_path(&plan, &meta, &[], &[], 0, 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_count_star_empty() {
+        // COUNT(*) with no segments → 0
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::CountStar, -1, 23)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let state = try_metadata_fast_path(&plan, &meta, &[], &[], 0, 0).unwrap();
+        assert_eq!(state.result_rows.len(), 1);
+        assert_eq!(state.result_rows[0][0].0.value(), 0usize);
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_count_star() {
+        // COUNT(*) sums row_count across segments
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::CountStar, -1, 23)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let segs = vec![
+            make_empty_segment(1000),
+            make_empty_segment(2000),
+            make_empty_segment(500),
+        ];
+        let state = try_metadata_fast_path(&plan, &meta, &segs, &[], 0, 0).unwrap();
+        assert_eq!(state.result_rows[0][0].0.value(), 3500usize);
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_count_star_skips_zero_rows() {
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::CountStar, -1, 23)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let segs = vec![
+            make_empty_segment(100),
+            make_empty_segment(0), // should be skipped
+            make_empty_segment(50),
+        ];
+        let state = try_metadata_fast_path(&plan, &meta, &segs, &[], 0, 0).unwrap();
+        assert_eq!(state.result_rows[0][0].0.value(), 150usize);
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_min_int() {
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Min, 1, 20)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        ); // INT8OID=20
+        let mut seg1 = make_empty_segment(100);
+        seg1.col_minmax.insert(
+            "value".to_string(),
+            ColMinMax {
+                min_encoded: 50i64,
+                max_encoded: 200i64,
+                min_null: false,
+                max_null: false,
+                type_oid: pg_sys::Oid::from(20u32),
+            },
+        );
+        let mut seg2 = make_empty_segment(100);
+        seg2.col_minmax.insert(
+            "value".to_string(),
+            ColMinMax {
+                min_encoded: 10i64,
+                max_encoded: 300i64,
+                min_null: false,
+                max_null: false,
+                type_oid: pg_sys::Oid::from(20u32),
+            },
+        );
+        let state = try_metadata_fast_path(&plan, &meta, &[seg1, seg2], &[], 0, 0).unwrap();
+        let result = state.result_rows[0][0].0.value() as i64;
+        assert_eq!(result, 10);
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_max_int() {
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Max, 1, 20)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let mut seg1 = make_empty_segment(100);
+        seg1.col_minmax.insert(
+            "value".to_string(),
+            ColMinMax {
+                min_encoded: 10i64,
+                max_encoded: 200i64,
+                min_null: false,
+                max_null: false,
+                type_oid: pg_sys::Oid::from(20u32),
+            },
+        );
+        let mut seg2 = make_empty_segment(100);
+        seg2.col_minmax.insert(
+            "value".to_string(),
+            ColMinMax {
+                min_encoded: 5i64,
+                max_encoded: 999i64,
+                min_null: false,
+                max_null: false,
+                type_oid: pg_sys::Oid::from(20u32),
+            },
+        );
+        let state = try_metadata_fast_path(&plan, &meta, &[seg1, seg2], &[], 0, 0).unwrap();
+        let result = state.result_rows[0][0].0.value() as i64;
+        assert_eq!(result, 999);
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_min_skips_null() {
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Min, 1, 20)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let mut seg1 = make_empty_segment(100);
+        seg1.col_minmax.insert(
+            "value".to_string(),
+            ColMinMax {
+                min_encoded: 0i64,
+                max_encoded: 0i64,
+                min_null: true, // all nulls in this segment
+                max_null: true,
+                type_oid: pg_sys::Oid::from(20u32),
+            },
+        );
+        let mut seg2 = make_empty_segment(100);
+        seg2.col_minmax.insert(
+            "value".to_string(),
+            ColMinMax {
+                min_encoded: 77i64,
+                max_encoded: 77i64,
+                min_null: false,
+                max_null: false,
+                type_oid: pg_sys::Oid::from(20u32),
+            },
+        );
+        let state = try_metadata_fast_path(&plan, &meta, &[seg1, seg2], &[], 0, 0).unwrap();
+        let result = state.result_rows[0][0].0.value() as i64;
+        assert_eq!(result, 77);
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_missing_minmax_metadata() {
+        // If a segment doesn't have minmax metadata for the needed column, fall through
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Min, 1, 20)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let seg = make_empty_segment(100); // no col_minmax
+        assert!(try_metadata_fast_path(&plan, &meta, &[seg], &[], 0, 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_missing_sum_metadata() {
+        // If a segment doesn't have sum metadata for a SUM column, fall through
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Sum, 1, 20)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let seg = make_empty_segment(100); // no col_sums
+        assert!(try_metadata_fast_path(&plan, &meta, &[seg], &[], 0, 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_count_with_nonnull() {
+        // COUNT(col) reads nonnull_count from ColSum
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Count, 1, 20)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let mut seg1 = make_empty_segment(1000);
+        seg1.col_sums.insert(
+            "value".to_string(),
+            ColSum {
+                sum_datum: pg_sys::Datum::from(0usize),
+                sum_null: true,
+                sum_i128: None,
+                sum_f64: None,
+                nonnull_count: 900,
+                nonzero_count: -1,
+                type_oid: pg_sys::Oid::from(1700u32),
+            },
+        );
+        let mut seg2 = make_empty_segment(500);
+        seg2.col_sums.insert(
+            "value".to_string(),
+            ColSum {
+                sum_datum: pg_sys::Datum::from(0usize),
+                sum_null: true,
+                sum_i128: None,
+                sum_f64: None,
+                nonnull_count: 450,
+                nonzero_count: -1,
+                type_oid: pg_sys::Oid::from(1700u32),
+            },
+        );
+        let state = try_metadata_fast_path(&plan, &meta, &[seg1, seg2], &[], 0, 0).unwrap();
+        assert_eq!(state.result_rows[0][0].0.value() as i64, 1350);
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_sum_float() {
+        // SUM on float column: reads sum_datum as f64 bits
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Sum, 1, 701)], // FLOAT8OID=701
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let sum_val: f64 = 123.5;
+        let mut seg = make_empty_segment(100);
+        seg.col_sums.insert(
+            "value".to_string(),
+            ColSum {
+                sum_datum: pg_sys::Datum::from(sum_val.to_bits() as usize),
+                sum_null: false,
+                sum_i128: None,
+                sum_f64: None,
+                nonnull_count: 100,
+                nonzero_count: -1,
+                type_oid: pg_sys::Oid::from(701u32),
+            },
+        );
+        let state = try_metadata_fast_path(&plan, &meta, &[seg], &[], 0, 0).unwrap();
+        let result_bits = state.result_rows[0][0].0.value() as u64;
+        let result = f64::from_bits(result_bits);
+        assert!((result - 123.5).abs() < 1e-10);
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_sum_int_via_numeric() {
+        // SUM on integer column: sum_datum is a NUMERIC, needs PG numeric_out to parse.
+        // Build a real NUMERIC datum via SPI.
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Sum, 1, 20)], // INT8OID=20
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        // Create a real NUMERIC datum for the value 42000 via numeric_in
+        let numeric_datum: pg_sys::Datum = unsafe {
+            let s = std::ffi::CString::new("42000").unwrap();
+            pg_sys::OidFunctionCall3Coll(
+                pg_sys::Oid::from(1701u32), // numeric_in
+                pg_sys::InvalidOid,
+                pg_sys::Datum::from(s.as_ptr()),
+                pg_sys::Datum::from(0usize),
+                pg_sys::Datum::from(-1i32 as usize),
+            )
+        };
+        let mut seg = make_empty_segment(100);
+        seg.col_sums.insert(
+            "value".to_string(),
+            ColSum {
+                sum_datum: numeric_datum,
+                sum_null: false,
+                sum_i128: None,
+                sum_f64: None,
+                nonnull_count: 100,
+                nonzero_count: -1,
+                type_oid: pg_sys::Oid::from(1700u32),
+            },
+        );
+        let state = try_metadata_fast_path(&plan, &meta, &[seg], &[], 0, 0).unwrap();
+        // SumInt finalized: returns NUMERIC datum — verify via numeric_out
+        let result_datum = state.result_rows[0][0].0;
+        let s = unsafe {
+            let cstr = pg_sys::OidOutputFunctionCall(pg_sys::Oid::from(1702u32), result_datum);
+            let s = std::ffi::CStr::from_ptr(cstr)
+                .to_string_lossy()
+                .into_owned();
+            pg_sys::pfree(cstr as *mut _);
+            s
+        };
+        assert_eq!(s.as_str(), "42000");
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_sum_add_const() {
+        // SUM(col + 10): should compute SUM(col) + 10 * nonnull_count
+        let meta = make_meta(&["ts", "value"]);
+        let mut spec = make_agg_spec(AggType::Sum, 1, 701); // FLOAT8OID
+        spec.expr_kind = AggExpr::AddConst;
+        spec.const_offset = 10;
+        let plan = make_plan(vec![spec], Vec::new(), Vec::new(), true);
+        let base_sum: f64 = 100.0;
+        let mut seg = make_empty_segment(50);
+        seg.col_sums.insert(
+            "value".to_string(),
+            ColSum {
+                sum_datum: pg_sys::Datum::from(base_sum.to_bits() as usize),
+                sum_null: false,
+                sum_i128: None,
+                sum_f64: None,
+                nonnull_count: 50,
+                nonzero_count: -1,
+                type_oid: pg_sys::Oid::from(701u32),
+            },
+        );
+        let state = try_metadata_fast_path(&plan, &meta, &[seg], &[], 0, 0).unwrap();
+        let result = f64::from_bits(state.result_rows[0][0].0.value() as u64);
+        // Expected: 100.0 + 10 * 50 = 600.0
+        assert!((result - 600.0).abs() < 1e-10);
+    }
+
+    #[pg_test]
+    fn test_metadata_fast_path_reports_segment_count() {
+        let meta = make_meta(&["ts", "value"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::CountStar, -1, 23)],
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let segs = vec![make_empty_segment(10), make_empty_segment(20)];
+        let state = try_metadata_fast_path(&plan, &meta, &segs, &[], 123, 456).unwrap();
+        assert_eq!(state.total_segments, 2);
+        assert_eq!(state.metadata_us, 123);
+        assert_eq!(state.heap_scan_us, 456);
+    }
+}

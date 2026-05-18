@@ -1523,3 +1523,296 @@ pub(crate) unsafe fn compact_emit_partial(
         }
     }
 }
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use super::super::cd_set::{new_cd_set_int, new_cd_set_str};
+    use super::super::state::{AggAccumulator, AggExecSpec, AggExpr, AggType, OutputTransform};
+    use super::*;
+    use pgrx::pg_sys;
+    use pgrx::prelude::*;
+
+    fn make_agg_spec(agg_type: AggType, col_idx: i32, col_type_oid: u32) -> AggExecSpec {
+        AggExecSpec {
+            agg_type,
+            col_idx,
+            col_type_oid: pg_sys::Oid::from(col_type_oid),
+            expr_kind: AggExpr::Column,
+            const_offset: 0,
+            is_partial: false,
+            transtype_oid: pg_sys::InvalidOid,
+            output_transform: OutputTransform::None,
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // datum_to_i128 tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_datum_to_i128_int2() {
+        let d = pg_sys::Datum::from(-5i16 as usize);
+        assert_eq!(datum_to_i128(d, pg_sys::INT2OID), -5);
+    }
+
+    #[test]
+    fn test_datum_to_i128_int4() {
+        let d = pg_sys::Datum::from(-100_000i32 as usize);
+        assert_eq!(datum_to_i128(d, pg_sys::INT4OID), -100_000);
+    }
+
+    #[test]
+    fn test_datum_to_i128_int8() {
+        let d = pg_sys::Datum::from(-9_000_000_000i64 as usize);
+        assert_eq!(datum_to_i128(d, pg_sys::INT8OID), -9_000_000_000);
+    }
+
+    #[test]
+    fn test_datum_to_i128_unknown_oid() {
+        // Falls through to raw usize cast
+        let d = pg_sys::Datum::from(42usize);
+        assert_eq!(datum_to_i128(d, pg_sys::Oid::from(9999u32)), 42);
+    }
+
+    // -------------------------------------------------------------------
+    // datum_to_f64 tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_datum_to_f64_float4() {
+        let f: f32 = 1.5;
+        let d = pg_sys::Datum::from(f.to_bits() as usize);
+        let result = datum_to_f64(d, pg_sys::FLOAT4OID);
+        assert!((result - 1.5f64).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_datum_to_f64_float8() {
+        let f: f64 = 1.23456789;
+        let d = pg_sys::Datum::from(f.to_bits() as usize);
+        let result = datum_to_f64(d, pg_sys::FLOAT8OID);
+        assert!((result - 1.23456789).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_datum_to_f64_unknown_oid() {
+        let d = pg_sys::Datum::from(100usize);
+        assert_eq!(datum_to_f64(d, pg_sys::Oid::from(9999u32)), 100.0);
+    }
+
+    // -------------------------------------------------------------------
+    // StringArena tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_arena_alloc_and_get() {
+        let mut arena = StringArena::new();
+        let (off, len) = arena.alloc("hello");
+        assert_eq!(arena.get(off, len), "hello");
+    }
+
+    #[test]
+    fn test_arena_multiple_allocs() {
+        let mut arena = StringArena::new();
+        let (o1, l1) = arena.alloc("foo");
+        let (o2, l2) = arena.alloc("bar");
+        let (o3, l3) = arena.alloc("baz");
+        assert_eq!(arena.get(o1, l1), "foo");
+        assert_eq!(arena.get(o2, l2), "bar");
+        assert_eq!(arena.get(o3, l3), "baz");
+    }
+
+    #[test]
+    fn test_arena_empty_string() {
+        let mut arena = StringArena::new();
+        let (off, len) = arena.alloc("");
+        assert_eq!(arena.get(off, len), "");
+    }
+
+    #[test]
+    fn test_arena_unicode() {
+        let mut arena = StringArena::new();
+        let (off, len) = arena.alloc("hello\u{00e9}world");
+        assert_eq!(arena.get(off, len), "hello\u{00e9}world");
+    }
+
+    // -------------------------------------------------------------------
+    // finalize_accumulator tests
+    //
+    // Stays `#[pg_test]` because some branches (SumInt → NUMERIC, Avg)
+    // allocate PG numeric datums via `pg_sys` and need a live backend.
+    // -------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_finalize_count() {
+        let acc = AggAccumulator::Count { count: 42 };
+        let spec = make_agg_spec(AggType::Count, 0, 20);
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        assert_eq!(datum.value(), 42);
+    }
+
+    #[pg_test]
+    fn test_finalize_count_distinct_int() {
+        let mut seen = new_cd_set_int();
+        seen.insert(10i64);
+        seen.insert(20);
+        seen.insert(30);
+        let acc = AggAccumulator::CountDistinctInt { seen };
+        let spec = make_agg_spec(AggType::CountDistinct, 0, 20);
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        assert_eq!(datum.value(), 3);
+    }
+
+    #[pg_test]
+    fn test_finalize_count_distinct_str() {
+        let mut seen = new_cd_set_str();
+        seen.insert(0xdeadbeef_u128);
+        seen.insert(0xcafebabe_u128);
+        let acc = AggAccumulator::CountDistinctStr { seen };
+        let spec = make_agg_spec(AggType::CountDistinct, 0, 25);
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        assert_eq!(datum.value(), 2);
+    }
+
+    #[pg_test]
+    fn test_finalize_sum_int_zero_count_is_null() {
+        let acc = AggAccumulator::SumInt { sum: 0, count: 0 };
+        let spec = make_agg_spec(AggType::Sum, 0, 20);
+        let (_, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(is_null);
+    }
+
+    #[pg_test]
+    fn test_finalize_sum_int4_returns_int8() {
+        // SUM(int4) → INT8 datum
+        let acc = AggAccumulator::SumInt {
+            sum: 100_000,
+            count: 10,
+        };
+        let spec = make_agg_spec(AggType::Sum, 0, 23); // INT4OID
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        assert_eq!(datum.value() as i64, 100_000);
+    }
+
+    #[pg_test]
+    fn test_finalize_sum_int8_returns_numeric() {
+        // SUM(int8) → NUMERIC
+        let acc = AggAccumulator::SumInt {
+            sum: 999_999_999,
+            count: 5,
+        };
+        let spec = make_agg_spec(AggType::Sum, 0, 20); // INT8OID
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        // Verify via numeric_out
+        let s = unsafe {
+            let cstr = pg_sys::OidOutputFunctionCall(pg_sys::Oid::from(1702u32), datum);
+            let s = std::ffi::CStr::from_ptr(cstr)
+                .to_string_lossy()
+                .into_owned();
+            pg_sys::pfree(cstr as *mut _);
+            s
+        };
+        assert_eq!(s, "999999999");
+    }
+
+    #[pg_test]
+    fn test_finalize_sum_float_zero_count_is_null() {
+        let acc = AggAccumulator::SumFloat { sum: 0.0, count: 0 };
+        let spec = make_agg_spec(AggType::Sum, 0, 701);
+        let (_, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(is_null);
+    }
+
+    #[pg_test]
+    fn test_finalize_sum_float8() {
+        let acc = AggAccumulator::SumFloat { sum: 1.5, count: 1 };
+        let spec = make_agg_spec(AggType::Sum, 0, 701); // FLOAT8OID
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        let result = f64::from_bits(datum.value() as u64);
+        assert!((result - 1.5).abs() < 1e-10);
+    }
+
+    #[pg_test]
+    fn test_finalize_sum_float4() {
+        let acc = AggAccumulator::SumFloat { sum: 2.5, count: 1 };
+        let spec = make_agg_spec(AggType::Sum, 0, 700); // FLOAT4OID
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        let result = f32::from_bits(datum.value() as u32);
+        assert!((result - 2.5).abs() < 0.001);
+    }
+
+    #[pg_test]
+    fn test_finalize_avg_int() {
+        // AVG(int) → NUMERIC (sum/count via PG numeric_div)
+        let acc = AggAccumulator::SumInt { sum: 100, count: 4 };
+        let spec = make_agg_spec(AggType::Avg, 0, 23); // INT4OID
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        let s = unsafe {
+            let cstr = pg_sys::OidOutputFunctionCall(pg_sys::Oid::from(1702u32), datum);
+            let s = std::ffi::CStr::from_ptr(cstr)
+                .to_string_lossy()
+                .into_owned();
+            pg_sys::pfree(cstr as *mut _);
+            s
+        };
+        assert_eq!(s, "25.0000000000000000");
+    }
+
+    #[pg_test]
+    fn test_finalize_avg_float() {
+        // AVG(float8) → FLOAT8 (sum/count)
+        let acc = AggAccumulator::SumFloat {
+            sum: 10.0,
+            count: 4,
+        };
+        let spec = make_agg_spec(AggType::Avg, 0, 701);
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        let result = f64::from_bits(datum.value() as u64);
+        assert!((result - 2.5).abs() < 1e-10);
+    }
+
+    #[pg_test]
+    fn test_finalize_min_int_some() {
+        let acc = AggAccumulator::MinInt { val: Some(-42) };
+        let spec = make_agg_spec(AggType::Min, 0, 20);
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        assert_eq!(datum.value() as i64, -42);
+    }
+
+    #[pg_test]
+    fn test_finalize_min_int_none_is_null() {
+        let acc = AggAccumulator::MinInt { val: None };
+        let spec = make_agg_spec(AggType::Min, 0, 20);
+        let (_, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(is_null);
+    }
+
+    #[pg_test]
+    fn test_finalize_max_float_some() {
+        let acc = AggAccumulator::MaxFloat { val: Some(99.9) };
+        let spec = make_agg_spec(AggType::Max, 0, 701);
+        let (datum, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(!is_null);
+        let result = f64::from_bits(datum.value() as u64);
+        assert!((result - 99.9).abs() < 1e-10);
+    }
+
+    #[pg_test]
+    fn test_finalize_max_float_none_is_null() {
+        let acc = AggAccumulator::MaxFloat { val: None };
+        let spec = make_agg_spec(AggType::Max, 0, 701);
+        let (_, is_null) = unsafe { finalize_accumulator(&acc, &spec) };
+        assert!(is_null);
+    }
+}

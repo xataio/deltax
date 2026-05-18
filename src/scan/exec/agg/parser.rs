@@ -577,3 +577,431 @@ pub(super) unsafe fn parse_agg_private(custom_private: *mut pg_sys::List) -> Par
         }
     } // unsafe
 }
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use super::super::test_utils::build_int_list;
+    use super::{AggExpr, AggType, GroupByExpr, HavingOp, OutputEntry, parse_agg_private};
+    use pgrx::prelude::*;
+
+    // -------------------------------------------------------------------
+    // parse_agg_private tests
+    // -------------------------------------------------------------------
+
+    #[pg_test]
+    fn test_parse_single_count_star() {
+        // Layout: [oid=1234, sentinel=-1, num_aggs=1, (type=2(CountStar), col=-1, result_oid=0, col_type=0, expr=0)]
+        unsafe {
+            let list = build_int_list(&[
+                1234, -1, // companion OID + sentinel
+                1,  // num_aggs
+                2, -1, 0, 0,
+                0, // CountStar: type=2, col=-1, result_oid=0, col_type=0, expr=Column(0)
+            ]);
+
+            let plan = parse_agg_private(list);
+            assert_eq!(plan.companion_oids.len(), 1);
+            assert_eq!(u32::from(plan.companion_oids[0]), 1234);
+            assert_eq!(plan.agg_specs.len(), 1);
+            assert_eq!(plan.agg_specs[0].agg_type, AggType::CountStar);
+            assert_eq!(plan.agg_specs[0].col_idx, -1);
+            assert_eq!(plan.agg_specs[0].expr_kind, AggExpr::Column);
+            assert!(plan.group_specs.is_empty());
+            assert!(plan.output_map.len() == 1); // default: aggs then groups
+            assert!(plan.having_filters.is_empty());
+            assert!(plan.where_quals.is_null());
+            assert_eq!(plan.topn_limit, 0);
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_multiple_companion_oids() {
+        unsafe {
+            let list = build_int_list(&[
+                100, 200, 300, -1, // three companion OIDs + sentinel
+                0,  // num_aggs = 0
+            ]);
+
+            let plan = parse_agg_private(list);
+            assert_eq!(plan.companion_oids.len(), 3);
+            assert_eq!(u32::from(plan.companion_oids[0]), 100);
+            assert_eq!(u32::from(plan.companion_oids[1]), 200);
+            assert_eq!(u32::from(plan.companion_oids[2]), 300);
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_all_agg_types() {
+        // Test that all 7 AggType variants parse correctly.
+        // Each agg spec: (type, col_idx, result_oid, col_type_oid, expr_kind)
+        unsafe {
+            let list = build_int_list(&[
+                42, -1, // companion OID + sentinel
+                7,  // num_aggs
+                0, 0, 0, 23, 0, // Sum, col=0, INT4OID=23
+                1, 1, 0, 23, 0, // Count, col=1
+                2, -1, 0, 0, 0, // CountStar
+                3, 2, 0, 701, 0, // Avg, col=2, FLOAT8OID=701
+                4, 3, 0, 25, 0, // CountDistinct, col=3, TEXTOID=25
+                5, 0, 0, 23, 0, 0, // Min, col=0, OutputTransform=None
+                6, 0, 0, 23, 0, 0, // Max, col=0, OutputTransform=None
+            ]);
+
+            let plan = parse_agg_private(list);
+            assert_eq!(plan.agg_specs.len(), 7);
+            assert_eq!(plan.agg_specs[0].agg_type, AggType::Sum);
+            assert_eq!(plan.agg_specs[1].agg_type, AggType::Count);
+            assert_eq!(plan.agg_specs[2].agg_type, AggType::CountStar);
+            assert_eq!(plan.agg_specs[3].agg_type, AggType::Avg);
+            assert_eq!(plan.agg_specs[4].agg_type, AggType::CountDistinct);
+            assert_eq!(plan.agg_specs[5].agg_type, AggType::Min);
+            assert_eq!(plan.agg_specs[6].agg_type, AggType::Max);
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_expr_kinds() {
+        // Test LengthOf (expr=1) and AddConst (expr=2, followed by offset)
+        unsafe {
+            let list = build_int_list(&[
+                42, -1, // companion OID + sentinel
+                3,  // num_aggs
+                0, 0, 0, 23, 0, // Sum, Column (expr=0)
+                0, 1, 0, 23, 1, // Sum, LengthOf (expr=1)
+                0, 2, 0, 23, 2, 77, // Sum, AddConst (expr=2), offset=77
+            ]);
+
+            let plan = parse_agg_private(list);
+            assert_eq!(plan.agg_specs[0].expr_kind, AggExpr::Column);
+            assert_eq!(plan.agg_specs[0].const_offset, 0);
+            assert_eq!(plan.agg_specs[1].expr_kind, AggExpr::LengthOf);
+            assert_eq!(plan.agg_specs[2].expr_kind, AggExpr::AddConst);
+            assert_eq!(plan.agg_specs[2].const_offset, 77);
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_group_by_column() {
+        // GROUP BY col: expr_tag=0
+        unsafe {
+            let list = build_int_list(&[
+                42, -1, // companion OID + sentinel
+                0,  // num_aggs = 0
+                1,  // num_groups = 1
+                3, 25, 0, // col_idx=3, type_oid=TEXTOID(25), expr_tag=0(Column)
+            ]);
+
+            let plan = parse_agg_private(list);
+            assert_eq!(plan.group_specs.len(), 1);
+            assert_eq!(plan.group_specs[0].col_idx, 3);
+            assert_eq!(u32::from(plan.group_specs[0].type_oid), 25);
+            assert_eq!(plan.group_specs[0].expr, GroupByExpr::Column);
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_group_by_date_trunc() {
+        // GROUP BY date_trunc('hour', ts): expr_tag=2, func_oid, unit_len, unit_bytes...
+        unsafe {
+            let unit = b"hour";
+            let mut vals = vec![
+                42i32,
+                -1, // companion OID + sentinel
+                0,  // num_aggs = 0
+                1,  // num_groups = 1
+                0,
+                1184,
+                2,   // col_idx=0, type_oid=TIMESTAMPTZOID(1184), expr_tag=2(DateTrunc)
+                100, // func_oid
+                unit.len() as i32, // unit_len
+            ];
+            for &b in unit.iter() {
+                vals.push(b as i32);
+            }
+            let list = build_int_list(&vals);
+
+            let plan = parse_agg_private(list);
+            assert_eq!(plan.group_specs.len(), 1);
+            match &plan.group_specs[0].expr {
+                GroupByExpr::DateTrunc {
+                    unit,
+                    unit_usecs,
+                    func_oid,
+                } => {
+                    assert_eq!(unit, "hour");
+                    assert_eq!(*unit_usecs, 3_600_000_000);
+                    assert_eq!(*func_oid, 100);
+                }
+                other => panic!("expected DateTrunc, got {:?}", other),
+            }
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_group_by_extract() {
+        // GROUP BY extract(minute FROM ts): expr_tag=3, divisor=0
+        unsafe {
+            let unit = b"minute";
+            let mut vals = vec![
+                42i32,
+                -1,
+                0, // num_aggs
+                1, // num_groups
+                0,
+                1184,
+                3,   // col_idx=0, TIMESTAMPTZOID, expr_tag=3(Extract)
+                200, // func_oid
+                0,
+                0, // divisor (i64 hi/lo): 0 = pg_usec input
+                unit.len() as i32,
+            ];
+            for &b in unit.iter() {
+                vals.push(b as i32);
+            }
+            let list = build_int_list(&vals);
+
+            let plan = parse_agg_private(list);
+            match &plan.group_specs[0].expr {
+                GroupByExpr::Extract {
+                    unit,
+                    func_oid,
+                    divisor,
+                } => {
+                    assert_eq!(unit, "minute");
+                    assert_eq!(*func_oid, 200);
+                    assert_eq!(*divisor, 0);
+                }
+                other => panic!("expected Extract, got {:?}", other),
+            }
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_group_by_extract_with_divisor() {
+        // GROUP BY extract(hour FROM to_timestamp(bigint_col / 1_000_000)):
+        // expr_tag=3 with non-zero divisor.
+        unsafe {
+            let unit = b"hour";
+            let divisor: i64 = 1_000_000;
+            let mut vals = vec![
+                42i32,
+                -1,
+                0, // num_aggs
+                1, // num_groups
+                0,
+                20,
+                3,   // col_idx=0, INT8OID, expr_tag=3(Extract)
+                200, // func_oid
+                (divisor >> 32) as i32,
+                divisor as i32,
+                unit.len() as i32,
+            ];
+            for &b in unit.iter() {
+                vals.push(b as i32);
+            }
+            let list = build_int_list(&vals);
+
+            let plan = parse_agg_private(list);
+            match &plan.group_specs[0].expr {
+                GroupByExpr::Extract {
+                    unit,
+                    func_oid,
+                    divisor,
+                } => {
+                    assert_eq!(unit, "hour");
+                    assert_eq!(*func_oid, 200);
+                    assert_eq!(*divisor, 1_000_000);
+                }
+                other => panic!("expected Extract, got {:?}", other),
+            }
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_group_by_add_const() {
+        // GROUP BY col + 5: expr_tag=4, offset, op_oid
+        unsafe {
+            let list = build_int_list(&[
+                42, -1, 0, // num_aggs
+                1, // num_groups
+                2, 23, 4, // col_idx=2, INT4OID, expr_tag=4(AddConst)
+                5, 551, // offset=5, op_oid=551
+            ]);
+
+            let plan = parse_agg_private(list);
+            match &plan.group_specs[0].expr {
+                GroupByExpr::AddConst { offset, op_oid } => {
+                    assert_eq!(*offset, 5);
+                    assert_eq!(*op_oid, 551);
+                }
+                other => panic!("expected AddConst, got {:?}", other),
+            }
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_group_by_regexp_replace() {
+        // GROUP BY regexp_replace(col, 'pat', 'rep'): expr_tag=1
+        unsafe {
+            let pattern = b"abc";
+            let replacement = b"xyz";
+            let mut vals = vec![
+                42i32,
+                -1,
+                0, // num_aggs
+                1, // num_groups
+                1,
+                25,
+                1, // col_idx=1, TEXTOID, expr_tag=1(RegexpReplace)
+                300,
+                100, // func_oid=300, collation=100
+                pattern.len() as i32,
+            ];
+            for &b in pattern.iter() {
+                vals.push(b as i32);
+            }
+            vals.push(replacement.len() as i32);
+            for &b in replacement.iter() {
+                vals.push(b as i32);
+            }
+            let list = build_int_list(&vals);
+
+            let plan = parse_agg_private(list);
+            match &plan.group_specs[0].expr {
+                GroupByExpr::RegexpReplace {
+                    pattern,
+                    replacement,
+                    func_oid,
+                    collation,
+                } => {
+                    assert_eq!(pattern, "abc");
+                    assert_eq!(replacement, "xyz");
+                    assert_eq!(*func_oid, 300);
+                    assert_eq!(*collation, 100);
+                }
+                other => panic!("expected RegexpReplace, got {:?}", other),
+            }
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_output_map() {
+        // Explicit output map: [num_output=3, (type=1,ref=0), (type=0,ref=0), (type=0,ref=1)]
+        // type=0 → Agg, type=1 → Group
+        unsafe {
+            let list = build_int_list(&[
+                42, -1, // companion OID + sentinel
+                2,  // num_aggs
+                2, -1, 0, 0, 0, // CountStar
+                0, 0, 0, 23, 0, // Sum col=0
+                1, // num_groups
+                0, 23, 0, // col_idx=0, INT4OID, Column
+                3, // num_output = 3
+                1, 0, // Group(0)
+                0, 0, // Agg(0)
+                0, 1, // Agg(1)
+            ]);
+
+            let plan = parse_agg_private(list);
+            assert_eq!(plan.output_map.len(), 3);
+            assert!(matches!(plan.output_map[0], OutputEntry::Group(0)));
+            assert!(matches!(plan.output_map[1], OutputEntry::Agg(0)));
+            assert!(matches!(plan.output_map[2], OutputEntry::Agg(1)));
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_default_output_map() {
+        // When no output map is specified, defaults to aggs then groups.
+        unsafe {
+            let list = build_int_list(&[
+                42, -1, 1, // num_aggs
+                2, -1, 0, 0, 0, // CountStar
+                1, // num_groups
+                0, 23, 0, // col_idx=0, INT4OID, Column
+                0, // num_output = 0 (triggers default)
+            ]);
+
+            let plan = parse_agg_private(list);
+            assert_eq!(plan.output_map.len(), 2);
+            assert!(matches!(plan.output_map[0], OutputEntry::Agg(0)));
+            assert!(matches!(plan.output_map[1], OutputEntry::Group(0)));
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_having_filters() {
+        unsafe {
+            let list = build_int_list(&[
+                42, -1, 1, // num_aggs
+                2, -1, 0, 0, 0, // CountStar
+                0, // num_groups
+                1, // num_output
+                0, 0, // Agg(0)
+                2, // num_having = 2
+                0, 0, 10, // agg_idx=0, op=Gt(0), const=10
+                0, 4, 100, // agg_idx=0, op=Eq(4), const=100
+            ]);
+
+            let plan = parse_agg_private(list);
+            assert_eq!(plan.having_filters.len(), 2);
+            assert_eq!(plan.having_filters[0].agg_idx, 0);
+            assert!(matches!(plan.having_filters[0].op, HavingOp::Gt));
+            assert_eq!(plan.having_filters[0].const_val, 10);
+            assert!(matches!(plan.having_filters[1].op, HavingOp::Eq));
+            assert_eq!(plan.having_filters[1].const_val, 100);
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_topn() {
+        unsafe {
+            let list = build_int_list(&[
+                42, -1, 1, // num_aggs
+                2, -1, 0, 0, 0, // CountStar
+                0, // num_groups
+                1, // num_output
+                0, 0,  // Agg(0)
+                0,  // num_having
+                0,  // where_str_len = 0 (no WHERE)
+                25, // topn_limit = 25
+                2,  // topn_sort_col = 2
+                0,  // topn_ascending = false
+            ]);
+
+            let plan = parse_agg_private(list);
+            assert_eq!(plan.topn_limit, 25);
+            assert_eq!(plan.topn_sort_col, 2);
+            assert!(!plan.topn_ascending);
+        }
+    }
+
+    #[pg_test]
+    fn test_parse_all_having_ops() {
+        // Verify all 6 HavingOp variants: Gt=0, Lt=1, Ge=2, Le=3, Eq=4, Ne=5
+        unsafe {
+            let list = build_int_list(&[
+                42, -1, 1, 2, -1, 0, 0, 0, // 1 agg: CountStar
+                0, // num_groups
+                1, 0, 0, // num_output=1, Agg(0)
+                6, // num_having = 6
+                0, 0, 1, // Gt
+                0, 1, 2, // Lt
+                0, 2, 3, // Ge
+                0, 3, 4, // Le
+                0, 4, 5, // Eq
+                0, 5, 6, // Ne
+            ]);
+
+            let plan = parse_agg_private(list);
+            assert_eq!(plan.having_filters.len(), 6);
+            assert!(matches!(plan.having_filters[0].op, HavingOp::Gt));
+            assert!(matches!(plan.having_filters[1].op, HavingOp::Lt));
+            assert!(matches!(plan.having_filters[2].op, HavingOp::Ge));
+            assert!(matches!(plan.having_filters[3].op, HavingOp::Le));
+            assert!(matches!(plan.having_filters[4].op, HavingOp::Eq));
+            assert!(matches!(plan.having_filters[5].op, HavingOp::Ne));
+        }
+    }
+}
