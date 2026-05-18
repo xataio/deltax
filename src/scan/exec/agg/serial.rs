@@ -1378,12 +1378,12 @@ unsafe fn serial_compact_row_loop(
                 match kind {
                     CompactAccKind::Count => match spec.agg_type {
                         AggType::CountStar => {
-                            *storage.count_mut(group_idx, spec_idx) += 1;
+                            storage.incr_count(group_idx, spec_idx, 1);
                         }
                         AggType::Count => {
                             let col = &decompressed[spec.col_idx as usize];
                             if !col.is_empty() && !col[row].1 {
-                                *storage.count_mut(group_idx, spec_idx) += 1;
+                                storage.incr_count(group_idx, spec_idx, 1);
                             }
                         }
                         _ => {}
@@ -1392,39 +1392,36 @@ unsafe fn serial_compact_row_loop(
                         let col = &decompressed[spec.col_idx as usize];
                         if !col.is_empty() && !col[row].1 {
                             let v = datum_to_i128(col[row].0, spec.col_type_oid);
-                            let (sum, count) = storage.sum_int_mut(group_idx, spec_idx);
-                            if spec.expr_kind == AggExpr::AddConst {
-                                *sum += v + spec.const_offset as i128;
+                            let sum_delta = if spec.expr_kind == AggExpr::AddConst {
+                                v + spec.const_offset as i128
                             } else {
-                                *sum += v;
-                            }
-                            *count += 1;
+                                v
+                            };
+                            storage.add_sum_int(group_idx, spec_idx, sum_delta, 1);
                         }
                     }
                     CompactAccKind::SumIntNarrow => {
                         let col = &decompressed[spec.col_idx as usize];
                         if !col.is_empty() && !col[row].1 {
                             let v = col[row].0.value() as i64;
-                            let (sum, count) = storage.sum_int_narrow_mut(group_idx, spec_idx);
-                            if spec.expr_kind == AggExpr::AddConst {
-                                *sum += v + spec.const_offset;
+                            let sum_delta = if spec.expr_kind == AggExpr::AddConst {
+                                v + spec.const_offset
                             } else {
-                                *sum += v;
-                            }
-                            *count += 1;
+                                v
+                            };
+                            storage.add_sum_int_narrow(group_idx, spec_idx, sum_delta, 1);
                         }
                     }
                     CompactAccKind::SumFloat => {
                         let col = &decompressed[spec.col_idx as usize];
                         if !col.is_empty() && !col[row].1 {
                             let v = datum_to_f64(col[row].0, spec.col_type_oid);
-                            let (sum, count) = storage.sum_float_mut(group_idx, spec_idx);
-                            if spec.expr_kind == AggExpr::AddConst {
-                                *sum += v + spec.const_offset as f64;
+                            let sum_delta = if spec.expr_kind == AggExpr::AddConst {
+                                v + spec.const_offset as f64
                             } else {
-                                *sum += v;
-                            }
-                            *count += 1;
+                                v
+                            };
+                            storage.add_sum_float(group_idx, spec_idx, sum_delta, 1);
                         }
                     }
                     CompactAccKind::MinStr | CompactAccKind::MaxStr => {

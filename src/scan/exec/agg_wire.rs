@@ -525,9 +525,7 @@ mod tests {
             let idx = r.compact_storage.alloc_group();
             r.cd_sidecar.alloc_group();
             r.compact_map.insert(key, idx);
-            unsafe {
-                *r.compact_storage.count_mut(idx, 0) = count;
-            }
+            r.compact_storage.set_count(idx, 0, count);
         }
         r
     }
@@ -581,9 +579,7 @@ mod tests {
             r.cd_sidecar.alloc_group();
             r.compact_map.insert(key, idx);
             let (off, len) = r.compact_storage.str_arena.alloc(s);
-            unsafe {
-                r.compact_storage.write_min_max_str(idx, 0, off, len);
-            }
+            r.compact_storage.write_min_max_str(idx, 0, off, len);
         }
         let layout = layout_partial(&r, &specs);
         let mut buf = vec![0u8; layout.total_size as usize];

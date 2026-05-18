@@ -877,9 +877,7 @@ impl CountDistinctSideCar {
                     CdKind::Int => e.sets_int[gidx as usize].len() as i64,
                     CdKind::DictBitset => e.bitsets[gidx as usize].count_ones() as i64,
                 };
-                unsafe {
-                    *storage.count_mut(gidx, e.spec_idx) = count;
-                }
+                storage.set_count(gidx, e.spec_idx, count);
             }
         }
     }
@@ -896,32 +894,14 @@ impl CountDistinctSideCar {
 /// has size/kind dictated by `layout.slots[i].1`. Field alignment is
 /// enforced by `CompactAccLayout::new()`.
 ///
-/// # Safety of accessor methods
-///
-/// All `unsafe fn` accessor methods below (`count_mut`, `sum_int_mut`,
-/// `read_count`, etc.) share the same preconditions:
-///
-/// 1. `group_idx < (buf.len() / layout.group_stride)` — the group must
-///    have been allocated via [`alloc_group`].
-/// 2. `slot < layout.slots.len()` — guaranteed by the layout shape
-///    `agg_specs.len()` returned from [`CompactAccLayout::new`].
-/// 3. The slot's `CompactAccKind` must match the access type the
-///    caller is invoking (e.g. `count_mut` only on `Count` slots,
-///    `sum_int_mut` only on `SumInt`). Mixing types is undefined
-///    behaviour because they reinterpret raw bytes through different
-///    pointer casts.
-///
-/// (1) is bounds-checkable in debug builds; (2) panics on out-of-range
-/// `slots` indexing; (3) is a runtime contract enforced by the
-/// dispatch logic, which inspects `layout.slots[slot].1` before
-/// choosing which accessor to call.
-///
-/// The methods are `unsafe fn` rather than safe-with-internal-asserts
-/// because they sit on the hot accumulator path (called per-row,
-/// per-spec, millions of times per query) and the safe equivalents
-/// (`from_le_bytes`/`to_le_bytes` value-semantics setters) cost real
-/// time at this depth. A future redesign that backs the buffer with
-/// typed storage could lift the unsafe — left for a separate session.
+/// The accessor methods below (`read_count`/`incr_count`/`read_sum_int`
+/// /`add_sum_int`/…) are safe: they go through bounds-checked slice
+/// indexing into `buf` and read/write via `from_le_bytes`/`to_le_bytes`,
+/// which LLVM lowers to plain loads/stores on little-endian targets.
+/// The caller is responsible for matching the slot's `CompactAccKind`
+/// to the access type (e.g. `read_count` on a `Count` slot only); the
+/// dispatch logic inspects `layout.slots[slot].1` before choosing.
+/// Mismatched kinds produce incorrect numeric results but no UB.
 pub(crate) struct CompactAccStorage {
     pub(crate) buf: Vec<u8>,
     pub(crate) layout: CompactAccLayout,
@@ -975,232 +955,182 @@ impl CompactAccStorage {
         for slot_idx in 0..self.layout.slots.len() {
             let (_, kind) = self.layout.slots[slot_idx];
             if kind == CompactAccKind::MinStr || kind == CompactAccKind::MaxStr {
-                unsafe {
-                    self.write_min_max_str(group_idx as u32, slot_idx, u32::MAX, 0);
-                }
+                self.write_min_max_str(group_idx as u32, slot_idx, u32::MAX, 0);
             }
         }
         group_idx as u32
     }
 
-    /// Get a mutable i64 reference (for Count).
+    /// Byte offset of (group_idx, slot)'s field in `buf`.
     #[inline]
-    pub(crate) unsafe fn count_mut(&mut self, group_idx: u32, slot: usize) -> &mut i64 {
-        unsafe {
-            let (offset, _) = self.layout.slots[slot];
-            let ptr = self
-                .buf
-                .as_mut_ptr()
-                .add(group_idx as usize * self.layout.group_stride + offset);
-            &mut *(ptr as *mut i64)
-        }
+    fn field_start(&self, group_idx: u32, slot: usize) -> usize {
+        let (offset, _) = self.layout.slots[slot];
+        group_idx as usize * self.layout.group_stride + offset
     }
 
-    /// Get mutable references to (sum: i128, count: i64) for SumInt.
+    // ----- Count slot (8 bytes: i64 count) -----
+
+    /// Read the current count.
     #[inline]
-    pub(crate) unsafe fn sum_int_mut(
+    pub(crate) fn read_count(&self, group_idx: u32, slot: usize) -> i64 {
+        let s = self.field_start(group_idx, slot);
+        i64::from_le_bytes(self.buf[s..s + 8].try_into().unwrap())
+    }
+
+    /// Add `delta` to the count.
+    #[inline]
+    pub(crate) fn incr_count(&mut self, group_idx: u32, slot: usize, delta: i64) {
+        let s = self.field_start(group_idx, slot);
+        let bytes: &mut [u8; 8] = (&mut self.buf[s..s + 8]).try_into().unwrap();
+        let cur = i64::from_le_bytes(*bytes);
+        *bytes = (cur + delta).to_le_bytes();
+    }
+
+    /// Overwrite the count with `val`.
+    #[inline]
+    pub(crate) fn set_count(&mut self, group_idx: u32, slot: usize, val: i64) {
+        let s = self.field_start(group_idx, slot);
+        self.buf[s..s + 8].copy_from_slice(&val.to_le_bytes());
+    }
+
+    // ----- SumInt slot (24 bytes: i128 sum + i64 count) -----
+
+    /// Read (sum_i128, count).
+    #[inline]
+    pub(crate) fn read_sum_int(&self, group_idx: u32, slot: usize) -> (i128, i64) {
+        let s = self.field_start(group_idx, slot);
+        let sum = i128::from_le_bytes(self.buf[s..s + 16].try_into().unwrap());
+        let count = i64::from_le_bytes(self.buf[s + 16..s + 24].try_into().unwrap());
+        (sum, count)
+    }
+
+    /// Add `(sum_delta, count_delta)` to (sum, count).
+    #[inline]
+    pub(crate) fn add_sum_int(
         &mut self,
         group_idx: u32,
         slot: usize,
-    ) -> (&mut i128, &mut i64) {
-        unsafe {
-            let (offset, _) = self.layout.slots[slot];
-            let base = self
-                .buf
-                .as_mut_ptr()
-                .add(group_idx as usize * self.layout.group_stride + offset);
-            let sum = &mut *(base as *mut i128);
-            let count = &mut *(base.add(16) as *mut i64);
-            (sum, count)
-        }
+        sum_delta: i128,
+        count_delta: i64,
+    ) {
+        let s = self.field_start(group_idx, slot);
+        let sum_bytes: &mut [u8; 16] = (&mut self.buf[s..s + 16]).try_into().unwrap();
+        *sum_bytes = (i128::from_le_bytes(*sum_bytes) + sum_delta).to_le_bytes();
+        let count_bytes: &mut [u8; 8] = (&mut self.buf[s + 16..s + 24]).try_into().unwrap();
+        *count_bytes = (i64::from_le_bytes(*count_bytes) + count_delta).to_le_bytes();
     }
 
-    /// Get mutable references to (sum: i64, count: i64) for SumIntNarrow.
+    // ----- SumIntNarrow slot (16 bytes: i64 sum + i64 count) -----
+
+    /// Read (sum_i64, count).
     #[inline]
-    pub(crate) unsafe fn sum_int_narrow_mut(
+    pub(crate) fn read_sum_int_narrow(&self, group_idx: u32, slot: usize) -> (i64, i64) {
+        let s = self.field_start(group_idx, slot);
+        let sum = i64::from_le_bytes(self.buf[s..s + 8].try_into().unwrap());
+        let count = i64::from_le_bytes(self.buf[s + 8..s + 16].try_into().unwrap());
+        (sum, count)
+    }
+
+    /// Add `(sum_delta, count_delta)` to the narrow (sum, count).
+    #[inline]
+    pub(crate) fn add_sum_int_narrow(
         &mut self,
         group_idx: u32,
         slot: usize,
-    ) -> (&mut i64, &mut i64) {
-        unsafe {
-            let (offset, _) = self.layout.slots[slot];
-            let base = self
-                .buf
-                .as_mut_ptr()
-                .add(group_idx as usize * self.layout.group_stride + offset);
-            let sum = &mut *(base as *mut i64);
-            let count = &mut *(base.add(8) as *mut i64);
-            (sum, count)
-        }
+        sum_delta: i64,
+        count_delta: i64,
+    ) {
+        let s = self.field_start(group_idx, slot);
+        let sum_bytes: &mut [u8; 8] = (&mut self.buf[s..s + 8]).try_into().unwrap();
+        *sum_bytes = (i64::from_le_bytes(*sum_bytes) + sum_delta).to_le_bytes();
+        let count_bytes: &mut [u8; 8] = (&mut self.buf[s + 8..s + 16]).try_into().unwrap();
+        *count_bytes = (i64::from_le_bytes(*count_bytes) + count_delta).to_le_bytes();
     }
 
-    /// Get mutable references to (sum: f64, count: i64) for SumFloat.
+    // ----- SumFloat slot (16 bytes: f64 sum + i64 count) -----
+
+    /// Read (sum_f64, count).
     #[inline]
-    pub(crate) unsafe fn sum_float_mut(
+    pub(crate) fn read_sum_float(&self, group_idx: u32, slot: usize) -> (f64, i64) {
+        let s = self.field_start(group_idx, slot);
+        let sum = f64::from_le_bytes(self.buf[s..s + 8].try_into().unwrap());
+        let count = i64::from_le_bytes(self.buf[s + 8..s + 16].try_into().unwrap());
+        (sum, count)
+    }
+
+    /// Add `(sum_delta, count_delta)` to the float (sum, count).
+    #[inline]
+    pub(crate) fn add_sum_float(
         &mut self,
         group_idx: u32,
         slot: usize,
-    ) -> (&mut f64, &mut i64) {
-        unsafe {
-            let (offset, _) = self.layout.slots[slot];
-            let base = self
-                .buf
-                .as_mut_ptr()
-                .add(group_idx as usize * self.layout.group_stride + offset);
-            let sum = &mut *(base as *mut f64);
-            let count = &mut *(base.add(8) as *mut i64);
-            (sum, count)
-        }
+        sum_delta: f64,
+        count_delta: i64,
+    ) {
+        let s = self.field_start(group_idx, slot);
+        let sum_bytes: &mut [u8; 8] = (&mut self.buf[s..s + 8]).try_into().unwrap();
+        *sum_bytes = (f64::from_le_bytes(*sum_bytes) + sum_delta).to_le_bytes();
+        let count_bytes: &mut [u8; 8] = (&mut self.buf[s + 8..s + 16]).try_into().unwrap();
+        *count_bytes = (i64::from_le_bytes(*count_bytes) + count_delta).to_le_bytes();
     }
 
-    /// Read count value for finalization.
-    #[inline]
-    pub(crate) unsafe fn read_count(&self, group_idx: u32, slot: usize) -> i64 {
-        unsafe {
-            let (offset, _) = self.layout.slots[slot];
-            let ptr = self
-                .buf
-                .as_ptr()
-                .add(group_idx as usize * self.layout.group_stride + offset);
-            *(ptr as *const i64)
-        }
-    }
+    // ----- MinStr / MaxStr slot (8 bytes: u32 arena_offset + u32 length) -----
 
-    /// Read (sum_i128, count) for finalization.
+    /// Read MinStr/MaxStr: returns (arena_offset, length). Sentinel is
+    /// (u32::MAX, 0) = no value.
     #[inline]
-    pub(crate) unsafe fn read_sum_int(&self, group_idx: u32, slot: usize) -> (i128, i64) {
-        unsafe {
-            let (offset, _) = self.layout.slots[slot];
-            let base = self
-                .buf
-                .as_ptr()
-                .add(group_idx as usize * self.layout.group_stride + offset);
-            let sum = *(base as *const i128);
-            let count = *(base.add(16) as *const i64);
-            (sum, count)
-        }
-    }
-
-    /// Read (sum_i64, count) for finalization (narrow path).
-    #[inline]
-    pub(crate) unsafe fn read_sum_int_narrow(&self, group_idx: u32, slot: usize) -> (i64, i64) {
-        unsafe {
-            let (offset, _) = self.layout.slots[slot];
-            let base = self
-                .buf
-                .as_ptr()
-                .add(group_idx as usize * self.layout.group_stride + offset);
-            let sum = *(base as *const i64);
-            let count = *(base.add(8) as *const i64);
-            (sum, count)
-        }
-    }
-
-    /// Read (sum_f64, count) for finalization.
-    #[inline]
-    pub(crate) unsafe fn read_sum_float(&self, group_idx: u32, slot: usize) -> (f64, i64) {
-        unsafe {
-            let (offset, _) = self.layout.slots[slot];
-            let base = self
-                .buf
-                .as_ptr()
-                .add(group_idx as usize * self.layout.group_stride + offset);
-            let sum = *(base as *const f64);
-            let count = *(base.add(8) as *const i64);
-            (sum, count)
-        }
-    }
-
-    /// Read MinStr/MaxStr: returns (arena_offset, length). Sentinel is (u32::MAX, 0) = no value.
-    #[inline]
-    pub(crate) unsafe fn read_min_max_str(&self, group_idx: u32, slot: usize) -> (u32, u32) {
-        unsafe {
-            let (offset, _) = self.layout.slots[slot];
-            let base = self
-                .buf
-                .as_ptr()
-                .add(group_idx as usize * self.layout.group_stride + offset);
-            let off = *(base as *const u32);
-            let len = *(base.add(4) as *const u32);
-            (off, len)
-        }
+    pub(crate) fn read_min_max_str(&self, group_idx: u32, slot: usize) -> (u32, u32) {
+        let s = self.field_start(group_idx, slot);
+        let off = u32::from_le_bytes(self.buf[s..s + 4].try_into().unwrap());
+        let len = u32::from_le_bytes(self.buf[s + 4..s + 8].try_into().unwrap());
+        (off, len)
     }
 
     /// Write MinStr/MaxStr arena offset and length.
     #[inline]
-    pub(crate) unsafe fn write_min_max_str(
-        &mut self,
-        group_idx: u32,
-        slot: usize,
-        off: u32,
-        len: u32,
-    ) {
-        unsafe {
-            let (offset, _) = self.layout.slots[slot];
-            let base = self
-                .buf
-                .as_mut_ptr()
-                .add(group_idx as usize * self.layout.group_stride + offset);
-            *(base as *mut u32) = off;
-            *(base.add(4) as *mut u32) = len;
-        }
+    pub(crate) fn write_min_max_str(&mut self, group_idx: u32, slot: usize, off: u32, len: u32) {
+        let s = self.field_start(group_idx, slot);
+        self.buf[s..s + 4].copy_from_slice(&off.to_le_bytes());
+        self.buf[s + 4..s + 8].copy_from_slice(&len.to_le_bytes());
     }
 
-    /// Read MinInt/MaxInt: returns (value, has_value). `has_value=false` means
-    /// no value has been observed yet (zero-init from `alloc_group`).
+    // ----- MinInt / MaxInt slot (16 bytes: i64 val + i64 has_value flag) -----
+
+    /// Read MinInt/MaxInt: returns (value, has_value). `has_value=false`
+    /// means no value has been observed yet (zero-init from `alloc_group`).
     #[inline]
-    pub(crate) unsafe fn read_min_max_int(&self, group_idx: u32, slot: usize) -> (i64, bool) {
-        unsafe {
-            let (offset, _) = self.layout.slots[slot];
-            let base = self
-                .buf
-                .as_ptr()
-                .add(group_idx as usize * self.layout.group_stride + offset);
-            let val = *(base as *const i64);
-            let has = *(base.add(8) as *const i64);
-            (val, has != 0)
-        }
+    pub(crate) fn read_min_max_int(&self, group_idx: u32, slot: usize) -> (i64, bool) {
+        let s = self.field_start(group_idx, slot);
+        let val = i64::from_le_bytes(self.buf[s..s + 8].try_into().unwrap());
+        let has = i64::from_le_bytes(self.buf[s + 8..s + 16].try_into().unwrap());
+        (val, has != 0)
     }
 
     /// Write MinInt/MaxInt value + has_value flag.
     #[inline]
-    pub(crate) unsafe fn write_min_max_int(
-        &mut self,
-        group_idx: u32,
-        slot: usize,
-        val: i64,
-        has: bool,
-    ) {
-        unsafe {
-            let (offset, _) = self.layout.slots[slot];
-            let base = self
-                .buf
-                .as_mut_ptr()
-                .add(group_idx as usize * self.layout.group_stride + offset);
-            *(base as *mut i64) = val;
-            *(base.add(8) as *mut i64) = if has { 1 } else { 0 };
+    pub(crate) fn write_min_max_int(&mut self, group_idx: u32, slot: usize, val: i64, has: bool) {
+        let s = self.field_start(group_idx, slot);
+        self.buf[s..s + 8].copy_from_slice(&val.to_le_bytes());
+        self.buf[s + 8..s + 16].copy_from_slice(&i64::from(has).to_le_bytes());
+    }
+
+    /// Update MinInt: replace stored value if `candidate < stored` or no
+    /// value yet.
+    #[inline]
+    pub(crate) fn update_min_int(&mut self, group_idx: u32, slot: usize, candidate: i64) {
+        let (val, has) = self.read_min_max_int(group_idx, slot);
+        if !has || candidate < val {
+            self.write_min_max_int(group_idx, slot, candidate, true);
         }
     }
 
-    /// Update MinInt: replace stored value if `candidate < stored` or no value yet.
+    /// Update MaxInt: replace stored value if `candidate > stored` or no
+    /// value yet.
     #[inline]
-    pub(crate) unsafe fn update_min_int(&mut self, group_idx: u32, slot: usize, candidate: i64) {
-        unsafe {
-            let (val, has) = self.read_min_max_int(group_idx, slot);
-            if !has || candidate < val {
-                self.write_min_max_int(group_idx, slot, candidate, true);
-            }
-        }
-    }
-
-    /// Update MaxInt: replace stored value if `candidate > stored` or no value yet.
-    #[inline]
-    pub(crate) unsafe fn update_max_int(&mut self, group_idx: u32, slot: usize, candidate: i64) {
-        unsafe {
-            let (val, has) = self.read_min_max_int(group_idx, slot);
-            if !has || candidate > val {
-                self.write_min_max_int(group_idx, slot, candidate, true);
-            }
+    pub(crate) fn update_max_int(&mut self, group_idx: u32, slot: usize, candidate: i64) {
+        let (val, has) = self.read_min_max_int(group_idx, slot);
+        if !has || candidate > val {
+            self.write_min_max_int(group_idx, slot, candidate, true);
         }
     }
 }
@@ -1248,14 +1178,7 @@ pub(crate) fn can_use_compact_accs(agg_specs: &[AggExecSpec]) -> bool {
 /// from compact storage, without full finalization.
 ///
 /// Uses a BinaryHeap of size `limit` to find the top-N in O(n log limit) time.
-///
-/// # Safety
-///
-/// Forwards the `CompactAccStorage` accessor preconditions (see the
-/// struct's safety section): every `group_idx` in `map` must have been
-/// allocated, `sort_slot` must be in range, and the slot's kind must
-/// match one of the `read_*` calls dispatched on `kind` below.
-pub(crate) unsafe fn compact_topn_select(
+pub(crate) fn compact_topn_select(
     map: &CompactGroupMap,
     storage: &CompactAccStorage,
     sort_slot: usize,
@@ -1263,65 +1186,60 @@ pub(crate) unsafe fn compact_topn_select(
     ascending: bool,
     sort_is_avg: bool,
 ) -> Vec<(u128, u32)> {
-    unsafe {
-        let (_, kind) = storage.layout.slots[sort_slot];
-        let read_val = |group_idx: u32| -> i64 {
-            if sort_is_avg {
-                let avg = match kind {
-                    CompactAccKind::SumIntNarrow => {
-                        let (s, c) = storage.read_sum_int_narrow(group_idx, sort_slot);
-                        if c > 0 { s as f64 / c as f64 } else { 0.0 }
-                    }
-                    CompactAccKind::SumFloat => {
-                        let (s, c) = storage.read_sum_float(group_idx, sort_slot);
-                        if c > 0 { s / c as f64 } else { 0.0 }
-                    }
-                    _ => storage.read_count(group_idx, sort_slot) as f64,
-                };
-                let bits = avg.to_bits() as i64;
-                if bits >= 0 { bits } else { bits ^ i64::MAX }
-            } else {
-                match kind {
-                    CompactAccKind::Count => storage.read_count(group_idx, sort_slot),
-                    CompactAccKind::SumIntNarrow => {
-                        storage.read_sum_int_narrow(group_idx, sort_slot).0
-                    }
-                    CompactAccKind::MinInt | CompactAccKind::MaxInt => {
-                        storage.read_min_max_int(group_idx, sort_slot).0
-                    }
-                    _ => storage.read_count(group_idx, sort_slot),
+    let (_, kind) = storage.layout.slots[sort_slot];
+    let read_val = |group_idx: u32| -> i64 {
+        if sort_is_avg {
+            let avg = match kind {
+                CompactAccKind::SumIntNarrow => {
+                    let (s, c) = storage.read_sum_int_narrow(group_idx, sort_slot);
+                    if c > 0 { s as f64 / c as f64 } else { 0.0 }
                 }
-            }
-        };
-        if ascending {
-            // Min-N: max-heap evicts the largest, keeping the smallest N
-            let mut heap: BinaryHeap<(i64, u128, u32)> = BinaryHeap::with_capacity(limit + 1);
-            for (&packed_key, &group_idx) in map {
-                let val = read_val(group_idx);
-                heap.push((val, packed_key, group_idx));
-                if heap.len() > limit {
-                    heap.pop();
+                CompactAccKind::SumFloat => {
+                    let (s, c) = storage.read_sum_float(group_idx, sort_slot);
+                    if c > 0 { s / c as f64 } else { 0.0 }
                 }
-            }
-            let mut result: Vec<(u128, u32)> = heap.into_iter().map(|(_, k, g)| (k, g)).collect();
-            result.sort_by_key(|&(_, g)| read_val(g));
-            result
+                _ => storage.read_count(group_idx, sort_slot) as f64,
+            };
+            let bits = avg.to_bits() as i64;
+            if bits >= 0 { bits } else { bits ^ i64::MAX }
         } else {
-            // Max-N: min-heap (via Reverse) evicts the smallest, keeping the largest N
-            let mut heap: BinaryHeap<Reverse<(i64, u128, u32)>> =
-                BinaryHeap::with_capacity(limit + 1);
-            for (&packed_key, &group_idx) in map {
-                let val = read_val(group_idx);
-                heap.push(Reverse((val, packed_key, group_idx)));
-                if heap.len() > limit {
-                    heap.pop();
+            match kind {
+                CompactAccKind::Count => storage.read_count(group_idx, sort_slot),
+                CompactAccKind::SumIntNarrow => storage.read_sum_int_narrow(group_idx, sort_slot).0,
+                CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+                    storage.read_min_max_int(group_idx, sort_slot).0
                 }
+                _ => storage.read_count(group_idx, sort_slot),
             }
-            let mut result: Vec<(u128, u32)> =
-                heap.into_iter().map(|Reverse((_, k, g))| (k, g)).collect();
-            result.sort_by_key(|&(_, gb)| std::cmp::Reverse(read_val(gb)));
-            result
         }
+    };
+    if ascending {
+        // Min-N: max-heap evicts the largest, keeping the smallest N
+        let mut heap: BinaryHeap<(i64, u128, u32)> = BinaryHeap::with_capacity(limit + 1);
+        for (&packed_key, &group_idx) in map {
+            let val = read_val(group_idx);
+            heap.push((val, packed_key, group_idx));
+            if heap.len() > limit {
+                heap.pop();
+            }
+        }
+        let mut result: Vec<(u128, u32)> = heap.into_iter().map(|(_, k, g)| (k, g)).collect();
+        result.sort_by_key(|&(_, g)| read_val(g));
+        result
+    } else {
+        // Max-N: min-heap (via Reverse) evicts the smallest, keeping the largest N
+        let mut heap: BinaryHeap<Reverse<(i64, u128, u32)>> = BinaryHeap::with_capacity(limit + 1);
+        for (&packed_key, &group_idx) in map {
+            let val = read_val(group_idx);
+            heap.push(Reverse((val, packed_key, group_idx)));
+            if heap.len() > limit {
+                heap.pop();
+            }
+        }
+        let mut result: Vec<(u128, u32)> =
+            heap.into_iter().map(|Reverse((_, k, g))| (k, g)).collect();
+        result.sort_by_key(|&(_, gb)| std::cmp::Reverse(read_val(gb)));
+        result
     }
 }
 
@@ -1482,101 +1400,94 @@ pub(crate) unsafe fn compact_finalize(
 /// `unreachable!` in the unsupported branches is the bug-catcher: if planner
 /// gating drifts and we land here at runtime, we'd produce silently-wrong
 /// results otherwise.
-///
-/// # Safety
-///
-/// Inherits the `CompactAccStorage` accessor contract. Must run inside
-/// an active PG transaction for the NUMERIC sum-int8 path.
 #[allow(dead_code)] // wired by the C.2 activation planner code in path.rs
-pub(crate) unsafe fn compact_emit_partial(
+pub(crate) fn compact_emit_partial(
     storage: &CompactAccStorage,
     group_idx: u32,
     slot: usize,
     spec: &AggExecSpec,
 ) -> (pg_sys::Datum, bool) {
-    unsafe {
-        let (_, kind) = storage.layout.slots[slot];
-        match kind {
-            CompactAccKind::Count => {
-                // partial state for `count` and `count(*)` is `int8`.
-                let count = storage.read_count(group_idx, slot);
-                (pg_sys::Datum::from(count as usize), false)
-            }
-            CompactAccKind::SumIntNarrow => {
-                // SUM(int2/int4): partial state is `int8` (the running sum).
-                // count is unused at the partial level for SUM. AVG path
-                // not supported here yet — gating must reject it.
-                if spec.agg_type != AggType::Sum {
-                    unreachable!(
-                        "compact_emit_partial: SumIntNarrow only supports Sum (got {:?}); \
-                         planner gating drift",
-                        spec.agg_type,
-                    );
-                }
-                let (sum, _count) = storage.read_sum_int_narrow(group_idx, slot);
-                (pg_sys::Datum::from(sum as usize), false)
-            }
-            CompactAccKind::SumFloat => {
-                // SUM(float4/float8): partial state is `float8` (the running
-                // sum). count is unused at the partial level. combinefn is
-                // `float8pl`.
-                if spec.agg_type != AggType::Sum {
-                    unreachable!(
-                        "compact_emit_partial: SumFloat only supports Sum (got {:?}); \
-                         planner gating drift",
-                        spec.agg_type,
-                    );
-                }
-                let (sum, count) = storage.read_sum_float(group_idx, slot);
-                if count == 0 {
-                    return (pg_sys::Datum::from(0usize), true);
-                }
-                (pg_sys::Datum::from(sum.to_bits() as usize), false)
-            }
-            CompactAccKind::MinStr | CompactAccKind::MaxStr => {
-                // partial state for MIN/MAX is the value itself; combinefn
-                // is `text_smaller` / `text_larger`. Same emit as finalize.
-                let (off, len) = storage.read_min_max_str(group_idx, slot);
-                if off == u32::MAX {
-                    (pg_sys::Datum::from(0usize), true)
-                } else {
-                    let s = storage.str_arena.get(off, len);
-                    let datum = string_to_datum(s, spec.col_type_oid);
-                    (datum, false)
-                }
-            }
-            CompactAccKind::MinInt | CompactAccKind::MaxInt => {
-                // partial state for MIN/MAX(int|timestamp) is the value itself;
-                // combinefn is `int*smaller`/`int*larger` (or `timestamp*_smaller`
-                // / `timestamp*_larger`). Same emit as finalize — apply the
-                // monotonic OutputTransform here too so the post-shift value
-                // is what flows up to PG's combinefn.
-                let (val, has) = storage.read_min_max_int(group_idx, slot);
-                if !has {
-                    (pg_sys::Datum::from(0usize), true)
-                } else {
-                    let out = match spec.output_transform {
-                        OutputTransform::None => val,
-                        OutputTransform::PgUsShift { delta } => val.wrapping_add(delta),
-                    };
-                    (pg_sys::Datum::from(out as usize), false)
-                }
-            }
-            CompactAccKind::SumInt => {
-                // SUM(int8) partial state is `internal` via int8_avg_serialize
-                // → `bytea`. Not implemented yet; gating must reject SUM(int8)
-                // / AVG until we wire int8_avg_serialize.
+    let (_, kind) = storage.layout.slots[slot];
+    match kind {
+        CompactAccKind::Count => {
+            // partial state for `count` and `count(*)` is `int8`.
+            let count = storage.read_count(group_idx, slot);
+            (pg_sys::Datum::from(count as usize), false)
+        }
+        CompactAccKind::SumIntNarrow => {
+            // SUM(int2/int4): partial state is `int8` (the running sum).
+            // count is unused at the partial level for SUM. AVG path
+            // not supported here yet — gating must reject it.
+            if spec.agg_type != AggType::Sum {
                 unreachable!(
-                    "compact_emit_partial: SumInt (transtype=internal) not yet supported \
-                     for partial emit; planner gating drift",
-                );
-            }
-            CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
-                unreachable!(
-                    "compact_emit_partial: COUNT(DISTINCT) has no PG aggcombinefn; \
+                    "compact_emit_partial: SumIntNarrow only supports Sum (got {:?}); \
                      planner gating drift",
+                    spec.agg_type,
                 );
             }
+            let (sum, _count) = storage.read_sum_int_narrow(group_idx, slot);
+            (pg_sys::Datum::from(sum as usize), false)
+        }
+        CompactAccKind::SumFloat => {
+            // SUM(float4/float8): partial state is `float8` (the running
+            // sum). count is unused at the partial level. combinefn is
+            // `float8pl`.
+            if spec.agg_type != AggType::Sum {
+                unreachable!(
+                    "compact_emit_partial: SumFloat only supports Sum (got {:?}); \
+                     planner gating drift",
+                    spec.agg_type,
+                );
+            }
+            let (sum, count) = storage.read_sum_float(group_idx, slot);
+            if count == 0 {
+                return (pg_sys::Datum::from(0usize), true);
+            }
+            (pg_sys::Datum::from(sum.to_bits() as usize), false)
+        }
+        CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+            // partial state for MIN/MAX is the value itself; combinefn
+            // is `text_smaller` / `text_larger`. Same emit as finalize.
+            let (off, len) = storage.read_min_max_str(group_idx, slot);
+            if off == u32::MAX {
+                (pg_sys::Datum::from(0usize), true)
+            } else {
+                let s = storage.str_arena.get(off, len);
+                let datum = string_to_datum(s, spec.col_type_oid);
+                (datum, false)
+            }
+        }
+        CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+            // partial state for MIN/MAX(int|timestamp) is the value itself;
+            // combinefn is `int*smaller`/`int*larger` (or `timestamp*_smaller`
+            // / `timestamp*_larger`). Same emit as finalize — apply the
+            // monotonic OutputTransform here too so the post-shift value
+            // is what flows up to PG's combinefn.
+            let (val, has) = storage.read_min_max_int(group_idx, slot);
+            if !has {
+                (pg_sys::Datum::from(0usize), true)
+            } else {
+                let out = match spec.output_transform {
+                    OutputTransform::None => val,
+                    OutputTransform::PgUsShift { delta } => val.wrapping_add(delta),
+                };
+                (pg_sys::Datum::from(out as usize), false)
+            }
+        }
+        CompactAccKind::SumInt => {
+            // SUM(int8) partial state is `internal` via int8_avg_serialize
+            // → `bytea`. Not implemented yet; gating must reject SUM(int8)
+            // / AVG until we wire int8_avg_serialize.
+            unreachable!(
+                "compact_emit_partial: SumInt (transtype=internal) not yet supported \
+                 for partial emit; planner gating drift",
+            );
+        }
+        CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+            unreachable!(
+                "compact_emit_partial: COUNT(DISTINCT) has no PG aggcombinefn; \
+                 planner gating drift",
+            );
         }
     }
 }

@@ -626,15 +626,13 @@ pub(super) fn process_segments_compact(
                 let (_, kind) = compact_storage.layout.slots[spec_idx];
                 match kind {
                     CompactAccKind::Count => match spec.agg_type {
-                        AggType::CountStar => unsafe {
-                            *compact_storage.count_mut(group_idx, spec_idx) += 1;
-                        },
+                        AggType::CountStar => {
+                            compact_storage.incr_count(group_idx, spec_idx, 1);
+                        }
                         AggType::Count => {
                             let col = &decompressed[spec.col_idx as usize];
                             if !col.is_empty() && !col[row].1 {
-                                unsafe {
-                                    *compact_storage.count_mut(group_idx, spec_idx) += 1;
-                                }
+                                compact_storage.incr_count(group_idx, spec_idx, 1);
                             }
                         }
                         _ => {}
@@ -643,42 +641,36 @@ pub(super) fn process_segments_compact(
                         let col = &decompressed[spec.col_idx as usize];
                         if !col.is_empty() && !col[row].1 {
                             let v = datum_to_i128(col[row].0, spec.col_type_oid);
-                            let (sum, count) =
-                                unsafe { compact_storage.sum_int_mut(group_idx, spec_idx) };
-                            if spec.expr_kind == AggExpr::AddConst {
-                                *sum += v + spec.const_offset as i128;
+                            let sum_delta = if spec.expr_kind == AggExpr::AddConst {
+                                v + spec.const_offset as i128
                             } else {
-                                *sum += v;
-                            }
-                            *count += 1;
+                                v
+                            };
+                            compact_storage.add_sum_int(group_idx, spec_idx, sum_delta, 1);
                         }
                     }
                     CompactAccKind::SumIntNarrow => {
                         let col = &decompressed[spec.col_idx as usize];
                         if !col.is_empty() && !col[row].1 {
                             let v = col[row].0.value() as i64;
-                            let (sum, count) =
-                                unsafe { compact_storage.sum_int_narrow_mut(group_idx, spec_idx) };
-                            if spec.expr_kind == AggExpr::AddConst {
-                                *sum += v + spec.const_offset;
+                            let sum_delta = if spec.expr_kind == AggExpr::AddConst {
+                                v + spec.const_offset
                             } else {
-                                *sum += v;
-                            }
-                            *count += 1;
+                                v
+                            };
+                            compact_storage.add_sum_int_narrow(group_idx, spec_idx, sum_delta, 1);
                         }
                     }
                     CompactAccKind::SumFloat => {
                         let col = &decompressed[spec.col_idx as usize];
                         if !col.is_empty() && !col[row].1 {
                             let v = datum_to_f64(col[row].0, spec.col_type_oid);
-                            let (sum, count) =
-                                unsafe { compact_storage.sum_float_mut(group_idx, spec_idx) };
-                            if spec.expr_kind == AggExpr::AddConst {
-                                *sum += v + spec.const_offset as f64;
+                            let sum_delta = if spec.expr_kind == AggExpr::AddConst {
+                                v + spec.const_offset as f64
                             } else {
-                                *sum += v;
-                            }
-                            *count += 1;
+                                v
+                            };
+                            compact_storage.add_sum_float(group_idx, spec_idx, sum_delta, 1);
                         }
                     }
                     CompactAccKind::MinStr | CompactAccKind::MaxStr => {
@@ -690,18 +682,14 @@ pub(super) fn process_segments_compact(
                         let col = &decompressed[spec.col_idx as usize];
                         if !col.is_empty() && !col[row].1 {
                             let v = col[row].0.value() as i64;
-                            unsafe {
-                                compact_storage.update_min_int(group_idx, spec_idx, v);
-                            }
+                            compact_storage.update_min_int(group_idx, spec_idx, v);
                         }
                     }
                     CompactAccKind::MaxInt => {
                         let col = &decompressed[spec.col_idx as usize];
                         if !col.is_empty() && !col[row].1 {
                             let v = col[row].0.value() as i64;
-                            unsafe {
-                                compact_storage.update_max_int(group_idx, spec_idx, v);
-                            }
+                            compact_storage.update_max_int(group_idx, spec_idx, v);
                         }
                     }
                     CompactAccKind::CountDistinctInt => {
@@ -723,17 +711,15 @@ pub(super) fn process_segments_compact(
     let topk = config.topn_spec.map(|(sort_slot, k, ascending)| {
         let (_, sort_kind) = compact_storage.layout.slots[sort_slot];
         let read_val = |gidx: u32| -> i64 {
-            unsafe {
-                match sort_kind {
-                    CompactAccKind::Count => compact_storage.read_count(gidx, sort_slot),
-                    CompactAccKind::SumIntNarrow => {
-                        compact_storage.read_sum_int_narrow(gidx, sort_slot).0
-                    }
-                    CompactAccKind::MinInt | CompactAccKind::MaxInt => {
-                        compact_storage.read_min_max_int(gidx, sort_slot).0
-                    }
-                    _ => compact_storage.read_count(gidx, sort_slot),
+            match sort_kind {
+                CompactAccKind::Count => compact_storage.read_count(gidx, sort_slot),
+                CompactAccKind::SumIntNarrow => {
+                    compact_storage.read_sum_int_narrow(gidx, sort_slot).0
                 }
+                CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+                    compact_storage.read_min_max_int(gidx, sort_slot).0
+                }
+                _ => compact_storage.read_count(gidx, sort_slot),
             }
         };
 
@@ -844,35 +830,41 @@ pub(super) fn merge_compact_results(
         for (slot_idx, _spec) in agg_specs.iter().enumerate() {
             let (_, kind) = global_storage.layout.slots[slot_idx];
             match kind {
-                CompactAccKind::Count => unsafe {
+                CompactAccKind::Count => {
                     let worker_count = worker_storage.read_count(worker_group_idx, slot_idx);
-                    *global_storage.count_mut(global_group_idx, slot_idx) += worker_count;
-                },
-                CompactAccKind::SumInt => unsafe {
+                    global_storage.incr_count(global_group_idx, slot_idx, worker_count);
+                }
+                CompactAccKind::SumInt => {
                     let (worker_sum, worker_count) =
                         worker_storage.read_sum_int(worker_group_idx, slot_idx);
-                    let (global_sum, global_count) =
-                        global_storage.sum_int_mut(global_group_idx, slot_idx);
-                    *global_sum += worker_sum;
-                    *global_count += worker_count;
-                },
-                CompactAccKind::SumIntNarrow => unsafe {
+                    global_storage.add_sum_int(
+                        global_group_idx,
+                        slot_idx,
+                        worker_sum,
+                        worker_count,
+                    );
+                }
+                CompactAccKind::SumIntNarrow => {
                     let (worker_sum, worker_count) =
                         worker_storage.read_sum_int_narrow(worker_group_idx, slot_idx);
-                    let (global_sum, global_count) =
-                        global_storage.sum_int_narrow_mut(global_group_idx, slot_idx);
-                    *global_sum += worker_sum;
-                    *global_count += worker_count;
-                },
-                CompactAccKind::SumFloat => unsafe {
+                    global_storage.add_sum_int_narrow(
+                        global_group_idx,
+                        slot_idx,
+                        worker_sum,
+                        worker_count,
+                    );
+                }
+                CompactAccKind::SumFloat => {
                     let (worker_sum, worker_count) =
                         worker_storage.read_sum_float(worker_group_idx, slot_idx);
-                    let (global_sum, global_count) =
-                        global_storage.sum_float_mut(global_group_idx, slot_idx);
-                    *global_sum += worker_sum;
-                    *global_count += worker_count;
-                },
-                CompactAccKind::MinStr | CompactAccKind::MaxStr => unsafe {
+                    global_storage.add_sum_float(
+                        global_group_idx,
+                        slot_idx,
+                        worker_sum,
+                        worker_count,
+                    );
+                }
+                CompactAccKind::MinStr | CompactAccKind::MaxStr => {
                     let (w_off, w_len) =
                         worker_storage.read_min_max_str(worker_group_idx, slot_idx);
                     if w_off != u32::MAX {
@@ -883,7 +875,8 @@ pub(super) fn merge_compact_results(
                             true
                         } else {
                             let g_str = global_storage.str_arena.get(g_off, g_len);
-                            let cmp = collation_strcmp(w_str, g_str);
+                            // SAFETY: collation_strcmp wraps PG strcoll FFI; caller is in active PG transaction.
+                            let cmp = unsafe { collation_strcmp(w_str, g_str) };
                             match kind {
                                 CompactAccKind::MinStr => cmp < 0,
                                 CompactAccKind::MaxStr => cmp > 0,
@@ -901,21 +894,21 @@ pub(super) fn merge_compact_results(
                             );
                         }
                     }
-                },
-                CompactAccKind::MinInt => unsafe {
+                }
+                CompactAccKind::MinInt => {
                     let (w_val, w_has) =
                         worker_storage.read_min_max_int(worker_group_idx, slot_idx);
                     if w_has {
                         global_storage.update_min_int(global_group_idx, slot_idx, w_val);
                     }
-                },
-                CompactAccKind::MaxInt => unsafe {
+                }
+                CompactAccKind::MaxInt => {
                     let (w_val, w_has) =
                         worker_storage.read_min_max_int(worker_group_idx, slot_idx);
                     if w_has {
                         global_storage.update_max_int(global_group_idx, slot_idx, w_val);
                     }
-                },
+                }
                 CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                     global_cd.union_from(slot_idx, global_group_idx, worker_cd, worker_group_idx);
                 }
@@ -1022,29 +1015,23 @@ unsafe fn compact_bare_limit(
                         match kind {
                             CompactAccKind::Count => {
                                 let wc = result.compact_storage.read_count(worker_idx, slot_idx);
-                                *storage.count_mut(global_idx, slot_idx) += wc;
+                                storage.incr_count(global_idx, slot_idx, wc);
                             }
                             CompactAccKind::SumInt => {
                                 let (ws, wc) =
                                     result.compact_storage.read_sum_int(worker_idx, slot_idx);
-                                let (gs, gc) = storage.sum_int_mut(global_idx, slot_idx);
-                                *gs += ws;
-                                *gc += wc;
+                                storage.add_sum_int(global_idx, slot_idx, ws, wc);
                             }
                             CompactAccKind::SumIntNarrow => {
                                 let (ws, wc) = result
                                     .compact_storage
                                     .read_sum_int_narrow(worker_idx, slot_idx);
-                                let (gs, gc) = storage.sum_int_narrow_mut(global_idx, slot_idx);
-                                *gs += ws;
-                                *gc += wc;
+                                storage.add_sum_int_narrow(global_idx, slot_idx, ws, wc);
                             }
                             CompactAccKind::SumFloat => {
                                 let (ws, wc) =
                                     result.compact_storage.read_sum_float(worker_idx, slot_idx);
-                                let (gs, gc) = storage.sum_float_mut(global_idx, slot_idx);
-                                *gs += ws;
-                                *gc += wc;
+                                storage.add_sum_float(global_idx, slot_idx, ws, wc);
                             }
                             CompactAccKind::MinStr | CompactAccKind::MaxStr => {
                                 let (w_off, w_len) = result
@@ -1106,7 +1093,7 @@ unsafe fn compact_bare_limit(
 
             for e in &bare_cd_sidecar.entries {
                 let count = e.count(global_idx);
-                *storage.count_mut(global_idx, e.spec_idx) = count;
+                storage.set_count(global_idx, e.spec_idx, count);
             }
 
             let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
@@ -1691,32 +1678,25 @@ unsafe fn compact_speculative_topn(
                                         let wc = result
                                             .compact_storage
                                             .read_count(worker_idx_w, slot_idx);
-                                        *storage.count_mut(global_idx, slot_idx) += wc;
+                                        storage.incr_count(global_idx, slot_idx, wc);
                                     }
                                     CompactAccKind::SumInt => {
                                         let (ws, wc) = result
                                             .compact_storage
                                             .read_sum_int(worker_idx_w, slot_idx);
-                                        let (gs, gc) = storage.sum_int_mut(global_idx, slot_idx);
-                                        *gs += ws;
-                                        *gc += wc;
+                                        storage.add_sum_int(global_idx, slot_idx, ws, wc);
                                     }
                                     CompactAccKind::SumIntNarrow => {
                                         let (ws, wc) = result
                                             .compact_storage
                                             .read_sum_int_narrow(worker_idx_w, slot_idx);
-                                        let (gs, gc) =
-                                            storage.sum_int_narrow_mut(global_idx, slot_idx);
-                                        *gs += ws;
-                                        *gc += wc;
+                                        storage.add_sum_int_narrow(global_idx, slot_idx, ws, wc);
                                     }
                                     CompactAccKind::SumFloat => {
                                         let (ws, wc) = result
                                             .compact_storage
                                             .read_sum_float(worker_idx_w, slot_idx);
-                                        let (gs, gc) = storage.sum_float_mut(global_idx, slot_idx);
-                                        *gs += ws;
-                                        *gc += wc;
+                                        storage.add_sum_float(global_idx, slot_idx, ws, wc);
                                     }
                                     CompactAccKind::MinStr | CompactAccKind::MaxStr => {
                                         let (w_off, w_len) = result
@@ -1777,8 +1757,7 @@ unsafe fn compact_speculative_topn(
 
                         // Write CD counts from parallel pass into storage.
                         for (cd_rank, &(slot_idx, _)) in cd_slot_specs.iter().enumerate() {
-                            *storage.count_mut(global_idx, slot_idx) =
-                                cd_counts[winner_idx][cd_rank];
+                            storage.set_count(global_idx, slot_idx, cd_counts[winner_idx][cd_rank]);
                         }
 
                         // Finalize this group.
@@ -1869,34 +1848,26 @@ unsafe fn compact_speculative_topn(
                                             let wc = result
                                                 .compact_storage
                                                 .read_count(worker_idx, slot_idx);
-                                            *storage.count_mut(global_idx, slot_idx) += wc;
+                                            storage.incr_count(global_idx, slot_idx, wc);
                                         }
                                         CompactAccKind::SumInt => {
                                             let (ws, wc) = result
                                                 .compact_storage
                                                 .read_sum_int(worker_idx, slot_idx);
-                                            let (gs, gc) =
-                                                storage.sum_int_mut(global_idx, slot_idx);
-                                            *gs += ws;
-                                            *gc += wc;
+                                            storage.add_sum_int(global_idx, slot_idx, ws, wc);
                                         }
                                         CompactAccKind::SumIntNarrow => {
                                             let (ws, wc) = result
                                                 .compact_storage
                                                 .read_sum_int_narrow(worker_idx, slot_idx);
-                                            let (gs, gc) =
-                                                storage.sum_int_narrow_mut(global_idx, slot_idx);
-                                            *gs += ws;
-                                            *gc += wc;
+                                            storage
+                                                .add_sum_int_narrow(global_idx, slot_idx, ws, wc);
                                         }
                                         CompactAccKind::SumFloat => {
                                             let (ws, wc) = result
                                                 .compact_storage
                                                 .read_sum_float(worker_idx, slot_idx);
-                                            let (gs, gc) =
-                                                storage.sum_float_mut(global_idx, slot_idx);
-                                            *gs += ws;
-                                            *gc += wc;
+                                            storage.add_sum_float(global_idx, slot_idx, ws, wc);
                                         }
                                         CompactAccKind::MinStr | CompactAccKind::MaxStr => {
                                             let (w_off, w_len) = result
@@ -1965,7 +1936,7 @@ unsafe fn compact_speculative_topn(
 
                         for e in &spec_cd_sidecar.entries {
                             let count = e.count(global_idx);
-                            *storage.count_mut(global_idx, e.spec_idx) = count;
+                            storage.set_count(global_idx, e.spec_idx, count);
                         }
 
                         let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::new();
@@ -2086,33 +2057,25 @@ unsafe fn compact_partitioned_topn(
                                                 let wc = worker
                                                     .compact_storage
                                                     .read_count(wgidx, slot_idx);
-                                                *storage.count_mut(gidx, slot_idx) += wc;
+                                                storage.incr_count(gidx, slot_idx, wc);
                                             }
                                             CompactAccKind::SumInt => {
                                                 let (ws, wc) = worker
                                                     .compact_storage
                                                     .read_sum_int(wgidx, slot_idx);
-                                                let (gs, gc) = storage.sum_int_mut(gidx, slot_idx);
-                                                *gs += ws;
-                                                *gc += wc;
+                                                storage.add_sum_int(gidx, slot_idx, ws, wc);
                                             }
                                             CompactAccKind::SumIntNarrow => {
                                                 let (ws, wc) = worker
                                                     .compact_storage
                                                     .read_sum_int_narrow(wgidx, slot_idx);
-                                                let (gs, gc) =
-                                                    storage.sum_int_narrow_mut(gidx, slot_idx);
-                                                *gs += ws;
-                                                *gc += wc;
+                                                storage.add_sum_int_narrow(gidx, slot_idx, ws, wc);
                                             }
                                             CompactAccKind::SumFloat => {
                                                 let (ws, wc) = worker
                                                     .compact_storage
                                                     .read_sum_float(wgidx, slot_idx);
-                                                let (gs, gc) =
-                                                    storage.sum_float_mut(gidx, slot_idx);
-                                                *gs += ws;
-                                                *gc += wc;
+                                                storage.add_sum_float(gidx, slot_idx, ws, wc);
                                             }
                                             CompactAccKind::MinStr | CompactAccKind::MaxStr => {
                                                 let (w_off, w_len) = worker
