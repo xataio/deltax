@@ -63,7 +63,7 @@ ssh:
 setup:
 	@test -n "$(EC2)" || (echo "Usage: make $@ EC2=<ip> [SCALE=<n>]"; exit 1)
 	@echo "=== Syncing pg_deltax source ==="
-	rsync -az --exclude target --exclude .git --exclude docker --exclude tests --exclude '*.md' \
+	rsync -az --delete --exclude target --exclude .git --exclude docker --exclude tests --exclude '*.md' \
 		-e "ssh -i $(EC2_KEY) -o StrictHostKeyChecking=no" \
 		$(PG_DELTAX_SRC)/ $(EC2_USER)@$(EC2):~/pg_deltax/
 	@echo "=== Syncing jsonbench scripts ==="
@@ -76,7 +76,7 @@ setup:
 deploy:
 	@test -n "$(EC2)" || (echo "Usage: make $@ EC2=<ip>"; exit 1)
 	@echo "=== Syncing pg_deltax source ==="
-	rsync -az --exclude target --exclude .git --exclude docker --exclude tests --exclude '*.md' \
+	rsync -az --delete --exclude target --exclude .git --exclude docker --exclude tests --exclude '*.md' \
 		-e "ssh -i $(EC2_KEY) -o StrictHostKeyChecking=no" \
 		$(PG_DELTAX_SRC)/ $(EC2_USER)@$(EC2):~/pg_deltax/
 	@echo "=== Syncing jsonbench scripts ==="
