@@ -3803,36 +3803,35 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 // col_idx is fed to get_attname against the parent rel and
                 // crashes with "cache lookup failed for attribute N of
                 // relation X" because the parent has no such physical attno.
-                if json_extract_ctx.is_none() {
-                    json_extract_ctx = Some(super::json_extract::AggChainCtx::from_root(root));
-                }
-                let physical_count = json_extract_ctx
-                    .as_ref()
-                    .and_then(|opt| opt.as_ref())
-                    .map(|c| c.physical_count as i32);
+                //
+                // Try the cheap pg_attribute lookup first (missing_ok=true so
+                // a synthetic col_idx returns NULL instead of erroring); only
+                // populate the json_extract context — which costs an SPI
+                // lookup against `deltax_extract_specs` — when we actually
+                // encounter an attno that pg_attribute doesn't have. Queries
+                // over tables without json_extract configured (e.g. ClickBench)
+                // skip the SPI lookup entirely.
                 let group_col_names: Vec<Option<String>> = group_specs
                     .iter()
                     .map(|gs| {
-                        if let Some(pc) = physical_count
-                            && gs.col_idx >= pc
-                        {
-                            let spec_idx = (gs.col_idx - pc) as usize;
-                            return json_extract_ctx
-                                .as_ref()
-                                .and_then(|opt| opt.as_ref())
-                                .and_then(|c| c.specs.get(spec_idx))
-                                .map(|s| s.target_name.clone());
-                        }
                         let attno = (gs.col_idx + 1) as i16;
                         let name_ptr = pg_sys::get_attname(group_by_relid, attno, true);
-                        if name_ptr.is_null() {
-                            return None;
+                        if !name_ptr.is_null() {
+                            return Some(
+                                std::ffi::CStr::from_ptr(name_ptr)
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            );
                         }
-                        Some(
-                            std::ffi::CStr::from_ptr(name_ptr)
-                                .to_string_lossy()
-                                .into_owned(),
-                        )
+                        // attno > physical natts → must be a json_extract
+                        // synthetic. Lazy-populate the ctx and look it up.
+                        if json_extract_ctx.is_none() {
+                            json_extract_ctx =
+                                Some(super::json_extract::AggChainCtx::from_root(root));
+                        }
+                        let ctx = json_extract_ctx.as_ref().and_then(|o| o.as_ref())?;
+                        let spec_idx = (gs.col_idx - ctx.physical_count as i32) as usize;
+                        ctx.specs.get(spec_idx).map(|s| s.target_name.clone())
                     })
                     .collect();
 
