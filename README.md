@@ -7,18 +7,15 @@
 
 # DeltaX (δx) - Fast time-series extension for PostgreSQL
 
-δx is a PostgreSQL extension offering compression and columnar storage for time-series 
+DeltaX (δx) is a PostgreSQL extension offering compression and columnar storage for time-series 
 data. It can be used as a pure open-source (Apache 2.0) alternative to TimescaleDB or
 as a PostgreSQL-native alternative to dedicated analytics stores like ClickHouse, when
 you'd like your data to stay in Postgres.
 
-δx stores the compressed data in regular Postgres tables. It does _not_ use its own storage 
-format on disk. The advantage of this approach is that features like physical/logical 
-replication, crash recovery, backups, and pg_dump work as for any other Postgres table.
-
-δx is currently developed and maintained by the [Xata](https://xata.io) team. We hope other
-Postgres providers will offer it as an extension (see the [How can I help](#how-can-i-help)
-section).
+δx stores the compressed columnar data in regular Postgres tables. It does _not_ use 
+its own storage format on disk. The advantage of this approach is that features like 
+physical/logical replication, crash recovery, backups, and pg_dump work as for any other 
+Postgres table.
 
 ## Contents
 
