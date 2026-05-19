@@ -20,9 +20,21 @@ replication, crash recovery, backups, and pg_dump work as for any other Postgres
 Postgres providers will offer it as an extension (see the [How can I help](#how-can-i-help)
 section).
 
+## Contents
+
+- [Benchmarks](#benchmarks)
+- [How it works](#how-it-works)
+- [Features](#features)
+- [Limitations](#limitations)
+- [Installation and quick start](#installation-and-quick-start)
+- [Correctness testing](#correctness-testing)
+- [Reference](#reference)
+- [How can I help](#how-can-i-help)
+- [License](#license)
+
 ## Benchmarks
 
-These results are as of May 16th, 2026.
+These results are as of May 19th, 2026.
 
 ### ClickBench
 
@@ -30,6 +42,10 @@ On the [ClickBench](https://benchmark.clickhouse.com/) benchmark, which runs 43 
 queries against a web analytics dataset of 100M rows × 105 columns, δx currently ranks lower than 
 specialized analytical stores like ClickHouse and DuckDB, but it is the highest-ranking of 
 all the systems that are storing the data in PostgreSQL.
+
+The following screenshot contains a selection of Postgres extensions/projects + ClickHouse for reference.
+It displays the "combined" metric, which is a weighted average combining hot times, cold time, load time,
+and storage size.
 
 <img src="images/clickbench-combined.png" width="800" alt="ClickBench combined: pg_deltax ranks in-between ClickHouse and TimescaleDB">
 
@@ -40,19 +56,11 @@ this particular dataset. Compression ratios vary considerably by data characteri
 
 <img src="images/clickbench-storage-size.png" width="800" alt="ClickBench storage size: pg_deltax compression ratio is ~7x">
 
-#### Cold run
-
-<img src="images/clickbench-cold-run.png" width="800" alt="ClickBench cold run result">
-
-#### Hot run
-
-<img src="images/clickbench-hot-run.png" width="800" alt="ClickBench hot run result">
-
 #### Load time
 
 <img src="images/clickbench-load-time.png" width="800" alt="ClickBench load times result">
 
-The reason δx can load the data faster than Postgres is that it has support for backfilling data directly
+Note: The reason δx can load the data faster than Postgres is that it has support for backfilling data directly
 from Parquet files. On a more standard setup where the data is loaded into normal Postgres tables and
 then compressed, the load time would be similar to the PostgreSQL result plus the compression time.
 
@@ -66,6 +74,7 @@ on semi-structured data. The dataset contains Bluesky firehose data exported as 
 columnar algorithms as the native columns. This enables the following results on JSONBench.
 
 <img src="images/jsonbench-hot-run.png" width="800" alt="JSONBench hot run results">
+
 
 ## How it works
 
@@ -122,22 +131,7 @@ The compressed data and the metadata are stored in companion tables for each par
 
 An important design trade-off of δx is that compressed partitions become read-only. Writes to them are rejected and the only way to update individual rows is to decompress and re-compress the whole partition.
 
-## Correctness testing
 
-The main correctness invariant in the test suite is: δx must always respond with the same results as plain Postgres returns from the uncompressed version of the table. Whenever the response is different, it is a bug. There are cases where this condition is relaxed: for example, on a `LIMIT 10` query, if the 10th row has ties, any of them is accepted. We have the following comparison policies:
-
-- `ordered_exact` — rows and row order must match exactly.
-- `unordered_exact` — row multiset must match, order is ignored.
-- `limit_ties` — relaxed policy for non-unique `ORDER BY ... LIMIT` cases; boundary rows can differ as long as they're tied with rows the other side returned.
-- `float_tolerant` — ordered comparison with a small numeric tolerance.
-
-We have four layers of automated tests:
-
-- Rust unit tests (`make test`)
-- Integration tests (`make integration-test`): end-to-end tests against a running PostgreSQL with the extension loaded, run against both PG 17 and 18. They cover partitioning, compression / decompression round-trips, the background worker, parallel scans, parquet loading, JSONB field extraction, the blob cache, value bitmaps, meta-only aggregation, and more.
-- Plain-PG-vs-δx correctness harness (`make correctness`): the implementation of the invariant above. Loads identical logical data into a regular PostgreSQL table and a δx table, runs the same query against both, and compares the results. The suite covers aggregates, ordering, predicates, codec round-trips via direct backfill, planner-mode coverage, partition / segment edges, joins with uncompressed tables.
-- Benchmark correctness (e.g. `make -C clickbench verify`). The benchmark harnesses also act as cross-implementation parity checks, so a query that benchmarks fast but returns wrong results fails the run.
-    
 ## Features
 
 Current features include:
@@ -178,7 +172,43 @@ Current features include:
 - No offloading of old partitions to S3. Data tiering is on our roadmap.
 - Postgres 17 and 18 only.
 
-## Quick start
+## Installation and quick start
+
+### Installation from deb file
+
+Download the `.deb` matching your PG major version and architecture from the [latest release](https://github.com/xataio/pg_deltax/releases/latest), then:
+
+```sh
+apt-get install -y ./pg-deltax-pg17_<version>_amd64.deb
+```
+
+δx registers a background worker from `_PG_init`, so it must be in `shared_preload_libraries`:
+
+```sh
+echo "shared_preload_libraries = 'pg_deltax'" >> $PGDATA/postgresql.conf
+# restart PostgreSQL, then:
+psql -c "CREATE EXTENSION pg_deltax;"
+```
+
+### Installation from source
+
+Requires a Rust toolchain, the PostgreSQL server dev headers (`postgresql-server-dev-17` or `-18` on Debian / Ubuntu), and `cargo-pgrx` matching the `pgrx` version in `Cargo.toml`:
+
+```sh
+cargo install cargo-pgrx --version 0.17.0 --locked
+cargo pgrx init --pg17=$(which pg_config)
+```
+
+Then build and install the extension into the PostgreSQL instance pointed at by `pg_config`:
+
+```sh
+cargo pgrx install --release --pg-config $(which pg_config) \
+    --features pg17 --no-default-features
+```
+
+Replace `pg17` with `pg18` to target PostgreSQL 18. Then add `pg_deltax` to `shared_preload_libraries`, restart PostgreSQL, and `CREATE EXTENSION pg_deltax;` as above.
+
+### Quickstart
 
 ```sql
 CREATE TABLE metrics (ts TIMESTAMPTZ NOT NULL, device TEXT, value FLOAT8);
@@ -199,120 +229,26 @@ SELECT * FROM deltax_compression_stats('metrics');
 SELECT pg_size_pretty(deltax_table_size('metrics'));
 ```
 
-## Installation from deb file
+## Correctness testing
 
-Download the `.deb` matching your PG major version and architecture from the [latest release](https://github.com/xataio/pg_deltax/releases/latest), then:
+The main correctness invariant in the test suite is: δx must always respond with the same results as plain Postgres returns from the uncompressed version of the table. Whenever the response is different, it is a bug. There are cases where this condition is relaxed: for example, on a `LIMIT 10` query, if the 10th row has ties, any of them is accepted. We have the following comparison policies:
 
-```sh
-apt-get install -y ./pg-deltax-pg17_<version>_amd64.deb
-```
+- `ordered_exact` — rows and row order must match exactly.
+- `unordered_exact` — row multiset must match, order is ignored.
+- `limit_ties` — relaxed policy for non-unique `ORDER BY ... LIMIT` cases; boundary rows can differ as long as they're tied with rows the other side returned.
+- `float_tolerant` — ordered comparison with a small numeric tolerance.
 
-δx registers a background worker from `_PG_init`, so it must be in `shared_preload_libraries`:
+We have four layers of automated tests:
 
-```sh
-echo "shared_preload_libraries = 'pg_deltax'" >> $PGDATA/postgresql.conf
-# restart PostgreSQL, then:
-psql -c "CREATE EXTENSION pg_deltax;"
-```
+- Rust unit tests (`make test`)
+- Integration tests (`make integration-test`): end-to-end tests against a running PostgreSQL with the extension loaded, run against both PG 17 and 18. They cover partitioning, compression / decompression round-trips, the background worker, parallel scans, parquet loading, JSONB field extraction, the blob cache, value bitmaps, meta-only aggregation, and more.
+- Plain-PG-vs-δx correctness harness (`make correctness`): the implementation of the invariant above. Loads identical logical data into a regular PostgreSQL table and a δx table, runs the same query against both, and compares the results. The suite covers aggregates, ordering, predicates, codec round-trips via direct backfill, planner-mode coverage, partition / segment edges, joins with uncompressed tables.
+- Benchmark correctness (e.g. `make -C clickbench verify`). The benchmark harnesses also act as cross-implementation parity checks, so a query that benchmarks fast but returns wrong results fails the run.
 
-## Installation from source
+## Reference
 
-Requires a Rust toolchain, the PostgreSQL server dev headers (`postgresql-server-dev-17` or `-18` on Debian / Ubuntu), and `cargo-pgrx` matching the `pgrx` version in `Cargo.toml`:
-
-```sh
-cargo install cargo-pgrx --version 0.17.0 --locked
-cargo pgrx init --pg17=$(which pg_config)
-```
-
-Then build and install the extension into the PostgreSQL instance pointed at by `pg_config`:
-
-```sh
-cargo pgrx install --release --pg-config $(which pg_config) \
-    --features pg17 --no-default-features
-```
-
-Replace `pg17` with `pg18` to target PostgreSQL 18. Then add `pg_deltax` to `shared_preload_libraries`, restart PostgreSQL, and `CREATE EXTENSION pg_deltax;` as above.
-
-## Function reference
-
-### Partitioning
-
-| Function | Description |
-|---|---|
-| `deltax_create_table(relation, time_column, partition_interval DEFAULT '1 day', premake DEFAULT 3)` | Convert a table into a partitioned deltatable. Creates initial partitions around "now". |
-| `deltax_partition_info(relation)` | List all partitions with their range bounds and compression status. |
-| `deltax_deltatable_info(relation)` | Show metadata for a deltatable (time column, interval, partition count). |
-
-### Retention
-
-| Function | Description |
-|---|---|
-| `deltax_set_retention(relation, drop_after)` | Set a retention policy — partitions older than `drop_after` are automatically dropped by the background worker. |
-| `deltax_remove_retention(relation)` | Remove the retention policy. |
-
-### Compression
-
-| Function | Description |
-|---|---|
-| `deltax_enable_compression(relation, segment_by DEFAULT '{}', order_by DEFAULT '{}', segment_size DEFAULT 30000, json_extract DEFAULT NULL)` | Enable compression on a deltatable. Configures how data is segmented and ordered within segments. `json_extract` is an optional JSONB spec — `[{"src","path","name","type"}, ...]` — that pulls fields out of a JSONB column into synthetic typed columns at compression time. |
-| `deltax_set_compression_policy(relation, compress_after)` | Set automatic compression — partitions older than `compress_after` are compressed by the background worker. |
-| `deltax_compress_partition(partition)` | Manually compress a single partition. |
-| `deltax_decompress_partition(partition)` | Decompress a single partition back to heap storage. |
-| `deltax_analyze_partition(partition)` | Refresh `pg_class.reltuples` and `pg_statistic` for a compressed partition from the existing `_colstats` data. Useful on partitions compressed before the stats-population path shipped, or after an accidental `ANALYZE` on a compressed partition. |
-| `deltax_analyze_table(relation)` | Run `deltax_analyze_partition` on every compressed partition of a deltatable. |
-| `deltax_compression_stats(relation)` | Per-partition compression statistics: raw size, compressed size, ratio, row count. |
-| `deltax_table_size(relation)` | Total on-disk size in bytes, accounting for compressed storage. Use with `pg_size_pretty()` for human-readable output. |
-
-### Analytics
-
-| Function | Description |
-|---|---|
-| `time_bucket(bucket_width, ts)` | Truncate a timestamp to the nearest interval boundary (like `date_trunc` but for arbitrary intervals). |
-| `time_bucket(bucket_width, ts, origin)` | Same as above but with an offset (e.g., buckets starting at 06:00 instead of 00:00). |
-| `first(value, ts)` | Aggregate: return the value associated with the earliest timestamp. |
-| `last(value, ts)` | Aggregate: return the value associated with the latest timestamp. |
-
-### Blob cache observability
-
-| Function | Description |
-|---|---|
-| `pg_deltax_blob_cache_stats()` | Process-wide blob-cache counters: hits, misses, evictions, current bytes / entries, configured size. |
-| `pg_deltax_blob_cache_shard_stats()` | Same as above but broken down per shard. Used to diagnose hot-shard contention. |
-
-## Configuration reference
-
-All settings are PostgreSQL GUCs and follow the usual scoping rules (`SET`, `ALTER SYSTEM`, `postgresql.conf`).
-
-### Parallelism
-
-| GUC | Default | Context | Description |
-|---|---|---|---|
-| `pg_deltax.parallel_workers` | `0` | userset | Number of internal Rust worker threads used by parallel aggregation inside a custom scan. `0` = auto (CPU count, capped at 16); `1` = single-threaded; `2..=64` explicit. |
-| `pg_deltax.max_parallel_workers_per_scan` | `-1` | userset | Cap on PG parallel workers for `DeltaXAppend` partial paths. `-1` follows `max_parallel_workers_per_gather`; `0` disables the partial-path variant (scans run serially); `1..=64` caps explicitly. |
-| `pg_deltax.parallel_regex` | `on` | userset | When ON, compatible `REGEXP_REPLACE(...)` patterns used inside `GROUP BY` use the Rust `regex` crate so they can run thread-safe in parallel workers. |
-
-### Blob cache (shared memory)
-
-| GUC | Default | Context | Description |
-|---|---|---|---|
-| `pg_deltax.blob_cache_mb` | `-1` (auto) | postmaster | Size of the process-shared blob cache, in MiB. `-1` = auto (25% of physical RAM, clamped to `[256, 4096]`); `0` = cache disabled; `N > 0` = explicit MiB (up to 32768). Restart required — the shmem reservation is captured at postmaster start. See `dev/docs/BLOB_CACHE.md`. |
-| `pg_deltax.blob_cache_shards` | `64` | postmaster | Number of shards (power of two, `1..=1024`) in the blob cache. Each shard owns an LWLock + LRU list; more shards reduce contention under high concurrency, fewer save shmem overhead. Restart required. |
-
-### Optimization toggles
-
-| GUC | Default | Context | Description |
-|---|---|---|---|
-| `pg_deltax.bloom_filters` | `on` | userset | Build per-segment bloom filters during compression for equality / `IN` predicate pushdown. Size is proportional to column cardinality (~2–5% storage overhead). Turning off applies to *new* compressions only. |
-| `pg_deltax.disable_meta_agg_fastpath` | `off` | userset | When ON, `DeltaXCount` / `DeltaXMinMax` fast paths are skipped for queries with `WHERE` clauses; those queries fall through to the generic `DeltaXAgg` path instead. Used for A/B correctness comparisons. |
-| `pg_deltax.disable_parallel_agg` | `off` | userset | When ON, the partial+Gather+FinalAgg path for `DeltaXAgg` is disabled and the planner only sees the complete CustomScan `DeltaXAgg`. Escape hatch for bisecting suspected regressions on the partial path; internal-Rust parallelism still runs. |
-| `pg_deltax.json_extract_mode` | `none` | userset | How `COPY ... WITH (FORMAT deltax_compress)` extracts JSON paths into extra columnar columns. `none` disables extraction and the planner-side rewrite; `fields` uses the path list configured in `deltax_enable_compression(... json_extract => ...)`; `all` is reserved for auto-discovery (not yet implemented). |
-
-### Testing
-
-| GUC | Default | Context | Description |
-|---|---|---|---|
-| `pg_deltax.mock_now` | (empty) | suset | Override current time with a `timestamptz` literal. Empty string = use real wall-clock time. Used by the test suite to drive deterministic time-based behavior in the background worker and partition-creation paths. |
-
+- [Function reference](docs/FUNCTIONS.md) — partitioning, retention, compression, analytics, and blob-cache observability functions.
+- [Configuration reference](docs/CONFIGURATION.md) — all `pg_deltax.*` GUCs.
 
 ## How can I help
 
