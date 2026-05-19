@@ -3804,8 +3804,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 // crashes with "cache lookup failed for attribute N of
                 // relation X" because the parent has no such physical attno.
                 if json_extract_ctx.is_none() {
-                    json_extract_ctx =
-                        Some(super::json_extract::AggChainCtx::from_root(root));
+                    json_extract_ctx = Some(super::json_extract::AggChainCtx::from_root(root));
                 }
                 let physical_count = json_extract_ctx
                     .as_ref()
@@ -3860,26 +3859,25 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 if has_text_group && has_where && n_workers <= 1 {
                     let estimated_rows = (*input_rel).rows;
                     let few_rows = estimated_rows < total_uncompressed_rows * 0.05;
-                    let has_high_card_text =
-                        group_specs.iter().enumerate().any(|(i, gs)| {
-                            if !matches!(gs.expr, GroupByExpr::Column) {
-                                return false;
-                            }
-                            let is_text = gs.type_oid == pg_sys::TEXTOID
-                                || gs.type_oid == pg_sys::VARCHAROID
-                                || gs.type_oid == pg_sys::BPCHAROID
-                                || gs.type_oid == pg_sys::NAMEOID;
-                            if !is_text {
-                                return false;
-                            }
-                            let Some(col_name) = group_col_names[i].as_deref() else {
-                                return false;
-                            };
-                            merged_ndistinct
-                                .get(col_name)
-                                .map(|&nd| nd > 100_000)
-                                .unwrap_or(false)
-                        });
+                    let has_high_card_text = group_specs.iter().enumerate().any(|(i, gs)| {
+                        if !matches!(gs.expr, GroupByExpr::Column) {
+                            return false;
+                        }
+                        let is_text = gs.type_oid == pg_sys::TEXTOID
+                            || gs.type_oid == pg_sys::VARCHAROID
+                            || gs.type_oid == pg_sys::BPCHAROID
+                            || gs.type_oid == pg_sys::NAMEOID;
+                        if !is_text {
+                            return false;
+                        }
+                        let Some(col_name) = group_col_names[i].as_deref() else {
+                            return false;
+                        };
+                        merged_ndistinct
+                            .get(col_name)
+                            .map(|&nd| nd > 100_000)
+                            .unwrap_or(false)
+                    });
                     if few_rows && has_high_card_text {
                         return;
                     }
@@ -3889,19 +3887,18 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     // Bail out for high-cardinality GROUP BY (only without WHERE)
                     if !has_where {
                         let threshold = total_uncompressed_rows * 0.5;
-                        let has_high_cardinality =
-                            group_specs.iter().enumerate().any(|(i, gs)| {
-                                if !matches!(gs.expr, GroupByExpr::Column) {
-                                    return false;
-                                }
-                                let Some(col_name) = group_col_names[i].as_deref() else {
-                                    return false;
-                                };
-                                merged_ndistinct
-                                    .get(col_name)
-                                    .map(|&nd| nd as f64 > threshold)
-                                    .unwrap_or(false)
-                            });
+                        let has_high_cardinality = group_specs.iter().enumerate().any(|(i, gs)| {
+                            if !matches!(gs.expr, GroupByExpr::Column) {
+                                return false;
+                            }
+                            let Some(col_name) = group_col_names[i].as_deref() else {
+                                return false;
+                            };
+                            merged_ndistinct
+                                .get(col_name)
+                                .map(|&nd| nd as f64 > threshold)
+                                .unwrap_or(false)
+                        });
                         if has_high_cardinality {
                             return;
                         }
