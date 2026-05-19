@@ -398,6 +398,78 @@ class TestJsonExtractCorrectness:
             f"{second} vs control {control}"
         )
 
+    def test_groupby_physical_ts_extract_with_synthetic(self, db):
+        """Regression for issue #4: mixing a physical-column EXTRACT and a
+        JSONB chain in GROUP BY crashed planning with `cache lookup
+        failed for attribute N of relation X`. The Extract shape (a) over
+        the physical `ts` Var sets `group_by_relid` to the parent rel;
+        the chain synthetic group spec carries `col_idx` past the
+        parent's pg_attribute count, so resolving its name via
+        `get_attname(group_by_relid, col_idx + 1)` errored out.
+
+        The bug fires only when the planner's ndistinct heuristic block
+        runs, which is gated on `companion_oids` being non-empty (i.e.
+        the partition is compressed). Use the direct-backfill COPY so
+        the compression happens deterministically without depending on
+        the background worker."""
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE events (
+                ts TIMESTAMPTZ NOT NULL,
+                data JSONB NOT NULL
+            )
+        """)
+        db.execute(
+            "SELECT deltax_create_table('events', 'ts', '1 day'::interval, 5)"
+        )
+        _enable_extracts(db, segment_size=50)
+        db.execute("SET pg_deltax.json_extract_mode = 'fields'")
+        db.commit()
+
+        # Direct-backfill into the first-day partition. Generates 200
+        # rows across two hours so EXTRACT(HOUR FROM ts) yields >1 group.
+        collections = [
+            "app.bsky.feed.post",
+            "app.bsky.feed.repost",
+            "app.bsky.feed.like",
+        ]
+        rows = []
+        for i in range(200):
+            ts = f"2025-01-15 {(i // 100):02d}:{(i % 60):02d}:00+00"
+            payload = {
+                "kind": "commit",
+                "did": f"did:plc:{i % 10:03d}",
+                "time_us": 1700000000000000 + i * 1000,
+                "commit": {
+                    "collection": collections[i % 3],
+                    "operation": "create",
+                    "rkey": f"rec{i}",
+                },
+            }
+            rows.append((ts, json.dumps(payload)))
+        text = "\n".join(f"{ts}\t{payload}" for ts, payload in rows) + "\n"
+        with db.cursor() as cur:
+            with cur.copy(
+                "COPY events FROM STDIN WITH (FORMAT deltax_compress)"
+            ) as cp:
+                cp.write(text)
+        db.commit()
+
+        none, fields = _ab(db, """
+            SELECT data->'commit'->>'collection' AS event,
+                   EXTRACT(HOUR FROM ts) AS hour_of_day,
+                   COUNT(*) AS count
+            FROM events
+            WHERE data->>'kind' = 'commit'
+              AND data->'commit'->>'operation' = 'create'
+              AND data->'commit'->>'collection' IN
+                  ('app.bsky.feed.post', 'app.bsky.feed.repost', 'app.bsky.feed.like')
+            GROUP BY event, hour_of_day
+            ORDER BY hour_of_day, event
+        """)
+        assert none == fields
+        assert len(fields) >= 1
+
     def test_chain_in_in_clause(self, db):
         """`ScalarArrayOpExpr` is `chain IN ('a', 'b', 'c')` after PG's
         normalization. Walker must descend into it on both the rewrite
