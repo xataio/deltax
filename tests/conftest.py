@@ -52,7 +52,14 @@ def pg_container():
     ]
     if persist:
         cmd += ["-v", f"{BENCH_VOLUME}:/var/lib/postgresql/data"]
-    cmd += [image, "-c", "shared_preload_libraries=pg_deltax"]
+    cmd += [
+        image,
+        "-c", "shared_preload_libraries=pg_deltax",
+        # Enable logical decoding so test_logical_replication.py can exercise
+        # publications/subscriptions. Strictly a superset of the default
+        # wal_level=replica; harmless for all other tests.
+        "-c", "wal_level=logical",
+    ]
     subprocess.check_call(cmd)
 
     # Wait for readiness
