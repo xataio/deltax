@@ -473,3 +473,192 @@ def test_partition_attached_after_publication_auto_publishes(replicated_pair):
             "SELECT count(*) FROM ONLY metrics_default"
         ).fetchone()[0]
         assert sub_in_default == 0
+
+
+def test_scenario_2_replicate_companion_tables_directly(replicated_pair):
+    """Scenario 2: replicate the COMPANION TABLES themselves so the replica
+    never has to run compression — it just receives compressed bytes and uses
+    pg_deltax's custom scan for queries.
+
+    Structural caveat with vanilla logical replication
+    --------------------------------------------------
+    pg_deltax creates companion tables (`_deltax_compressed.<part>_meta`,
+    `_blobs`, `_colstats`, `_blooms`, `_text_lengths`, `_valbitmap`) on demand
+    when a partition gets compressed. Logical replication does not replicate
+    DDL — so a fresh subscriber would receive INSERT events targeting tables
+    it has never seen and the apply worker would error.
+
+    For a production "query-only replica" model the right tool is *physical*
+    streaming replication: pg_deltax's companion tables are ordinary heaps,
+    so the whole storage layout — heap partitions, companion tables, catalog
+    rows, even the DML-reject trigger — replicates byte-for-byte to the
+    standby, and the worker on the replica no-ops because it checks
+    `pg_is_in_recovery()`.
+
+    What this test does
+    -------------------
+    Demonstrates that the logical-replication *transport* is capable of
+    moving companion-table contents and `deltax_partition` catalog rows once
+    the schema bootstrap problem is solved. We solve it the brute-force way:
+    run identical compression on both sides first (so matching companion
+    table shells exist), then wipe the subscriber's companion data + catalog
+    row to simulate "received nothing yet", then let a fresh subscription
+    with `copy_data = true` stream everything through. A real-world variant
+    of (b) above would replace the "compress on both sides" bootstrap with a
+    helper that pre-creates companion-table shells on the subscriber.
+    """
+    repl = replicated_pair
+
+    # 1. Bootstrap: identical setup + compression on both sides. After this
+    #    the publisher and subscriber have matching companion-table shapes
+    #    and equivalent catalog rows.
+    for db in (repl["pub_db"], repl["sub_db"]):
+        with _db_conn(db) as c:
+            _create_metrics_table(c)
+            c.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+            c.execute(
+                f"INSERT INTO metrics (ts, device_id, temperature) "
+                f"SELECT '{BASE_TS}'::timestamptz + (g * interval '1 minute'), "
+                f"       'device-' || MOD(g, 5)::text, 20.0 + g * 0.1 "
+                f"FROM generate_series(0, 99) g"
+            )
+            c.execute(
+                "SELECT deltax_enable_compression('metrics', "
+                "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+            )
+            cur = c.execute(
+                f"SELECT partition_name FROM deltax_partition_info('metrics') "
+                f"WHERE range_start <= '{BASE_TS}'::timestamptz "
+                f"  AND range_end   >  '{BASE_TS}'::timestamptz"
+            )
+            parts_to_compress = [r[0] for r in cur.fetchall()]
+            for part in parts_to_compress:
+                c.execute(f"SELECT deltax_compress_partition('{part}')")
+            # Sanity-check that compression produced segments in the meta table.
+            seg_count = c.execute(
+                f'SELECT count(*) FROM "_deltax_compressed".'
+                f'"{parts_to_compress[0]}_meta"'
+            ).fetchone()[0]
+            assert seg_count > 0, f"[{db}] compression produced no segments"
+
+    # 2. Wipe ONLY the subscriber's companion-table contents. The catalog
+    #    row (`deltax_partition`) stays as `is_compressed = true` — that
+    #    keeps pg_deltax in compressed-read mode, and (importantly) avoids
+    #    a UNIQUE-key conflict during the subscription's initial COPY, since
+    #    we won't publish `deltax_partition`.
+    with _db_conn(repl["sub_db"]) as sub:
+        cur = sub.execute(
+            "SELECT format('%I.%I', schemaname, tablename) "
+            "FROM pg_tables WHERE schemaname = '_deltax_compressed'"
+        )
+        for (fqn,) in cur.fetchall():
+            sub.execute(f"TRUNCATE TABLE {fqn}")
+
+    # Confirm subscriber's companion tables really are empty before we wire
+    # up replication. Note: `SELECT count(*) FROM metrics` would still return
+    # 100 here, because pg_deltax has a count(*) pushdown that reads the
+    # immutable `deltax_partition.row_count` directly — bypassing the meta
+    # scan. We didn't reset that column (intentionally, so we don't have to
+    # publish `deltax_partition` and dodge UNIQUE-key conflicts on initial
+    # copy). Real-row queries with a WHERE clause go through the meta scan
+    # and correctly observe 0.
+    with _db_conn(repl["sub_db"]) as sub:
+        meta_rows = sub.execute(
+            'SELECT count(*) FROM "_deltax_compressed"."metrics_p20250615_meta"'
+        ).fetchone()[0]
+        assert meta_rows == 0, f"meta table not empty after truncate: {meta_rows}"
+        actual_rows = sub.execute(
+            f"SELECT count(*) FROM metrics "
+            f"WHERE ts >= '{BASE_TS}'::timestamptz"
+        ).fetchone()[0]
+        assert actual_rows == 0, (
+            f"subscriber returned {actual_rows} rows via meta scan after "
+            f"truncate — expected 0"
+        )
+
+    # 3. Publication scoped to JUST `_deltax_compressed.*` — exactly the
+    #    surface area scenario 2 cares about. We omit `metrics` itself
+    #    (heap is empty on both sides anyway, and including the parent
+    #    partitioned table would require deciding on publish_via_partition_root)
+    #    and omit `deltax_partition` to dodge the UNIQUE conflict mentioned
+    #    above. In a real "scenario 2" deployment the catalog row would be
+    #    kept in sync by some other mechanism — pgrx hooks, a periodic
+    #    refresh task, or just physical streaming replication.
+    with _db_conn(repl["pub_db"], autocommit=True) as pub:
+        pub.execute(
+            f"CREATE PUBLICATION {repl['pub_name']} "
+            f"FOR TABLES IN SCHEMA _deltax_compressed"
+        )
+        pub.execute(
+            f"SELECT pg_create_logical_replication_slot("
+            f"'{repl['pub_slot']}', 'pgoutput')"
+        )
+
+    # 4. Subscription with `copy_data = true` — the initial table sync will
+    #    refill the subscriber's empty companion tables and re-insert the
+    #    `deltax_partition` row, restoring the compressed state from the
+    #    publisher's bytes.
+    with _db_conn(repl["sub_db"], autocommit=True) as sub:
+        sub.execute(
+            f"CREATE SUBSCRIPTION {repl['sub_name']} "
+            f"CONNECTION '{repl['conn_str']}' "
+            f"PUBLICATION {repl['pub_name']} "
+            f"WITH (copy_data = true, slot_name = '{repl['pub_slot']}', "
+            f"      create_slot = false)"
+        )
+
+    # 5. Wait for initial sync to fill the subscriber's companion tables,
+    #    then verify a real-row query returns the full set. We use a WHERE
+    #    clause so the query goes through the meta scan (DeltaXDecompress),
+    #    not the count(*) pushdown that bypasses the meta table.
+    with _db_conn(repl["sub_db"]) as sub:
+        deadline = time.time() + REPLICATION_TIMEOUT_S
+        n = None
+        while time.time() < deadline:
+            n = sub.execute(
+                f"SELECT count(*) FROM metrics "
+                f"WHERE ts >= '{BASE_TS}'::timestamptz"
+            ).fetchone()[0]
+            sub.commit()
+            if n == 100:
+                break
+            time.sleep(0.2)
+        assert n == 100, (
+            f"subscriber has {n} rows after initial sync, expected 100 — "
+            f"companion-table replication may have failed"
+        )
+
+        # Belt and braces: the data really came through companion tables,
+        # not the leaf-partition heap. The compressed leaf's heap is still
+        # empty (compression truncated it on both sides; we never published
+        # `metrics` itself).
+        cur = sub.execute(
+            "SELECT table_name FROM deltax_partition "
+            "WHERE is_compressed = true AND table_name LIKE 'metrics_p%'"
+        )
+        compressed_parts = [r[0] for r in cur.fetchall()]
+        assert compressed_parts
+
+        # The companion `_meta` table should now have segment rows again,
+        # delivered by the subscription. (Note: `SELECT count(*) FROM ONLY
+        # <part>` does NOT bypass the custom scan — pg_deltax still reads
+        # through the companion tables for compressed partitions, so it
+        # can't be used to inspect the raw heap.)
+        meta_segments = sub.execute(
+            f'SELECT count(*) FROM "_deltax_compressed"."{compressed_parts[0]}_meta"'
+        ).fetchone()[0]
+        assert meta_segments > 0, (
+            "companion _meta table is still empty after subscription sync — "
+            "FOR TABLES IN SCHEMA didn't pick up companion contents"
+        )
+
+        # And the actual decompressed values match what we put in. Use a
+        # narrow predicate that forces a real meta scan + decompression.
+        sample = sub.execute(
+            f"SELECT device_id, temperature FROM metrics "
+            f"WHERE ts = '{BASE_TS}'::timestamptz + interval '50 minutes'"
+        ).fetchall()
+        assert len(sample) == 1
+        device, temp = sample[0]
+        assert device == "device-0"  # MOD(50, 5) = 0
+        assert temp == pytest.approx(20.0 + 50 * 0.1)
