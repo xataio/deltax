@@ -407,3 +407,69 @@ def test_compression_with_truncate_excluded_preserves_subscriber(replicated_pair
 
     with _db_conn(repl["sub_db"]) as sub:
         _wait_for_row_count(sub, "metrics", 201)
+
+
+def test_partition_attached_after_publication_auto_publishes(replicated_pair):
+    """A partition attached to the parent AFTER the publication is created
+    is automatically part of the published stream.
+
+    pg_deltax's worker creates partitions with plain
+    `CREATE TABLE … PARTITION OF parent FOR VALUES FROM (…) TO (…)`. We
+    simulate that here directly (the worker only runs in the `postgres`
+    DB, not in these per-test DBs) and prove the new partition's inserts
+    flow through without us touching the publication.
+    """
+    repl = replicated_pair
+    _setup_publication_and_subscription(repl)
+
+    # Sanity: existing partitions replicate.
+    with _db_conn(repl["pub_db"]) as pub:
+        pub.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        pub.execute(
+            f"INSERT INTO metrics (ts, device_id, temperature) VALUES "
+            f"('{BASE_TS}'::timestamptz, 'd-A', 1.0)"
+        )
+    with _db_conn(repl["sub_db"]) as sub:
+        _wait_for_row_count(sub, "metrics", 1)
+
+    # Attach a brand-new partition on both sides covering a date range
+    # well outside what deltax_create_table pre-made — i.e. a partition
+    # that did not exist when CREATE PUBLICATION ran. This is exactly the
+    # operation pg_deltax's worker performs on its 60s tick.
+    far_start = "2025-08-10 00:00:00+00"
+    far_end = "2025-08-11 00:00:00+00"
+    new_partition = "metrics_p20250810"
+    for db in (repl["pub_db"], repl["sub_db"]):
+        with _db_conn(db) as c:
+            c.execute(
+                f"CREATE TABLE {new_partition} PARTITION OF metrics "
+                f"FOR VALUES FROM ('{far_start}') TO ('{far_end}')"
+            )
+
+    # Insert a row that PG routes into the new partition on the publisher.
+    # If publish_via_partition_root is doing its job, this INSERT shows up
+    # in the WAL stream and reaches the subscriber's matching new partition
+    # — without any ALTER PUBLICATION call in between.
+    with _db_conn(repl["pub_db"]) as pub:
+        pub.execute(
+            f"INSERT INTO metrics (ts, device_id, temperature) VALUES "
+            f"('{far_start}'::timestamptz, 'd-FUTURE', 999.0)"
+        )
+        pub_in_new = pub.execute(
+            f"SELECT count(*) FROM ONLY {new_partition}"
+        ).fetchone()[0]
+        assert pub_in_new == 1, "row didn't route to the new publisher partition"
+
+    with _db_conn(repl["sub_db"]) as sub:
+        _wait_for_row_count(sub, "metrics", 2)
+        sub_in_new = sub.execute(
+            f"SELECT count(*) FROM ONLY {new_partition}"
+        ).fetchone()[0]
+        assert sub_in_new == 1, (
+            "subscriber did not receive INSERT into the newly-attached "
+            "partition — publish_via_partition_root failed to auto-include it"
+        )
+        sub_in_default = sub.execute(
+            "SELECT count(*) FROM ONLY metrics_default"
+        ).fetchone()[0]
+        assert sub_in_default == 0
