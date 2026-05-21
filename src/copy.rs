@@ -17,7 +17,8 @@ use crate::compress::{
     classify_column, compress_text_lengths, compress_typed_column, compute_minmax_encoded_i64,
     compute_segment_blooms, compute_segment_ndistinct, compute_typed_minmax, compute_typed_sum,
     format_minmax_for_insert, get_column_metadata, init_typed_columns, is_text_data_type,
-    new_typed_column, new_worker_typed_column, sort_typed_columns, supports_minmax, supports_sum,
+    lz4_clause, new_typed_column, new_worker_typed_column, sort_typed_columns, supports_minmax,
+    supports_sum,
 };
 use crate::copyparse::{
     CopyLineReader, CopyTextOptions, HeaderMode, LineResult, parse_and_append,
@@ -643,24 +644,27 @@ impl BackfillState {
 /// Companion blobs-table DDL (no PK; PK added in `finalize_partition`).
 fn create_blobs_table(fqn: &str) {
     spi_exec(&format!(
-        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4)",
-        fqn
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA{})",
+        fqn,
+        lz4_clause()
     ));
 }
 
 /// Companion blooms-table DDL (no PK; PK added in `finalize_partition`).
 fn create_blooms_table(fqn: &str) {
     spi_exec(&format!(
-        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _num_hashes SMALLINT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
-        fqn
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _num_hashes SMALLINT NOT NULL, _data BYTEA{} NOT NULL)",
+        fqn,
+        lz4_clause()
     ));
 }
 
 /// Companion text-lengths-table DDL (no PK; PK added in `finalize_partition`).
 fn create_text_lengths_table(fqn: &str) {
     spi_exec(&format!(
-        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL)",
-        fqn
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA{} NOT NULL)",
+        fqn,
+        lz4_clause()
     ));
 }
 

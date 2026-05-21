@@ -1,9 +1,12 @@
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
 use std::hash::{Hash, Hasher};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cardinality_estimator::CardinalityEstimator;
 
+use crate::USE_LZ4;
 use crate::catalog;
 use crate::compression::{self, CompressedColumn, CompressionType};
 
@@ -420,6 +423,7 @@ fn deltax_enable_compression(
     segment_size: default!(i32, "30000"),
     json_extract: default!(Option<pgrx::datum::JsonB>, "NULL"),
 ) -> String {
+    maybe_warn_lz4();
     Spi::connect_mut(|client| {
         let (schema, table) = crate::partition::resolve_relation(client, relation);
         let ht = catalog::get_deltatable(client, &schema, &table)
@@ -1928,6 +1932,66 @@ pub(crate) struct CompanionDdl {
     pub(crate) valbitmap_ddl: String,
 }
 
+/// Cached probe result for whether the running PostgreSQL was built with
+/// `--with-lz4`. lz4 support is a postmaster compile-time property, so one
+/// probe per backend is sufficient.
+static LZ4_SUPPORTED: OnceLock<bool> = OnceLock::new();
+
+/// Set to true after we've emitted the one-shot `use_lz4=on but PG lacks
+/// lz4` WARNING for the current backend, so we don't spam users that enable
+/// compression on multiple tables.
+static LZ4_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Detect whether the running PostgreSQL was built with `--with-lz4`.
+/// Cheap probe: `default_toast_compression` is an enum GUC whose accepted
+/// values include `lz4` only when the server has lz4 linked in.
+pub(crate) fn lz4_supported() -> bool {
+    *LZ4_SUPPORTED.get_or_init(|| {
+        Spi::get_one::<bool>(
+            "SELECT enumvals @> ARRAY['lz4'] \
+             FROM pg_settings WHERE name = 'default_toast_compression'",
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+    })
+}
+
+/// Pure logic for [`lz4_clause`]: emit the lz4 attribute only when the user
+/// has opted in (`use_lz4=on`) *and* the server supports it. Split out so
+/// unit tests can cover all four combinations without depending on the
+/// cached probe or the live GUC.
+fn compute_lz4_clause(use_lz4: bool, supported: bool) -> &'static str {
+    if use_lz4 && supported {
+        " COMPRESSION lz4"
+    } else {
+        ""
+    }
+}
+
+/// Returns `" COMPRESSION lz4"` (with a leading space) when the running PG
+/// supports lz4 and the `pg_deltax.use_lz4` GUC is on; otherwise `""`. Used
+/// at the seven companion-table DDL sites.
+pub(crate) fn lz4_clause() -> &'static str {
+    compute_lz4_clause(USE_LZ4.get(), lz4_supported())
+}
+
+/// Emit a one-shot WARNING per backend when `use_lz4=on` was requested
+/// but the running PG wasn't built with lz4 support. Called from
+/// `deltax_enable_compression`.
+pub(crate) fn maybe_warn_lz4() {
+    if !USE_LZ4.get() || lz4_supported() {
+        return;
+    }
+    if LZ4_WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    pgrx::warning!(
+        "pg_deltax: PostgreSQL was not built with --with-lz4; \
+        compressed-blob storage might be larger and cold reads slower."
+    )
+}
+
 /// Build DDL for companion tables (meta, colstats, blobs, blooms) for a partition.
 ///
 /// The meta table is thin: only segment_id, segment_by cols, time column min/max,
@@ -1975,22 +2039,24 @@ pub(crate) fn build_companion_ddl(part_table: &str, columns: &[ColumnMeta]) -> C
         colstats_fqn
     );
 
+    let lz4 = lz4_clause();
+
     let blobs_ddl = format!(
-        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4, PRIMARY KEY (_col_idx, _segment_id))",
-        blobs_fqn
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA{}, PRIMARY KEY (_col_idx, _segment_id))",
+        blobs_fqn, lz4
     );
 
     let blooms_ddl = format!(
-        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _num_hashes SMALLINT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL, PRIMARY KEY (_col_idx, _segment_id))",
-        blooms_fqn
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _num_hashes SMALLINT NOT NULL, _data BYTEA{} NOT NULL, PRIMARY KEY (_col_idx, _segment_id))",
+        blooms_fqn, lz4
     );
 
     // Per-text-column per-segment length sidecar: compact u32 array, LZ4-compressed.
     // Used when a query only needs length(col)/col=''/col<>'' — lets the scan skip
     // detoasting the (typically large) main text blob.
     let text_lengths_ddl = format!(
-        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA COMPRESSION lz4 NOT NULL, PRIMARY KEY (_col_idx, _segment_id))",
-        text_lengths_fqn
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _data BYTEA{} NOT NULL, PRIMARY KEY (_col_idx, _segment_id))",
+        text_lengths_fqn, lz4
     );
 
     // Per-segment value-presence bitmap for low-cardinality (≤32) text columns.
@@ -1998,8 +2064,8 @@ pub(crate) fn build_companion_ddl(part_table: &str, columns: &[ColumnMeta]) -> C
     // `deltax_partition.column_valmap`). Lets `WHERE col = const` queries skip
     // segments where the constant's bit is clear, with no false positives.
     let valbitmap_ddl = format!(
-        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _bits BYTEA COMPRESSION lz4 NOT NULL, PRIMARY KEY (_col_idx, _segment_id))",
-        valbitmap_fqn
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _bits BYTEA{} NOT NULL, PRIMARY KEY (_col_idx, _segment_id))",
+        valbitmap_fqn, lz4
     );
 
     CompanionDdl {
@@ -4333,5 +4399,14 @@ mod tests {
         assert!(matches!(classify_column("jsonb", false), ColumnKind::Jsonb));
         // Unknown types default to Text (no error — caller doesn't see this).
         assert!(matches!(classify_column("uuid", false), ColumnKind::Text));
+    }
+
+    #[test]
+    fn test_compute_lz4_clause_all_combinations() {
+        // Only the (use_lz4=on AND supported) case yields the attribute.
+        assert_eq!(compute_lz4_clause(true, true), " COMPRESSION lz4");
+        assert_eq!(compute_lz4_clause(true, false), "");
+        assert_eq!(compute_lz4_clause(false, true), "");
+        assert_eq!(compute_lz4_clause(false, false), "");
     }
 }

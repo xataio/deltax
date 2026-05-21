@@ -4281,3 +4281,75 @@ class TestAvgTopNCorrectness:
         assert [r[0] for r in after] == [r[0] for r in before], (
             f"Float AVG order mismatch: before={before}, after={after}"
         )
+
+
+class TestLz4Optional:
+    """`pg_deltax.use_lz4 = off` must produce companion tables without the
+    `COMPRESSION lz4` attribute, and compression/decompression must still
+    round-trip correctly. Simulates running against a PG built without
+    `--with-lz4`, which we can't easily build in CI."""
+
+    def test_use_lz4_off_roundtrip_and_no_lz4_attribute(self, db):
+        db.execute("SET pg_deltax.use_lz4 = off")
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE nolz4_metrics (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                temperature DOUBLE PRECISION,
+                payload TEXT
+            )
+        """)
+        db.execute(
+            "SELECT deltax_create_table('nolz4_metrics', 'ts', '1 day'::interval)"
+        )
+        db.commit()
+
+        # Mix of small + large text payloads so the blobs column gets some
+        # real bytes (toast threshold is ~2 KB).
+        for i in range(200):
+            ts = f"'{BASE_TS}'::timestamptz + interval '{i} minutes'"
+            payload = ("x" * 100 + str(i)).replace("'", "''")
+            db.execute(
+                f"INSERT INTO nolz4_metrics VALUES "
+                f"({ts}, 'device-{i % 5:04d}', {20.0 + i * 0.1}, '{payload}')"
+            )
+        db.commit()
+
+        before = db.execute(
+            "SELECT ts, device_id, temperature, payload "
+            "FROM nolz4_metrics ORDER BY ts"
+        ).fetchall()
+
+        db.execute(
+            "SELECT deltax_enable_compression('nolz4_metrics', "
+            "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "nolz4_metrics")
+
+        after = db.execute(
+            "SELECT ts, device_id, temperature, payload "
+            "FROM nolz4_metrics ORDER BY ts"
+        ).fetchall()
+
+        assert after == before, "use_lz4=off round-trip mismatch"
+
+        # Confirm the companion _blobs table's _data column is NOT declared
+        # with `COMPRESSION lz4`. `attcompression='\\0'` means "use the
+        # default toast compression"; 'l' would mean lz4.
+        rows = db.execute("""
+            SELECT n.nspname, c.relname, a.attcompression
+            FROM pg_attribute a
+            JOIN pg_class c     ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = '_deltax_compressed'
+              AND c.relname LIKE 'nolz4_metrics_%_blobs'
+              AND a.attname = '_data'
+        """).fetchall()
+        assert rows, "expected at least one _blobs companion table"
+        for nsp, rel, ac in rows:
+            assert ac != "l", (
+                f"{nsp}.{rel}._data was created with COMPRESSION lz4 "
+                f"despite use_lz4=off"
+            )

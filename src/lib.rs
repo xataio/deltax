@@ -76,6 +76,19 @@ pub(crate) static BLOB_CACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(-1);
 /// fit for typical OLAP workloads. Restart required to change.
 pub(crate) static BLOB_CACHE_SHARDS: GucSetting<i32> = GucSetting::<i32>::new(64);
 
+/// When ON, internal columnar-blob companion tables (`_blobs`, `_blooms`,
+/// `_text_lengths`, `_valbitmap`) are declared with `BYTEA COMPRESSION lz4`.
+/// The actual columnar compression happens in Rust regardless; this flag
+/// only controls the Postgres TOAST-pass attribute on those BYTEA columns.
+///
+/// Defaults to ON. If the running PostgreSQL was not built with
+/// `--with-lz4`, the DDL is emitted without the `COMPRESSION lz4` clause
+/// (so `CREATE TABLE` doesn't fail) and a one-shot WARNING is raised on
+/// the first `deltax_enable_compression` call per backend. Users can
+/// also set this to OFF explicitly to suppress the lz4 attribute on
+/// lz4-capable builds (e.g., for testing the fallback path).
+pub(crate) static USE_LZ4: GucSetting<bool> = GucSetting::<bool>::new(true);
+
 /// Resolve the effective number of parallel workers.
 /// 0 = auto (num_cpus, capped at 16), 1 = single-threaded, 2..=64 = explicit.
 pub(crate) fn get_parallel_workers() -> usize {
@@ -274,6 +287,14 @@ pub extern "C-unwind" fn _PG_init() {
         1,
         1024,
         GucContext::Postmaster,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.use_lz4",
+        c"Declare internal columnar BYTEA companion columns with COMPRESSION lz4",
+        c"Default ON. Set OFF (or run on a PG built without --with-lz4) and the companion-table DDL is emitted without the lz4 attribute; the actual columnar compression in Rust is unaffected. On an lz4-less build with this ON, deltax_enable_compression raises a one-shot WARNING and the DDL falls back automatically.",
+        &USE_LZ4,
+        GucContext::Userset,
         GucFlags::default(),
     );
     blob_cache::register_hooks();
