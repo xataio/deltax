@@ -68,12 +68,13 @@ pub extern "C-unwind" fn deltax_worker_main(_arg: pg_sys::Datum) {
                     // would block creation of new partitions whose range
                     // overlaps with those rows.
                     match drain_default_partition(client, ht) {
-                        Ok(moved) => {
-                            if moved > 0 {
+                        Ok(drained) => {
+                            if drained.rows_moved > 0 {
                                 log!(
-                                    "pg_deltax: drained {} rows from {}_default",
-                                    moved,
-                                    ht.table_name
+                                    "pg_deltax: drained {} rows from {}_default into {} partition(s)",
+                                    drained.rows_moved,
+                                    ht.table_name,
+                                    drained.partitions_created
                                 );
                             }
                         }
@@ -138,12 +139,20 @@ pub extern "C-unwind" fn deltax_worker_main(_arg: pg_sys::Datum) {
     log!("pg_deltax: background worker shutting down");
 }
 
+/// Outcome of a single drain pass: how many rows were moved from the
+/// `<table>_default` partition into proper time-aligned partitions, and
+/// how many new partitions were created to hold them.
+pub(crate) struct DrainResult {
+    pub rows_moved: i64,
+    pub partitions_created: i32,
+}
+
 /// Move rows from the default partition into proper partitions.
 /// Creates missing partitions on demand.
-fn drain_default_partition(
+pub(crate) fn drain_default_partition(
     client: &mut SpiClient,
     ht: &catalog::DeltatableInfo,
-) -> spi::SpiResult<i64> {
+) -> spi::SpiResult<DrainResult> {
     let default_name = format!("{}_default", ht.table_name);
     let fq_default = partition::fqn(&ht.schema_name, &default_name);
 
@@ -154,7 +163,10 @@ fn drain_default_partition(
         .unwrap_or(0);
 
     if row_count == 0 {
-        return Ok(0);
+        return Ok(DrainResult {
+            rows_moved: 0,
+            partitions_created: 0,
+        });
     }
 
     let interval_usec = partition::interval_to_usec(&ht.partition_interval);
@@ -182,7 +194,10 @@ fn drain_default_partition(
     };
 
     if boundaries.is_empty() {
-        return Ok(row_count);
+        return Ok(DrainResult {
+            rows_moved: row_count,
+            partitions_created: 0,
+        });
     }
 
     let parent = partition::fqn(&ht.schema_name, &ht.table_name);
@@ -236,5 +251,8 @@ fn drain_default_partition(
         &[],
     )?;
 
-    Ok(row_count)
+    Ok(DrainResult {
+        rows_moved: row_count,
+        partitions_created: boundaries.len() as i32,
+    })
 }

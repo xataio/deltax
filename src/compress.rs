@@ -588,6 +588,97 @@ fn deltax_compress_partition(partition: &str) -> String {
     Spi::connect_mut(|client| compress_partition_impl(client, partition))
 }
 
+/// Compress every "sealed" uncompressed partition of a deltax-managed table
+/// in one call. A partition is sealed when its `range_end` is in the past
+/// (with respect to `pg_deltax.mock_now` when set, otherwise `now()`); this
+/// avoids racing with writers on the current partition. With `older_than`,
+/// the threshold becomes `now() - older_than` so users can demand an extra
+/// retention buffer.
+///
+/// Returns one row per partition the call touched, with the same status
+/// string `deltax_compress_partition` produces. An empty result set means
+/// nothing was eligible — not an error.
+#[pg_extern]
+fn deltax_compress_all_partitions(
+    relation: &str,
+    older_than: default!(Option<pgrx::datum::Interval>, "NULL"),
+) -> TableIterator<
+    'static,
+    (
+        name!(partition_name, String),
+        name!(result, String),
+    ),
+> {
+    maybe_warn_lz4();
+
+    let rows = Spi::connect_mut(|client| {
+        let (schema, table) = crate::partition::resolve_relation(client, relation);
+        let ht = catalog::get_deltatable(client, &schema, &table)
+            .expect("failed to query deltatable")
+            .unwrap_or_else(|| {
+                pgrx::error!(
+                    "pg_deltax: table {}.{} is not a deltax table",
+                    schema,
+                    table
+                )
+            });
+
+        // Threshold is now() (mock-aware) minus older_than. interval_to_usec
+        // rejects month-based intervals, matching the rest of the codebase.
+        let now = crate::partition::now_usec();
+        let threshold_usec = match &older_than {
+            Some(i) => now - crate::partition::interval_to_usec(i),
+            None => now,
+        };
+        let threshold_tstz = crate::partition::usec_to_tstz(threshold_usec);
+
+        let result = client
+            .select(
+                "SELECT schema_name, table_name FROM deltax_partition
+                 WHERE deltatable_id = $1
+                   AND NOT is_compressed
+                   AND range_end <= $2::timestamptz
+                 ORDER BY range_start",
+                None,
+                &[ht.id.into(), threshold_tstz.into()],
+            )
+            .expect("failed to query eligible partitions");
+
+        // Materialize the partition list first; `compress_partition_impl`
+        // needs `&mut SpiClient` and would conflict with the live iterator.
+        let mut targets: Vec<(String, String)> = Vec::new();
+        for row in result {
+            let sch: String = row
+                .get_datum_by_ordinal(1)
+                .unwrap()
+                .value::<String>()
+                .unwrap()
+                .unwrap();
+            let name: String = row
+                .get_datum_by_ordinal(2)
+                .unwrap()
+                .value::<String>()
+                .unwrap()
+                .unwrap();
+            targets.push((sch, name));
+        }
+
+        let mut out: Vec<(String, String)> = Vec::with_capacity(targets.len());
+        for (sch, name) in targets {
+            // `compress_partition_impl` re-resolves the name via
+            // `resolve_relation`, which expects an unquoted `schema.table`
+            // (or bare) form. The deltax-generated partition names are
+            // simple identifiers, so this is safe.
+            let qualified = format!("{}.{}", sch, name);
+            let msg = compress_partition_impl(client, &qualified);
+            out.push((name, msg));
+        }
+        out
+    });
+
+    TableIterator::new(rows)
+}
+
 /// Decompress a single partition.
 #[pg_extern]
 fn deltax_decompress_partition(partition: &str) -> String {

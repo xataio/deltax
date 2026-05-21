@@ -207,23 +207,52 @@ Replace `pg17` with `pg18` to target PostgreSQL 18. Then add `pg_deltax` to `sha
 
 ### Quickstart
 
+Either install pg_deltax as per above or run in this repo:
+
+```sh
+make run     # starts Postgres in docker with the extension loaded
+make psql    # connects to it via psql
+```
+
+Then: 
+
 ```sql
+CREATE EXTENSION IF NOT EXISTS pg_deltax;
 CREATE TABLE metrics (ts TIMESTAMPTZ NOT NULL, device TEXT, value FLOAT8);
 SELECT deltax_create_table('metrics', 'ts', '1 day');
 
-INSERT INTO metrics VALUES (now(), 'sensor-1', 42.0);
+-- Insert ~100,000 rows spanning the last ~2.3 days across 5 devices. The past
+-- (sealed) partition needs enough data that the per-partition companion-table
+-- overhead is dwarfed by the compression savings — at very small scales the
+-- fixed overhead can actually grow the database after compression.
+INSERT INTO metrics (ts, device, value)
+SELECT
+    now() - (i * interval '2 seconds'),
+    'sensor-' || (i % 5),
+    20.0 + sin(i::float / 100) * 5
+FROM generate_series(0, 100000) AS i;
 
-SELECT time_bucket('1 hour', ts), avg(value) FROM metrics GROUP BY 1;
-SELECT first(value, ts), last(value, ts) FROM metrics;
+-- simulate a bg worker run which would drain the defualt partition every 60s
+SELECT deltax_drain_default_partition('metrics');
+
+-- Check size and info before compression
+SELECT pg_size_pretty(pg_database_size(current_database())) AS size;
 SELECT * FROM deltax_partition_info('metrics');
 
--- Compression
+-- Compression — compresses every partition whose window is fully in the past
+-- (today's still-open partition is skipped). Normally done by the bg thread automatically.
 SELECT deltax_enable_compression('metrics', order_by => ARRAY['device', 'ts']);
-SELECT deltax_compress_partition('metrics_p20250401');
+SELECT * FROM deltax_compress_all_partitions('metrics');
 SELECT * FROM deltax_compression_stats('metrics');
 
--- Size reporting (accounts for compressed storage)
+-- Demo queries
+SELECT time_bucket('1 day', ts) AS day, avg(value) FROM metrics GROUP BY 1 ORDER BY 1;
+SELECT first(value, ts), last(value, ts) FROM metrics;
+
+-- Size reporting after compression — both the deltatable's catalog-truthful
+-- size and the whole database for comparison with the value above.
 SELECT pg_size_pretty(deltax_table_size('metrics'));
+SELECT pg_size_pretty(pg_database_size(current_database())) AS size;
 ```
 
 ## Correctness testing

@@ -538,18 +538,14 @@ pub fn install_compressed_dml_trigger(
     schema: &str,
     table: &str,
 ) -> spi::SpiResult<()> {
+    // PG 14+ supports `CREATE OR REPLACE TRIGGER`, so we can avoid the
+    // `DROP TRIGGER IF EXISTS` step that otherwise emits a noisy
+    // `NOTICE: trigger "..." does not exist, skipping` on the first
+    // compression of a partition.
     let partition_fqn = crate::partition::fqn(schema, table);
     client.update(
         &format!(
-            "DROP TRIGGER IF EXISTS deltax_reject_compressed_dml ON {}",
-            partition_fqn
-        ),
-        None,
-        &[],
-    )?;
-    client.update(
-        &format!(
-            "CREATE TRIGGER deltax_reject_compressed_dml
+            "CREATE OR REPLACE TRIGGER deltax_reject_compressed_dml
              BEFORE INSERT OR UPDATE OR DELETE ON {}
              FOR EACH ROW EXECUTE FUNCTION deltax_reject_compressed_partition_dml()",
             partition_fqn
