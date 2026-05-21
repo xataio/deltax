@@ -602,13 +602,7 @@ fn deltax_compress_partition(partition: &str) -> String {
 fn deltax_compress_all_partitions(
     relation: &str,
     older_than: default!(Option<pgrx::datum::Interval>, "NULL"),
-) -> TableIterator<
-    'static,
-    (
-        name!(partition_name, String),
-        name!(result, String),
-    ),
-> {
+) -> TableIterator<'static, (name!(partition_name, String), name!(result, String))> {
     maybe_warn_lz4();
 
     let rows = Spi::connect_mut(|client| {
