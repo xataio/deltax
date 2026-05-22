@@ -1,6 +1,6 @@
 # Function reference
 
-All pg_deltax functions live in the `deltax` schema (so its `time_bucket`, `first`, `last`, etc. don't collide with TimescaleDB or pg_duckdb). Names below are shown unqualified for readability — call them as `deltax.<fn>(...)`, e.g.:
+All pg_deltax functions live in the `deltax` schema. Names below are shown unqualified for readability — call them as `deltax.<fn>(...)`, e.g.:
 
 ```sql
 SELECT deltax.deltax_create_table('metrics', 'ts', '1 day');
