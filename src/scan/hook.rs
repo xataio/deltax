@@ -3794,6 +3794,47 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     }
                 }
 
+                // Resolve a column name for each group spec, distinguishing
+                // physical attrs (look up pg_attribute) from json_extract
+                // synthetics (look up the spec's target_name). A mixed GROUP
+                // BY of physical + synthetic columns (e.g. EXTRACT(HOUR FROM
+                // ts) + data->'commit'->>'collection') sets group_by_relid
+                // to the parent rel; without this distinction the synthetic
+                // col_idx is fed to get_attname against the parent rel and
+                // crashes with "cache lookup failed for attribute N of
+                // relation X" because the parent has no such physical attno.
+                //
+                // Try the cheap pg_attribute lookup first (missing_ok=true so
+                // a synthetic col_idx returns NULL instead of erroring); only
+                // populate the json_extract context — which costs an SPI
+                // lookup against `deltax_extract_specs` — when we actually
+                // encounter an attno that pg_attribute doesn't have. Queries
+                // over tables without json_extract configured (e.g. ClickBench)
+                // skip the SPI lookup entirely.
+                let group_col_names: Vec<Option<String>> = group_specs
+                    .iter()
+                    .map(|gs| {
+                        let attno = (gs.col_idx + 1) as i16;
+                        let name_ptr = pg_sys::get_attname(group_by_relid, attno, true);
+                        if !name_ptr.is_null() {
+                            return Some(
+                                std::ffi::CStr::from_ptr(name_ptr)
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            );
+                        }
+                        // attno > physical natts → must be a json_extract
+                        // synthetic. Lazy-populate the ctx and look it up.
+                        if json_extract_ctx.is_none() {
+                            json_extract_ctx =
+                                Some(super::json_extract::AggChainCtx::from_root(root));
+                        }
+                        let ctx = json_extract_ctx.as_ref().and_then(|o| o.as_ref())?;
+                        let spec_idx = (gs.col_idx - ctx.physical_count as i32) as usize;
+                        ctx.specs.get(spec_idx).map(|s| s.target_name.clone())
+                    })
+                    .collect();
+
                 // Guard: text GROUP BY columns need low cardinality
                 // (ndistinct < 30K). High-cardinality text GROUP BY
                 // (e.g. URL with 275K distinct) is still slower in AggScan
@@ -3817,7 +3858,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 if has_text_group && has_where && n_workers <= 1 {
                     let estimated_rows = (*input_rel).rows;
                     let few_rows = estimated_rows < total_uncompressed_rows * 0.05;
-                    let has_high_card_text = group_specs.iter().any(|gs| {
+                    let has_high_card_text = group_specs.iter().enumerate().any(|(i, gs)| {
                         if !matches!(gs.expr, GroupByExpr::Column) {
                             return false;
                         }
@@ -3828,12 +3869,9 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         if !is_text {
                             return false;
                         }
-                        let attno = (gs.col_idx + 1) as i16;
-                        let name_ptr = pg_sys::get_attname(group_by_relid, attno, false);
-                        if name_ptr.is_null() {
+                        let Some(col_name) = group_col_names[i].as_deref() else {
                             return false;
-                        }
-                        let col_name = std::ffi::CStr::from_ptr(name_ptr).to_str().unwrap_or("");
+                        };
                         merged_ndistinct
                             .get(col_name)
                             .map(|&nd| nd > 100_000)
@@ -3848,17 +3886,13 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     // Bail out for high-cardinality GROUP BY (only without WHERE)
                     if !has_where {
                         let threshold = total_uncompressed_rows * 0.5;
-                        let has_high_cardinality = group_specs.iter().any(|gs| {
+                        let has_high_cardinality = group_specs.iter().enumerate().any(|(i, gs)| {
                             if !matches!(gs.expr, GroupByExpr::Column) {
                                 return false;
                             }
-                            let attno = (gs.col_idx + 1) as i16;
-                            let name_ptr = pg_sys::get_attname(group_by_relid, attno, false);
-                            if name_ptr.is_null() {
+                            let Some(col_name) = group_col_names[i].as_deref() else {
                                 return false;
-                            }
-                            let col_name =
-                                std::ffi::CStr::from_ptr(name_ptr).to_str().unwrap_or("");
+                            };
                             merged_ndistinct
                                 .get(col_name)
                                 .map(|&nd| nd as f64 > threshold)
@@ -3873,7 +3907,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                     {
                         let mut product: f64 = 1.0;
                         let mut all_found = true;
-                        for gs in &group_specs {
+                        for (i, gs) in group_specs.iter().enumerate() {
                             match &gs.expr {
                                 GroupByExpr::Extract { unit, .. } => {
                                     // Bounded cardinality for extract fields
@@ -3897,15 +3931,10 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                                     break;
                                 }
                                 GroupByExpr::Column | GroupByExpr::AddConst { .. } => {
-                                    let attno = (gs.col_idx + 1) as i16;
-                                    let name_ptr =
-                                        pg_sys::get_attname(group_by_relid, attno, false);
-                                    if name_ptr.is_null() {
+                                    let Some(col_name) = group_col_names[i].as_deref() else {
                                         all_found = false;
                                         break;
-                                    }
-                                    let col_name =
-                                        std::ffi::CStr::from_ptr(name_ptr).to_str().unwrap_or("");
+                                    };
                                     if let Some(&nd) = merged_ndistinct.get(col_name) {
                                         product *= nd as f64;
                                     } else {

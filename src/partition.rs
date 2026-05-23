@@ -79,7 +79,7 @@ fn align_to_interval(ts_usec: i64, interval_usec: i64) -> i64 {
 
 /// Get current time as microseconds since Unix epoch via SPI.
 /// Respects the `pg_deltax.mock_now` GUC when set.
-fn now_usec() -> i64 {
+pub(crate) fn now_usec() -> i64 {
     if let Some(mock_cstr) = crate::MOCK_NOW.get() {
         let mock_val = mock_cstr.to_str().unwrap_or("");
         if !mock_val.is_empty() {
@@ -502,6 +502,39 @@ fn deltax_deltatable_info(
     });
 
     TableIterator::new(rows)
+}
+
+/// Drain rows that landed in `<table>_default` into proper, time-aligned
+/// partitions on demand. The background worker performs the same step every
+/// 60 seconds; calling this explicitly is useful right after a bulk load
+/// (or in the README quickstart) so the rows are eligible for
+/// `deltax_compress_all_partitions` without waiting for the next worker tick.
+#[pg_extern]
+fn deltax_drain_default_partition(relation: &str) -> String {
+    Spi::connect_mut(|client| {
+        let (schema, table) = resolve_relation(client, relation);
+        let ht = catalog::get_deltatable(client, &schema, &table)
+            .expect("failed to query deltatable")
+            .unwrap_or_else(|| {
+                pgrx::error!(
+                    "pg_deltax: table {}.{} is not a deltax table",
+                    schema,
+                    table
+                )
+            });
+
+        let drained = crate::worker::drain_default_partition(client, &ht)
+            .expect("failed to drain default partition");
+
+        if drained.rows_moved == 0 {
+            format!("{}.{}_default is empty; nothing to drain", schema, table)
+        } else {
+            format!(
+                "Drained {} row(s) from {}.{}_default into {} new partition(s)",
+                drained.rows_moved, schema, table, drained.partitions_created
+            )
+        }
+    })
 }
 
 /// Set a retention policy on a deltatable.

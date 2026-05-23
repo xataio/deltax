@@ -4281,3 +4281,222 @@ class TestAvgTopNCorrectness:
         assert [r[0] for r in after] == [r[0] for r in before], (
             f"Float AVG order mismatch: before={before}, after={after}"
         )
+
+
+class TestLz4Optional:
+    """`pg_deltax.use_lz4 = off` must produce companion tables without the
+    `COMPRESSION lz4` attribute, and compression/decompression must still
+    round-trip correctly. Simulates running against a PG built without
+    `--with-lz4`, which we can't easily build in CI."""
+
+    def test_use_lz4_off_roundtrip_and_no_lz4_attribute(self, db):
+        db.execute("SET pg_deltax.use_lz4 = off")
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE nolz4_metrics (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                temperature DOUBLE PRECISION,
+                payload TEXT
+            )
+        """)
+        db.execute(
+            "SELECT deltax_create_table('nolz4_metrics', 'ts', '1 day'::interval)"
+        )
+        db.commit()
+
+        # Mix of small + large text payloads so the blobs column gets some
+        # real bytes (toast threshold is ~2 KB).
+        for i in range(200):
+            ts = f"'{BASE_TS}'::timestamptz + interval '{i} minutes'"
+            payload = ("x" * 100 + str(i)).replace("'", "''")
+            db.execute(
+                f"INSERT INTO nolz4_metrics VALUES "
+                f"({ts}, 'device-{i % 5:04d}', {20.0 + i * 0.1}, '{payload}')"
+            )
+        db.commit()
+
+        before = db.execute(
+            "SELECT ts, device_id, temperature, payload "
+            "FROM nolz4_metrics ORDER BY ts"
+        ).fetchall()
+
+        db.execute(
+            "SELECT deltax_enable_compression('nolz4_metrics', "
+            "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, "nolz4_metrics")
+
+        after = db.execute(
+            "SELECT ts, device_id, temperature, payload "
+            "FROM nolz4_metrics ORDER BY ts"
+        ).fetchall()
+
+        assert after == before, "use_lz4=off round-trip mismatch"
+
+        # Confirm the companion _blobs table's _data column is NOT declared
+        # with `COMPRESSION lz4`. `attcompression='\\0'` means "use the
+        # default toast compression"; 'l' would mean lz4.
+        rows = db.execute("""
+            SELECT n.nspname, c.relname, a.attcompression
+            FROM pg_attribute a
+            JOIN pg_class c     ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = '_deltax_compressed'
+              AND c.relname LIKE 'nolz4_metrics_%_blobs'
+              AND a.attname = '_data'
+        """).fetchall()
+        assert rows, "expected at least one _blobs companion table"
+        for nsp, rel, ac in rows:
+            assert ac != "l", (
+                f"{nsp}.{rel}._data was created with COMPRESSION lz4 "
+                f"despite use_lz4=off"
+            )
+
+
+class TestCompressAllPartitions:
+    """`deltax_compress_all_partitions` should compress every sealed
+    uncompressed partition, skip the still-open one and any partition
+    already compressed, respect `older_than`, and return zero rows when
+    nothing is eligible."""
+
+    T0 = "2025-01-15 12:00:00+00"   # creation time
+    T1 = "2025-01-19 12:00:00+00"   # later time so the originally-created partitions are sealed
+    T_BACK = "2025-01-10 00:00:00+00"
+
+    def _setup(self, db, with_data=True):
+        """Create a deltatable at T0 with 1-day partitions. Optionally
+        populate per-day data into Jan 14..Jan 17 via generate_series."""
+        db.execute(f"SET pg_deltax.mock_now = '{self.T0}'")
+        db.execute("""
+            CREATE TABLE metrics_cap (
+                ts TIMESTAMPTZ NOT NULL,
+                device TEXT,
+                value FLOAT8
+            )
+        """)
+        db.execute(
+            "SELECT deltax_create_table('metrics_cap', 'ts', '1 day'::interval)"
+        )
+        db.commit()
+
+        if with_data:
+            # Spread 4 days of synthetic data across Jan 14..Jan 17 so we
+            # have several non-empty past partitions to exercise.
+            db.execute("""
+                INSERT INTO metrics_cap (ts, device, value)
+                SELECT
+                    '2025-01-14 00:00:00+00'::timestamptz + (i * interval '1 minute'),
+                    'sensor-' || (i % 5),
+                    20.0 + sin(i::float / 100) * 5
+                FROM generate_series(0, 4 * 24 * 60 - 1) AS i
+            """)
+            db.commit()
+
+        db.execute(
+            "SELECT deltax_enable_compression('metrics_cap', "
+            "segment_by => ARRAY['device'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+
+    def _stats(self, db):
+        """Return {partition_name: (is_compressed, row_count)} from the stats view."""
+        rows = db.execute(
+            "SELECT partition_name, is_compressed, row_count "
+            "FROM deltax_compression_stats('metrics_cap')"
+        ).fetchall()
+        return {r[0]: (r[1], r[2]) for r in rows}
+
+    def test_compresses_sealed_skips_open_and_already_compressed(self, db):
+        self._setup(db)
+        # Pre-compress one partition manually so it appears as already-done.
+        # Jan 15's partition is named metrics_cap_p20250115 (per existing
+        # deltax naming convention seen elsewhere in the test suite).
+        db.execute(
+            "SELECT deltax_compress_partition('metrics_cap_p20250115')"
+        )
+        db.commit()
+
+        # Jump time forward so Jan 14..Jan 18 are all sealed.
+        db.execute(f"SET pg_deltax.mock_now = '{self.T1}'")
+
+        results = db.execute(
+            "SELECT partition_name, result "
+            "FROM deltax_compress_all_partitions('metrics_cap')"
+        ).fetchall()
+        db.commit()
+
+        names = [r[0] for r in results]
+        # The pre-compressed Jan 15 must not be re-visited.
+        assert "metrics_cap_p20250115" not in names, (
+            f"already-compressed partition was re-visited: {names}"
+        )
+        # The originally-created premake-future partitions (Jan 16, 17, 18)
+        # are now sealed under T1 and should be touched. Jan 14 (the
+        # original "past" premake) is also sealed and should be touched.
+        # We don't pin an exact list here because the worker isn't running,
+        # but we require at least the four non-Jan-15 partitions known to
+        # exist after create_table.
+        expected_subset = {
+            "metrics_cap_p20250114",
+            "metrics_cap_p20250116",
+            "metrics_cap_p20250117",
+            "metrics_cap_p20250118",
+        }
+        assert expected_subset.issubset(set(names)), (
+            f"missing expected partitions in results: "
+            f"expected ⊇ {expected_subset}, got {set(names)}"
+        )
+
+        # Verify the catalog now reflects compression for the data-bearing
+        # past partitions. Jan 14..Jan 17 had data; Jan 18 was empty in our
+        # insert range and stays uncompressed.
+        stats = self._stats(db)
+        for part in ("metrics_cap_p20250114",
+                     "metrics_cap_p20250115",  # via pre-compress
+                     "metrics_cap_p20250116",
+                     "metrics_cap_p20250117"):
+            assert stats[part][0] is True, (
+                f"{part} should be compressed, stats={stats[part]}"
+            )
+
+    def test_older_than_narrows_the_set(self, db):
+        self._setup(db)
+        db.execute(f"SET pg_deltax.mock_now = '{self.T1}'")
+
+        # threshold = T1 - 2 days = 2025-01-17 12:00:00+00. Only partitions
+        # whose range_end <= that are eligible: Jan 14 (ends Jan 15),
+        # Jan 15 (ends Jan 16), Jan 16 (ends Jan 17). Jan 17 (ends Jan 18)
+        # and Jan 18 (ends Jan 19) are not eligible.
+        results = db.execute(
+            "SELECT partition_name "
+            "FROM deltax_compress_all_partitions('metrics_cap', "
+            "older_than => '2 days'::interval)"
+        ).fetchall()
+        db.commit()
+
+        names = set(r[0] for r in results)
+        assert "metrics_cap_p20250114" in names
+        assert "metrics_cap_p20250115" in names
+        assert "metrics_cap_p20250116" in names
+        assert "metrics_cap_p20250117" not in names, (
+            f"Jan 17 should be excluded by older_than=2 days, got {names}"
+        )
+        assert "metrics_cap_p20250118" not in names
+
+    def test_no_eligible_partitions_returns_empty(self, db):
+        # Set mock_now BEFORE the table is created so afterwards we can
+        # also rewind it past the earliest partition's range_end.
+        self._setup(db, with_data=False)
+        # Rewind to before any partition's range_end → nothing is sealed.
+        db.execute(f"SET pg_deltax.mock_now = '{self.T_BACK}'")
+
+        results = db.execute(
+            "SELECT * FROM deltax_compress_all_partitions('metrics_cap')"
+        ).fetchall()
+        db.commit()
+
+        assert results == [], (
+            f"expected zero eligible partitions, got {results}"
+        )
