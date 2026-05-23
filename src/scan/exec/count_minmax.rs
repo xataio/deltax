@@ -243,6 +243,7 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
                     &[],
                     &meta.col_types,
                     &[],
+                    &meta.blob_idx,
                     false,
                 );
                 for seg in &segs {
@@ -556,6 +557,7 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                 &stats_cols,
                 &meta.col_types,
                 &minmax_cols,
+                &meta.blob_idx,
                 false,
             );
             for seg in &segs {

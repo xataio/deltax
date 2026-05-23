@@ -169,6 +169,7 @@ CREATE TABLE IF NOT EXISTS deltax_partition (
 ALTER TABLE deltax_partition ADD COLUMN IF NOT EXISTS column_valmap JSONB;
 ALTER TABLE deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract JSONB;
 ALTER TABLE deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract_added_at TIMESTAMPTZ;
+ALTER TABLE deltax_partition ADD COLUMN IF NOT EXISTS compressed_columns JSONB;
 
 CREATE OR REPLACE FUNCTION deltax_reject_compressed_partition_dml()
 RETURNS trigger

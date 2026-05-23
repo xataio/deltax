@@ -213,6 +213,10 @@ pub(super) struct ParallelMixedConfig<'a> {
     pub(super) col_names: &'a [String],
     pub(super) col_types: &'a [pg_sys::Oid],
     pub(super) segment_by: &'a [String],
+    /// Persisted `_col_idx` map (see `MetadataInfo.blob_idx`). Required by
+    /// `segment_skippable_by_dict` so it can find each queried column's
+    /// blob slot without re-counting from segment_by names.
+    pub(super) blob_idx: &'a [Option<u16>],
     pub(super) needed_cols: &'a [bool],
     pub(super) batch_quals: &'a [BatchQual],
     pub(super) seg_filters: &'a [(usize, String)],
@@ -682,8 +686,7 @@ pub(super) fn process_segments_mixed(
         // Dictionary-based LIKE pruning
         if segment_skippable_by_dict(
             config.batch_quals,
-            config.col_names,
-            config.segment_by,
+            config.blob_idx,
             &seg.compressed_blobs,
         ) {
             continue;
@@ -3389,6 +3392,7 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             col_names: &meta.col_names,
             col_types: &meta.col_types,
             segment_by: &meta.segment_by,
+            blob_idx: &meta.blob_idx,
             needed_cols,
             batch_quals,
             seg_filters,

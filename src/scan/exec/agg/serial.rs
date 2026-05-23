@@ -242,8 +242,7 @@ pub(super) unsafe fn dispatch_serial_path(
             // Dictionary-based LIKE pruning: skip segment if no dict entry matches
             if segment_skippable_by_dict(
                 batch_quals,
-                &meta.col_names,
-                &meta.segment_by,
+                &meta.blob_idx,
                 &seg.compressed_blobs,
             ) {
                 continue;

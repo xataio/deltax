@@ -30,6 +30,7 @@ pub(super) unsafe fn build_int_list(values: &[i32]) -> *mut pg_sys::List {
 
 /// Empty `MetadataInfo` with the given column names, all INT4 typed.
 pub(super) fn make_meta(col_names: &[&str]) -> MetadataInfo {
+    let n = col_names.len();
     MetadataInfo {
         col_names: col_names.iter().map(|s| s.to_string()).collect(),
         col_types: col_names.iter().map(|_| pg_sys::Oid::from(23u32)).collect(),
@@ -38,6 +39,12 @@ pub(super) fn make_meta(col_names: &[&str]) -> MetadataInfo {
         segment_by: Vec::new(),
         order_by: Vec::new(),
         time_column: "ts".to_string(),
+        // Identity positional mapping (matches the legacy path; all cols
+        // are non-segment_by in this helper) so existing tests that rely
+        // on `_col_idx = position-in-col_names` keep working.
+        blob_idx: (0..n).map(|i| Some(i as u16)).collect(),
+        attnums: (0..n).map(|i| (i + 1) as i32).collect(),
+        missing_values: vec![None; n],
     }
 }
 

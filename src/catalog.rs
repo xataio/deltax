@@ -32,6 +32,13 @@ pub struct PartitionInfo {
     pub range_start: TimestampWithTimeZone,
     pub range_end: TimestampWithTimeZone,
     pub is_compressed: bool,
+    /// Snapshot of physical-column shape (attnum, name, type_oid, typmod,
+    /// is_segment_by, compressed_col_idx, dropped) at the moment this
+    /// partition was last compressed. `None` for partitions that were
+    /// compressed before this catalog column existed — the scan path falls
+    /// back to positional `pg_attribute` mapping in that case. See
+    /// `dev/docs/SCHEMA_CHANGES.md`.
+    pub compressed_columns: Option<serde_json::Value>,
 }
 
 /// Register a new deltatable in the catalog. Returns the new deltatable id.
@@ -225,7 +232,8 @@ pub fn get_partitions(
     deltatable_id: i32,
 ) -> spi::SpiResult<Vec<PartitionInfo>> {
     let result = client.select(
-        "SELECT id, deltatable_id, schema_name, table_name, range_start, range_end, is_compressed
+        "SELECT id, deltatable_id, schema_name, table_name, range_start, range_end,
+                is_compressed, compressed_columns
          FROM deltax_partition
          WHERE deltatable_id = $1
          ORDER BY range_start",
@@ -252,6 +260,10 @@ pub fn get_partitions(
                 .get_datum_by_ordinal(7)?
                 .value::<bool>()?
                 .unwrap_or(false),
+            compressed_columns: row
+                .get_datum_by_ordinal(8)?
+                .value::<pgrx::datum::JsonB>()?
+                .map(|j| j.0),
         });
     }
     Ok(partitions)
@@ -430,6 +442,81 @@ pub fn update_partition_column_valmap(
     Ok(())
 }
 
+/// Snapshot the current physical-column shape of the parent (deltatable) at
+/// compression time, returning JSON text suitable for
+/// `deltax_partition.compressed_columns`. One entry per non-dropped
+/// pg_attribute row in ascending attnum order. `compressed_col_idx` is
+/// assigned to non-`segment_by` columns starting at 0 — same order
+/// `scan::exec::segments` expects when indexing `_blobs`/`_colstats`/etc.
+/// Segment-by columns get `compressed_col_idx: null` (they live in `_meta`).
+pub fn snapshot_compressed_columns(
+    client: &SpiClient,
+    parent_schema: &str,
+    parent_table: &str,
+    segment_by: &[String],
+) -> spi::SpiResult<String> {
+    let result = client.select(
+        "SELECT a.attnum::int4, a.attname::text, a.atttypid::int8, a.atttypmod
+         FROM pg_attribute a
+         JOIN pg_class c ON c.oid = a.attrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = $1 AND c.relname = $2
+           AND a.attnum > 0 AND NOT a.attisdropped
+         ORDER BY a.attnum",
+        None,
+        &[parent_schema.into(), parent_table.into()],
+    )?;
+
+    let segment_by_set: std::collections::HashSet<&str> =
+        segment_by.iter().map(|s| s.as_str()).collect();
+
+    let mut entries: Vec<String> = Vec::new();
+    let mut next_compressed_col_idx: i32 = 0;
+    for row in result {
+        let attnum: i32 = row.get_datum_by_ordinal(1)?.value::<i32>()?.unwrap();
+        let attname: String = row.get_datum_by_ordinal(2)?.value::<String>()?.unwrap();
+        let atttypid: i64 = row.get_datum_by_ordinal(3)?.value::<i64>()?.unwrap();
+        let atttypmod: i32 = row.get_datum_by_ordinal(4)?.value::<i32>()?.unwrap();
+
+        let is_segment_by = segment_by_set.contains(attname.as_str());
+        let compressed_col_idx_json = if is_segment_by {
+            "null".to_string()
+        } else {
+            let idx = next_compressed_col_idx;
+            next_compressed_col_idx += 1;
+            idx.to_string()
+        };
+
+        entries.push(format!(
+            "{{\"attnum\":{},\"name\":\"{}\",\"type_oid\":{},\"typmod\":{},\
+             \"is_segment_by\":{},\"compressed_col_idx\":{},\"dropped\":false}}",
+            attnum,
+            json_escape(&attname),
+            atttypid,
+            atttypmod,
+            is_segment_by,
+            compressed_col_idx_json,
+        ));
+    }
+
+    Ok(format!("[{}]", entries.join(",")))
+}
+
+/// Persist the compressed-columns descriptor for a partition. See
+/// `snapshot_compressed_columns` for the shape and rationale.
+pub fn update_partition_compressed_columns(
+    client: &mut SpiClient,
+    partition_id: i32,
+    json: &str,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax_partition SET compressed_columns = $1::jsonb WHERE id = $2",
+        None,
+        &[json.into(), partition_id.into()],
+    )?;
+    Ok(())
+}
+
 /// Escape a string for inclusion in a JSON string literal. Handles all
 /// JSON-mandatory escapes (`"`, `\\`, control chars 0x00–0x1F). Used by the
 /// hand-rolled JSON writers above; we don't pull in a full JSON crate just
@@ -585,7 +672,8 @@ pub fn get_partition_by_name(
     table_name: &str,
 ) -> spi::SpiResult<Option<PartitionInfo>> {
     let mut result = client.select(
-        "SELECT id, deltatable_id, schema_name, table_name, range_start, range_end, is_compressed
+        "SELECT id, deltatable_id, schema_name, table_name, range_start, range_end,
+                is_compressed, compressed_columns
          FROM deltax_partition
          WHERE schema_name = $1 AND table_name = $2",
         None,
@@ -610,6 +698,10 @@ pub fn get_partition_by_name(
                 .get_datum_by_ordinal(7)?
                 .value::<bool>()?
                 .unwrap_or(false),
+            compressed_columns: row
+                .get_datum_by_ordinal(8)?
+                .value::<pgrx::datum::JsonB>()?
+                .map(|j| j.0),
         }));
     }
 

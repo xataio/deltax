@@ -156,9 +156,11 @@ Use a `ProcessUtility_hook`, not a plain SQL event trigger, for v1.
 
 Reason: we need exact `AlterTableStmt` / `AlterTableCmd` subcommand classification before PostgreSQL rewrites or validates empty compressed heaps. SQL event triggers are useful for coarse DDL observation, but `ddl_command_end` is post-facto and `pg_event_trigger_ddl_commands()` does not give the same direct, preflight control over every ALTER subcommand. A utility hook lets us inspect the parse tree, reject unsafe operations before execution, and pass safe operations through to the previous hook / `standard_ProcessUtility`.
 
+The hook itself is already installed by `copy::register_process_utility_hook()` from `_PG_init` to intercept `COPY ... FORMAT deltax_compress` and `ANALYZE`. The ALTER work **extends** that existing dispatcher — we don't install a second hook. The new module `src/ddl.rs` owns the `AlterTableStmt` / `RenameStmt` / `AlterObjectSchemaStmt` walkers; the existing hook calls into it when the target relation belongs to a registered deltatable.
+
 Steps:
 
-1. Resolve the target table; check whether it (or its parent for partitions) is registered in `deltax_deltatable`. If not, return.
+1. Resolve the target table; check whether it (or its parent for partitions) is registered in `deltax_deltatable`. If not, pass through.
 2. Walk the `AlterTableStmt` subcommands. Each subcommand maps to one of the tiers above.
 3. Tier 1: optionally update catalog (RENAME COLUMN / RENAME TO / SET SCHEMA, GRANT cascade). Otherwise nothing.
 4. Tier 2 (`DROP COLUMN`): update `deltax_partition.compressed_columns` with a tombstone for that position.
@@ -214,6 +216,43 @@ Per-operation tests, each parametrized over the partition state (uncompressed, c
 - Tier 1: run the ALTER, verify the data reads correctly before/after and the catalog reflects any rename.
 - Tier 2 (DROP COLUMN): run the ALTER, verify reads return the right shape, verify tombstone is recorded, verify a later recompression GCs the orphan rows.
 - Tier 3: assert the ALTER errors with the expected message, then run the documented recipe and assert it succeeds.
+
+## Sessions
+
+The v1 work splits across three sessions. Each session lands a coherent slice and ends green on `make clippy` + `make test` + `make integration-test` (PG17 and PG18). Pre-feature compressed partitions (where `compressed_columns` is NULL) fall back to today's positional `pg_attribute` mapping throughout — same gating pattern as `json_extract_added_at` / `is_json_extract_safe_for_rel`.
+
+### Session 1 — Descriptor catalog + scan-path generalization
+
+Lands storage and read-path machinery without yet intercepting any ALTER.
+
+- Add `compressed_columns JSONB` to `deltax_partition`; extend `PartitionInfo` and add `update_partition_compressed_columns()` next to the existing column-metadata writers.
+- Factor `catalog::snapshot_compressed_columns(deltatable_id, parent_oid)`; write the descriptor in `compress::compress_partition_impl` and the COPY finalization path.
+- Teach `scan::exec::segments::load_metadata` to read the descriptor; fall back to positional mapping when NULL; error defensively if descriptor type/typmod diverges from current `pg_attribute`.
+- Synthesize missing values from `pg_attribute.attmissingval` in `scan::exec::datum_utils` for columns added after the partition was compressed.
+
+**Exit criteria:** `ADD COLUMN` nullable / `ADD COLUMN DEFAULT <nonvolatile>` / `ADD COLUMN NOT NULL DEFAULT <nonvolatile>` are transparent on already-compressed partitions (PG already passes them through; the scan path now does the right thing). Smoke tests in `tests/test_schema_changes.py` for these three ops plus a legacy-partition test (`compressed_columns` set to NULL).
+
+**Performance gate:** The descriptor read is on every `load_metadata` call, so this session is the one where a scan-path regression could appear. Run full **ClickBench** (`make -C clickbench bench EC2=<ip>`) and full **JSONBench** (`make -C jsonbench bench EC2=<ip>`) against this session's branch, compare against the latest `main` run in `clickbench/results/history/` and `jsonbench/results/history/`. The descriptor lookup runs once per scan (not per row), so any visible delta is a bug — investigate before merging. Local `make bench-rtabench-keep` is also useful for the result-equality correctness check it doubles as.
+
+### Session 2 — Utility-hook ALTER dispatch + Tier 1 + Tier 3 blocking
+
+Adds the policy layer.
+
+- New `src/ddl.rs` with `handle_alter_table` / `handle_rename` / `handle_schema_change` walkers; classify each subcommand against the Tier 1/3 lists above.
+- Extend the existing ProcessUtility hook (in `copy.rs` or a small shared module) to dispatch `T_AlterTableStmt`, `T_RenameStmt`, `T_AlterObjectSchemaStmt`, `T_GrantStmt`, `T_AlterOwnerStmt` to `ddl::*` when the target relation is a registered deltatable.
+- Tier 1 catalog work for `RENAME COLUMN` (touch `time_column`, `segment_by`, `order_by`, `column_ndistinct` keys, `column_valmap` keys, and `compressed_columns` entries), `RENAME TO`, `SET SCHEMA`, `GRANT`/`OWNER TO` cascade to companion tables.
+- Tier 3 errors via `ereport(ERROR, ERRCODE_FEATURE_NOT_SUPPORTED)` with a `HINT` pointing at the recipe. Fail-closed default for unrecognized `AT_*` discriminators.
+
+**Exit criteria:** Tier 1 and Tier 3 integration tests pass — for each Tier 3 op, assert the error, run the recipe, assert second attempt succeeds. No benchmark gate needed: this session only touches the ProcessUtility dispatch and catalog updaters, neither of which is on the scan path.
+
+### Session 3 — Tier 2 DROP COLUMN + polish
+
+- `AT_DropColumn` for non-`segment_by` / non-`order_by` / non-time columns: post-success, set `dropped: true` on the matching descriptor entry of each compressed partition.
+- Tighten `load_metadata` tombstone handling; tombstoned positions are skipped (no missing-value synthesis — column no longer exists in current `pg_attribute`).
+- Parametrized test sweep: each Tier 1/2/3 op × partition state (all-uncompressed, all-compressed, mixed) + a round-trip test for the recipe on `ALTER COLUMN TYPE`.
+- Flip the doc's Status section from "Not yet implemented" to "Shipped in v1".
+
+**Exit criteria:** Full test sweep green. Final regression check across all three benches: `make bench-rtabench-keep` (local correctness + perf), full **ClickBench** and full **JSONBench** on EC2 against this session's branch compared to `main`. Tombstone handling adds a "skip this `_col_idx`" branch in the decompress loop; verify it's not measurable on ClickBench (cold and hot) where the per-batch loop dominates.
 
 ## Future work
 

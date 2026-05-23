@@ -2851,6 +2851,29 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
         .expect("failed to update partition column_ndistinct");
         catalog::update_partition_column_valmap(client, partition_id, &column_valmap)
             .expect("failed to update partition column_valmap");
+
+        // Snapshot the physical-column shape so a later ADD COLUMN on the
+        // parent doesn't desync this partition's blobs. See
+        // dev/docs/SCHEMA_CHANGES.md.
+        let partition_row = catalog::get_partition_by_name(
+            client,
+            &buf.partition_schema,
+            &buf.partition_table,
+        )
+        .expect("failed to query partition for compressed_columns snapshot")
+        .expect("partition row missing during finalize");
+        let deltatable = catalog::get_deltatable_by_id(client, partition_row.deltatable_id)
+            .expect("failed to query deltatable for compressed_columns snapshot")
+            .expect("deltatable row missing during finalize");
+        let cc_json = catalog::snapshot_compressed_columns(
+            client,
+            &deltatable.schema_name,
+            &deltatable.table_name,
+            &deltatable.segment_by,
+        )
+        .expect("failed to snapshot compressed_columns");
+        catalog::update_partition_compressed_columns(client, partition_id, &cc_json)
+            .expect("failed to update partition compressed_columns");
     });
 }
 

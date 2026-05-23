@@ -106,6 +106,39 @@ pub(super) fn string_to_datum(s: &str, type_oid: pg_sys::Oid) -> pg_sys::Datum {
     }
 }
 
+/// Read the missing-value default for a single attribute via PG's
+/// `getmissingattr`. Opens the relation by OID, gets its tupdesc, calls
+/// `pg_sys::getmissingattr(tupdesc, attnum, &mut isnull)`, then closes.
+///
+/// Used by the compressed scan path to synthesize values for columns that
+/// were added to the parent (`ALTER TABLE ... ADD COLUMN ... DEFAULT x`)
+/// after a partition was compressed — those columns have no blob, and
+/// PG's fast-default machinery populates `pg_attribute.attmissingval`
+/// with the value every existing row should appear to have.
+///
+/// SAFETY: For pass-by-reference types (text, jsonb, bytea, …) the returned
+/// `Datum` is a pointer into the relation's `tupdesc->constr->missing[]`
+/// array. PG's relcache keeps the descriptor alive for the duration of
+/// the query, so the pointer is valid for the lifetime of the scan that
+/// called this. Do NOT cache the result across queries.
+pub(super) unsafe fn missing_attr_for_relation(
+    rel_oid: pg_sys::Oid,
+    attnum: i32,
+) -> (pg_sys::Datum, bool) {
+    unsafe {
+        let rel = pg_sys::relation_open(rel_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let tupdesc = (*rel).rd_att;
+        let mut is_null: bool = false;
+        let datum = pg_sys::getmissingattr(tupdesc, attnum, &mut is_null);
+        pg_sys::relation_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        if is_null {
+            (pg_sys::Datum::from(0usize), true)
+        } else {
+            (datum, false)
+        }
+    }
+}
+
 /// Map a PG type name (udt_name) to a type OID.
 pub(super) fn pg_type_oid(type_name: &str) -> pg_sys::Oid {
     match type_name {
