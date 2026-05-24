@@ -1769,7 +1769,7 @@ unsafe fn const_is_positive_numeric(c: *const pg_sys::Const) -> bool {
                     return false;
                 }
                 let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
-                let data = pgrx::vardata_any(detoasted) as *const u8;
+                let data = pgrx::vardata_any(detoasted);
                 let header = u16::from_le_bytes([*data, *data.add(1)]);
                 let was_toasted = detoasted != varlena_ptr;
                 if was_toasted {
@@ -1794,7 +1794,7 @@ unsafe fn const_is_positive_numeric(c: *const pg_sys::Const) -> bool {
 ///
 /// Designed for JSONBench Q4 — `ORDER BY EXTRACT(EPOCH FROM (MAX(t) - MIN(t)))
 /// * 1000 DESC`. The strip step handles the EXTRACT and `* 1000` wrappers;
-/// the inner shape is two Aggrefs subtracted.
+///   the inner shape is two Aggrefs subtracted.
 unsafe fn try_match_derived_minmax_topn(
     sort_expr: *const pg_sys::Node,
     aggrefs: &[*const pg_sys::Aggref],

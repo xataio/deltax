@@ -2108,15 +2108,15 @@ fn process_topn_text_chunk(
             let sort_key = sort_seg_col.get_str(row_idx);
 
             // Byte-order threshold pruning
-            if let Some(ref thr) = threshold {
-                if cmp_nullable_str_byte(
+            if let Some(ref thr) = threshold
+                && cmp_nullable_str_byte(
                     sort_key,
                     thr.as_deref(),
                     config.ascending,
                     config.nulls_first,
-                ) == std::cmp::Ordering::Greater {
-                    continue;
-                }
+                ) == std::cmp::Ordering::Greater
+            {
+                continue;
             }
 
             candidates.push((seg_idx, row_idx, sort_key.map(str::to_string)));
@@ -2789,17 +2789,17 @@ unsafe fn exec_topn_text_sequential(
                 let (datum, is_null) = sort_datums[row_idx];
 
                 // Skip if worse than threshold (collation-aware comparison)
-                if let Some((threshold, threshold_is_null)) = threshold_datum {
-                    if cmp_text_key(
+                if let Some((threshold, threshold_is_null)) = threshold_datum
+                    && cmp_text_key(
                         datum,
                         is_null,
                         threshold,
                         threshold_is_null,
                         state.topn_ascending,
                         state.topn_nulls_first,
-                    ) == std::cmp::Ordering::Greater {
-                        continue;
-                    }
+                    ) == std::cmp::Ordering::Greater
+                {
+                    continue;
                 }
 
                 // Store Phase 1 datums for this candidate.

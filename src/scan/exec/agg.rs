@@ -11108,6 +11108,7 @@ fn can_parallel_mixed(
             bq.col_idx == i && (
                 (matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::Ne) && bq.text_const.is_some())
                 || (matches!(bq.op, BatchCompareOp::Like | BatchCompareOp::NotLike) && bq.like_strategy.is_some())
+                || (bq.op == BatchCompareOp::InList && bq.in_list_text.is_some())
             )
         });
         let is_text_minmax_agg = agg_specs.iter().any(|s| {
