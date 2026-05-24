@@ -517,6 +517,172 @@ pub fn update_partition_compressed_columns(
     Ok(())
 }
 
+/// Mirror a `RENAME COLUMN old TO new` into the deltax catalog. Updates
+/// `deltax_deltatable.time_column` (when it equals `old`), replaces `old`
+/// inside the `segment_by` / `order_by` arrays, and rewrites the JSONB
+/// keys in every child partition's `column_ndistinct` / `column_valmap`,
+/// plus the `name` field inside each entry of `compressed_columns`.
+/// The ALTER policy hook blocks renames of any column referenced by
+/// segment_by / order_by / time_column today, so the array/scalar
+/// updates here are defensive — they only fire after a future hook
+/// change that lifts that restriction.
+pub fn rename_column_in_deltatable(
+    client: &mut SpiClient,
+    deltatable_id: i32,
+    old: &str,
+    new: &str,
+) -> spi::SpiResult<()> {
+    if old == new {
+        return Ok(());
+    }
+    // Update deltatable scalar + array references in one statement.
+    client.update(
+        "UPDATE deltax.deltax_deltatable
+         SET time_column = CASE WHEN time_column = $2 THEN $3 ELSE time_column END,
+             segment_by  = COALESCE(
+                 array(SELECT CASE WHEN x = $2 THEN $3 ELSE x END FROM unnest(segment_by) AS x),
+                 segment_by
+             ),
+             order_by    = COALESCE(
+                 array(SELECT CASE WHEN x = $2 THEN $3 ELSE x END FROM unnest(order_by) AS x),
+                 order_by
+             )
+         WHERE id = $1",
+        None,
+        &[deltatable_id.into(), old.into(), new.into()],
+    )?;
+
+    // Rewrite the keys of column_ndistinct and column_valmap JSONB
+    // objects in every child partition. Use a CTE that re-keys with
+    // jsonb_object_agg.
+    client.update(
+        "UPDATE deltax.deltax_partition
+         SET column_ndistinct = CASE
+             WHEN column_ndistinct ? $2 THEN
+                 (SELECT jsonb_object_agg(
+                     CASE WHEN key = $2 THEN $3 ELSE key END,
+                     value
+                 ) FROM jsonb_each(column_ndistinct))
+             ELSE column_ndistinct
+         END,
+         column_valmap = CASE
+             WHEN column_valmap ? $2 THEN
+                 (SELECT jsonb_object_agg(
+                     CASE WHEN key = $2 THEN $3 ELSE key END,
+                     value
+                 ) FROM jsonb_each(column_valmap))
+             ELSE column_valmap
+         END
+         WHERE deltatable_id = $1",
+        None,
+        &[deltatable_id.into(), old.into(), new.into()],
+    )?;
+
+    // Rewrite the `name` field inside each entry of compressed_columns.
+    // The descriptor is a JSONB array of objects; jsonb_set on each
+    // matching entry via jsonb_path expressions is awkward, so unnest +
+    // re-aggregate with jsonb_agg.
+    client.update(
+        "UPDATE deltax.deltax_partition
+         SET compressed_columns = (
+             SELECT jsonb_agg(
+                 CASE WHEN elem ->> 'name' = $2
+                      THEN jsonb_set(elem, '{name}', to_jsonb($3::text))
+                      ELSE elem
+                 END
+                 ORDER BY ord
+             )
+             FROM jsonb_array_elements(compressed_columns) WITH ORDINALITY AS t(elem, ord)
+         )
+         WHERE deltatable_id = $1
+           AND compressed_columns IS NOT NULL
+           AND compressed_columns @> jsonb_build_array(jsonb_build_object('name', $2::text))",
+        None,
+        &[deltatable_id.into(), old.into(), new.into()],
+    )?;
+
+    Ok(())
+}
+
+/// Mirror a `RENAME TO new` into the deltax catalog. Updates
+/// `deltax_deltatable.table_name`. Partition table names in PG don't
+/// auto-rename when the parent renames, so child `deltax_partition.table_name`
+/// rows keep their existing values — `<parent>_pYYYYMMDD` no longer
+/// matches the renamed parent, which is fine because partition rows are
+/// keyed by `id` everywhere except metadata-display contexts.
+pub fn rename_deltatable(
+    client: &mut SpiClient,
+    deltatable_id: i32,
+    new: &str,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_deltatable SET table_name = $2 WHERE id = $1",
+        None,
+        &[deltatable_id.into(), new.into()],
+    )?;
+    Ok(())
+}
+
+/// Mirror a Tier 2 `DROP COLUMN col` into every child partition's
+/// `compressed_columns` descriptor by flipping `dropped: true` on the
+/// matching entry. Orphan rows in `_blobs` / `_colstats` / `_blooms` /
+/// `_text_lengths` / `_valbitmap` keyed by that descriptor's
+/// `compressed_col_idx` are left as dead weight until the partition is
+/// recompressed (see `dev/docs/SCHEMA_CHANGES.md` Future Work — GC).
+///
+/// Note: the partition table's `pg_attribute` has already been updated
+/// by PG by the time this runs (this is a post-success PostAction), so
+/// the descriptor and current schema disagree only in the JSON `dropped`
+/// flag. `scan::exec::segments::load_metadata` already filters
+/// `NOT a.attisdropped` in its `pg_attribute` SPI query, so a dropped
+/// column never appears in `col_names`; `entry.dropped` is consulted
+/// only on the unusual flow where a column is dropped then re-added
+/// under the same name (PG assigns a new `attnum`, and the scan path
+/// then synthesizes via `getmissingattr` for the new attnum).
+pub fn tombstone_column_in_descriptor(
+    client: &mut SpiClient,
+    deltatable_id: i32,
+    column_name: &str,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_partition
+         SET compressed_columns = (
+             SELECT jsonb_agg(
+                 CASE WHEN elem ->> 'name' = $2
+                      THEN jsonb_set(elem, '{dropped}', 'true'::jsonb)
+                      ELSE elem
+                 END
+                 ORDER BY ord
+             )
+             FROM jsonb_array_elements(compressed_columns) WITH ORDINALITY AS t(elem, ord)
+         )
+         WHERE deltatable_id = $1
+           AND compressed_columns IS NOT NULL
+           AND compressed_columns @> jsonb_build_array(jsonb_build_object('name', $2::text))",
+        None,
+        &[deltatable_id.into(), column_name.into()],
+    )?;
+    Ok(())
+}
+
+/// Mirror a `SET SCHEMA new` into the deltax catalog. Updates only the
+/// deltatable's `schema_name` — PG does NOT move partitions when the
+/// parent's schema changes (each partition stays in its original
+/// schema), so `deltax_partition.schema_name` rows are left alone.
+/// Companion tables in `_deltax_compressed` likewise stay put.
+pub fn set_deltatable_schema(
+    client: &mut SpiClient,
+    deltatable_id: i32,
+    new: &str,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_deltatable SET schema_name = $2 WHERE id = $1",
+        None,
+        &[deltatable_id.into(), new.into()],
+    )?;
+    Ok(())
+}
+
 /// Escape a string for inclusion in a JSON string literal. Handles all
 /// JSON-mandatory escapes (`"`, `\\`, control chars 0x00–0x1F). Used by the
 /// hand-rolled JSON writers above; we don't pull in a full JSON crate just

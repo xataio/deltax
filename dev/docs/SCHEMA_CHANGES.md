@@ -2,7 +2,13 @@
 
 ## Status
 
-**Not yet implemented.** This document is the design spec for how pg_deltax will handle `ALTER TABLE` on managed tables. Today, ALTERs run through to PG with no awareness from pg_deltax; some work by accident, others corrupt the catalog or break decompression silently.
+**Shipped on `schema_changes` branch.** Implementation summary:
+
+- **Descriptor catalog** — `compressed_columns` JSONB on `deltax.deltax_partition`, snapshotted at compression time (`catalog::snapshot_compressed_columns`). The scan path's `MetadataInfo.blob_idx` reads it back via `scan::exec::segments::load_metadata`, with missing-value synthesis via `pg_sys::getmissingattr` for columns added after compression. Legacy partitions whose descriptor is NULL fall back to positional `pg_attribute` mapping, bit-for-bit unchanged from the pre-feature behavior.
+- **ProcessUtility-hook ALTER dispatch** — `src/ddl.rs` classifies every `T_AlterTableStmt` / `T_RenameStmt` / `T_AlterObjectSchemaStmt` against the tier matrix below. Tier 1 ops pass through and run optional catalog bookkeeping (RENAME COLUMN updates `segment_by` / `order_by` / `time_column` and JSONB keys in `column_ndistinct` / `column_valmap` / `compressed_columns`). Tier 2 `DROP COLUMN` for a non-key column passes through and flips `dropped: true` on every matching descriptor entry. Tier 3 ops `ereport(ERROR, ERRCODE_FEATURE_NOT_SUPPORTED)` with a `HINT` pointing at the recipe below. The block is gated on `has_compressed_partitions` so the recipe itself just works. A thread-local bypass (`ddl::with_bypass`) lets pg_deltax's own internal DDL (partition rotation, COPY finalization, `CREATE EXTENSION` migrations) sidestep the hook.
+- **Safety guards** — `DISABLE TRIGGER deltax_reject_compressed_dml` and `DISABLE TRIGGER ALL` are Tier 3 (would silently let DML through to compressed partitions). DROP of a key column (`segment_by` / `order_by` / `time_column`) is Tier 3 because `_meta` embeds those by name.
+
+One known limitation: filter pushdown on a column added *after* compression returns wrong results because the aggregation paths in `scan/exec/agg/` still derive `_col_idx` positionally instead of consulting `MetadataInfo.blob_idx`. Tracked as `tests/test_schema_changes.py::test_filter_on_added_column` (xfail) and documented in Future Work. Non-aggregating reads and direct-projection scans work correctly.
 
 ## Goal
 
@@ -217,45 +223,11 @@ Per-operation tests, each parametrized over the partition state (uncompressed, c
 - Tier 2 (DROP COLUMN): run the ALTER, verify reads return the right shape, verify tombstone is recorded, verify a later recompression GCs the orphan rows.
 - Tier 3: assert the ALTER errors with the expected message, then run the documented recipe and assert it succeeds.
 
-## Sessions
-
-The v1 work splits across three sessions. Each session lands a coherent slice and ends green on `make clippy` + `make test` + `make integration-test` (PG17 and PG18). Pre-feature compressed partitions (where `compressed_columns` is NULL) fall back to today's positional `pg_attribute` mapping throughout — same gating pattern as `json_extract_added_at` / `is_json_extract_safe_for_rel`.
-
-### Session 1 — Descriptor catalog + scan-path generalization
-
-Lands storage and read-path machinery without yet intercepting any ALTER.
-
-- Add `compressed_columns JSONB` to `deltax_partition`; extend `PartitionInfo` and add `update_partition_compressed_columns()` next to the existing column-metadata writers.
-- Factor `catalog::snapshot_compressed_columns(deltatable_id, parent_oid)`; write the descriptor in `compress::compress_partition_impl` and the COPY finalization path.
-- Teach `scan::exec::segments::load_metadata` to read the descriptor; fall back to positional mapping when NULL; error defensively if descriptor type/typmod diverges from current `pg_attribute`.
-- Synthesize missing values from `pg_attribute.attmissingval` in `scan::exec::datum_utils` for columns added after the partition was compressed.
-
-**Exit criteria:** `ADD COLUMN` nullable / `ADD COLUMN DEFAULT <nonvolatile>` / `ADD COLUMN NOT NULL DEFAULT <nonvolatile>` are transparent on already-compressed partitions (PG already passes them through; the scan path now does the right thing). Smoke tests in `tests/test_schema_changes.py` for these three ops plus a legacy-partition test (`compressed_columns` set to NULL).
-
-**Performance gate:** The descriptor read is on every `load_metadata` call, so this session is the one where a scan-path regression could appear. Run full **ClickBench** (`make -C clickbench bench EC2=<ip>`) and full **JSONBench** (`make -C jsonbench bench EC2=<ip>`) against this session's branch, compare against the latest `main` run in `clickbench/results/history/` and `jsonbench/results/history/`. The descriptor lookup runs once per scan (not per row), so any visible delta is a bug — investigate before merging. Local `make bench-rtabench-keep` is also useful for the result-equality correctness check it doubles as.
-
-### Session 2 — Utility-hook ALTER dispatch + Tier 1 + Tier 3 blocking
-
-Adds the policy layer.
-
-- New `src/ddl.rs` with `handle_alter_table` / `handle_rename` / `handle_schema_change` walkers; classify each subcommand against the Tier 1/3 lists above.
-- Extend the existing ProcessUtility hook (in `copy.rs` or a small shared module) to dispatch `T_AlterTableStmt`, `T_RenameStmt`, `T_AlterObjectSchemaStmt`, `T_GrantStmt`, `T_AlterOwnerStmt` to `ddl::*` when the target relation is a registered deltatable.
-- Tier 1 catalog work for `RENAME COLUMN` (touch `time_column`, `segment_by`, `order_by`, `column_ndistinct` keys, `column_valmap` keys, and `compressed_columns` entries), `RENAME TO`, `SET SCHEMA`, `GRANT`/`OWNER TO` cascade to companion tables.
-- Tier 3 errors via `ereport(ERROR, ERRCODE_FEATURE_NOT_SUPPORTED)` with a `HINT` pointing at the recipe. Fail-closed default for unrecognized `AT_*` discriminators.
-
-**Exit criteria:** Tier 1 and Tier 3 integration tests pass — for each Tier 3 op, assert the error, run the recipe, assert second attempt succeeds. No benchmark gate needed: this session only touches the ProcessUtility dispatch and catalog updaters, neither of which is on the scan path.
-
-### Session 3 — Tier 2 DROP COLUMN + polish
-
-- `AT_DropColumn` for non-`segment_by` / non-`order_by` / non-time columns: post-success, set `dropped: true` on the matching descriptor entry of each compressed partition.
-- Tighten `load_metadata` tombstone handling; tombstoned positions are skipped (no missing-value synthesis — column no longer exists in current `pg_attribute`).
-- Parametrized test sweep: each Tier 1/2/3 op × partition state (all-uncompressed, all-compressed, mixed) + a round-trip test for the recipe on `ALTER COLUMN TYPE`.
-- Flip the doc's Status section from "Not yet implemented" to "Shipped in v1".
-
-**Exit criteria:** Full test sweep green. Final regression check across all three benches: `make bench-rtabench-keep` (local correctness + perf), full **ClickBench** and full **JSONBench** on EC2 against this session's branch compared to `main`. Tombstone handling adds a "skip this `_col_idx`" branch in the decompress loop; verify it's not measurable on ClickBench (cold and hot) where the per-batch loop dominates.
-
 ## Future work
 
+- **Aggregation paths consulting `MetadataInfo.blob_idx`.** Today `scan/exec/agg/{compact,mixed,serial}.rs` derive `_col_idx` positionally from `col_names` + `segment_by` instead of reading the persisted descriptor. The result: a filter pushed into the aggregate path against a column added *after* compression returns wrong results (`SELECT count(*) WHERE new_col = X` evaluates against unfilled slots). Non-aggregating reads work correctly because the basic decompress path already routes through `blob_idx`. Tracked as the xfail `tests/test_schema_changes.py::test_filter_on_added_column`. Fix shape: thread `&meta.blob_idx` and `&meta.missing_values` through the `Parallel*Config` / `Serial*` paths and the dict-skip prefilter, mirroring how the basic decompress path handles them.
+- **GRANT / OWNER TO cascade to companion tables.** Today `GRANT/REVOKE` and `OWNER TO` on a deltatable pass through PG and apply to the parent only; the companion tables in `_deltax_compressed.*` (`_meta`, `_blobs`, `_colstats`, `_blooms`, `_text_lengths`, `_valbitmap`) keep their original owner / ACLs. Users who change ownership must manually re-grant. Future: detect `AT_ChangeOwner` and `GrantStmt` post-success, enumerate `companion_ddl::CompanionDdl` for every compressed partition, and re-apply.
+- **Looser volatile-default detection for ADD COLUMN.** The current classifier blocks ADD COLUMN whose default expression isn't a `T_A_Const` or `TypeCast(T_A_Const)` — i.e. anything other than a literal or cast-of-literal. This rejects technically-safe stable defaults like `DEFAULT current_date` even though PG would set `attmissingval` for them. To soften the rule we'd need to transform the raw expression via `pg_sys::transformExpr` inside the hook, then call `pg_sys::contain_volatile_functions` on the analyzed form. Users hit by this today fall back to the recipe.
 - Auto-running the decompress/recompress recipe in the background for Tier 3 operations (move from "block" to "do it for you").
 - A `deltax_alter_table(...)` convenience wrapper that performs the recipe atomically per partition.
 - GC of orphan blob rows after DROP COLUMN (right now they linger until the next recompression).

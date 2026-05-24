@@ -395,14 +395,19 @@ fn convert_to_partitioned(client: &mut SpiClient, schema: &str, table: &str, tim
     let tmp_name = format!("_deltax_tmp_{}", table);
     let tmp_fqn = fqn(schema, &tmp_name);
 
-    // Rename original table
-    client
-        .update(
+    // Rename original table. Wrapped in `with_bypass` so the ALTER
+    // policy hook (`src/ddl.rs`) doesn't try to mirror this transient
+    // rename into the deltax catalog — the parent isn't registered yet
+    // when this runs from `deltax_create_table`, but the bypass keeps
+    // the behavior safe for any future ordering change.
+    crate::ddl::with_bypass(|| {
+        client.update(
             &format!("ALTER TABLE {} RENAME TO \"{}\"", table_fqn, tmp_name),
             None,
             &[],
         )
-        .expect("failed to rename table");
+    })
+    .expect("failed to rename table");
 
     // Create new partitioned table with same structure
     client
@@ -640,14 +645,17 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
 
         let part_fqn = fqn(schema, name);
 
-        // Detach partition from parent
-        client
-            .update(
+        // Detach partition from parent. Bypass the ALTER policy hook —
+        // we own partition lifecycle, ATTACH/DETACH is Tier 3 for users
+        // but legal from inside the extension.
+        crate::ddl::with_bypass(|| {
+            client.update(
                 &format!("ALTER TABLE {} DETACH PARTITION {}", parent_fqn, part_fqn),
                 None,
                 &[],
             )
-            .expect("failed to detach partition");
+        })
+        .expect("failed to detach partition");
 
         // Drop the partition table
         client

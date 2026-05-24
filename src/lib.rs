@@ -17,6 +17,7 @@ mod compression;
 mod copy;
 mod copyparquet;
 mod copyparse;
+mod ddl;
 mod functions;
 mod partition;
 mod scan;

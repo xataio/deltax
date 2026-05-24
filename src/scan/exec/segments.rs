@@ -801,10 +801,11 @@ pub(super) struct MetadataInfo {
     pub(super) blob_idx: Vec<Option<u16>>,
     /// Parallel to `col_names`. Current `pg_attribute.attnum` for physical
     /// columns, or `0` for json-extract synthetic columns (which have no
-    /// pg_attribute row). Used to call `pg_sys::getmissingattr` for
-    /// columns that were added after compression, and by Sessions 2/3 of
-    /// the schema-changes work to join the descriptor to current shape.
-    #[allow(dead_code)] // populated in Session 1, consumed in Sessions 2/3
+    /// pg_attribute row). Used inside `load_metadata` to call
+    /// `pg_sys::getmissingattr` for columns added after compression;
+    /// kept on `MetadataInfo` for future descriptor-shape resolution
+    /// that needs to join by attnum rather than name.
+    #[allow(dead_code)] // surfaced for downstream consumers; unused today
     pub(super) attnums: Vec<i32>,
     /// Parallel to `col_names`. `Some((datum, is_null))` = pre-computed
     /// missing value via `pg_sys::getmissingattr` for a column that was
