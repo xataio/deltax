@@ -19,13 +19,13 @@
 //! this module exports `handle_alter_table` / `handle_rename` /
 //! `handle_alter_object_schema` for it to dispatch into.
 
+use pgrx::PgLogLevel;
+use pgrx::PgSqlErrorCode;
 use pgrx::pg_sys;
-use pgrx::pg_sys::panic::ErrorReport;
 use pgrx::pg_sys::AlterTableType;
 use pgrx::pg_sys::ConstrType;
 use pgrx::pg_sys::ObjectType;
-use pgrx::PgLogLevel;
-use pgrx::PgSqlErrorCode;
+use pgrx::pg_sys::panic::ErrorReport;
 use std::cell::Cell;
 use std::ffi::CStr;
 
@@ -75,9 +75,7 @@ pub(crate) enum AlterDisposition {
     NotOurTable,
     /// Pass straight through to `standard_ProcessUtility`. After success,
     /// run each `PostAction` to mirror the change into our catalog.
-    Tier1 {
-        post_actions: Vec<PostAction>,
-    },
+    Tier1 { post_actions: Vec<PostAction> },
     /// Block before PG executes anything. `op_name` and `table` describe
     /// what was rejected; raise via `raise_tier3`.
     Tier3 {
@@ -145,13 +143,15 @@ pub(crate) fn apply_post_actions(actions: Vec<PostAction>) {
         for act in actions {
             match act {
                 PostAction::RenameColumn { ht_id, old, new } => {
-                    if let Err(e) =
-                        catalog::rename_column_in_deltatable(client, ht_id, &old, &new)
+                    if let Err(e) = catalog::rename_column_in_deltatable(client, ht_id, &old, &new)
                     {
                         pgrx::warning!(
                             "pg_deltax: failed to mirror RENAME COLUMN into catalog \
                              (ht={}, {} -> {}): {:?}",
-                            ht_id, old, new, e,
+                            ht_id,
+                            old,
+                            new,
+                            e,
                         );
                     }
                 }
@@ -160,7 +160,9 @@ pub(crate) fn apply_post_actions(actions: Vec<PostAction>) {
                         pgrx::warning!(
                             "pg_deltax: failed to mirror RENAME TABLE into catalog \
                              (ht={}, -> {}): {:?}",
-                            ht_id, new, e,
+                            ht_id,
+                            new,
+                            e,
                         );
                     }
                 }
@@ -169,7 +171,9 @@ pub(crate) fn apply_post_actions(actions: Vec<PostAction>) {
                         pgrx::warning!(
                             "pg_deltax: failed to mirror SET SCHEMA into catalog \
                              (ht={}, -> {}): {:?}",
-                            ht_id, new, e,
+                            ht_id,
+                            new,
+                            e,
                         );
                     }
                 }
@@ -180,7 +184,9 @@ pub(crate) fn apply_post_actions(actions: Vec<PostAction>) {
                         pgrx::warning!(
                             "pg_deltax: failed to tombstone DROP COLUMN in descriptor \
                              (ht={}, col={}): {:?}",
-                            ht_id, column_name, e,
+                            ht_id,
+                            column_name,
+                            e,
                         );
                     }
                 }
@@ -192,7 +198,9 @@ pub(crate) fn apply_post_actions(actions: Vec<PostAction>) {
                         pgrx::warning!(
                             "pg_deltax: failed to cascade OWNER TO {} onto companions \
                              (ht={}): {:?}",
-                            new_owner_sql, ht_id, e,
+                            new_owner_sql,
+                            ht_id,
+                            e,
                         );
                     }
                 }
@@ -201,13 +209,14 @@ pub(crate) fn apply_post_actions(actions: Vec<PostAction>) {
                     grant_prefix,
                     grant_suffix,
                 } => {
-                    if let Err(e) =
-                        cascade_grant(client, ht_id, &grant_prefix, &grant_suffix)
-                    {
+                    if let Err(e) = cascade_grant(client, ht_id, &grant_prefix, &grant_suffix) {
                         pgrx::warning!(
                             "pg_deltax: failed to cascade GRANT/REVOKE onto companions \
                              (ht={}, sql={}<companion>{}): {:?}",
-                            ht_id, grant_prefix, grant_suffix, e,
+                            ht_id,
+                            grant_prefix,
+                            grant_suffix,
+                            e,
                         );
                     }
                 }
@@ -366,9 +375,7 @@ unsafe fn lookup_target(rv: *mut pg_sys::RangeVar) -> Option<AlterTarget> {
 
 /// Classify an `ALTER TABLE` statement against the Tier 1 / Tier 3
 /// matrix and return what the ProcessUtility hook should do.
-pub(crate) unsafe fn handle_alter_table(
-    stmt: *mut pg_sys::AlterTableStmt,
-) -> AlterDisposition {
+pub(crate) unsafe fn handle_alter_table(stmt: *mut pg_sys::AlterTableStmt) -> AlterDisposition {
     unsafe {
         if stmt.is_null() || bypass_active() {
             return AlterDisposition::NotOurTable;
@@ -410,10 +417,7 @@ pub(crate) unsafe fn handle_alter_table(
                     if target.has_compressed_partitions {
                         return AlterDisposition::Tier3 {
                             op_name,
-                            table: format!(
-                                "{}.{}",
-                                target.ht.schema_name, target.ht.table_name
-                            ),
+                            table: format!("{}.{}", target.ht.schema_name, target.ht.table_name),
                         };
                     }
                     // No compressed partitions — let PG handle it. No
@@ -655,12 +659,8 @@ pub(crate) unsafe fn handle_alter_object_schema(
 
 /// Per-subcommand verdict (one entry in an `ALTER TABLE … , … , …` chain).
 enum SubDisposition {
-    Tier1 {
-        post_action: Option<PostAction>,
-    },
-    Tier3 {
-        op_name: &'static str,
-    },
+    Tier1 { post_action: Option<PostAction> },
+    Tier3 { op_name: &'static str },
 }
 
 /// The classifier — match every `AlterTableType` discriminant and route
@@ -801,11 +801,9 @@ unsafe fn classify_at_subcommand(
         | AlterTableType::AT_DisableRule => SubDisposition::Tier3 {
             op_name: "ENABLE/DISABLE RULE",
         },
-        AlterTableType::AT_ClusterOn | AlterTableType::AT_DropCluster => {
-            SubDisposition::Tier3 {
-                op_name: "CLUSTER ON / SET WITHOUT CLUSTER",
-            }
-        }
+        AlterTableType::AT_ClusterOn | AlterTableType::AT_DropCluster => SubDisposition::Tier3 {
+            op_name: "CLUSTER ON / SET WITHOUT CLUSTER",
+        },
         AlterTableType::AT_SetAccessMethod => SubDisposition::Tier3 {
             op_name: "SET ACCESS METHOD",
         },
@@ -820,11 +818,9 @@ unsafe fn classify_at_subcommand(
         | AlterTableType::AT_DetachPartitionFinalize => SubDisposition::Tier3 {
             op_name: "ATTACH/DETACH PARTITION (pg_deltax owns partition lifecycle)",
         },
-        AlterTableType::AT_AddInherit | AlterTableType::AT_DropInherit => {
-            SubDisposition::Tier3 {
-                op_name: "INHERIT / NO INHERIT",
-            }
-        }
+        AlterTableType::AT_AddInherit | AlterTableType::AT_DropInherit => SubDisposition::Tier3 {
+            op_name: "INHERIT / NO INHERIT",
+        },
 
         // DROP COLUMN — Tier 2. Non-key columns: pass through and
         // tombstone the descriptor entry post-success. Key columns
@@ -1034,8 +1030,7 @@ unsafe fn default_is_volatile(raw_default: *mut pg_sys::Node) -> bool {
             raw_default,
             pg_sys::ParseExprKind::EXPR_KIND_COLUMN_DEFAULT,
         );
-        let is_volatile = !analyzed.is_null()
-            && pg_sys::contain_volatile_functions(analyzed);
+        let is_volatile = !analyzed.is_null() && pg_sys::contain_volatile_functions(analyzed);
 
         pg_sys::MemoryContextSwitchTo(old);
         pg_sys::MemoryContextDelete(mcxt);

@@ -1043,7 +1043,8 @@ pub(super) fn load_metadata(
         // compress time as `non_segment_by_physical_count + i`. Recover that
         // count from the descriptor when present (more accurate when columns
         // have been added since), and fall back to live count otherwise.
-        let non_segment_by_physical_count: u16 = if let Some(entries) = descriptor_entries.as_ref() {
+        let non_segment_by_physical_count: u16 = if let Some(entries) = descriptor_entries.as_ref()
+        {
             entries
                 .iter()
                 .filter(|e| !e.dropped && e.compressed_col_idx.is_some())

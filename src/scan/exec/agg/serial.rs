@@ -240,11 +240,7 @@ pub(super) unsafe fn dispatch_serial_path(
             }
 
             // Dictionary-based LIKE pruning: skip segment if no dict entry matches
-            if segment_skippable_by_dict(
-                batch_quals,
-                &meta.blob_idx,
-                &seg.compressed_blobs,
-            ) {
+            if segment_skippable_by_dict(batch_quals, &meta.blob_idx, &seg.compressed_blobs) {
                 continue;
             }
 
@@ -294,8 +290,12 @@ pub(super) unsafe fn dispatch_serial_path(
             for (col_idx, col_name) in meta.col_names.iter().enumerate() {
                 let type_oid = meta.col_types[col_idx];
                 let is_segment_by = meta.segment_by.contains(col_name);
-                let blob_slot: Option<usize> =
-                    meta.blob_idx.get(col_idx).copied().flatten().map(|s| s as usize);
+                let blob_slot: Option<usize> = meta
+                    .blob_idx
+                    .get(col_idx)
+                    .copied()
+                    .flatten()
+                    .map(|s| s as usize);
 
                 if !needed_cols[col_idx] {
                     if is_segment_by {

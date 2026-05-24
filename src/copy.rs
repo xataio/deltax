@@ -2915,13 +2915,10 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
         // Snapshot the physical-column shape so a later ADD COLUMN on the
         // parent doesn't desync this partition's blobs. See
         // dev/docs/SCHEMA_CHANGES.md.
-        let partition_row = catalog::get_partition_by_name(
-            client,
-            &buf.partition_schema,
-            &buf.partition_table,
-        )
-        .expect("failed to query partition for compressed_columns snapshot")
-        .expect("partition row missing during finalize");
+        let partition_row =
+            catalog::get_partition_by_name(client, &buf.partition_schema, &buf.partition_table)
+                .expect("failed to query partition for compressed_columns snapshot")
+                .expect("partition row missing during finalize");
         let deltatable = catalog::get_deltatable_by_id(client, partition_row.deltatable_id)
             .expect("failed to query deltatable for compressed_columns snapshot")
             .expect("deltatable row missing during finalize");

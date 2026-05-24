@@ -1541,11 +1541,8 @@ unsafe fn exec_topn_two_pass(
             let seg = &state.segments_data[seg_idx];
 
             // Dictionary-based LIKE pruning
-            if segment_skippable_by_dict(
-                &state.batch_quals,
-                &state.blob_idx,
-                &seg.compressed_blobs,
-            ) {
+            if segment_skippable_by_dict(&state.batch_quals, &state.blob_idx, &seg.compressed_blobs)
+            {
                 state.timing.segments_skipped += 1;
                 continue;
             }
@@ -1629,8 +1626,8 @@ unsafe fn exec_topn_two_pass(
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
                 let type_oid = state.col_types[col_idx];
 
-                let is_missing_from_blob = state.blob_idx[col_idx].is_none()
-                    && !state.segment_by.contains(col_name);
+                let is_missing_from_blob =
+                    state.blob_idx[col_idx].is_none() && !state.segment_by.contains(col_name);
 
                 if !state.needed_cols[col_idx] && col_idx != sort_col {
                     if state.segment_by.contains(col_name) {
@@ -2027,8 +2024,8 @@ unsafe fn exec_topn_two_pass(
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
                 let type_oid = state.col_types[col_idx];
 
-                let is_missing_from_blob = state.blob_idx[col_idx].is_none()
-                    && !state.segment_by.contains(col_name);
+                let is_missing_from_blob =
+                    state.blob_idx[col_idx].is_none() && !state.segment_by.contains(col_name);
 
                 if !state.needed_cols[col_idx] {
                     if state.segment_by.contains(col_name) {
@@ -2772,8 +2769,8 @@ unsafe fn exec_topn_text(
                 for (col_idx, col_name) in state.col_names.iter().enumerate() {
                     let type_oid = state.col_types[col_idx];
 
-                    let is_missing_from_blob = state.blob_idx[col_idx].is_none()
-                        && !state.segment_by.contains(col_name);
+                    let is_missing_from_blob =
+                        state.blob_idx[col_idx].is_none() && !state.segment_by.contains(col_name);
 
                     if !state.needed_cols[col_idx] {
                         if state.segment_by.contains(col_name) {
@@ -2937,8 +2934,8 @@ unsafe fn exec_topn_text_sequential(
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
                 let type_oid = state.col_types[col_idx];
 
-                let is_missing_from_blob = state.blob_idx[col_idx].is_none()
-                    && !state.segment_by.contains(col_name);
+                let is_missing_from_blob =
+                    state.blob_idx[col_idx].is_none() && !state.segment_by.contains(col_name);
 
                 if !state.needed_cols[col_idx] && col_idx != sort_col {
                     if state.segment_by.contains(col_name) {
@@ -3261,8 +3258,8 @@ unsafe fn exec_topn_text_sequential(
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
                 let type_oid = state.col_types[col_idx];
 
-                let is_missing_from_blob = state.blob_idx[col_idx].is_none()
-                    && !state.segment_by.contains(col_name);
+                let is_missing_from_blob =
+                    state.blob_idx[col_idx].is_none() && !state.segment_by.contains(col_name);
 
                 if !state.needed_cols[col_idx] {
                     if state.segment_by.contains(col_name) {
@@ -3678,11 +3675,8 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
             let seg = &state.segments_data[seg_idx];
 
             // Dictionary-based LIKE pruning
-            if segment_skippable_by_dict(
-                &state.batch_quals,
-                &state.blob_idx,
-                &seg.compressed_blobs,
-            ) {
+            if segment_skippable_by_dict(&state.batch_quals, &state.blob_idx, &seg.compressed_blobs)
+            {
                 state.timing.segments_skipped += 1;
                 continue;
             }
@@ -3720,8 +3714,8 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
                 // the persisted `_col_idx` — it's just the index of the next
                 // blob to consume in this loop. Only incremented for columns
                 // that actually had a blob written at compression time.
-                let is_missing_from_blob = state.blob_idx[col_idx].is_none()
-                    && !state.segment_by.contains(col_name);
+                let is_missing_from_blob =
+                    state.blob_idx[col_idx].is_none() && !state.segment_by.contains(col_name);
 
                 if !state.needed_cols[col_idx] {
                     // Column not needed — push null placeholders and advance index

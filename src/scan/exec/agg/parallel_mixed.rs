@@ -692,11 +692,7 @@ pub(super) fn process_segments_mixed(
         }
 
         // Dictionary-based LIKE pruning
-        if segment_skippable_by_dict(
-            config.batch_quals,
-            config.blob_idx,
-            &seg.compressed_blobs,
-        ) {
+        if segment_skippable_by_dict(config.batch_quals, config.blob_idx, &seg.compressed_blobs) {
             continue;
         }
 

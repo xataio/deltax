@@ -151,7 +151,12 @@ fn process_cd_segments(segments: &[SegmentData], config: &ParallelCdConfig) -> P
                                 datum.cast_mut_ptr::<pg_sys::varlena>(),
                             );
                             let len = pgrx::varlena::varsize_any_exhdr(s);
-                            let body = pgrx::varlena::vardata_any(s);
+                            // `vardata_any` returns `*const c_char`,
+                            // which is `i8` on some platforms (e.g.
+                            // x86_64-linux) and `u8` on others
+                            // (aarch64-darwin). `cast::<u8>()` makes the
+                            // resulting slice type portable.
+                            let body: *const u8 = pgrx::varlena::vardata_any(s).cast();
                             let slice = std::slice::from_raw_parts(body, len);
                             str_sets[si].insert(hash128_str(slice));
                         }

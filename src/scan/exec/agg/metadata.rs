@@ -621,12 +621,7 @@ pub(super) unsafe fn accumulate_segment_decompressed(
                 let data_type = pg_type_name(meta.col_types[col_idx]);
                 let typmod = meta.col_typmods[col_idx];
                 let datums = unsafe {
-                    decompress_blob_to_datums(
-                        blob,
-                        &data_type,
-                        meta.col_types[col_idx],
-                        typmod,
-                    )
+                    decompress_blob_to_datums(blob, &data_type, meta.col_types[col_idx], typmod)
                 };
                 decompressed.insert(col_idx, datums);
             }
