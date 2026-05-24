@@ -129,7 +129,7 @@ fn restore_compressed_partition_stats() {
     let result: Result<usize, String> = Spi::connect_mut(|client| {
         let rows = client
             .select(
-                "SELECT schema_name, table_name FROM deltax_partition \
+                "SELECT schema_name, table_name FROM deltax.deltax_partition \
                  WHERE is_compressed = true",
                 None,
                 &[],

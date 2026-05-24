@@ -628,7 +628,7 @@ fn deltax_compress_all_partitions(
 
         let result = client
             .select(
-                "SELECT schema_name, table_name FROM deltax_partition
+                "SELECT schema_name, table_name FROM deltax.deltax_partition
                  WHERE deltatable_id = $1
                    AND NOT is_compressed
                    AND range_end <= $2::timestamptz
@@ -728,7 +728,7 @@ fn deltax_compression_stats(
         let result = client
             .select(
                 "SELECT table_name, is_compressed, raw_size, compressed_size, row_count
-                 FROM deltax_partition
+                 FROM deltax.deltax_partition
                  WHERE deltatable_id = $1
                  ORDER BY range_start",
                 None,
@@ -786,7 +786,7 @@ fn deltax_table_size(relation: &str) -> i64 {
         let result = client
             .select(
                 "SELECT table_name, is_compressed
-                 FROM deltax_partition
+                 FROM deltax.deltax_partition
                  WHERE deltatable_id = $1",
                 None,
                 &[ht.id.into()],
@@ -2155,7 +2155,7 @@ pub(crate) fn build_companion_ddl(part_table: &str, columns: &[ColumnMeta]) -> C
 
     // Per-segment value-presence bitmap for low-cardinality (≤32) text columns.
     // One bit per distinct partition-level value (mapping persisted in
-    // `deltax_partition.column_valmap`). Lets `WHERE col = const` queries skip
+    // `deltax.deltax_partition.column_valmap`). Lets `WHERE col = const` queries skip
     // segments where the constant's bit is clear, with no false positives.
     let valbitmap_ddl = format!(
         "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _bits BYTEA{} NOT NULL, PRIMARY KEY (_col_idx, _segment_id))",
@@ -3856,7 +3856,7 @@ pub fn auto_compress_partitions(client: &mut SpiClient<'_>, ht: &catalog::Deltat
     // range_end < now() - compress_after AND NOT is_compressed
     let eligible = client
         .select(
-            "SELECT table_name FROM deltax_partition
+            "SELECT table_name FROM deltax.deltax_partition
              WHERE deltatable_id = $1 AND is_compressed = false
                AND range_end < now() - $2::interval",
             None,
@@ -3950,7 +3950,7 @@ pub(crate) fn analyze_partition_impl_split(
 
     let row_count: i64 = client
         .select(
-            "SELECT row_count FROM deltax_partition WHERE id = $1",
+            "SELECT row_count FROM deltax.deltax_partition WHERE id = $1",
             None,
             &[part_info.id.into()],
         )
@@ -3989,9 +3989,9 @@ pub(crate) fn analyze_partition_impl_split(
 
 fn analyze_table_impl(client: &mut SpiClient, relation: &str) -> String {
     let (schema, table) = crate::partition::resolve_relation(client, relation);
-    let query = "SELECT schema_name, table_name FROM deltax_partition \
+    let query = "SELECT schema_name, table_name FROM deltax.deltax_partition \
                  WHERE schema_name = $1 AND is_compressed = true AND deltatable_id = (\
-                     SELECT id FROM deltax_deltatable WHERE schema_name = $1 AND table_name = $2\
+                     SELECT id FROM deltax.deltax_deltatable WHERE schema_name = $1 AND table_name = $2\
                  ) \
                  ORDER BY range_start";
     let rows = match client.select(query, None, &[schema.clone().into(), table.clone().into()]) {

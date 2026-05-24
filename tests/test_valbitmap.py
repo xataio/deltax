@@ -42,7 +42,7 @@ def _setup_event_table(conn, n_segments=4, segment_size=200):
         )
     """)
     conn.execute(
-        "SELECT deltax_create_table('evt', 'ts', '1 day'::interval)"
+        "SELECT deltax.deltax_create_table('evt', 'ts', '1 day'::interval)"
     )
     conn.commit()
 
@@ -86,21 +86,21 @@ def _setup_event_table(conn, n_segments=4, segment_size=200):
     # order_id (matching the RTABench layout) — and small segment_size so
     # we get the requested n_segments.
     conn.execute(
-        "SELECT deltax_enable_compression('evt', "
+        "SELECT deltax.deltax_enable_compression('evt', "
         f"order_by => ARRAY['order_id'], segment_size => {segment_size})"
     )
     conn.commit()
 
     # Compress all non-empty, non-default partitions.
     parts = conn.execute(
-        "SELECT partition_name FROM deltax_partition_info('evt') "
+        "SELECT partition_name FROM deltax.deltax_partition_info('evt') "
         "WHERE partition_name NOT LIKE '%default%'"
     ).fetchall()
     for (part_name,) in parts:
         n = conn.execute(f'SELECT count(*) FROM "{part_name}"').fetchone()[0]
         if n == 0:
             continue
-        conn.execute(f"SELECT deltax_compress_partition('{part_name}')")
+        conn.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
     conn.commit()
 
 
@@ -215,10 +215,10 @@ class TestValbitmap:
             )
         """)
         db.execute(
-            "SELECT deltax_create_table('evt_db', 'ts', '1 day'::interval)"
+            "SELECT deltax.deltax_create_table('evt_db', 'ts', '1 day'::interval)"
         )
         db.execute(
-            "SELECT deltax_enable_compression('evt_db', "
+            "SELECT deltax.deltax_enable_compression('evt_db', "
             "order_by => ARRAY['order_id'], segment_size => 200)"
         )
         db.commit()
@@ -250,7 +250,7 @@ class TestValbitmap:
         # Verify column_valmap is populated.
         row = db.execute("""
             SELECT column_valmap::text
-            FROM deltax_partition
+            FROM deltax.deltax_partition
             WHERE table_name LIKE 'evt_db_%' AND is_compressed = true
             LIMIT 1
         """).fetchone()
@@ -271,13 +271,13 @@ class TestValbitmap:
         )
 
     def test_catalog_column_valmap_populated(self, db):
-        """After compression, deltax_partition.column_valmap should hold
+        """After compression, deltax.deltax_partition.column_valmap should hold
         the sorted value list for the low-cardinality `event_type`
         column and should NOT include `payload` (>32 distinct values)."""
         _setup_event_table(db, n_segments=4)
         row = db.execute("""
             SELECT column_valmap::text
-            FROM deltax_partition
+            FROM deltax.deltax_partition
             WHERE table_name LIKE 'evt_%' AND is_compressed = true
             LIMIT 1
         """).fetchone()

@@ -95,7 +95,7 @@ def _create_metrics_table(conn):
         )
         """
     )
-    conn.execute("SELECT deltax_create_table('metrics', 'ts', '1 day'::interval)")
+    conn.execute("SELECT deltax.deltax_create_table('metrics', 'ts', '1 day'::interval)")
     conn.commit()
 
 
@@ -365,17 +365,17 @@ def test_compression_with_truncate_excluded_preserves_subscriber(replicated_pair
     # its heap rows.
     with _db_conn(repl["pub_db"]) as pub:
         pub.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
         )
         partitions = pub.execute(
-            "SELECT partition_name FROM deltax_partition_info('metrics') "
+            "SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
             f"WHERE range_start <= '{BASE_TS}'::timestamptz "
             f"  AND range_end   >  '{BASE_TS}'::timestamptz"
         ).fetchall()
         assert partitions, "expected a partition covering BASE_TS"
         for (part,) in partitions:
-            pub.execute(f"SELECT deltax_compress_partition('{part}')")
+            pub.execute(f"SELECT deltax.deltax_compress_partition('{part}')")
 
         # Publisher: the heap partition is empty (data moved to companion
         # tables), but a `SELECT * FROM metrics` still returns 200 rows
@@ -498,7 +498,7 @@ def test_scenario_2_replicate_companion_tables_directly(replicated_pair):
     What this test does
     -------------------
     Demonstrates that the logical-replication *transport* is capable of
-    moving companion-table contents and `deltax_partition` catalog rows once
+    moving companion-table contents and `deltax.deltax_partition` catalog rows once
     the schema bootstrap problem is solved. We solve it the brute-force way:
     run identical compression on both sides first (so matching companion
     table shells exist), then wipe the subscriber's companion data + catalog
@@ -523,17 +523,17 @@ def test_scenario_2_replicate_companion_tables_directly(replicated_pair):
                 f"FROM generate_series(0, 99) g"
             )
             c.execute(
-                "SELECT deltax_enable_compression('metrics', "
+                "SELECT deltax.deltax_enable_compression('metrics', "
                 "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
             )
             cur = c.execute(
-                f"SELECT partition_name FROM deltax_partition_info('metrics') "
+                f"SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
                 f"WHERE range_start <= '{BASE_TS}'::timestamptz "
                 f"  AND range_end   >  '{BASE_TS}'::timestamptz"
             )
             parts_to_compress = [r[0] for r in cur.fetchall()]
             for part in parts_to_compress:
-                c.execute(f"SELECT deltax_compress_partition('{part}')")
+                c.execute(f"SELECT deltax.deltax_compress_partition('{part}')")
             # Sanity-check that compression produced segments in the meta table.
             seg_count = c.execute(
                 f'SELECT count(*) FROM "_deltax_compressed".'
@@ -542,10 +542,10 @@ def test_scenario_2_replicate_companion_tables_directly(replicated_pair):
             assert seg_count > 0, f"[{db}] compression produced no segments"
 
     # 2. Wipe ONLY the subscriber's companion-table contents. The catalog
-    #    row (`deltax_partition`) stays as `is_compressed = true` — that
+    #    row (`deltax.deltax_partition`) stays as `is_compressed = true` — that
     #    keeps pg_deltax in compressed-read mode, and (importantly) avoids
     #    a UNIQUE-key conflict during the subscription's initial COPY, since
-    #    we won't publish `deltax_partition`.
+    #    we won't publish `deltax.deltax_partition`.
     with _db_conn(repl["sub_db"]) as sub:
         cur = sub.execute(
             "SELECT format('%I.%I', schemaname, tablename) "
@@ -557,9 +557,9 @@ def test_scenario_2_replicate_companion_tables_directly(replicated_pair):
     # Confirm subscriber's companion tables really are empty before we wire
     # up replication. Note: `SELECT count(*) FROM metrics` would still return
     # 100 here, because pg_deltax has a count(*) pushdown that reads the
-    # immutable `deltax_partition.row_count` directly — bypassing the meta
+    # immutable `deltax.deltax_partition.row_count` directly — bypassing the meta
     # scan. We didn't reset that column (intentionally, so we don't have to
-    # publish `deltax_partition` and dodge UNIQUE-key conflicts on initial
+    # publish `deltax.deltax_partition` and dodge UNIQUE-key conflicts on initial
     # copy). Real-row queries with a WHERE clause go through the meta scan
     # and correctly observe 0.
     with _db_conn(repl["sub_db"]) as sub:
@@ -580,7 +580,7 @@ def test_scenario_2_replicate_companion_tables_directly(replicated_pair):
     #    surface area scenario 2 cares about. We omit `metrics` itself
     #    (heap is empty on both sides anyway, and including the parent
     #    partitioned table would require deciding on publish_via_partition_root)
-    #    and omit `deltax_partition` to dodge the UNIQUE conflict mentioned
+    #    and omit `deltax.deltax_partition` to dodge the UNIQUE conflict mentioned
     #    above. In a real "scenario 2" deployment the catalog row would be
     #    kept in sync by some other mechanism — pgrx hooks, a periodic
     #    refresh task, or just physical streaming replication.
@@ -596,7 +596,7 @@ def test_scenario_2_replicate_companion_tables_directly(replicated_pair):
 
     # 4. Subscription with `copy_data = true` — the initial table sync will
     #    refill the subscriber's empty companion tables and re-insert the
-    #    `deltax_partition` row, restoring the compressed state from the
+    #    `deltax.deltax_partition` row, restoring the compressed state from the
     #    publisher's bytes.
     with _db_conn(repl["sub_db"], autocommit=True) as sub:
         sub.execute(
@@ -633,7 +633,7 @@ def test_scenario_2_replicate_companion_tables_directly(replicated_pair):
         # empty (compression truncated it on both sides; we never published
         # `metrics` itself).
         cur = sub.execute(
-            "SELECT table_name FROM deltax_partition "
+            "SELECT table_name FROM deltax.deltax_partition "
             "WHERE is_compressed = true AND table_name LIKE 'metrics_p%'"
         )
         compressed_parts = [r[0] for r in cur.fetchall()]

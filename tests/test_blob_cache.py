@@ -39,7 +39,7 @@ def _setup_compressed_table(conn, n_devices=20, n_points=200):
         )
     """)
     conn.execute(
-        "SELECT deltax_create_table('metrics', 'ts', '1 day'::interval)"
+        "SELECT deltax.deltax_create_table('metrics', 'ts', '1 day'::interval)"
     )
 
     # Two text columns ensure at least one blob per segment per partition.
@@ -56,7 +56,7 @@ def _setup_compressed_table(conn, n_devices=20, n_points=200):
     # Insert in one statement; the rows-per-partition split is handled by PG.
     conn.execute(f"INSERT INTO metrics VALUES {','.join(values)}")
     conn.execute(
-        "SELECT deltax_enable_compression('metrics', "
+        "SELECT deltax.deltax_enable_compression('metrics', "
         "segment_by => ARRAY[]::text[], order_by => ARRAY['ts'])"
     )
     # Compress every partition.
@@ -65,10 +65,10 @@ def _setup_compressed_table(conn, n_devices=20, n_points=200):
         DECLARE p text;
         BEGIN
           FOR p IN SELECT partition_name
-                   FROM deltax_partition_info('metrics')
+                   FROM deltax.deltax_partition_info('metrics')
                    WHERE NOT is_compressed
           LOOP
-            PERFORM deltax_compress_partition(p);
+            PERFORM deltax.deltax_compress_partition(p);
           END LOOP;
         END $$;
     """)
@@ -76,11 +76,11 @@ def _setup_compressed_table(conn, n_devices=20, n_points=200):
 
 
 def _stats(conn):
-    """Snapshot of pg_deltax_blob_cache_stats() as a dict."""
+    """Snapshot of deltax.pg_deltax_blob_cache_stats() as a dict."""
     row = conn.execute(
         "SELECT entries, bytes_used, bytes_max, hits_total, misses_total, "
         "evictions_total, insert_failures_total "
-        "FROM pg_deltax_blob_cache_stats()"
+        "FROM deltax.pg_deltax_blob_cache_stats()"
     ).fetchone()
     return {
         "entries": row[0],
@@ -193,7 +193,7 @@ def test_blob_cache_pins_release_between_queries(db):
     # Walk all shards; every entry should have pin_count == 0.
     rows = db.execute(
         "SELECT shard_id, pinned_count, unpinned_count "
-        "FROM pg_deltax_blob_cache_shard_stats() "
+        "FROM deltax.pg_deltax_blob_cache_shard_stats() "
         "WHERE pinned_count > 0"
     ).fetchall()
     assert rows == [], (

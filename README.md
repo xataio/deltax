@@ -216,10 +216,12 @@ make psql    # connects to it via psql
 
 Then: 
 
+pg_deltax installs all its functions and internal catalog tables into a dedicated `deltax` schema (so its `time_bucket`, `first`, `last`, etc. don't collide with TimescaleDB or pg_duckdb). Call them schema-qualified as `deltax.<fn>(...)` — or `SET search_path TO public, deltax;` once if you'd rather call them bare.
+
 ```sql
 CREATE EXTENSION IF NOT EXISTS pg_deltax;
 CREATE TABLE metrics (ts TIMESTAMPTZ NOT NULL, device TEXT, value FLOAT8);
-SELECT deltax_create_table('metrics', 'ts', '1 day');
+SELECT deltax.deltax_create_table('metrics', 'ts', '1 day');
 
 -- Insert ~100,000 rows spanning the last ~2.3 days across 5 devices. The past
 -- (sealed) partition needs enough data that the per-partition companion-table
@@ -233,25 +235,25 @@ SELECT
 FROM generate_series(0, 100000) AS i;
 
 -- simulate a bg worker run which would drain the defualt partition every 60s
-SELECT deltax_drain_default_partition('metrics');
+SELECT deltax.deltax_drain_default_partition('metrics');
 
 -- Check size and info before compression
 SELECT pg_size_pretty(pg_database_size(current_database())) AS size;
-SELECT * FROM deltax_partition_info('metrics');
+SELECT * FROM deltax.deltax_partition_info('metrics');
 
 -- Compression — compresses every partition whose window is fully in the past
 -- (today's still-open partition is skipped). Normally done by the bg thread automatically.
-SELECT deltax_enable_compression('metrics', order_by => ARRAY['device', 'ts']);
-SELECT * FROM deltax_compress_all_partitions('metrics');
-SELECT * FROM deltax_compression_stats('metrics');
+SELECT deltax.deltax_enable_compression('metrics', order_by => ARRAY['device', 'ts']);
+SELECT * FROM deltax.deltax_compress_all_partitions('metrics');
+SELECT * FROM deltax.deltax_compression_stats('metrics');
 
 -- Demo queries
-SELECT time_bucket('1 day', ts) AS day, avg(value) FROM metrics GROUP BY 1 ORDER BY 1;
-SELECT first(value, ts), last(value, ts) FROM metrics;
+SELECT deltax.time_bucket('1 day', ts) AS day, avg(value) FROM metrics GROUP BY 1 ORDER BY 1;
+SELECT deltax.first(value, ts), deltax.last(value, ts) FROM metrics;
 
 -- Size reporting after compression — both the deltatable's catalog-truthful
 -- size and the whole database for comparison with the value above.
-SELECT pg_size_pretty(deltax_table_size('metrics'));
+SELECT pg_size_pretty(deltax.deltax_table_size('metrics'));
 SELECT pg_size_pretty(pg_database_size(current_database())) AS size;
 ```
 

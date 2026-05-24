@@ -292,7 +292,7 @@ unsafe fn rti_to_rel_oid(root: *mut pg_sys::PlannerInfo, rti: pg_sys::Index) -> 
 
 /// SPI-look up the json_extract config for the deltatable that owns this
 /// relation. `rel_oid` may be either the partitioned parent (matched against
-/// `deltax_deltatable`) or a partition (matched via `deltax_partition`).
+/// `deltax.deltax_deltatable`) or a partition (matched via `deltax.deltax_partition`).
 /// Returns an empty Vec on any failure (no deltatable, no json_extract,
 /// parse error) — extraction is silently skipped rather than aborting
 /// query planning.
@@ -341,12 +341,12 @@ pub(crate) unsafe fn is_json_extract_safe_for_rel(rel_oid: pg_sys::Oid) -> bool 
                  ),
                  dt AS (
                      SELECT h.id, h.json_extract_added_at, 'parent'::text AS kind
-                     FROM deltax_deltatable h, ident i
+                     FROM deltax.deltax_deltatable h, ident i
                      WHERE h.schema_name = i.s AND h.table_name = i.t
                      UNION ALL
                      SELECT h.id, h.json_extract_added_at, 'partition'::text AS kind
-                     FROM deltax_deltatable h
-                     JOIN deltax_partition p ON p.deltatable_id = h.id
+                     FROM deltax.deltax_deltatable h
+                     JOIN deltax.deltax_partition p ON p.deltatable_id = h.id
                      JOIN ident i ON p.schema_name = i.s AND p.table_name = i.t
                      LIMIT 1
                  )
@@ -355,12 +355,12 @@ pub(crate) unsafe fn is_json_extract_safe_for_rel(rel_oid: pg_sys::Oid) -> bool 
                      CASE
                          WHEN dt.kind = 'parent' THEN
                              (SELECT min(p.compressed_at)
-                                FROM deltax_partition p
+                                FROM deltax.deltax_partition p
                                WHERE p.deltatable_id = dt.id
                                  AND p.is_compressed)
                          ELSE
                              (SELECT p.compressed_at
-                                FROM deltax_partition p, ident i
+                                FROM deltax.deltax_partition p, ident i
                                WHERE p.schema_name = i.s
                                  AND p.table_name = i.t)
                      END AS oldest_compressed
@@ -405,11 +405,11 @@ unsafe fn load_extract_specs_for_rel(rel_oid: pg_sys::Oid) -> Vec<crate::compres
                      JOIN pg_namespace n ON c.relnamespace = n.oid
                      WHERE c.oid = $1
                  )
-                 SELECT h.json_extract FROM deltax_deltatable h, ident i
+                 SELECT h.json_extract FROM deltax.deltax_deltatable h, ident i
                   WHERE h.schema_name = i.s AND h.table_name = i.t
                   UNION ALL
-                 SELECT h.json_extract FROM deltax_deltatable h
-                  JOIN deltax_partition p ON p.deltatable_id = h.id
+                 SELECT h.json_extract FROM deltax.deltax_deltatable h
+                  JOIN deltax.deltax_partition p ON p.deltatable_id = h.id
                   JOIN ident i ON p.schema_name = i.s AND p.table_name = i.t
                   LIMIT 1",
                 None,

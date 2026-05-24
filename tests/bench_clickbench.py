@@ -42,7 +42,7 @@ def setup_clickbench(conn, n_files: int):
     conn.execute("SET pg_deltax.mock_now = '2013-07-01 12:00:00+00'")
     conn.execute(CREATE_TABLE_SQL)
     conn.execute(
-        "SELECT deltax_create_table('hits', 'eventtime', '3 days'::interval, 15)"
+        "SELECT deltax.deltax_create_table('hits', 'eventtime', '3 days'::interval, 15)"
     )
     conn.commit()
 
@@ -58,7 +58,7 @@ def enable_compression(conn):
     """Enable compression matching ClickBench TimescaleDB config."""
     segment_size = int(os.environ.get("SEGMENT_SIZE", "30000"))
     conn.execute(
-        "SELECT deltax_enable_compression('hits', "
+        "SELECT deltax.deltax_enable_compression('hits', "
         "order_by => ARRAY['counterid', 'userid', 'eventtime'], "
         f"segment_size => {segment_size})"
     )
@@ -69,7 +69,7 @@ def enable_compression(conn):
 def compress_all_partitions(conn):
     """Compress all non-empty, non-default partitions. Returns per-partition stats."""
     partitions = conn.execute(
-        "SELECT partition_name FROM deltax_partition_info('hits') "
+        "SELECT partition_name FROM deltax.deltax_partition_info('hits') "
         "WHERE partition_name NOT LIKE '%default%' "
         "ORDER BY partition_name"
     ).fetchall()
@@ -83,7 +83,7 @@ def compress_all_partitions(conn):
             continue
 
         t0 = time.monotonic()
-        conn.execute(f"SELECT deltax_compress_partition('{part_name}')")
+        conn.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
         conn.commit()
         elapsed = time.monotonic() - t0
 
@@ -264,7 +264,7 @@ def print_compression_stats(conn):
     """Print markdown table of per-partition compression stats."""
     stats = conn.execute(
         "SELECT partition_name, raw_size, compressed_size, compression_ratio, row_count "
-        "FROM deltax_compression_stats('hits') "
+        "FROM deltax.deltax_compression_stats('hits') "
         "WHERE compressed_size IS NOT NULL "
         "ORDER BY partition_name"
     ).fetchall()
@@ -511,7 +511,7 @@ class TestClickBench:
         # Save results for cross-system comparison
         totals = conn.execute(
             "SELECT sum(raw_size), sum(compressed_size) "
-            "FROM deltax_compression_stats('hits') "
+            "FROM deltax.deltax_compression_stats('hits') "
             "WHERE compressed_size IS NOT NULL"
         ).fetchone()
         raw_bytes = int(totals[0] or 0)

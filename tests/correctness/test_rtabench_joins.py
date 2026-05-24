@@ -47,7 +47,7 @@ def test_rtabench_synthetic_compression_happened(rtabench_synthetic, db):
     compressed = db.execute(
         f"""
         SELECT count(*)
-        FROM deltax_compression_stats('{deltax_table}')
+        FROM deltax.deltax_compression_stats('{deltax_table}')
         WHERE is_compressed = true
           AND row_count > 0
         """

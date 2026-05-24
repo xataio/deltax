@@ -147,7 +147,7 @@ extension_sql!(
     r#"
 CREATE SCHEMA IF NOT EXISTS _deltax_compressed;
 
-CREATE TABLE IF NOT EXISTS deltax_deltatable (
+CREATE TABLE IF NOT EXISTS deltax.deltax_deltatable (
     id              SERIAL PRIMARY KEY,
     schema_name     TEXT NOT NULL,
     table_name      TEXT NOT NULL,
@@ -162,9 +162,9 @@ CREATE TABLE IF NOT EXISTS deltax_deltatable (
     UNIQUE(schema_name, table_name)
 );
 
-CREATE TABLE IF NOT EXISTS deltax_partition (
+CREATE TABLE IF NOT EXISTS deltax.deltax_partition (
     id              SERIAL PRIMARY KEY,
-    deltatable_id   INT REFERENCES deltax_deltatable(id) ON DELETE CASCADE,
+    deltatable_id   INT REFERENCES deltax.deltax_deltatable(id) ON DELETE CASCADE,
     schema_name     TEXT NOT NULL,
     table_name      TEXT NOT NULL,
     range_start     TIMESTAMPTZ NOT NULL,
@@ -179,12 +179,12 @@ CREATE TABLE IF NOT EXISTS deltax_partition (
     UNIQUE(schema_name, table_name)
 );
 
-ALTER TABLE deltax_partition ADD COLUMN IF NOT EXISTS column_valmap JSONB;
-ALTER TABLE deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract JSONB;
-ALTER TABLE deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract_added_at TIMESTAMPTZ;
-ALTER TABLE deltax_partition ADD COLUMN IF NOT EXISTS compressed_columns JSONB;
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_valmap JSONB;
+ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract JSONB;
+ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract_added_at TIMESTAMPTZ;
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS compressed_columns JSONB;
 
-CREATE OR REPLACE FUNCTION deltax_reject_compressed_partition_dml()
+CREATE OR REPLACE FUNCTION deltax.deltax_reject_compressed_partition_dml()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$

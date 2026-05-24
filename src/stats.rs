@@ -6,8 +6,8 @@
 //! keeps point lookups (Q07 `order_id = N`) off the parallel path.
 //!
 //! Source of truth:
-//! - `deltax_partition.row_count` — authoritative total rows
-//! - `deltax_partition.column_ndistinct` — per-column merged-HLL
+//! - `deltax.deltax_partition.row_count` — authoritative total rows
+//! - `deltax.deltax_partition.column_ndistinct` — per-column merged-HLL
 //!   estimate written by `compress.rs` at compress time (or SQL
 //!   fallback for the standalone analyze UDF)
 //! - `_<partition>_colstats._nonnull_count` — summed for nullfrac

@@ -26,6 +26,20 @@ pub extern "C-unwind" fn deltax_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     BackgroundWorker::connect_worker_to_spi(Some("postgres"), None);
 
+    // The worker runs as superuser (BackgroundWorkerInitializeConnection with
+    // username = NULL sets am_superuser = true), so an attacker who can plant
+    // objects in any schema on the session search_path could shadow names this
+    // code references unqualified — pg_class, pg_attribute, the `=` operator,
+    // `now()`, etc. — and have the worker call into them. Pin search_path to
+    // pg_catalog + pg_temp once at session start so unqualified references
+    // always resolve to the system catalog. Everything pg_deltax-owned is
+    // already schema-qualified (deltax.deltax_partition / _deltax_compressed.*),
+    // so we don't need our schema on the path.
+    BackgroundWorker::transaction(|| {
+        Spi::run("SET search_path = pg_catalog, pg_temp")
+            .expect("pg_deltax: failed to lock worker search_path");
+    });
+
     log!(
         "pg_deltax: background worker started, interval = {}s",
         DEFAULT_WORKER_INTERVAL_SECS
@@ -47,7 +61,7 @@ pub extern "C-unwind" fn deltax_worker_main(_arg: pg_sys::Datum) {
             Spi::connect_mut(|client| {
                 // Skip if the extension hasn't been installed yet (catalog tables missing)
                 let has_catalog = client.select(
-                    "SELECT 1 FROM pg_tables WHERE schemaname = 'public' AND tablename = 'deltax_deltatable'",
+                    "SELECT 1 FROM pg_tables WHERE schemaname = 'deltax' AND tablename = 'deltax_deltatable'",
                     None,
                     &[],
                 ).map(|r| !r.is_empty()).unwrap_or(false);

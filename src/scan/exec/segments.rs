@@ -843,8 +843,8 @@ pub(super) fn load_metadata(
         .select(
             "SELECT h.segment_by, h.order_by, h.time_column, h.schema_name, h.table_name,
                     h.json_extract, p.compressed_columns
-             FROM deltax_partition p
-             JOIN deltax_deltatable h ON h.id = p.deltatable_id
+             FROM deltax.deltax_partition p
+             JOIN deltax.deltax_deltatable h ON h.id = p.deltatable_id
              WHERE p.table_name = $1 AND p.is_compressed = true",
             None,
             &[partition_name.into()],

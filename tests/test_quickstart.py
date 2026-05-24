@@ -20,7 +20,7 @@ class TestReadmeQuickstart:
             "CREATE TABLE metrics ("
             "ts TIMESTAMPTZ NOT NULL, device TEXT, value FLOAT8)"
         )
-        db.execute("SELECT deltax_create_table('metrics', 'ts', '1 day')")
+        db.execute("SELECT deltax.deltax_create_table('metrics', 'ts', '1 day')")
         db.commit()
 
         # 2. Insert ~100,000 rows spanning the last ~2.3 days across 5 devices,
@@ -43,7 +43,7 @@ class TestReadmeQuickstart:
         # metrics_default (waiting on the background worker's 60s cycle)
         # and be invisible to deltax_compress_all_partitions.
         drain_msg = db.execute(
-            "SELECT deltax_drain_default_partition('metrics')"
+            "SELECT deltax.deltax_drain_default_partition('metrics')"
         ).fetchone()[0]
         db.commit()
         assert isinstance(drain_msg, str) and drain_msg, drain_msg
@@ -61,20 +61,20 @@ class TestReadmeQuickstart:
 
         # 3. Demo queries — every one must return rows.
         daily = db.execute(
-            "SELECT time_bucket('1 day', ts) AS day, avg(value) "
+            "SELECT deltax.time_bucket('1 day', ts) AS day, avg(value) "
             "FROM metrics GROUP BY 1 ORDER BY 1"
         ).fetchall()
         assert daily, "time_bucket aggregate returned no rows"
 
         first_last = db.execute(
-            "SELECT first(value, ts), last(value, ts) FROM metrics"
+            "SELECT deltax.first(value, ts), deltax.last(value, ts) FROM metrics"
         ).fetchone()
         assert first_last is not None and first_last[0] is not None
         assert first_last[1] is not None
 
         partitions = db.execute(
             "SELECT partition_name, is_compressed "
-            "FROM deltax_partition_info('metrics') "
+            "FROM deltax.deltax_partition_info('metrics') "
             "ORDER BY range_start"
         ).fetchall()
         # deltax_create_table defaults: 1 past + today + 3 future = 5 entries.
@@ -88,7 +88,7 @@ class TestReadmeQuickstart:
         # 4. Enable compression — message format may evolve; just require
         # the call returns a non-empty string and doesn't raise.
         enable_msg = db.execute(
-            "SELECT deltax_enable_compression("
+            "SELECT deltax.deltax_enable_compression("
             "'metrics', order_by => ARRAY['device', 'ts'])"
         ).fetchone()[0]
         assert isinstance(enable_msg, str) and enable_msg
@@ -100,7 +100,7 @@ class TestReadmeQuickstart:
         # still-open partition must not appear.
         compressed = db.execute(
             "SELECT partition_name, result "
-            "FROM deltax_compress_all_partitions('metrics')"
+            "FROM deltax.deltax_compress_all_partitions('metrics')"
         ).fetchall()
         db.commit()
         assert len(compressed) >= 2, (
@@ -113,7 +113,7 @@ class TestReadmeQuickstart:
         for part_name, _msg in compressed:
             row = db.execute(
                 "SELECT range_end <= now() "
-                "FROM deltax_partition_info('metrics') "
+                "FROM deltax.deltax_partition_info('metrics') "
                 "WHERE partition_name = %s",
                 (part_name,),
             ).fetchone()
@@ -126,7 +126,7 @@ class TestReadmeQuickstart:
         stats = db.execute(
             "SELECT partition_name, is_compressed, row_count, "
             "       raw_size, compressed_size "
-            "FROM deltax_compression_stats('metrics')"
+            "FROM deltax.deltax_compression_stats('metrics')"
         ).fetchall()
         compressed_rows = [r for r in stats if r[1] is True]
         assert compressed_rows, (
@@ -142,7 +142,7 @@ class TestReadmeQuickstart:
 
         # 7. Size reporting — pg_size_pretty must accept and format the value.
         size_text = db.execute(
-            "SELECT pg_size_pretty(deltax_table_size('metrics'))"
+            "SELECT pg_size_pretty(deltax.deltax_table_size('metrics'))"
         ).fetchone()[0]
         assert isinstance(size_text, str) and size_text
 

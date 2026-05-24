@@ -140,7 +140,7 @@ fi
 # partitions covers any plausible Bluesky collection window. Out-of-range data
 # falls into the default partition and stays uncompressed — the partition_info
 # query at the end will surface this if the heuristic is off.
-sudo -u postgres psql "$DB" -t -c "SET pg_deltax.mock_now = '$DATA_START'; SELECT deltax_create_table('bluesky', 'ts', '1 day'::interval, 365)"
+sudo -u postgres psql "$DB" -t -c "SET pg_deltax.mock_now = '$DATA_START'; SELECT deltax.deltax_create_table('bluesky', 'ts', '1 day'::interval, 365)"
 
 # Enable compression before loading (required for direct backfill).
 # json_extract pre-extracts the JSON paths every JSONBench query touches into
@@ -148,7 +148,7 @@ sudo -u postgres psql "$DB" -t -c "SET pg_deltax.mock_now = '$DATA_START'; SELEC
 # `data->>'kind'`-style chains in upper plans to Var refs into those
 # synthetic columns, sidestepping per-row jsonb_in / `->`/`->>` evaluation
 # on the warm path. Requires pg_deltax.json_extract_mode=fields at query time.
-sudo -u postgres psql "$DB" -t -c "SELECT deltax_enable_compression(
+sudo -u postgres psql "$DB" -t -c "SELECT deltax.deltax_enable_compression(
     'bluesky',
     order_by => ARRAY['ts'],
     segment_size => 30000,
@@ -191,7 +191,7 @@ VACUUM_END=$(date +%s)
 echo " done in $((VACUUM_END - VACUUM_START))s"
 
 # Capture data size (bytes) and row count for the JSONBench dashboard.
-DATA_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT deltax_table_size('bluesky')")
+DATA_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT deltax.deltax_table_size('bluesky')")
 NUM_LOADED=$(sudo -u postgres psql "$DB" -t -A -c "SELECT count(*) FROM bluesky")
 echo "Data size: $DATA_SIZE bytes ($(echo "$DATA_SIZE / 1024 / 1024 / 1024" | bc -l | xargs printf '%.2f') GB)"
 echo "Loaded documents: $NUM_LOADED"
@@ -215,7 +215,7 @@ sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '256MB'"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET jit TO off"
 
 # Report partition and compression info
-sudo -u postgres psql "$DB" -c "SELECT * FROM deltax_partition_info('bluesky')"
+sudo -u postgres psql "$DB" -c "SELECT * FROM deltax.deltax_partition_info('bluesky')"
 sudo -u postgres psql "$DB" -c "SELECT count(*) AS default_partition_rows FROM bluesky_default"
 
 echo "Setup complete. Database '$DB' is ready (SCALE=$SCALE, dataset=${SCALE}m)."

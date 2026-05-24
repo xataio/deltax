@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 thread_local! {
-    /// Cache of companion_oid → (row_count, segment_count) from deltax_partition.
+    /// Cache of companion_oid → (row_count, segment_count) from deltax.deltax_partition.
     /// Only populated on successful lookups; misses are not cached because
     /// companion lookups can race with partition creation.
     static PARTITION_STATS_CACHE: RefCell<HashMap<pg_sys::Oid, (i64, i64)>> =
@@ -73,7 +73,7 @@ pub(crate) fn parallel_divisor(workers: usize) -> f64 {
     w + leader
 }
 
-/// Get partition stats from deltax_partition catalog.
+/// Get partition stats from deltax.deltax_partition catalog.
 fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
     if let Some(cached) =
         PARTITION_STATS_CACHE.with(|cache| cache.borrow().get(&companion_oid).copied())
@@ -94,7 +94,7 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
     let partition_name = name.strip_suffix("_meta").unwrap_or(&name);
 
     let result = Spi::get_one_with_args::<i64>(
-        "SELECT row_count FROM deltax_partition WHERE table_name = $1 AND is_compressed = true",
+        "SELECT row_count FROM deltax.deltax_partition WHERE table_name = $1 AND is_compressed = true",
         &[partition_name.into()],
     );
 
@@ -128,7 +128,7 @@ pub(super) unsafe fn get_relpages(rel_oid: pg_sys::Oid) -> i32 {
     }
 }
 
-/// Get the uncompressed row count for a companion OID from deltax_partition catalog.
+/// Get the uncompressed row count for a companion OID from deltax.deltax_partition catalog.
 /// Returns Some(row_count) if positive, None otherwise.
 pub(super) fn get_row_count(companion_oid: pg_sys::Oid) -> Option<i64> {
     let (row_count, _) = get_partition_stats(companion_oid);
@@ -243,7 +243,7 @@ pub(super) fn get_segment_count(companion_oid: pg_sys::Oid) -> i64 {
 }
 
 /// Get per-column ndistinct for a companion OID from the catalog column
-/// `deltax_partition.column_ndistinct` (populated at compression time).
+/// `deltax.deltax_partition.column_ndistinct` (populated at compression time).
 /// Returns a map from column name to max-across-segments ndistinct count,
 /// or an empty map if the partition has no stored ndistinct info.
 ///
@@ -278,7 +278,7 @@ pub(super) fn get_column_ndistinct(
     // Retrieve the JSONB column as text and parse manually. This avoids
     // pulling in a JSON dependency just for a trivial `{string: int}` map.
     let json_text = Spi::get_one_with_args::<String>(
-        "SELECT column_ndistinct::text FROM deltax_partition
+        "SELECT column_ndistinct::text FROM deltax.deltax_partition
          WHERE table_name = $1 AND is_compressed = true",
         &[partition_name.into()],
     );
@@ -292,7 +292,7 @@ pub(super) fn get_column_ndistinct(
 }
 
 /// Get per-column value-list for the segment value-presence bitmap from
-/// `deltax_partition.column_valmap` (populated at compression time). Returns
+/// `deltax.deltax_partition.column_valmap` (populated at compression time). Returns
 /// a map of column-name → sorted distinct values; the array index is the bit
 /// position in each segment's bitmap. Empty map ⇒ no eligible columns.
 pub(crate) fn get_column_valmap(
@@ -319,7 +319,7 @@ pub(crate) fn get_column_valmap(
         std::collections::HashMap::new();
 
     let json_text = Spi::get_one_with_args::<String>(
-        "SELECT column_valmap::text FROM deltax_partition
+        "SELECT column_valmap::text FROM deltax.deltax_partition
          WHERE table_name = $1 AND is_compressed = true",
         &[partition_name.into()],
     );

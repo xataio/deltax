@@ -99,7 +99,7 @@ mod tests {
     #[pg_test]
     fn test_time_bucket_5min() {
         let result = Spi::get_one::<String>(
-            "SELECT time_bucket('5 minutes'::interval, '2025-01-15 14:23:42+00'::timestamptz)::text",
+            "SELECT deltax.time_bucket('5 minutes'::interval, '2025-01-15 14:23:42+00'::timestamptz)::text",
         )
         .expect("query failed");
         assert!(
@@ -112,7 +112,7 @@ mod tests {
     #[pg_test]
     fn test_time_bucket_1hour() {
         let result = Spi::get_one::<String>(
-            "SELECT time_bucket('1 hour'::interval, '2025-01-15 14:23:42+00'::timestamptz)::text",
+            "SELECT deltax.time_bucket('1 hour'::interval, '2025-01-15 14:23:42+00'::timestamptz)::text",
         )
         .expect("query failed");
         assert!(
@@ -125,7 +125,7 @@ mod tests {
     #[pg_test]
     fn test_time_bucket_1day() {
         let result = Spi::get_one::<String>(
-            "SELECT time_bucket('1 day'::interval, '2025-01-15 14:23:42+00'::timestamptz)::text",
+            "SELECT deltax.time_bucket('1 day'::interval, '2025-01-15 14:23:42+00'::timestamptz)::text",
         )
         .expect("query failed");
         let val = result.as_deref().unwrap();
@@ -139,7 +139,7 @@ mod tests {
     #[pg_test]
     fn test_time_bucket_with_offset() {
         let result = Spi::get_one::<String>(
-            "SELECT time_bucket('1 day'::interval, '2025-01-15 14:23:42+00'::timestamptz, '6 hours'::interval)::text",
+            "SELECT deltax.time_bucket('1 day'::interval, '2025-01-15 14:23:42+00'::timestamptz, '6 hours'::interval)::text",
         )
         .expect("query failed");
         assert!(

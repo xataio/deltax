@@ -1,5 +1,14 @@
 # Function reference
 
+All pg_deltax functions live in the `deltax` schema. Names below are shown unqualified for readability — call them as `deltax.<fn>(...)`, e.g.:
+
+```sql
+SELECT deltax.deltax_create_table('metrics', 'ts', '1 day');
+SELECT deltax.time_bucket('1 hour', ts), avg(value) FROM metrics GROUP BY 1;
+```
+
+(Or `SET search_path TO public, deltax;` once if you'd rather call them bare.)
+
 ## Partitioning
 
 | Function | Description |

@@ -31,7 +31,7 @@ def setup_and_compress(conn, n_devices=3, n_points=20):
             pressure DOUBLE PRECISION
         )
     """)
-    conn.execute("SELECT deltax_create_table('metrics', 'ts', '1 day'::interval)")
+    conn.execute("SELECT deltax.deltax_create_table('metrics', 'ts', '1 day'::interval)")
 
     rows = []
     for d in range(n_devices):
@@ -44,21 +44,21 @@ def setup_and_compress(conn, n_devices=3, n_points=20):
     )
 
     conn.execute(
-        "SELECT deltax_enable_compression('metrics', "
+        "SELECT deltax.deltax_enable_compression('metrics', "
         "segment_by => ARRAY['device_id'], "
         "order_by => ARRAY['ts'])"
     )
     conn.commit()
 
     partitions = conn.execute(
-        "SELECT partition_name FROM deltax_partition_info('metrics') "
+        "SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
         "WHERE range_start <= '2025-01-15'::timestamptz "
         "AND range_end > '2025-01-15'::timestamptz"
     ).fetchall()
     assert len(partitions) == 1, partitions
     part_name = partitions[0][0]
 
-    conn.execute(f"SELECT deltax_compress_partition('{part_name}')")
+    conn.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
     conn.commit()
 
     return part_name, n_devices * n_points
@@ -67,7 +67,7 @@ def setup_and_compress(conn, n_devices=3, n_points=20):
 def get_descriptor(conn, part_name):
     """Return the `compressed_columns` descriptor (Python list) for a partition."""
     raw = conn.execute(
-        "SELECT compressed_columns FROM deltax_partition WHERE table_name = %s",
+        "SELECT compressed_columns FROM deltax.deltax_partition WHERE table_name = %s",
         (part_name,),
     ).fetchone()[0]
     return raw  # psycopg returns JSONB as parsed Python
@@ -209,7 +209,7 @@ class TestLegacyPartitionFallback:
         part_name, total = setup_and_compress(db)
 
         db.execute(
-            "UPDATE deltax_partition SET compressed_columns = NULL "
+            "UPDATE deltax.deltax_partition SET compressed_columns = NULL "
             "WHERE table_name = %s",
             (part_name,),
         )

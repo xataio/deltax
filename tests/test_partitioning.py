@@ -10,14 +10,14 @@ def test_create_table_basic(db):
     )
     db.commit()
 
-    row = db.execute("SELECT deltax_create_table('metrics', 'ts')").fetchone()
+    row = db.execute("SELECT deltax.deltax_create_table('metrics', 'ts')").fetchone()
     db.commit()
 
     assert "Created deltax table" in row[0]
     assert "5 partitions" in row[0]
 
     partitions = db.execute(
-        "SELECT * FROM deltax_partition_info('metrics')"
+        "SELECT * FROM deltax.deltax_partition_info('metrics')"
     ).fetchall()
     assert len(partitions) == 5
 
@@ -29,11 +29,11 @@ def test_create_table_custom_interval(db):
     )
     db.commit()
 
-    db.execute("SELECT deltax_create_table('hourly', 'ts', '1 hour')")
+    db.execute("SELECT deltax.deltax_create_table('hourly', 'ts', '1 hour')")
     db.commit()
 
     partitions = db.execute(
-        "SELECT partition_name FROM deltax_partition_info('hourly')"
+        "SELECT partition_name FROM deltax.deltax_partition_info('hourly')"
     ).fetchall()
     assert len(partitions) == 5
 
@@ -52,14 +52,14 @@ def test_create_table_custom_premake(db):
     db.commit()
 
     row = db.execute(
-        "SELECT deltax_create_table('few', 'ts', '1 day', 1)"
+        "SELECT deltax.deltax_create_table('few', 'ts', '1 day', 1)"
     ).fetchone()
     db.commit()
 
     assert "3 partitions" in row[0]
 
     partitions = db.execute(
-        "SELECT * FROM deltax_partition_info('few')"
+        "SELECT * FROM deltax.deltax_partition_info('few')"
     ).fetchall()
     assert len(partitions) == 3
 
@@ -71,10 +71,10 @@ def test_create_table_already_exists(db):
     )
     db.commit()
 
-    db.execute("SELECT deltax_create_table('dup', 'ts')")
+    db.execute("SELECT deltax.deltax_create_table('dup', 'ts')")
     db.commit()
 
-    row = db.execute("SELECT deltax_create_table('dup', 'ts')").fetchone()
+    row = db.execute("SELECT deltax.deltax_create_table('dup', 'ts')").fetchone()
     db.commit()
 
     assert "already a deltax table" in row[0]
@@ -87,7 +87,7 @@ def test_insert_and_query(db):
     )
     db.commit()
 
-    db.execute("SELECT deltax_create_table('sensor', 'ts')")
+    db.execute("SELECT deltax.deltax_create_table('sensor', 'ts')")
     db.commit()
 
     now = datetime.now(timezone.utc)
@@ -112,12 +112,12 @@ def test_deltatable_info(db):
     )
     db.commit()
 
-    db.execute("SELECT deltax_create_table('ht_test', 'ts', '1 day')")
+    db.execute("SELECT deltax.deltax_create_table('ht_test', 'ts', '1 day')")
     db.commit()
 
     row = db.execute(
         "SELECT schema_name, table_name, time_column, partition_interval, num_partitions "
-        "FROM deltax_deltatable_info('ht_test')"
+        "FROM deltax.deltax_deltatable_info('ht_test')"
     ).fetchone()
 
     assert row[0] == "public"
@@ -135,11 +135,11 @@ def test_partition_info_ordering(db):
     )
     db.commit()
 
-    db.execute("SELECT deltax_create_table('ordered', 'ts')")
+    db.execute("SELECT deltax.deltax_create_table('ordered', 'ts')")
     db.commit()
 
     rows = db.execute(
-        "SELECT range_start FROM deltax_partition_info('ordered')"
+        "SELECT range_start FROM deltax.deltax_partition_info('ordered')"
     ).fetchall()
 
     starts = [r[0] for r in rows]

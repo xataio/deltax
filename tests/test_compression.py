@@ -28,7 +28,7 @@ def setup_metrics_table(conn, table_name="metrics"):
         )
     """)
     conn.execute(f"""
-        SELECT deltax_create_table('{table_name}', 'ts', '1 day'::interval)
+        SELECT deltax.deltax_create_table('{table_name}', 'ts', '1 day'::interval)
     """)
     conn.commit()
 
@@ -68,7 +68,7 @@ class TestEnableCompression:
     def test_enable_compression_basic(self, db):
         setup_metrics_table(db)
         result = db.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         ).fetchone()[0]
@@ -79,7 +79,7 @@ class TestEnableCompression:
     def test_enable_compression_no_segment(self, db):
         setup_metrics_table(db)
         result = db.execute(
-            "SELECT deltax_enable_compression('metrics')"
+            "SELECT deltax.deltax_enable_compression('metrics')"
         ).fetchone()[0]
         db.commit()
         assert "Compression enabled" in result
@@ -88,7 +88,7 @@ class TestEnableCompression:
         setup_metrics_table(db)
         with pytest.raises(Exception, match="segment_by column"):
             db.execute(
-                "SELECT deltax_enable_compression('metrics', "
+                "SELECT deltax.deltax_enable_compression('metrics', "
                 "segment_by => ARRAY['nonexistent'])"
             )
             db.commit()
@@ -100,7 +100,7 @@ class TestCompressDecompress:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=5, n_points=50)
         db.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -108,7 +108,7 @@ class TestCompressDecompress:
 
         # Find a partition to compress
         partitions = db.execute(
-            "SELECT partition_name FROM deltax_partition_info('metrics') "
+            "SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
             "WHERE range_start <= '2025-01-15'::timestamptz "
             "AND range_end > '2025-01-15'::timestamptz"
         ).fetchall()
@@ -123,7 +123,7 @@ class TestCompressDecompress:
 
         # Compress
         result = db.execute(
-            f"SELECT deltax_compress_partition('{part_name}')"
+            f"SELECT deltax.deltax_compress_partition('{part_name}')"
         ).fetchone()[0]
         db.commit()
         assert "Compressed" in result
@@ -148,7 +148,7 @@ class TestCompressDecompress:
 
         # Catalog should show compressed
         info = db.execute(
-            "SELECT is_compressed FROM deltax_partition_info('metrics') "
+            "SELECT is_compressed FROM deltax.deltax_partition_info('metrics') "
             f"WHERE partition_name = '{part_name}'"
         ).fetchone()
         assert info[0] is True
@@ -158,7 +158,7 @@ class TestCompressDecompress:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=3, n_points=20)
         db.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -166,7 +166,7 @@ class TestCompressDecompress:
 
         # Get partition and original data
         partitions = db.execute(
-            "SELECT partition_name FROM deltax_partition_info('metrics') "
+            "SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
             "WHERE range_start <= '2025-01-15'::timestamptz "
             "AND range_end > '2025-01-15'::timestamptz"
         ).fetchall()
@@ -181,12 +181,12 @@ class TestCompressDecompress:
         assert original_count > 0
 
         # Compress
-        db.execute(f"SELECT deltax_compress_partition('{part_name}')")
+        db.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
         db.commit()
 
         # Decompress
         result = db.execute(
-            f"SELECT deltax_decompress_partition('{part_name}')"
+            f"SELECT deltax.deltax_decompress_partition('{part_name}')"
         ).fetchone()[0]
         db.commit()
         assert "Decompressed" in result
@@ -209,17 +209,17 @@ class TestCompressDecompress:
         """Compressing an empty partition should be a no-op."""
         setup_metrics_table(db)
         db.execute(
-            "SELECT deltax_enable_compression('metrics')"
+            "SELECT deltax.deltax_enable_compression('metrics')"
         )
         db.commit()
 
         partitions = db.execute(
-            "SELECT partition_name FROM deltax_partition_info('metrics') LIMIT 1"
+            "SELECT partition_name FROM deltax.deltax_partition_info('metrics') LIMIT 1"
         ).fetchall()
         part_name = partitions[0][0]
 
         result = db.execute(
-            f"SELECT deltax_compress_partition('{part_name}')"
+            f"SELECT deltax.deltax_compress_partition('{part_name}')"
         ).fetchone()[0]
         db.commit()
         assert "no rows" in result.lower()
@@ -229,23 +229,23 @@ class TestCompressDecompress:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=2, n_points=10)
         db.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'])"
         )
         db.commit()
 
         partitions = db.execute(
-            "SELECT partition_name FROM deltax_partition_info('metrics') "
+            "SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
             "WHERE range_start <= '2025-01-15'::timestamptz "
             "AND range_end > '2025-01-15'::timestamptz"
         ).fetchall()
         part_name = partitions[0][0]
 
-        db.execute(f"SELECT deltax_compress_partition('{part_name}')")
+        db.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
         db.commit()
 
         result = db.execute(
-            f"SELECT deltax_compress_partition('{part_name}')"
+            f"SELECT deltax.deltax_compress_partition('{part_name}')"
         ).fetchone()[0]
         db.commit()
         assert "already compressed" in result.lower()
@@ -256,23 +256,23 @@ class TestCompressionStats:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=5, n_points=50)
         db.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'])"
         )
         db.commit()
 
         partitions = db.execute(
-            "SELECT partition_name FROM deltax_partition_info('metrics') "
+            "SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
             "WHERE range_start <= '2025-01-15'::timestamptz "
             "AND range_end > '2025-01-15'::timestamptz"
         ).fetchall()
         part_name = partitions[0][0]
 
-        db.execute(f"SELECT deltax_compress_partition('{part_name}')")
+        db.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
         db.commit()
 
         stats = db.execute(
-            "SELECT * FROM deltax_compression_stats('metrics') "
+            "SELECT * FROM deltax.deltax_compression_stats('metrics') "
             f"WHERE partition_name = '{part_name}'"
         ).fetchone()
         assert stats is not None
@@ -292,12 +292,12 @@ class TestCompressionPolicy:
     def test_set_policy(self, db):
         setup_metrics_table(db)
         db.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'])"
         )
         db.commit()
         result = db.execute(
-            "SELECT deltax_set_compression_policy('metrics', '7 days'::interval)"
+            "SELECT deltax.deltax_set_compression_policy('metrics', '7 days'::interval)"
         ).fetchone()[0]
         db.commit()
         assert "Compression policy set" in result
@@ -306,7 +306,7 @@ class TestCompressionPolicy:
         setup_metrics_table(db)
         with pytest.raises(Exception, match="enable compression first"):
             db.execute(
-                "SELECT deltax_set_compression_policy('metrics', '7 days'::interval)"
+                "SELECT deltax.deltax_set_compression_policy('metrics', '7 days'::interval)"
             )
             db.commit()
 
@@ -322,7 +322,7 @@ class TestTransparentQuery:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=5, n_points=50)
         db.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -340,7 +340,7 @@ class TestTransparentQuery:
 
         # Find and compress all non-default partitions
         partitions = db.execute(
-            "SELECT partition_name FROM deltax_partition_info('metrics') "
+            "SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
             "WHERE partition_name NOT LIKE '%default%'"
         ).fetchall()
 
@@ -351,7 +351,7 @@ class TestTransparentQuery:
             ).fetchone()[0]
             if row_ct == 0:
                 continue
-            db.execute(f"SELECT deltax_compress_partition('{part_name}')")
+            db.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
             db.commit()
             compressed_count += 1
 
@@ -398,7 +398,7 @@ class TestTransparentQuery:
                 val_real REAL
             )
         """)
-        db.execute("SELECT deltax_create_table('diverse', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('diverse', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert test data
@@ -446,14 +446,14 @@ class TestTransparentQuery:
 
         # Enable and compress
         db.execute(
-            "SELECT deltax_enable_compression('diverse', "
+            "SELECT deltax.deltax_enable_compression('diverse', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
 
         partitions = db.execute(
-            "SELECT partition_name FROM deltax_partition_info('diverse') "
+            "SELECT partition_name FROM deltax.deltax_partition_info('diverse') "
             "WHERE partition_name NOT LIKE '%default%'"
         ).fetchall()
 
@@ -463,7 +463,7 @@ class TestTransparentQuery:
             ).fetchone()[0]
             if row_ct == 0:
                 continue
-            db.execute(f"SELECT deltax_compress_partition('{part_name}')")
+            db.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
             db.commit()
 
         # Query AFTER compression
@@ -533,7 +533,7 @@ class TestTransparentQuery:
                 val_real REAL
             )
         """)
-        db.execute("SELECT deltax_create_table('avg_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('avg_test', 'ts', '1 day'::interval)")
         db.commit()
 
         for i in range(50):
@@ -569,13 +569,13 @@ class TestTransparentQuery:
 
         # Enable and compress
         db.execute(
-            "SELECT deltax_enable_compression('avg_test', "
+            "SELECT deltax.deltax_enable_compression('avg_test', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
         partitions = db.execute(
-            "SELECT partition_name FROM deltax_partition_info('avg_test') "
+            "SELECT partition_name FROM deltax.deltax_partition_info('avg_test') "
             "WHERE partition_name NOT LIKE '%default%'"
         ).fetchall()
         for (part_name,) in partitions:
@@ -584,7 +584,7 @@ class TestTransparentQuery:
             ).fetchone()[0]
             if row_ct == 0:
                 continue
-            db.execute(f"SELECT deltax_compress_partition('{part_name}')")
+            db.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
             db.commit()
 
         # Query AFTER compression
@@ -643,7 +643,7 @@ class TestTransparentQuery:
                 val INTEGER
             )
         """)
-        db.execute("SELECT deltax_create_table('agg_where_text', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('agg_where_text', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert rows: half with empty label, half with non-empty
@@ -672,7 +672,7 @@ class TestTransparentQuery:
 
         # Compress
         db.execute(
-            "SELECT deltax_enable_compression('agg_where_text', "
+            "SELECT deltax.deltax_enable_compression('agg_where_text', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -718,7 +718,7 @@ class TestTransparentQuery:
                 val INTEGER
             )
         """)
-        db.execute("SELECT deltax_create_table('agg_where_like', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('agg_where_like', 'ts', '1 day'::interval)")
         db.commit()
 
         for i in range(60):
@@ -737,7 +737,7 @@ class TestTransparentQuery:
         assert before_count == 10
 
         db.execute(
-            "SELECT deltax_enable_compression('agg_where_like', "
+            "SELECT deltax.deltax_enable_compression('agg_where_like', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -772,7 +772,7 @@ class TestTransparentQuery:
                 val INTEGER
             )
         """)
-        db.execute("SELECT deltax_create_table('like_decompress', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('like_decompress', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert enough distinct URLs to trigger LZ4 (not dictionary)
@@ -814,7 +814,7 @@ class TestTransparentQuery:
         assert before["not_like_count"] == 590
 
         db.execute(
-            "SELECT deltax_enable_compression('like_decompress', "
+            "SELECT deltax.deltax_enable_compression('like_decompress', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -874,7 +874,7 @@ class TestTransparentQuery:
                 data TEXT NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('like_boundary', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('like_boundary', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert strings designed to create cross-boundary false positives.
@@ -918,7 +918,7 @@ class TestTransparentQuery:
         assert before_search == 0, f"expected 0 search matches, got {before_search}"
 
         db.execute(
-            "SELECT deltax_enable_compression('like_boundary', "
+            "SELECT deltax.deltax_enable_compression('like_boundary', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -961,7 +961,7 @@ class TestTransparentQuery:
                 val INTEGER
             )
         """)
-        db.execute("SELECT deltax_create_table('like_prepared', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('like_prepared', 'ts', '1 day'::interval)")
         db.commit()
 
         for i in range(200):
@@ -974,7 +974,7 @@ class TestTransparentQuery:
         db.commit()
 
         db.execute(
-            "SELECT deltax_enable_compression('like_prepared', "
+            "SELECT deltax.deltax_enable_compression('like_prepared', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -1009,7 +1009,7 @@ class TestTransparentQuery:
                 val DOUBLE PRECISION
             )
         """)
-        db.execute("SELECT deltax_create_table('agg_where_num', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('agg_where_num', 'ts', '1 day'::interval)")
         db.commit()
 
         for i in range(60):
@@ -1040,7 +1040,7 @@ class TestTransparentQuery:
         assert before["count_ne"] == 48  # 60 - 12 rows with engine_id=0
 
         db.execute(
-            "SELECT deltax_enable_compression('agg_where_num', "
+            "SELECT deltax.deltax_enable_compression('agg_where_num', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -1094,7 +1094,7 @@ class TestTransparentQuery:
                 val INTEGER
             )
         """)
-        db.execute("SELECT deltax_create_table('agg_where_mixed', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('agg_where_mixed', 'ts', '1 day'::interval)")
         db.commit()
 
         for i in range(60):
@@ -1122,7 +1122,7 @@ class TestTransparentQuery:
         assert before_count > 0
 
         db.execute(
-            "SELECT deltax_enable_compression('agg_where_mixed', "
+            "SELECT deltax.deltax_enable_compression('agg_where_mixed', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -1163,7 +1163,7 @@ class TestTransparentQuery:
                 label TEXT NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('avg_len_mb', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('avg_len_mb', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert rows with multi-byte UTF-8 strings.
@@ -1206,7 +1206,7 @@ class TestTransparentQuery:
 
         # Compress
         db.execute(
-            "SELECT deltax_enable_compression('avg_len_mb', "
+            "SELECT deltax.deltax_enable_compression('avg_len_mb', "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -1245,7 +1245,7 @@ class TestTransparentQuery:
                 url TEXT NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('agg_regexp_min', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('agg_regexp_min', 'ts', '1 day'::interval)")
         db.commit()
 
         # URLs grouped by domain via regexp_replace.
@@ -1286,7 +1286,7 @@ class TestTransparentQuery:
         assert len(before) > 0, "expected results before compression"
 
         db.execute(
-            "SELECT deltax_enable_compression('agg_regexp_min', "
+            "SELECT deltax.deltax_enable_compression('agg_regexp_min', "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -1327,7 +1327,7 @@ class TestTransparentQuery:
                 url TEXT NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('agg_parallel_min', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('agg_parallel_min', 'ts', '1 day'::interval)")
         db.commit()
 
         # Create groups with URLs where byte-MIN != collation-MIN.
@@ -1386,7 +1386,7 @@ class TestTransparentQuery:
         assert len(before) > 0, "expected results before compression"
 
         db.execute(
-            "SELECT deltax_enable_compression('agg_parallel_min', "
+            "SELECT deltax.deltax_enable_compression('agg_parallel_min', "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -1428,7 +1428,7 @@ class TestTransparentQuery:
                 val INTEGER
             )
         """)
-        db.execute("SELECT deltax_create_table('agg_prep_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('agg_prep_test', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert rows: region_id 1 gets 20 rows, region_id 2 gets 40 rows
@@ -1451,7 +1451,7 @@ class TestTransparentQuery:
 
         # Compress
         db.execute(
-            "SELECT deltax_enable_compression('agg_prep_test', "
+            "SELECT deltax.deltax_enable_compression('agg_prep_test', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -1522,7 +1522,7 @@ class TestTransparentQuery:
                 value FLOAT8 NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('dt_trunc_gb', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('dt_trunc_gb', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert rows spanning multiple minutes
@@ -1548,7 +1548,7 @@ class TestTransparentQuery:
 
         # Compress
         db.execute(
-            "SELECT deltax_enable_compression('dt_trunc_gb', "
+            "SELECT deltax.deltax_enable_compression('dt_trunc_gb', "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -1574,7 +1574,7 @@ class TestTransparentQuery:
                 val INT NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('ac_gb', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('ac_gb', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert rows with a few distinct val values
@@ -1601,7 +1601,7 @@ class TestTransparentQuery:
 
         # Compress
         db.execute(
-            "SELECT deltax_enable_compression('ac_gb', "
+            "SELECT deltax.deltax_enable_compression('ac_gb', "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -1619,7 +1619,7 @@ class TestTransparentQuery:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=3, n_points=30)
         db.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -1633,7 +1633,7 @@ class TestTransparentQuery:
 
         # Compress all non-default partitions
         partitions = db.execute(
-            "SELECT partition_name FROM deltax_partition_info('metrics') "
+            "SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
             "WHERE partition_name NOT LIKE '%default%'"
         ).fetchall()
 
@@ -1643,7 +1643,7 @@ class TestTransparentQuery:
             ).fetchone()[0]
             if row_ct == 0:
                 continue
-            db.execute(f"SELECT deltax_compress_partition('{part_name}')")
+            db.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
             db.commit()
 
         # Query AFTER compression
@@ -1664,7 +1664,7 @@ class TestTransparentQuery:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=3, n_points=30)
         db.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -1685,7 +1685,7 @@ class TestTransparentQuery:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=5, n_points=50)
         db.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -1720,7 +1720,7 @@ class TestTransparentQuery:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=10, n_points=100)
         db.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -1761,7 +1761,7 @@ class TestTransparentQuery:
                 val SMALLINT
             )
         """)
-        db.execute("SELECT deltax_create_table('sum_add_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('sum_add_test', 'ts', '1 day'::interval)")
         db.commit()
 
         for i in range(100):
@@ -1780,7 +1780,7 @@ class TestTransparentQuery:
 
         # Enable and compress
         db.execute(
-            "SELECT deltax_enable_compression('sum_add_test', "
+            "SELECT deltax.deltax_enable_compression('sum_add_test', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -1824,7 +1824,7 @@ class TestTransparentQuery:
                 val INT NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('sum_fast', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('sum_fast', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert enough rows so timing is measurable
@@ -1844,7 +1844,7 @@ class TestTransparentQuery:
 
         # Enable and compress
         db.execute(
-            "SELECT deltax_enable_compression('sum_fast', "
+            "SELECT deltax.deltax_enable_compression('sum_fast', "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -1903,7 +1903,7 @@ class TestTransparentQuery:
                 b INT NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('sum_nf_cols', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('sum_nf_cols', 'ts', '1 day'::interval)")
         db.commit()
 
         rows = []
@@ -1918,7 +1918,7 @@ class TestTransparentQuery:
         before = db.execute(q).fetchone()
 
         db.execute(
-            "SELECT deltax_enable_compression('sum_nf_cols', "
+            "SELECT deltax.deltax_enable_compression('sum_nf_cols', "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -1949,7 +1949,7 @@ class TestTransparentQuery:
                 val INT NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('sum_nf_gb', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('sum_nf_gb', 'ts', '1 day'::interval)")
         db.commit()
 
         rows = []
@@ -1968,7 +1968,7 @@ class TestTransparentQuery:
         before = db.execute(q).fetchall()
 
         db.execute(
-            "SELECT deltax_enable_compression('sum_nf_gb', "
+            "SELECT deltax.deltax_enable_compression('sum_nf_gb', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -1998,7 +1998,7 @@ class TestTransparentQuery:
                 val INT
             )
         """)
-        db.execute("SELECT deltax_create_table('sum_nf_mix', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('sum_nf_mix', 'ts', '1 day'::interval)")
         db.commit()
 
         rows = []
@@ -2014,7 +2014,7 @@ class TestTransparentQuery:
         before = db.execute(q).fetchone()
 
         db.execute(
-            "SELECT deltax_enable_compression('sum_nf_mix', "
+            "SELECT deltax.deltax_enable_compression('sum_nf_mix', "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -2032,7 +2032,7 @@ class TestTransparentQuery:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=3, n_points=30)
         db.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -2063,7 +2063,7 @@ class TestTransparentQuery:
 def _compress_all_partitions(conn, table_name):
     """Enable compression and compress all non-empty, non-default partitions."""
     partitions = conn.execute(
-        f"SELECT partition_name FROM deltax_partition_info('{table_name}') "
+        f"SELECT partition_name FROM deltax.deltax_partition_info('{table_name}') "
         "WHERE partition_name NOT LIKE '%default%'"
     ).fetchall()
 
@@ -2073,7 +2073,7 @@ def _compress_all_partitions(conn, table_name):
         ).fetchone()[0]
         if row_ct == 0:
             continue
-        conn.execute(f"SELECT deltax_compress_partition('{part_name}')")
+        conn.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
         conn.commit()
 
 
@@ -2089,7 +2089,7 @@ class TestDatumConversions:
                 label TEXT NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('ts_epoch', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('ts_epoch', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert timestamps at known epoch boundaries — all within the
@@ -2116,7 +2116,7 @@ class TestDatumConversions:
 
         # Compress
         db.execute(
-            "SELECT deltax_enable_compression('ts_epoch', "
+            "SELECT deltax.deltax_enable_compression('ts_epoch', "
             "segment_by => ARRAY['label'], order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -2143,7 +2143,7 @@ class TestDatumConversions:
                 val_date DATE
             )
         """)
-        db.execute("SELECT deltax_create_table('date_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('date_test', 'ts', '1 day'::interval)")
         db.commit()
 
         test_dates = [
@@ -2166,7 +2166,7 @@ class TestDatumConversions:
             "FROM date_test ORDER BY ts"
         ).fetchall()
 
-        db.execute("SELECT deltax_enable_compression('date_test', order_by => ARRAY['ts'])")
+        db.execute("SELECT deltax.deltax_enable_compression('date_test', order_by => ARRAY['ts'])")
         db.commit()
         _compress_all_partitions(db, "date_test")
 
@@ -2191,7 +2191,7 @@ class TestDatumConversions:
                 val_big BIGINT
             )
         """)
-        db.execute("SELECT deltax_create_table('int_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('int_test', 'ts', '1 day'::interval)")
         db.commit()
 
         small_vals = [0, 1, -1, 32767, -32768]
@@ -2214,7 +2214,7 @@ class TestDatumConversions:
             "SELECT val_small, val_int, val_big FROM int_test ORDER BY ts"
         ).fetchall()
 
-        db.execute("SELECT deltax_enable_compression('int_test', order_by => ARRAY['ts'])")
+        db.execute("SELECT deltax.deltax_enable_compression('int_test', order_by => ARRAY['ts'])")
         db.commit()
         _compress_all_partitions(db, "int_test")
 
@@ -2238,7 +2238,7 @@ class TestDatumConversions:
                 val_real REAL
             )
         """)
-        db.execute("SELECT deltax_create_table('float_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('float_test', 'ts', '1 day'::interval)")
         db.commit()
 
         f8_vals = [0.0, 1.0, -1.0, 1e308, -1e308, 1e-307, math.pi]
@@ -2257,7 +2257,7 @@ class TestDatumConversions:
             "SELECT val_f8, val_real FROM float_test ORDER BY ts"
         ).fetchall()
 
-        db.execute("SELECT deltax_enable_compression('float_test', order_by => ARRAY['ts'])")
+        db.execute("SELECT deltax.deltax_enable_compression('float_test', order_by => ARRAY['ts'])")
         db.commit()
         _compress_all_partitions(db, "float_test")
 
@@ -2282,7 +2282,7 @@ class TestDatumConversions:
                 val_bool BOOLEAN
             )
         """)
-        db.execute("SELECT deltax_create_table('bool_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('bool_test', 'ts', '1 day'::interval)")
         db.commit()
 
         bools = [True, False, True, True, False, False, True, False, True, False]
@@ -2298,7 +2298,7 @@ class TestDatumConversions:
             "SELECT val_bool FROM bool_test ORDER BY ts"
         ).fetchall()
 
-        db.execute("SELECT deltax_enable_compression('bool_test', order_by => ARRAY['ts'])")
+        db.execute("SELECT deltax.deltax_enable_compression('bool_test', order_by => ARRAY['ts'])")
         db.commit()
         _compress_all_partitions(db, "bool_test")
 
@@ -2321,7 +2321,7 @@ class TestDatumConversions:
                 val_char CHAR(5)
             )
         """)
-        db.execute("SELECT deltax_create_table('text_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('text_test', 'ts', '1 day'::interval)")
         db.commit()
 
         texts = ["", "hello", "Hello World!", "multi\nline", "a" * 200]
@@ -2344,7 +2344,7 @@ class TestDatumConversions:
             "SELECT val_text, val_varchar, val_char FROM text_test ORDER BY ts"
         ).fetchall()
 
-        db.execute("SELECT deltax_enable_compression('text_test', order_by => ARRAY['ts'])")
+        db.execute("SELECT deltax.deltax_enable_compression('text_test', order_by => ARRAY['ts'])")
         db.commit()
         _compress_all_partitions(db, "text_test")
 
@@ -2370,7 +2370,7 @@ class TestDatumConversions:
                 val_bool BOOLEAN
             )
         """)
-        db.execute("SELECT deltax_create_table('null_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('null_test', 'ts', '1 day'::interval)")
         db.commit()
 
         # Various null patterns: first null, last null, consecutive, sparse
@@ -2400,7 +2400,7 @@ class TestDatumConversions:
             "FROM null_test ORDER BY ts"
         ).fetchall()
 
-        db.execute("SELECT deltax_enable_compression('null_test', order_by => ARRAY['ts'])")
+        db.execute("SELECT deltax.deltax_enable_compression('null_test', order_by => ARRAY['ts'])")
         db.commit()
         _compress_all_partitions(db, "null_test")
 
@@ -2434,9 +2434,9 @@ def _setup_minmax_table(conn):
             device_id TEXT NOT NULL
         )
     """)
-    conn.execute("SELECT deltax_create_table('minmax_test', 'ts', '1 day'::interval)")
+    conn.execute("SELECT deltax.deltax_create_table('minmax_test', 'ts', '1 day'::interval)")
     conn.execute(
-        "SELECT deltax_enable_compression('minmax_test', order_by => ARRAY['ts'])"
+        "SELECT deltax.deltax_enable_compression('minmax_test', order_by => ARRAY['ts'])"
     )
     conn.commit()
 
@@ -2581,9 +2581,9 @@ class TestMinMaxPushdown:
                 value INTEGER NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('minmax_seg', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('minmax_seg', 'ts', '1 day'::interval)")
         db.execute(
-            "SELECT deltax_enable_compression('minmax_seg', "
+            "SELECT deltax.deltax_enable_compression('minmax_seg', "
             "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -2636,21 +2636,21 @@ class TestDMLBlocking:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=3, n_points=20)
         db.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
         db.commit()
 
         partitions = db.execute(
-            "SELECT partition_name FROM deltax_partition_info('metrics') "
+            "SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
             "WHERE range_start <= '2025-01-15'::timestamptz "
             "AND range_end > '2025-01-15'::timestamptz"
         ).fetchall()
         assert len(partitions) > 0
         part_name = partitions[0][0]
 
-        db.execute(f"SELECT deltax_compress_partition('{part_name}')")
+        db.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
         db.commit()
         return part_name
 
@@ -2684,7 +2684,7 @@ class TestDMLBlocking:
         part_name = self._setup_and_compress(db)
 
         # Decompress
-        db.execute(f"SELECT deltax_decompress_partition('{part_name}')")
+        db.execute(f"SELECT deltax.deltax_decompress_partition('{part_name}')")
         db.commit()
 
         # INSERT should work
@@ -2704,7 +2704,7 @@ class TestDMLBlocking:
         setup_metrics_table(db)
         insert_metrics(db, n_devices=2, n_points=10)
         db.execute(
-            "SELECT deltax_enable_compression('metrics', "
+            "SELECT deltax.deltax_enable_compression('metrics', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -2712,17 +2712,17 @@ class TestDMLBlocking:
 
         # Compress only one partition (the 2025-01-15 one)
         partitions = db.execute(
-            "SELECT partition_name FROM deltax_partition_info('metrics') "
+            "SELECT partition_name FROM deltax.deltax_partition_info('metrics') "
             "WHERE range_start <= '2025-01-15'::timestamptz "
             "AND range_end > '2025-01-15'::timestamptz"
         ).fetchall()
         part_name = partitions[0][0]
-        db.execute(f"SELECT deltax_compress_partition('{part_name}')")
+        db.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
         db.commit()
 
         # Find an uncompressed partition to target
         uncompressed = db.execute(
-            "SELECT partition_name, range_start FROM deltax_partition_info('metrics') "
+            "SELECT partition_name, range_start FROM deltax.deltax_partition_info('metrics') "
             "WHERE is_compressed = false AND partition_name NOT LIKE '%default%' "
             "LIMIT 1"
         ).fetchall()
@@ -2760,7 +2760,7 @@ class TestRegressions:
                 big_val BIGINT NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('avg_precision', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('avg_precision', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert rows with large BIGINT values — the sum will exceed f64
@@ -2784,7 +2784,7 @@ class TestRegressions:
 
         # Enable compression and compress
         db.execute(
-            "SELECT deltax_enable_compression('avg_precision', "
+            "SELECT deltax.deltax_enable_compression('avg_precision', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -2823,7 +2823,7 @@ class TestRegressions:
                 value INTEGER NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('order_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('order_test', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert data with interleaved timestamps across devices so that
@@ -2852,7 +2852,7 @@ class TestRegressions:
 
         # Enable compression with segment_by and compress
         db.execute(
-            "SELECT deltax_enable_compression('order_test', "
+            "SELECT deltax.deltax_enable_compression('order_test', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -2899,7 +2899,7 @@ class TestRegressions:
                 val_small SMALLINT
             )
         """)
-        db.execute("SELECT deltax_create_table('sum_meta_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('sum_meta_test', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert data with some NULLs
@@ -2935,7 +2935,7 @@ class TestRegressions:
 
         # Enable compression and compress
         db.execute(
-            "SELECT deltax_enable_compression('sum_meta_test', "
+            "SELECT deltax.deltax_enable_compression('sum_meta_test', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -3026,7 +3026,7 @@ class TestExecCustomScanPaths:
                 temperature DOUBLE PRECISION
             )
         """)
-        db.execute(f"SELECT deltax_create_table('{table_name}', 'ts', '1 day'::interval)")
+        db.execute(f"SELECT deltax.deltax_create_table('{table_name}', 'ts', '1 day'::interval)")
         db.commit()
 
         for d in range(n_devices):
@@ -3040,7 +3040,7 @@ class TestExecCustomScanPaths:
         db.commit()
 
         db.execute(
-            f"SELECT deltax_enable_compression('{table_name}', "
+            f"SELECT deltax.deltax_enable_compression('{table_name}', "
             f"segment_by => ARRAY['device_id'], "
             f"order_by => ARRAY['ts'])"
         )
@@ -3244,7 +3244,7 @@ class TestExecCustomScanPaths:
                 value INTEGER NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('time_prune', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('time_prune', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert data spanning 3 hours
@@ -3256,7 +3256,7 @@ class TestExecCustomScanPaths:
         db.commit()
 
         db.execute(
-            "SELECT deltax_enable_compression('time_prune', "
+            "SELECT deltax.deltax_enable_compression('time_prune', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -3293,7 +3293,7 @@ class TestExecCustomScanPaths:
                 value INTEGER NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('dict_prune', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('dict_prune', 'ts', '1 day'::interval)")
         db.commit()
 
         # Device A: categories all start with "alpha-"
@@ -3311,7 +3311,7 @@ class TestExecCustomScanPaths:
         db.commit()
 
         db.execute(
-            "SELECT deltax_enable_compression('dict_prune', "
+            "SELECT deltax.deltax_enable_compression('dict_prune', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -3352,7 +3352,7 @@ class TestExecCustomScanPaths:
                 value INTEGER NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('phase2_test', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('phase2_test', 'ts', '1 day'::interval)")
         db.commit()
 
         for i in range(200):
@@ -3365,7 +3365,7 @@ class TestExecCustomScanPaths:
         db.commit()
 
         db.execute(
-            "SELECT deltax_enable_compression('phase2_test', "
+            "SELECT deltax.deltax_enable_compression('phase2_test', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -3403,7 +3403,7 @@ class TestExecCustomScanPaths:
                 value INTEGER NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('phase2_skip', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('phase2_skip', 'ts', '1 day'::interval)")
         db.commit()
 
         # Both devices have overlapping value ranges that include the filter
@@ -3431,7 +3431,7 @@ class TestExecCustomScanPaths:
         db.commit()
 
         db.execute(
-            "SELECT deltax_enable_compression('phase2_skip', "
+            "SELECT deltax.deltax_enable_compression('phase2_skip', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -3559,7 +3559,7 @@ class TestMultiPartitionQueries:
                 label TEXT NOT NULL
             )
         """)
-        db.execute(f"SELECT deltax_create_table('{table_name}', 'ts', '1 day'::interval)")
+        db.execute(f"SELECT deltax.deltax_create_table('{table_name}', 'ts', '1 day'::interval)")
         db.commit()
 
         row_id = 0
@@ -3576,7 +3576,7 @@ class TestMultiPartitionQueries:
         db.commit()
 
         db.execute(
-            f"SELECT deltax_enable_compression('{table_name}', "
+            f"SELECT deltax.deltax_enable_compression('{table_name}', "
             f"segment_by => ARRAY['device_id'], "
             f"order_by => ARRAY['ts'])"
         )
@@ -3720,7 +3720,7 @@ class TestDeltaXAppend:
                 value INTEGER NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('append_bug', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('append_bug', 'ts', '1 day'::interval)")
         db.commit()
 
         for day in range(3):
@@ -3733,7 +3733,7 @@ class TestDeltaXAppend:
         db.commit()
 
         db.execute(
-            "SELECT deltax_enable_compression('append_bug', "
+            "SELECT deltax.deltax_enable_compression('append_bug', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -3765,7 +3765,7 @@ class TestDeltaXAppend:
                 value INTEGER NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('append_query', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('append_query', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert 3 days × 50 rows = 150 rows total
@@ -3782,7 +3782,7 @@ class TestDeltaXAppend:
         db.commit()
 
         db.execute(
-            "SELECT deltax_enable_compression('append_query', "
+            "SELECT deltax.deltax_enable_compression('append_query', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -3835,7 +3835,7 @@ class TestTextDecompressionPaths:
                 value INTEGER NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('text_paths', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('text_paths', 'ts', '1 day'::interval)")
         db.commit()
 
         # Insert data with:
@@ -3869,7 +3869,7 @@ class TestTextDecompressionPaths:
         db.commit()
 
         db.execute(
-            "SELECT deltax_enable_compression('text_paths', "
+            "SELECT deltax.deltax_enable_compression('text_paths', "
             "segment_by => ARRAY['device_id'], "
             "order_by => ARRAY['ts'])"
         )
@@ -4071,7 +4071,7 @@ class TestAvgTopNCorrectness:
                 value INTEGER NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('avg_topn', 'ts', '1 day'::interval)")
+        db.execute("SELECT deltax.deltax_create_table('avg_topn', 'ts', '1 day'::interval)")
         db.commit()
 
         # Create groups with different counts and means:
@@ -4121,7 +4121,7 @@ class TestAvgTopNCorrectness:
 
         # Compress
         db.execute(
-            "SELECT deltax_enable_compression('avg_topn', "
+            "SELECT deltax.deltax_enable_compression('avg_topn', "
             "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -4155,7 +4155,7 @@ class TestAvgTopNCorrectness:
         before = db.execute(query).fetchall()
 
         db.execute(
-            "SELECT deltax_enable_compression('avg_topn', "
+            "SELECT deltax.deltax_enable_compression('avg_topn', "
             "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -4183,7 +4183,7 @@ class TestAvgTopNCorrectness:
         before = db.execute(query).fetchall()
 
         db.execute(
-            "SELECT deltax_enable_compression('avg_topn', "
+            "SELECT deltax.deltax_enable_compression('avg_topn', "
             "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -4217,7 +4217,7 @@ class TestAvgTopNCorrectness:
         before = db.execute(query).fetchall()
 
         db.execute(
-            "SELECT deltax_enable_compression('avg_topn', "
+            "SELECT deltax.deltax_enable_compression('avg_topn', "
             "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -4241,7 +4241,7 @@ class TestAvgTopNCorrectness:
             )
         """)
         db.execute(
-            "SELECT deltax_create_table('avg_float_topn', 'ts', '1 day'::interval)"
+            "SELECT deltax.deltax_create_table('avg_float_topn', 'ts', '1 day'::interval)"
         )
         db.commit()
 
@@ -4269,7 +4269,7 @@ class TestAvgTopNCorrectness:
         before = db.execute(query).fetchall()
 
         db.execute(
-            "SELECT deltax_enable_compression('avg_float_topn', "
+            "SELECT deltax.deltax_enable_compression('avg_float_topn', "
             "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -4301,7 +4301,7 @@ class TestLz4Optional:
             )
         """)
         db.execute(
-            "SELECT deltax_create_table('nolz4_metrics', 'ts', '1 day'::interval)"
+            "SELECT deltax.deltax_create_table('nolz4_metrics', 'ts', '1 day'::interval)"
         )
         db.commit()
 
@@ -4322,7 +4322,7 @@ class TestLz4Optional:
         ).fetchall()
 
         db.execute(
-            "SELECT deltax_enable_compression('nolz4_metrics', "
+            "SELECT deltax.deltax_enable_compression('nolz4_metrics', "
             "segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -4377,7 +4377,7 @@ class TestCompressAllPartitions:
             )
         """)
         db.execute(
-            "SELECT deltax_create_table('metrics_cap', 'ts', '1 day'::interval)"
+            "SELECT deltax.deltax_create_table('metrics_cap', 'ts', '1 day'::interval)"
         )
         db.commit()
 
@@ -4395,7 +4395,7 @@ class TestCompressAllPartitions:
             db.commit()
 
         db.execute(
-            "SELECT deltax_enable_compression('metrics_cap', "
+            "SELECT deltax.deltax_enable_compression('metrics_cap', "
             "segment_by => ARRAY['device'], order_by => ARRAY['ts'])"
         )
         db.commit()
@@ -4404,7 +4404,7 @@ class TestCompressAllPartitions:
         """Return {partition_name: (is_compressed, row_count)} from the stats view."""
         rows = db.execute(
             "SELECT partition_name, is_compressed, row_count "
-            "FROM deltax_compression_stats('metrics_cap')"
+            "FROM deltax.deltax_compression_stats('metrics_cap')"
         ).fetchall()
         return {r[0]: (r[1], r[2]) for r in rows}
 
@@ -4414,7 +4414,7 @@ class TestCompressAllPartitions:
         # Jan 15's partition is named metrics_cap_p20250115 (per existing
         # deltax naming convention seen elsewhere in the test suite).
         db.execute(
-            "SELECT deltax_compress_partition('metrics_cap_p20250115')"
+            "SELECT deltax.deltax_compress_partition('metrics_cap_p20250115')"
         )
         db.commit()
 
@@ -4423,7 +4423,7 @@ class TestCompressAllPartitions:
 
         results = db.execute(
             "SELECT partition_name, result "
-            "FROM deltax_compress_all_partitions('metrics_cap')"
+            "FROM deltax.deltax_compress_all_partitions('metrics_cap')"
         ).fetchall()
         db.commit()
 
@@ -4471,7 +4471,7 @@ class TestCompressAllPartitions:
         # and Jan 18 (ends Jan 19) are not eligible.
         results = db.execute(
             "SELECT partition_name "
-            "FROM deltax_compress_all_partitions('metrics_cap', "
+            "FROM deltax.deltax_compress_all_partitions('metrics_cap', "
             "older_than => '2 days'::interval)"
         ).fetchall()
         db.commit()
@@ -4493,7 +4493,7 @@ class TestCompressAllPartitions:
         db.execute(f"SET pg_deltax.mock_now = '{self.T_BACK}'")
 
         results = db.execute(
-            "SELECT * FROM deltax_compress_all_partitions('metrics_cap')"
+            "SELECT * FROM deltax.deltax_compress_all_partitions('metrics_cap')"
         ).fetchall()
         db.commit()
 

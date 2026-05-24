@@ -34,11 +34,11 @@ def _seed_compressed_table(db, n_partitions=4, rows_per_partition=120_000):
         ")"
     )
     db.execute(
-        "SELECT deltax_create_table('events', 'ts', '1 day', %s)",
+        "SELECT deltax.deltax_create_table('events', 'ts', '1 day', %s)",
         (n_partitions - 1,),
     )
     db.execute(
-        "SELECT deltax_enable_compression('events',"
+        "SELECT deltax.deltax_enable_compression('events',"
         "  segment_by => ARRAY['device_id'],"
         "  order_by => ARRAY['ts'])"
     )
@@ -77,7 +77,7 @@ def _seed_compressed_table(db, n_partitions=4, rows_per_partition=120_000):
     # errors on empty partitions).
     partitions = db.execute(
         "SELECT partition_info.partition_name "
-        "FROM deltax_partition_info('events') AS partition_info "
+        "FROM deltax.deltax_partition_info('events') AS partition_info "
         "WHERE EXISTS ("
         "  SELECT 1 FROM pg_class c "
         "  WHERE c.relname = partition_info.partition_name "
@@ -87,7 +87,7 @@ def _seed_compressed_table(db, n_partitions=4, rows_per_partition=120_000):
     for (name,) in partitions:
         cnt = db.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]
         if cnt > 0:
-            db.execute("SELECT deltax_compress_partition(%s)", (name,))
+            db.execute("SELECT deltax.deltax_compress_partition(%s)", (name,))
     db.commit()
 
     # ANALYZE so reltuples gets populated. collect_compressed_children in

@@ -50,7 +50,7 @@ pub fn register_deltatable(
     partition_interval: &pgrx::datum::Interval,
 ) -> spi::SpiResult<i32> {
     let result = client.update(
-        "INSERT INTO deltax_deltatable (schema_name, table_name, time_column, partition_interval)
+        "INSERT INTO deltax.deltax_deltatable (schema_name, table_name, time_column, partition_interval)
          VALUES ($1, $2, $3, $4)
          RETURNING id",
         None,
@@ -74,7 +74,7 @@ pub fn register_partition(
     range_end: TimestampWithTimeZone,
 ) -> spi::SpiResult<()> {
     client.update(
-        "INSERT INTO deltax_partition (deltatable_id, schema_name, table_name, range_start, range_end)
+        "INSERT INTO deltax.deltax_partition (deltatable_id, schema_name, table_name, range_start, range_end)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (schema_name, table_name) DO NOTHING",
         None,
@@ -97,7 +97,7 @@ pub fn get_deltatable(
 ) -> spi::SpiResult<Option<DeltatableInfo>> {
     let result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval
-         FROM deltax_deltatable
+         FROM deltax.deltax_deltatable
          WHERE schema_name = $1 AND table_name = $2",
         None,
         &[schema_name.into(), table_name.into()],
@@ -122,7 +122,7 @@ pub fn get_deltatable_by_id(client: &SpiClient, id: i32) -> spi::SpiResult<Optio
         "SELECT id, schema_name, table_name, time_column, partition_interval,
                 segment_by, order_by, compress_after, drop_after, segment_size,
                 json_extract
-         FROM deltax_deltatable
+         FROM deltax.deltax_deltatable
          WHERE id = $1",
         None,
         &[id.into()],
@@ -183,7 +183,7 @@ pub fn get_all_deltatables(client: &SpiClient) -> spi::SpiResult<Vec<DeltatableI
         "SELECT id, schema_name, table_name, time_column, partition_interval,
                 segment_by, order_by, compress_after, drop_after, segment_size,
                 json_extract
-         FROM deltax_deltatable",
+         FROM deltax.deltax_deltatable",
         None,
         &[],
     )?;
@@ -234,7 +234,7 @@ pub fn get_partitions(
     let result = client.select(
         "SELECT id, deltatable_id, schema_name, table_name, range_start, range_end,
                 is_compressed, compressed_columns
-         FROM deltax_partition
+         FROM deltax.deltax_partition
          WHERE deltatable_id = $1
          ORDER BY range_start",
         None,
@@ -290,7 +290,7 @@ pub fn update_deltatable_compression(
         // are missing the synthetic columns and must fall through to the slow
         // path.
         client.update(
-            "UPDATE deltax_deltatable
+            "UPDATE deltax.deltax_deltatable
              SET segment_by = $1, order_by = $2, segment_size = $3,
                  json_extract = $4, json_extract_added_at = now()
              WHERE id = $5",
@@ -305,7 +305,7 @@ pub fn update_deltatable_compression(
         )?;
     } else {
         client.update(
-            "UPDATE deltax_deltatable
+            "UPDATE deltax.deltax_deltatable
              SET segment_by = $1, order_by = $2, segment_size = $3
              WHERE id = $4",
             None,
@@ -327,7 +327,7 @@ pub fn set_compress_after(
     compress_after: &pgrx::datum::Interval,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE deltax_deltatable SET compress_after = $1 WHERE id = $2",
+        "UPDATE deltax.deltax_deltatable SET compress_after = $1 WHERE id = $2",
         None,
         &[(*compress_after).into(), deltatable_id.into()],
     )?;
@@ -341,7 +341,7 @@ pub fn set_drop_after(
     drop_after: &pgrx::datum::Interval,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE deltax_deltatable SET drop_after = $1 WHERE id = $2",
+        "UPDATE deltax.deltax_deltatable SET drop_after = $1 WHERE id = $2",
         None,
         &[(*drop_after).into(), deltatable_id.into()],
     )?;
@@ -351,7 +351,7 @@ pub fn set_drop_after(
 /// Clear the drop_after interval for a deltatable (remove retention policy).
 pub fn clear_drop_after(client: &mut SpiClient, deltatable_id: i32) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE deltax_deltatable SET drop_after = NULL WHERE id = $1",
+        "UPDATE deltax.deltax_deltatable SET drop_after = NULL WHERE id = $1",
         None,
         &[deltatable_id.into()],
     )?;
@@ -367,7 +367,7 @@ pub fn mark_partition_compressed(
     row_count: i64,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE deltax_partition
+        "UPDATE deltax.deltax_partition
          SET is_compressed = true, compressed_size = $1, raw_size = $2,
              row_count = $3, compressed_at = now()
          WHERE id = $4",
@@ -384,7 +384,7 @@ pub fn mark_partition_compressed(
 
 /// Write a pre-computed per-column ndistinct map (typically from
 /// HLL sketches merged across segments during compression) to the
-/// `deltax_partition.column_ndistinct` JSONB column.
+/// `deltax.deltax_partition.column_ndistinct` JSONB column.
 pub fn update_partition_column_ndistinct_from_map(
     client: &mut SpiClient,
     partition_id: i32,
@@ -399,7 +399,7 @@ pub fn update_partition_column_ndistinct_from_map(
     let json = format!("{{{}}}", parts.join(","));
 
     client.update(
-        "UPDATE deltax_partition SET column_ndistinct = $1::jsonb WHERE id = $2",
+        "UPDATE deltax.deltax_partition SET column_ndistinct = $1::jsonb WHERE id = $2",
         None,
         &[json.into(), partition_id.into()],
     )?;
@@ -435,7 +435,7 @@ pub fn update_partition_column_valmap(
     let json = format!("{{{}}}", parts.join(","));
 
     client.update(
-        "UPDATE deltax_partition SET column_valmap = $1::jsonb WHERE id = $2",
+        "UPDATE deltax.deltax_partition SET column_valmap = $1::jsonb WHERE id = $2",
         None,
         &[json.into(), partition_id.into()],
     )?;
@@ -510,7 +510,7 @@ pub fn update_partition_compressed_columns(
     json: &str,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE deltax_partition SET compressed_columns = $1::jsonb WHERE id = $2",
+        "UPDATE deltax.deltax_partition SET compressed_columns = $1::jsonb WHERE id = $2",
         None,
         &[json.into(), partition_id.into()],
     )?;
@@ -542,7 +542,7 @@ fn json_escape(s: &str) -> String {
 }
 
 /// Compute per-column max ndistinct from the meta table and store the
-/// result as a JSONB map on `deltax_partition.column_ndistinct`. Called
+/// result as a JSONB map on `deltax.deltax_partition.column_ndistinct`. Called
 /// once at the end of compression so that planner-time cost estimation
 /// (see `scan::cost::get_column_ndistinct`) can do a catalog lookup
 /// instead of a cold full-scan of the wide meta table on every fresh
@@ -592,7 +592,7 @@ pub fn update_partition_column_ndistinct(
     let json = format!("{{{}}}", parts.join(","));
 
     client.update(
-        "UPDATE deltax_partition SET column_ndistinct = $1::jsonb WHERE id = $2",
+        "UPDATE deltax.deltax_partition SET column_ndistinct = $1::jsonb WHERE id = $2",
         None,
         &[json.into(), partition_id.into()],
     )?;
@@ -605,7 +605,7 @@ pub fn mark_partition_decompressed(
     partition_id: i32,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE deltax_partition
+        "UPDATE deltax.deltax_partition
          SET is_compressed = false, compressed_size = NULL, raw_size = NULL,
              row_count = NULL, compressed_at = NULL
          WHERE id = $1",
@@ -634,7 +634,7 @@ pub fn install_compressed_dml_trigger(
         &format!(
             "CREATE OR REPLACE TRIGGER deltax_reject_compressed_dml
              BEFORE INSERT OR UPDATE OR DELETE ON {}
-             FOR EACH ROW EXECUTE FUNCTION deltax_reject_compressed_partition_dml()",
+             FOR EACH ROW EXECUTE FUNCTION deltax.deltax_reject_compressed_partition_dml()",
             partition_fqn
         ),
         None,
@@ -670,7 +670,7 @@ pub fn get_partition_by_name(
     let mut result = client.select(
         "SELECT id, deltatable_id, schema_name, table_name, range_start, range_end,
                 is_compressed, compressed_columns
-         FROM deltax_partition
+         FROM deltax.deltax_partition
          WHERE schema_name = $1 AND table_name = $2",
         None,
         &[schema_name.into(), table_name.into()],

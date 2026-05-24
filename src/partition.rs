@@ -104,13 +104,11 @@ pub(crate) fn usec_to_tstz(usec: i64) -> TimestampWithTimeZone {
         .unwrap()
 }
 
-/// Format a fully-qualified table name.
+/// Format a fully-qualified table name. Always emits "schema"."table" — even
+/// for public — so SPI queries resolve under the bgworker's locked
+/// search_path (pg_catalog, pg_temp) where no user schema is on the path.
 pub fn fqn(schema: &str, table: &str) -> String {
-    if schema == "public" {
-        format!("\"{}\"", table)
-    } else {
-        format!("\"{}\".\"{}\"", schema, table)
-    }
+    format!("\"{}\".\"{}\"", schema, table)
 }
 
 /// Create a single partition via SPI.
@@ -215,7 +213,7 @@ pub fn ensure_future_partitions(
 
         // Check if partition already registered
         let exists = client.select(
-            "SELECT 1 FROM deltax_partition WHERE schema_name = $1 AND table_name = $2",
+            "SELECT 1 FROM deltax.deltax_partition WHERE schema_name = $1 AND table_name = $2",
             None,
             &[ht.schema_name.as_str().into(), part_name.as_str().into()],
         )?;
@@ -598,7 +596,7 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
     // Find partitions eligible for dropping: range_end < now() - drop_after
     let eligible = client
         .select(
-            "SELECT schema_name, table_name, is_compressed FROM deltax_partition
+            "SELECT schema_name, table_name, is_compressed FROM deltax.deltax_partition
              WHERE deltatable_id = $1 AND range_end < $2::timestamptz - $3::interval",
             None,
             &[ht.id.into(), now.into(), (*drop_after).into()],
@@ -659,7 +657,7 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
         // Remove from catalog
         client
             .update(
-                "DELETE FROM deltax_partition WHERE schema_name = $1 AND table_name = $2",
+                "DELETE FROM deltax.deltax_partition WHERE schema_name = $1 AND table_name = $2",
                 None,
                 &[schema.as_str().into(), name.as_str().into()],
             )
@@ -677,11 +675,11 @@ mod tests {
     const HOUR: i64 = 3_600_000_000;
 
     #[test]
-    fn fqn_quotes_table_and_omits_public_schema() {
-        // `public.foo` is the implicit search-path default — quoting just the
-        // table mirrors PG's own behaviour and keeps the names readable in
-        // error messages.
-        assert_eq!(fqn("public", "foo"), "\"foo\"");
+    fn fqn_always_schema_qualifies() {
+        // Always emit "schema"."table" — the bgworker runs under a locked
+        // search_path (pg_catalog, pg_temp) so user-schema names must be
+        // explicitly qualified to resolve.
+        assert_eq!(fqn("public", "foo"), "\"public\".\"foo\"");
         assert_eq!(fqn("myschema", "foo"), "\"myschema\".\"foo\"");
         // Embedded uppercase + reserved-ish names — quoting is required.
         assert_eq!(fqn("S", "Tbl"), "\"S\".\"Tbl\"");

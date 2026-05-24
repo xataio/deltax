@@ -33,12 +33,12 @@ def _cleanup(db, table_name):
     db.rollback()
     db.execute("RESET pg_deltax.mock_now")
     db.execute(
-        "DELETE FROM deltax_partition WHERE deltatable_id IN "
-        "(SELECT id FROM deltax_deltatable WHERE table_name = %s)",
+        "DELETE FROM deltax.deltax_partition WHERE deltatable_id IN "
+        "(SELECT id FROM deltax.deltax_deltatable WHERE table_name = %s)",
         (table_name,),
     )
     db.execute(
-        "DELETE FROM deltax_deltatable WHERE table_name = %s", (table_name,)
+        "DELETE FROM deltax.deltax_deltatable WHERE table_name = %s", (table_name,)
     )
     db.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
     db.commit()
@@ -60,12 +60,12 @@ def test_worker_creates_future_partitions(postgres_db):
         # premake=2 → 4 partitions: 1 past + 1 current + 2 future
         #   [June 14-15), [June 15-16), [June 16-17), [June 17-18)
         db.execute(
-            f"SELECT deltax_create_table('{table}', 'ts', '1 day', 2)"
+            f"SELECT deltax.deltax_create_table('{table}', 'ts', '1 day', 2)"
         )
         db.commit()
 
         initial = db.execute(
-            f"SELECT count(*) FROM deltax_partition_info('{table}')"
+            f"SELECT count(*) FROM deltax.deltax_partition_info('{table}')"
         ).fetchone()[0]
         assert initial == 4
 
@@ -83,7 +83,7 @@ def test_worker_creates_future_partitions(postgres_db):
         while time.time() < deadline:
             time.sleep(5)
             new_count = db.execute(
-                f"SELECT count(*) FROM deltax_partition_info('{table}')"
+                f"SELECT count(*) FROM deltax.deltax_partition_info('{table}')"
             ).fetchone()[0]
             db.commit()
             if new_count > initial:
@@ -113,7 +113,7 @@ def test_worker_drains_default_partition(postgres_db):
 
         # premake=1 → 3 partitions: [June 14-15), [June 15-16), [June 16-17)
         db.execute(
-            f"SELECT deltax_create_table('{table}', 'ts', '1 day', 1)"
+            f"SELECT deltax.deltax_create_table('{table}', 'ts', '1 day', 1)"
         )
         db.commit()
 
@@ -175,7 +175,7 @@ def test_worker_retention_drops_old_partitions(postgres_db):
         # premake=2 → 4 partitions:
         #   [June 14-15), [June 15-16), [June 16-17), [June 17-18)
         db.execute(
-            f"SELECT deltax_create_table('{table}', 'ts', '1 day', 2)"
+            f"SELECT deltax.deltax_create_table('{table}', 'ts', '1 day', 2)"
         )
         db.commit()
 
@@ -193,14 +193,14 @@ def test_worker_retention_drops_old_partitions(postgres_db):
         initial_partitions = {
             row[0]
             for row in db.execute(
-                f"SELECT partition_name FROM deltax_partition_info('{table}')"
+                f"SELECT partition_name FROM deltax.deltax_partition_info('{table}')"
             ).fetchall()
         }
         assert len(initial_partitions) == 4
 
         # Set retention policy: drop partitions older than 3 days
         db.execute(
-            f"SELECT deltax_set_retention('{table}', '3 days')"
+            f"SELECT deltax.deltax_set_retention('{table}', '3 days')"
         )
         db.commit()
 
@@ -222,7 +222,7 @@ def test_worker_retention_drops_old_partitions(postgres_db):
             current_partitions = {
                 row[0]
                 for row in db.execute(
-                    f"SELECT partition_name FROM deltax_partition_info('{table}')"
+                    f"SELECT partition_name FROM deltax.deltax_partition_info('{table}')"
                 ).fetchall()
             }
             db.commit()

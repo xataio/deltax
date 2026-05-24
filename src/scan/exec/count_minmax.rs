@@ -143,7 +143,7 @@ pub(crate) unsafe extern "C-unwind" fn create_count_scan_state(
 
 /// BeginCustomScan callback for DeltaXCount: sum total row count across partitions.
 ///
-/// Fast path: read per-partition `row_count` from `deltax_partition` catalog
+/// Fast path: read per-partition `row_count` from `deltax.deltax_partition` catalog
 /// (cached thread-locally in `cost::get_row_count`). Since compressed partitions
 /// are read-only, the catalog value is exact. Segment count for EXPLAIN is
 /// approximated via `pg_class.reltuples` on the meta relation (one row per segment).
@@ -166,7 +166,7 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
         let (companion_oids, after_oids) = parse_companion_oids(custom_private, "DeltaXCount");
         let qual_bytes = parse_trailing_qual_bytes(custom_private, after_oids);
 
-        // Fast path: no WHERE → sum `deltax_partition.row_count` from
+        // Fast path: no WHERE → sum `deltax.deltax_partition.row_count` from
         // the catalog (one lookup per companion, no segment I/O).
         let t0 = Instant::now();
         let mut catalog_total: i64 = 0;

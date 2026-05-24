@@ -79,10 +79,10 @@ if grep 'ERROR' load_out.txt; then
 fi
 
 # Set up partitioning — mock_now must be set before deltax_create_table
-sudo -u postgres psql "$DB" -t -c "SET pg_deltax.mock_now = '2013-07-01 12:00:00'; SELECT deltax_create_table('hits', 'eventtime', '3 days'::interval, 15)"
+sudo -u postgres psql "$DB" -t -c "SET pg_deltax.mock_now = '2013-07-01 12:00:00'; SELECT deltax.deltax_create_table('hits', 'eventtime', '3 days'::interval, 15)"
 
 # Enable compression before loading (required for direct backfill)
-sudo -u postgres psql "$DB" -t -c "SELECT deltax_enable_compression('hits', order_by => ARRAY['counterid', 'userid', 'eventtime'], segment_size => 30000)"
+sudo -u postgres psql "$DB" -t -c "SELECT deltax.deltax_enable_compression('hits', order_by => ARRAY['counterid', 'userid', 'eventtime'], segment_size => 30000)"
 
 # Direct backfill: load and compress in a single pass using FORMAT deltax_compress
 LOAD_START=$(date +%s)
@@ -104,7 +104,7 @@ VACUUM_END=$(date +%s)
 echo "Vacuum time: $((VACUUM_END - VACUUM_START))s"
 
 # Capture data size (bytes)
-DATA_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT deltax_table_size('hits')")
+DATA_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT deltax.deltax_table_size('hits')")
 echo "Data size: $DATA_SIZE bytes ($(echo "$DATA_SIZE / 1024 / 1024 / 1024" | bc -l | xargs printf '%.2f') GB)"
 
 # Save load stats for the bench target to pick up later
@@ -120,7 +120,7 @@ sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '256MB'"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET jit TO off"
 
 # Report partition and compression info
-sudo -u postgres psql "$DB" -c "SELECT * FROM deltax_partition_info('hits')"
+sudo -u postgres psql "$DB" -c "SELECT * FROM deltax.deltax_partition_info('hits')"
 sudo -u postgres psql "$DB" -c "SELECT count(*) AS default_partition_rows FROM hits_default"
 
 echo "Setup complete. Database '$DB' is ready."

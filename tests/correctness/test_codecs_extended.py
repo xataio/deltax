@@ -25,14 +25,14 @@ def _compress_all_non_empty_partitions(conn, table_name):
     partitions = conn.execute(
         f"""
         SELECT partition_name
-        FROM deltax_partition_info('{table_name}')
+        FROM deltax.deltax_partition_info('{table_name}')
         ORDER BY partition_name
         """
     ).fetchall()
     for (partition_name,) in partitions:
         row_count = conn.execute(f'SELECT count(*) FROM "{partition_name}"').fetchone()[0]
         if row_count > 0:
-            conn.execute("SELECT deltax_compress_partition(%s)", (partition_name,))
+            conn.execute("SELECT deltax.deltax_compress_partition(%s)", (partition_name,))
 
 
 @pytest.fixture()
@@ -49,9 +49,9 @@ def fallback_type_matrix(db):
             )
             """
         )
-    db.execute("SELECT deltax_create_table('fallback_type_matrix', 'ts', '1 day'::interval, 3)")
+    db.execute("SELECT deltax.deltax_create_table('fallback_type_matrix', 'ts', '1 day'::interval, 3)")
     db.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         "'fallback_type_matrix', segment_by => ARRAY[]::text[], "
         "order_by => ARRAY['ts', 'id'], segment_size => 4)"
     )
@@ -129,9 +129,9 @@ def test_direct_csv_backfill_quoted_text_edges_match_plain_postgres(db):
             )
             """
         )
-    db.execute("SELECT deltax_create_table('csv_text_edges', 'ts', '1 day'::interval, 3)")
+    db.execute("SELECT deltax.deltax_create_table('csv_text_edges', 'ts', '1 day'::interval, 3)")
     db.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         "'csv_text_edges', segment_by => ARRAY[]::text[], "
         "order_by => ARRAY['ts', 'id'], segment_size => 2)"
     )
@@ -175,9 +175,9 @@ def test_direct_backfill_malformed_input_rolls_back_cleanly(db):
         )
         """
     )
-    db.execute("SELECT deltax_create_table('malformed_direct', 'ts', '1 day'::interval, 3)")
+    db.execute("SELECT deltax.deltax_create_table('malformed_direct', 'ts', '1 day'::interval, 3)")
     db.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         "'malformed_direct', segment_by => ARRAY[]::text[], "
         "order_by => ARRAY['ts', 'id'], segment_size => 2)"
     )
@@ -206,9 +206,9 @@ def test_float_special_nan_compression_regression(db):
         )
         """
     )
-    db.execute("SELECT deltax_create_table('float_special_nan', 'ts', '1 day'::interval, 3)")
+    db.execute("SELECT deltax.deltax_create_table('float_special_nan', 'ts', '1 day'::interval, 3)")
     db.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         "'float_special_nan', segment_by => ARRAY[]::text[], "
         "order_by => ARRAY['ts', 'id'], segment_size => 2)"
     )
@@ -224,11 +224,11 @@ def test_float_special_nan_compression_regression(db):
     partition_name = db.execute(
         """
         SELECT partition_name
-        FROM deltax_partition_info('float_special_nan')
+        FROM deltax.deltax_partition_info('float_special_nan')
         WHERE range_start = '2025-01-20 00:00:00+00'
         """
     ).fetchone()[0]
-    db.execute("SELECT deltax_compress_partition(%s)", (partition_name,))
+    db.execute("SELECT deltax.deltax_compress_partition(%s)", (partition_name,))
 
 
 @pytest.mark.xfail(strict=True, reason="direct backfill currently mis-restores NULL segment_by values")
@@ -245,9 +245,9 @@ def test_direct_backfill_null_segment_by_regression(db):
             )
             """
         )
-    db.execute("SELECT deltax_create_table('direct_null_segment', 'ts', '1 day'::interval, 3)")
+    db.execute("SELECT deltax.deltax_create_table('direct_null_segment', 'ts', '1 day'::interval, 3)")
     db.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         "'direct_null_segment', segment_by => ARRAY['device_id'], "
         "order_by => ARRAY['ts', 'id'], segment_size => 3)"
     )
@@ -288,9 +288,9 @@ def test_numeric_fallback_type_regression(db):
             )
             """
         )
-    db.execute("SELECT deltax_create_table('numeric_fallback', 'ts', '1 day'::interval, 3)")
+    db.execute("SELECT deltax.deltax_create_table('numeric_fallback', 'ts', '1 day'::interval, 3)")
     db.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         "'numeric_fallback', segment_by => ARRAY[]::text[], "
         "order_by => ARRAY['ts', 'id'], segment_size => 2)"
     )
@@ -313,11 +313,11 @@ def test_numeric_fallback_type_regression(db):
     partition_name = db.execute(
         """
         SELECT partition_name
-        FROM deltax_partition_info('numeric_fallback')
+        FROM deltax.deltax_partition_info('numeric_fallback')
         WHERE range_start = '2025-01-20 00:00:00+00'
         """
     ).fetchone()[0]
-    db.execute("SELECT deltax_compress_partition(%s)", (partition_name,))
+    db.execute("SELECT deltax.deltax_compress_partition(%s)", (partition_name,))
     assert_query_case(
         db,
         QueryCase(
@@ -346,9 +346,9 @@ def test_time_fallback_type_regression(db):
             )
             """
         )
-    db.execute("SELECT deltax_create_table('time_fallback', 'ts', '1 day'::interval, 3)")
+    db.execute("SELECT deltax.deltax_create_table('time_fallback', 'ts', '1 day'::interval, 3)")
     db.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         "'time_fallback', segment_by => ARRAY[]::text[], "
         "order_by => ARRAY['ts', 'id'], segment_size => 2)"
     )
@@ -365,11 +365,11 @@ def test_time_fallback_type_regression(db):
     partition_name = db.execute(
         """
         SELECT partition_name
-        FROM deltax_partition_info('time_fallback')
+        FROM deltax.deltax_partition_info('time_fallback')
         WHERE range_start = '2025-01-20 00:00:00+00'
         """
     ).fetchone()[0]
-    db.execute("SELECT deltax_compress_partition(%s)", (partition_name,))
+    db.execute("SELECT deltax.deltax_compress_partition(%s)", (partition_name,))
     assert_query_case(
         db,
         QueryCase(
@@ -398,9 +398,9 @@ def test_uuid_fallback_type_regression(db):
             )
             """
         )
-    db.execute("SELECT deltax_create_table('uuid_fallback', 'ts', '1 day'::interval, 3)")
+    db.execute("SELECT deltax.deltax_create_table('uuid_fallback', 'ts', '1 day'::interval, 3)")
     db.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         "'uuid_fallback', segment_by => ARRAY[]::text[], "
         "order_by => ARRAY['ts', 'id'], segment_size => 2)"
     )
@@ -417,11 +417,11 @@ def test_uuid_fallback_type_regression(db):
     partition_name = db.execute(
         """
         SELECT partition_name
-        FROM deltax_partition_info('uuid_fallback')
+        FROM deltax.deltax_partition_info('uuid_fallback')
         WHERE range_start = '2025-01-20 00:00:00+00'
         """
     ).fetchone()[0]
-    db.execute("SELECT deltax_compress_partition(%s)", (partition_name,))
+    db.execute("SELECT deltax.deltax_compress_partition(%s)", (partition_name,))
     assert_query_case(
         db,
         QueryCase(
@@ -450,9 +450,9 @@ def test_bytea_fallback_type_regression(db):
             )
             """
         )
-    db.execute("SELECT deltax_create_table('bytea_fallback', 'ts', '1 day'::interval, 3)")
+    db.execute("SELECT deltax.deltax_create_table('bytea_fallback', 'ts', '1 day'::interval, 3)")
     db.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         "'bytea_fallback', segment_by => ARRAY[]::text[], "
         "order_by => ARRAY['ts', 'id'], segment_size => 2)"
     )
@@ -469,11 +469,11 @@ def test_bytea_fallback_type_regression(db):
     partition_name = db.execute(
         """
         SELECT partition_name
-        FROM deltax_partition_info('bytea_fallback')
+        FROM deltax.deltax_partition_info('bytea_fallback')
         WHERE range_start = '2025-01-20 00:00:00+00'
         """
     ).fetchone()[0]
-    db.execute("SELECT deltax_compress_partition(%s)", (partition_name,))
+    db.execute("SELECT deltax.deltax_compress_partition(%s)", (partition_name,))
     assert_query_case(
         db,
         QueryCase(
@@ -504,9 +504,9 @@ def test_decompress_recompress_round_trip_matches_plain_postgres(db):
             )
             """
         )
-    db.execute("SELECT deltax_create_table('round_trip', 'ts', '1 day'::interval, 3)")
+    db.execute("SELECT deltax.deltax_create_table('round_trip', 'ts', '1 day'::interval, 3)")
     db.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         "'round_trip', segment_by => ARRAY['device_id'], "
         "order_by => ARRAY['ts', 'id'], segment_size => 3)"
     )
@@ -524,13 +524,13 @@ def test_decompress_recompress_round_trip_matches_plain_postgres(db):
     partition_name = db.execute(
         """
         SELECT partition_name
-        FROM deltax_partition_info('round_trip')
+        FROM deltax.deltax_partition_info('round_trip')
         WHERE range_start = '2025-01-20 00:00:00+00'
         """
     ).fetchone()[0]
 
-    db.execute("SELECT deltax_compress_partition(%s)", (partition_name,))
-    db.execute("SELECT deltax_decompress_partition(%s)", (partition_name,))
+    db.execute("SELECT deltax.deltax_compress_partition(%s)", (partition_name,))
+    db.execute("SELECT deltax.deltax_decompress_partition(%s)", (partition_name,))
     assert_query_case(
         db,
         QueryCase(
@@ -546,7 +546,7 @@ def test_decompress_recompress_round_trip_matches_plain_postgres(db):
         deltax_table="round_trip",
     )
 
-    db.execute("SELECT deltax_compress_partition(%s)", (partition_name,))
+    db.execute("SELECT deltax.deltax_compress_partition(%s)", (partition_name,))
     assert_query_case(
         db,
         QueryCase(
@@ -577,9 +577,9 @@ def test_mixed_regular_and_direct_backfill_partitions_match_plain_postgres(db):
             )
             """
         )
-    db.execute("SELECT deltax_create_table('mixed_load_paths', 'ts', '1 day'::interval, 3)")
+    db.execute("SELECT deltax.deltax_create_table('mixed_load_paths', 'ts', '1 day'::interval, 3)")
     db.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         "'mixed_load_paths', segment_by => ARRAY['device_id'], "
         "order_by => ARRAY['ts', 'id'], segment_size => 3)"
     )
@@ -603,11 +603,11 @@ def test_mixed_regular_and_direct_backfill_partitions_match_plain_postgres(db):
     partition_name = db.execute(
         """
         SELECT partition_name
-        FROM deltax_partition_info('mixed_load_paths')
+        FROM deltax.deltax_partition_info('mixed_load_paths')
         WHERE range_start = '2025-01-21 00:00:00+00'
         """
     ).fetchone()[0]
-    db.execute("SELECT deltax_compress_partition(%s)", (partition_name,))
+    db.execute("SELECT deltax.deltax_compress_partition(%s)", (partition_name,))
     db.execute("ANALYZE mixed_load_paths_plain")
     db.execute("ANALYZE mixed_load_paths")
 

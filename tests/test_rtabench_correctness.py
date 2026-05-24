@@ -79,7 +79,7 @@ def _create_schema(db):
     db.commit()
 
     db.execute(
-        "SELECT deltax_create_table('order_events', 'event_created', "
+        "SELECT deltax.deltax_create_table('order_events', 'event_created', "
         "'1 day'::interval, 20)"
     )
     # Small segment_size exercises multi-segment paths on a tiny dataset.
@@ -88,7 +88,7 @@ def _create_schema(db):
     # planner_hook walker can rewrite chain Exprs to synthetic-Var refs
     # and DeltaXAgg picks those queries up directly.
     db.execute(
-        "SELECT deltax_enable_compression('order_events', "
+        "SELECT deltax.deltax_enable_compression('order_events', "
         "order_by => ARRAY['order_id','event_created'], segment_size => 100, "
         "json_extract => '[{\"src\":\"event_payload\","
         "\"path\":[\"terminal\"],\"name\":\"x_terminal\",\"type\":\"text\"}]'::jsonb)"
@@ -390,9 +390,9 @@ def test_jsonb_scan_low_cardinality_dict_encoding(db):
     db.execute(
         "CREATE TABLE je (ts timestamptz NOT NULL, payload jsonb NOT NULL)"
     )
-    db.execute("SELECT deltax_create_table('je', 'ts', '1 day'::interval, 5)")
+    db.execute("SELECT deltax.deltax_create_table('je', 'ts', '1 day'::interval, 5)")
     db.execute(
-        "SELECT deltax_enable_compression('je', "
+        "SELECT deltax.deltax_enable_compression('je', "
         "order_by => ARRAY['ts'], segment_size => 200)"
     )
     db.commit()
@@ -440,7 +440,7 @@ def test_compression_actually_happened(rtabench_db):
     comparing plain PG to plain PG and prove nothing."""
     db = rtabench_db
     compressed = db.execute(
-        "SELECT count(*) FROM deltax_compression_stats('order_events') "
+        "SELECT count(*) FROM deltax.deltax_compression_stats('order_events') "
         "WHERE is_compressed = true AND row_count > 0"
     ).fetchone()[0]
     assert compressed > 0, (

@@ -15,13 +15,13 @@ def _setup_table(db, table_name="backfill", interval="1 day", segment_by=None, o
     )
     db.commit()
 
-    db.execute(f"SELECT deltax_create_table('{table_name}', 'ts', '{interval}')")
+    db.execute(f"SELECT deltax.deltax_create_table('{table_name}', 'ts', '{interval}')")
     db.commit()
 
     seg_by = f"ARRAY{segment_by}" if segment_by else "ARRAY[]::text[]"
     ord_by = f"ARRAY{order_by}" if order_by else "ARRAY['ts']"
     db.execute(
-        f"SELECT deltax_enable_compression('{table_name}', segment_by => {seg_by}, order_by => {ord_by})"
+        f"SELECT deltax.deltax_enable_compression('{table_name}', segment_by => {seg_by}, order_by => {ord_by})"
     )
     db.commit()
 
@@ -90,7 +90,7 @@ def test_multi_partition(db):
 
     # Check compression stats - at least 2 partitions should be compressed
     stats = db.execute(
-        "SELECT partition_name, is_compressed, row_count FROM deltax_compression_stats('backfill') WHERE is_compressed = true"
+        "SELECT partition_name, is_compressed, row_count FROM deltax.deltax_compression_stats('backfill') WHERE is_compressed = true"
     ).fetchall()
     assert len(stats) >= 2
 
@@ -147,7 +147,7 @@ def test_compression_not_enabled_error(db):
         "CREATE TABLE nocomp (ts TIMESTAMPTZ NOT NULL, device TEXT, value FLOAT8)"
     )
     db.commit()
-    db.execute("SELECT deltax_create_table('nocomp', 'ts')")
+    db.execute("SELECT deltax.deltax_create_table('nocomp', 'ts')")
     db.commit()
 
     now = datetime.now(timezone.utc).replace(microsecond=0)

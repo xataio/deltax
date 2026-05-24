@@ -59,7 +59,7 @@ unsafe fn cached_companion_for_rel(rel_oid: pg_sys::Oid) -> pg_sys::Oid {
 
 /// Look up the deltatable's `(time_column, segment_by[])` configuration
 /// for a parent relation OID, cached thread-locally. Returns `None` if
-/// the relation isn't registered in `deltax_deltatable`.
+/// the relation isn't registered in `deltax.deltax_deltatable`.
 unsafe fn get_meta_cols(parent_oid: pg_sys::Oid) -> Option<(String, Vec<String>)> {
     if let Some(v) = META_COLS_CACHE.with(|cache| cache.borrow().get(&parent_oid).cloned()) {
         if v.0.is_empty() {
@@ -88,7 +88,7 @@ unsafe fn get_meta_cols(parent_oid: pg_sys::Oid) -> Option<(String, Vec<String>)
             let row = client
                 .select(
                     "SELECT time_column, coalesce(segment_by, ARRAY[]::text[]) \
-                     FROM deltax_deltatable WHERE schema_name = $1 AND table_name = $2",
+                     FROM deltax.deltax_deltatable WHERE schema_name = $1 AND table_name = $2",
                     Some(1),
                     &[schema.clone().into(), table.clone().into()],
                 )
@@ -479,7 +479,7 @@ unsafe fn extract_topn_info(
 /// `WHERE order_id = N` as returning "maybe 1 row" even though
 /// pg_statistic.stadistinct is populated correctly.
 ///
-/// Injecting the true row count here (from `deltax_partition.row_count`
+/// Injecting the true row count here (from `deltax.deltax_partition.row_count`
 /// via `cost::get_row_count`) feeds the post-hook selectivity math
 /// properly: `rel->rows = row_count * eq_selectivity`.
 #[pg_guard]
@@ -802,7 +802,7 @@ fn is_minmax_meta_type(col_type_oid: pg_sys::Oid) -> bool {
 
 /// Half-open time interval `[lo, hi)` in PG-epoch microseconds
 /// (the internal TIMESTAMPTZ representation — same units as the
-/// `deltax_partition.range_start/range_end` datums and the `Const`
+/// `deltax.deltax_partition.range_start/range_end` datums and the `Const`
 /// values extracted from WHERE clauses).
 ///
 /// `None` on either side means unbounded; combining multiple quals
@@ -946,7 +946,7 @@ unsafe fn classify_meta_qual_node(
             pg_sys::TIMESTAMPTZOID | pg_sys::TIMESTAMPOID | pg_sys::DATEOID
         ) {
             // Only the internal-i64-encoded time types are comparable
-            // to our `deltax_partition.range_start/range_end` datums.
+            // to our `deltax.deltax_partition.range_start/range_end` datums.
             return false;
         }
         let v = (*c).constvalue.value() as i64;
@@ -1035,7 +1035,7 @@ unsafe fn partitions_contain_time_range(
             let names_array: Vec<&str> = part_names.iter().map(|s| s.as_str()).collect();
             let tuples = client
                 .select(
-                    "SELECT range_start, range_end FROM deltax_partition \
+                    "SELECT range_start, range_end FROM deltax.deltax_partition \
                      WHERE table_name = ANY($1)",
                     None,
                     &[names_array.into()],
@@ -2000,7 +2000,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         // =====================================================================
         // Fast path: Single COUNT(*) with no GROUP BY, no HAVING → DeltaXCount
         //
-        // - No WHERE:  catalog lookup of `deltax_partition.row_count`.
+        // - No WHERE:  catalog lookup of `deltax.deltax_partition.row_count`.
         // - With WHERE, if every qual is a time-column range/equality
         //   or segment-by equality, serialize the quals into the path
         //   and prune at segment level inside the executor. Otherwise
