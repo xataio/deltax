@@ -217,6 +217,9 @@ pub(super) struct ParallelMixedConfig<'a> {
     /// `segment_skippable_by_dict` so it can find each queried column's
     /// blob slot without re-counting from segment_by names.
     pub(super) blob_idx: &'a [Option<u16>],
+    /// Pre-computed missing-value datums for columns added after this
+    /// partition was compressed (see `MetadataInfo.missing_values`).
+    pub(super) missing_values: &'a [Option<(pg_sys::Datum, bool)>],
     pub(super) needed_cols: &'a [bool],
     pub(super) batch_quals: &'a [BatchQual],
     pub(super) seg_filters: &'a [(usize, String)],
@@ -251,6 +254,11 @@ pub(super) struct ParallelMixedConfig<'a> {
     /// `global_id` without further coordination.
     pub(super) dict_distinct_remaps: &'a std::collections::HashMap<usize, DictDistinctRemap>,
 }
+
+// SAFETY: see equivalent impl on `ParallelCompactConfig` for the
+// `missing_values` Datum-pointer lifetime argument.
+unsafe impl Send for ParallelMixedConfig<'_> {}
+unsafe impl Sync for ParallelMixedConfig<'_> {}
 
 // TextQualInfo is now in text_col.rs
 
@@ -741,28 +749,30 @@ pub(super) fn process_segments_mixed(
             })
             .collect();
 
-        // Decompress needed columns
+        // Decompress needed columns. `config.blob_idx[col_idx]` is the
+        // persisted `_col_idx` slot in `compressed_blobs`; `None` means
+        // either the column is `segment_by` (value in `_meta`) or was
+        // added after this partition was compressed (synthesize from
+        // `config.missing_values[col_idx]`).
         let t_dec = Instant::now();
         let mut numeric_cols: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
         let mut text_seg_cols: Vec<Option<SegTextColumn>> = Vec::new();
-        let mut blob_idx = 0;
         let mut seg_val_idx = 0;
 
         for (col_idx, col_name) in config.col_names.iter().enumerate() {
             let type_oid = config.col_types[col_idx];
+            let is_segment_by = config.segment_by.contains(col_name);
 
             if !config.needed_cols[col_idx] {
-                if config.segment_by.contains(col_name) {
+                if is_segment_by {
                     seg_val_idx += 1;
-                } else {
-                    blob_idx += 1;
                 }
                 numeric_cols.push(Vec::new());
                 text_seg_cols.push(None);
                 continue;
             }
 
-            if config.segment_by.contains(col_name) {
+            if is_segment_by {
                 if config.text_group_col_flags[col_idx] {
                     // Text segment-by column
                     let val = &seg.segment_values[seg_val_idx];
@@ -781,37 +791,51 @@ pub(super) fn process_segments_mixed(
                     text_seg_cols.push(None);
                 }
                 seg_val_idx += 1;
-            } else if config
-                .sidecar_only_cols
-                .get(col_idx)
-                .copied()
-                .unwrap_or(false)
-            {
-                // Text column in sidecar-only mode: main blob wasn't loaded;
-                // decode the length sidecar instead.
-                let sidecar_blob = &seg.text_length_blobs[blob_idx];
-                text_seg_cols.push(decompress_length_sidecar(sidecar_blob));
-                numeric_cols.push(Vec::new());
-                blob_idx += 1;
-            } else {
-                let blob = &seg.compressed_blobs[blob_idx];
-                if config.text_group_col_flags[col_idx] {
-                    // Text GROUP BY column — decompress to SegTextColumn
-                    text_seg_cols.push(decompress_text_to_seg_col(blob));
+            } else if let Some(slot) = config.blob_idx[col_idx] {
+                let slot = slot as usize;
+                if config
+                    .sidecar_only_cols
+                    .get(col_idx)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    // Text column in sidecar-only mode: main blob wasn't loaded;
+                    // decode the length sidecar instead.
+                    let sidecar_blob = &seg.text_length_blobs[slot];
+                    text_seg_cols.push(decompress_length_sidecar(sidecar_blob));
                     numeric_cols.push(Vec::new());
-                } else if skip_numeric_decompress[col_idx] {
-                    numeric_cols.push(Vec::new());
-                    text_seg_cols.push(None);
-                } else if is_numeric_type(type_oid) {
-                    // Numeric column
-                    numeric_cols.push(decompress_numeric_blob(blob, type_oid));
-                    text_seg_cols.push(None);
                 } else {
-                    // Text column needed only for WHERE qual (not GROUP BY)
-                    text_seg_cols.push(decompress_text_to_seg_col(blob));
-                    numeric_cols.push(Vec::new());
+                    let blob = &seg.compressed_blobs[slot];
+                    if config.text_group_col_flags[col_idx] {
+                        // Text GROUP BY column — decompress to SegTextColumn
+                        text_seg_cols.push(decompress_text_to_seg_col(blob));
+                        numeric_cols.push(Vec::new());
+                    } else if skip_numeric_decompress[col_idx] {
+                        numeric_cols.push(Vec::new());
+                        text_seg_cols.push(None);
+                    } else if is_numeric_type(type_oid) {
+                        // Numeric column
+                        numeric_cols.push(decompress_numeric_blob(blob, type_oid));
+                        text_seg_cols.push(None);
+                    } else {
+                        // Text column needed only for WHERE qual (not GROUP BY)
+                        text_seg_cols.push(decompress_text_to_seg_col(blob));
+                        numeric_cols.push(Vec::new());
+                    }
                 }
-                blob_idx += 1;
+            } else {
+                // Column added after this partition was compressed —
+                // synthesize from the pre-computed missing value.
+                let (datum, is_null) = config
+                    .missing_values
+                    .get(col_idx)
+                    .copied()
+                    .flatten()
+                    .unwrap_or((pg_sys::Datum::from(0usize), true));
+                let repeated: Vec<(pg_sys::Datum, bool)> =
+                    (0..seg.row_count).map(|_| (datum, is_null)).collect();
+                numeric_cols.push(repeated);
+                text_seg_cols.push(None);
             }
         }
         // Build regex-transformed text columns for GROUP BY keys (separate from originals,
@@ -3393,6 +3417,7 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             col_types: &meta.col_types,
             segment_by: &meta.segment_by,
             blob_idx: &meta.blob_idx,
+            missing_values: &meta.missing_values,
             needed_cols,
             batch_quals,
             seg_filters,

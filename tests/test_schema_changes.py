@@ -215,17 +215,6 @@ class TestAddColumnTransparent:
         assert len(rows) == total
         assert all(r[0] == 7 for r in rows)
 
-    @pytest.mark.xfail(
-        reason="Known limitation: filter pushdown on a column added after "
-        "compression routes through the aggregate compact/mixed paths "
-        "(scan/exec/agg/), which still derive `_col_idx` positionally "
-        "from `col_names` + `segment_by` instead of consulting "
-        "MetadataInfo.blob_idx. Fix: thread `&meta.blob_idx` and "
-        "`&meta.missing_values` through Parallel*Config / Serial* — "
-        "same shape as the basic decompress path. Tracked in "
-        "dev/docs/SCHEMA_CHANGES.md Future Work.",
-        strict=True,
-    )
     def test_filter_on_added_column(self, db):
         part_name, total = setup_and_compress(db)
 
@@ -243,6 +232,40 @@ class TestAddColumnTransparent:
             f'SELECT count(*) FROM "{part_name}" WHERE bucket = 999'
         ).fetchone()[0]
         assert miss == 0
+
+    def test_aggregate_on_added_column(self, db):
+        """sum/avg/min/max on a column added after compression should
+        return the constant default repeated for every row — i.e. the
+        agg path is consulting MetadataInfo.missing_values for the
+        synthesized datum."""
+        part_name, total = setup_and_compress(db)
+
+        db.execute("ALTER TABLE metrics ADD COLUMN bucket INT DEFAULT 5")
+        db.commit()
+
+        row = db.execute(
+            f'SELECT count(*), sum(bucket), avg(bucket), min(bucket), max(bucket) '
+            f'FROM "{part_name}"'
+        ).fetchone()
+        assert row[0] == total
+        assert row[1] == 5 * total
+        assert float(row[2]) == 5.0
+        assert row[3] == 5
+        assert row[4] == 5
+
+    def test_group_by_added_column(self, db):
+        """GROUP BY on a column added after compression should produce a
+        single group whose key is the synthesized default."""
+        part_name, total = setup_and_compress(db)
+
+        db.execute("ALTER TABLE metrics ADD COLUMN bucket INT DEFAULT 5")
+        db.commit()
+
+        groups = db.execute(
+            f'SELECT bucket, count(*) FROM "{part_name}" '
+            f'GROUP BY bucket ORDER BY bucket'
+        ).fetchall()
+        assert groups == [(5, total)]
 
     def test_select_existing_columns_unchanged_after_add(self, db):
         """ADD COLUMN must not perturb reads of pre-existing columns."""

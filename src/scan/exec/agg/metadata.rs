@@ -604,30 +604,43 @@ pub(super) unsafe fn accumulate_segment_decompressed(
     }
 
     // Decompress needed columns. Map col_idx → decompressed datums.
+    // For columns added after this partition was compressed
+    // (`meta.blob_idx[col_idx] == None && !segment_by`), synthesize from
+    // `meta.missing_values[col_idx]` — a single constant Datum repeated
+    // `row_count` times so qual evaluation downstream behaves identically
+    // to a real decompressed column.
     let mut decompressed: HashMap<usize, Vec<(pg_sys::Datum, bool)>> = HashMap::new();
     for &col_idx in &col_indices {
         let col_name = &meta.col_names[col_idx];
         if meta.segment_by.contains(col_name) {
             continue; // segment_by columns are not in compressed_blobs
         }
-        // Compute blob index (skip segment_by columns)
-        let mut blob_idx = 0;
-        for (ci, cn) in meta.col_names.iter().enumerate() {
-            if ci == col_idx {
-                break;
+        match meta.blob_idx.get(col_idx).copied().flatten() {
+            Some(slot) => {
+                let blob = &seg.compressed_blobs[slot as usize];
+                let data_type = pg_type_name(meta.col_types[col_idx]);
+                let typmod = meta.col_typmods[col_idx];
+                let datums = unsafe {
+                    decompress_blob_to_datums(
+                        blob,
+                        &data_type,
+                        meta.col_types[col_idx],
+                        typmod,
+                    )
+                };
+                decompressed.insert(col_idx, datums);
             }
-            if !meta.segment_by.contains(cn) {
-                blob_idx += 1;
+            None => {
+                let (datum, is_null) = meta
+                    .missing_values
+                    .get(col_idx)
+                    .copied()
+                    .flatten()
+                    .unwrap_or((pg_sys::Datum::from(0usize), true));
+                let datums: Vec<(pg_sys::Datum, bool)> =
+                    (0..row_count).map(|_| (datum, is_null)).collect();
+                decompressed.insert(col_idx, datums);
             }
-        }
-        if blob_idx < seg.compressed_blobs.len() {
-            let blob = &seg.compressed_blobs[blob_idx];
-            let data_type = pg_type_name(meta.col_types[col_idx]);
-            let typmod = meta.col_typmods[col_idx];
-            let datums = unsafe {
-                decompress_blob_to_datums(blob, &data_type, meta.col_types[col_idx], typmod)
-            };
-            decompressed.insert(col_idx, datums);
         }
     }
 
