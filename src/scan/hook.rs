@@ -1769,7 +1769,8 @@ unsafe fn const_is_positive_numeric(c: *const pg_sys::Const) -> bool {
                     return false;
                 }
                 let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
-                let data = pgrx::vardata_any(detoasted);
+                #[allow(clippy::unnecessary_cast)]
+                let data = pgrx::vardata_any(detoasted) as *const u8;
                 let header = u16::from_le_bytes([*data, *data.add(1)]);
                 let was_toasted = detoasted != varlena_ptr;
                 if was_toasted {

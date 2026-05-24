@@ -699,6 +699,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
                     &meta.time_column, false, &seg_filters, t_min, t_max,
                     lazy_cols.as_deref(), &batch_quals, &[],
                     &meta.col_types,
+                    &meta.col_not_null,
                     &[],
                     skip_blob_load,
                 );
@@ -894,6 +895,7 @@ fn load_decompress_state(
             &meta.time_column, false, &seg_filters, t_min, t_max,
             lazy_cols.as_deref(), &batch_quals, &[],
             &meta.col_types,
+            &meta.col_not_null,
             &[],
             false,
         )

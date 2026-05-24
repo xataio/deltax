@@ -197,6 +197,7 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
                     &[],
                     &[],
                     &meta.col_types,
+                    &meta.col_not_null,
                     &[],
                     false,
                 );
@@ -511,6 +512,7 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                 &[],
                 &stats_cols,
                 &meta.col_types,
+                &meta.col_not_null,
                 &minmax_cols,
                 false,
             );

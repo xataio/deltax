@@ -921,6 +921,7 @@ unsafe fn build_agg_exec_context_from_plan(plan: ParsedAggPlan) -> AggExecContex
                 &batch_quals,
                 /* needed_stats_cols */ &[],
                 &meta.col_types,
+                &meta.col_not_null,
                 /* needed_minmax_cols */ &[],
                 /* skip_text */ false,
             );
@@ -2313,6 +2314,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                     &meta.time_column, load_minmax, &seg_filters, time_min, time_max, None,
                     &fast_batch_quals, &needed_stats_cols,
                     &meta.col_types,
+                    &meta.col_not_null,
                     &needed_minmax_cols,
                     false,
                 );
@@ -2522,6 +2524,7 @@ pub(super) unsafe extern "C-unwind" fn begin_agg_scan(
                 if use_lazy { Some(&lazy_cols) } else { None },
                 &batch_quals, &[],
                 &meta.col_types,
+                &meta.col_not_null,
                 &[],
                 false,
             );

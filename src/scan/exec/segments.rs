@@ -259,6 +259,193 @@ unsafe fn lookup_segments_by_minmax_index(
     }
 }
 
+/// Fast path for point lookups on a NOT NULL numeric column whose min/max
+/// stats live in `_colstats`: return candidate segments directly from the
+/// `(_col_idx, _min, _max)` btree without scanning the partition `_meta` heap.
+unsafe fn lookup_point_segments_by_minmax_index(
+    colstats_oid: pg_sys::Oid,
+    col_idx: i16,
+    value: i64,
+    num_blob_cols: usize,
+) -> Option<Vec<SegmentData>> {
+    unsafe {
+        let cs_rel = pg_sys::table_open(
+            colstats_oid,
+            pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+        );
+
+        let mut minmax_idx_oid = pg_sys::InvalidOid;
+        let index_list = pg_sys::RelationGetIndexList(cs_rel);
+        if !index_list.is_null() {
+            let n = (*index_list).length;
+            for i in 0..n {
+                let idx_oid = (*(*index_list).elements.add(i as usize)).oid_value;
+                let idx_rel = pg_sys::index_open(
+                    idx_oid,
+                    pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+                );
+                let info = (*idx_rel).rd_index;
+                let is_target = if !info.is_null() {
+                    let is_primary = (*info).indisprimary;
+                    let nkeys = (*info).indnkeyatts as usize;
+                    if !is_primary && nkeys >= 3 {
+                        let indkey = (*info).indkey.values.as_ptr();
+                        *indkey.add(0) == 1
+                            && *indkey.add(1) == 3
+                            && *indkey.add(2) == 4
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                pg_sys::index_close(
+                    idx_rel,
+                    pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+                );
+                if is_target {
+                    minmax_idx_oid = idx_oid;
+                    break;
+                }
+            }
+            pg_sys::list_free(index_list);
+        }
+
+        if minmax_idx_oid == pg_sys::InvalidOid {
+            pg_sys::table_close(cs_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            return None;
+        }
+
+        let cs_tupdesc = (*cs_rel).rd_att;
+        let cs_natts = (*cs_tupdesc).natts as usize;
+        let mut sid_att: Option<usize> = None;
+        let mut max_att: Option<usize> = None;
+        let mut nonnull_att: Option<usize> = None;
+        for i in 0..cs_natts {
+            let att = &*tupdesc_get_attr(cs_tupdesc, i);
+            if att.attisdropped {
+                continue;
+            }
+            let name = std::ffi::CStr::from_ptr(att.attname.data.as_ptr())
+                .to_string_lossy();
+            match name.as_ref() {
+                "_segment_id" => sid_att = Some(i),
+                "_max" => max_att = Some(i),
+                "_nonnull_count" => nonnull_att = Some(i),
+                _ => {}
+            }
+        }
+        let (Some(sid_att), Some(max_att), Some(nonnull_att)) =
+            (sid_att, max_att, nonnull_att)
+        else {
+            pg_sys::table_close(cs_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            return None;
+        };
+
+        let snapshot = pg_sys::GetActiveSnapshot();
+        let idx_rel = pg_sys::index_open(
+            minmax_idx_oid,
+            pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+        );
+        let slot = pg_sys::table_slot_create(cs_rel, std::ptr::null_mut());
+
+        let mut skey = [pg_sys::ScanKeyData::default(); 2];
+        pg_sys::ScanKeyInit(
+            &mut skey[0],
+            1,
+            pg_sys::BTEqualStrategyNumber as u16,
+            pg_sys::F_INT2EQ.into(),
+            pg_sys::Datum::from(col_idx),
+        );
+        pg_sys::ScanKeyInit(
+            &mut skey[1],
+            2,
+            pg_sys::BTLessEqualStrategyNumber as u16,
+            pg_sys::F_INT8LE.into(),
+            pg_sys::Datum::from(value as usize),
+        );
+
+        #[cfg(any(feature = "pg14", feature = "pg15", feature = "pg16", feature = "pg17"))]
+        let scan = pg_sys::index_beginscan(cs_rel, idx_rel, snapshot, 2, 0);
+        #[cfg(feature = "pg18")]
+        let scan = pg_sys::index_beginscan(
+            cs_rel,
+            idx_rel,
+            snapshot,
+            std::ptr::null_mut(),
+            2,
+            0,
+        );
+        pg_sys::index_rescan(scan, skey.as_mut_ptr(), 2, std::ptr::null_mut(), 0);
+
+        let mut segments = Vec::new();
+        loop {
+            if !pg_sys::index_getnext_slot(
+                scan,
+                pg_sys::ScanDirection::ForwardScanDirection,
+                slot,
+            ) {
+                break;
+            }
+            pg_sys::slot_getallattrs(slot);
+            let tts_values = (*slot).tts_values;
+            let tts_isnull = (*slot).tts_isnull;
+            if *tts_isnull.add(sid_att)
+                || *tts_isnull.add(max_att)
+                || *tts_isnull.add(nonnull_att)
+            {
+                continue;
+            }
+            let max_v = (*tts_values.add(max_att)).value() as i64;
+            if max_v < value {
+                continue;
+            }
+            let segment_id = (*tts_values.add(sid_att)).value() as i32;
+            let row_count = (*tts_values.add(nonnull_att)).value() as i32;
+            segments.push(SegmentData {
+                companion_oid: pg_sys::InvalidOid,
+                segment_id,
+                segment_values: Vec::new(),
+                compressed_blobs: vec![Vec::new(); num_blob_cols],
+                text_length_blobs: vec![Vec::new(); num_blob_cols],
+                row_count,
+                min_time: None,
+                max_time: None,
+                col_minmax: HashMap::new(),
+                col_sums: HashMap::new(),
+                toast_pointers: vec![Vec::new(); num_blob_cols],
+            });
+        }
+
+        pg_sys::index_endscan(scan);
+        pg_sys::ExecDropSingleTupleTableSlot(slot);
+        pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        pg_sys::table_close(cs_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+        Some(segments)
+    }
+}
+
+unsafe fn reltuples_as_u64(rel_oid: pg_sys::Oid) -> Option<u64> {
+    unsafe {
+        let tuple = pg_sys::SearchSysCache1(
+            pg_sys::SysCacheIdentifier::RELOID as i32,
+            pg_sys::ObjectIdGetDatum(rel_oid),
+        );
+        if tuple.is_null() {
+            return None;
+        }
+        let rel_form = pg_sys::GETSTRUCT(tuple) as pg_sys::Form_pg_class;
+        let reltuples = (*rel_form).reltuples;
+        pg_sys::ReleaseSysCache(tuple);
+        if reltuples > 0.0 {
+            Some(reltuples.round() as u64)
+        } else {
+            None
+        }
+    }
+}
+
 /// Encode a pg_sys::Datum to i64 for the given type OID, matching the order-preserving
 /// encoding used in the colstats table.
 ///
@@ -771,6 +958,7 @@ pub(super) fn load_metadata(
             col_names.push(spec.target_name.clone());
             col_types.push(crate::scan::json_extract::kind_to_type_oid(spec.target_kind));
             col_typmods.push(-1);
+            col_not_null.push(false);
         }
     }
 
@@ -878,6 +1066,7 @@ pub(super) unsafe fn load_segments_heap(
     batch_quals: &[BatchQual],
     needed_stats_cols: &[String],
     col_types: &[pg_sys::Oid],
+    col_not_null: &[bool],
     needed_minmax_cols: &[String],
     // `skip_blob_load = true` skips Phase 2 entirely. Callers that fetch blobs
     // on-claim via `fetch_segment_blobs` pass true — compressed_blobs and
@@ -1016,6 +1205,90 @@ pub(super) unsafe fn load_segments_heap(
                     ci += 1;
                     num_blob_cols += 1;
                 }
+            }
+        }
+
+        let meta_name_ptr = pg_sys::get_rel_name(meta_oid);
+        let meta_name_str = if meta_name_ptr.is_null() {
+            String::new()
+        } else {
+            std::ffi::CStr::from_ptr(meta_name_ptr)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let meta_ns_oid = pg_sys::get_rel_namespace(meta_oid);
+        let partition_name = meta_name_str.strip_suffix("_meta").unwrap_or(&meta_name_str);
+
+        let point_lookup_filter = if segment_by.is_empty()
+            && segment_by_filters.is_empty()
+            && time_min.is_none()
+            && time_max.is_none()
+            && !load_minmax
+            && needed_stats_cols.is_empty()
+            && needed_minmax_cols.is_empty()
+            && skip_blob_load
+            && batch_quals.len() == 1
+        {
+            let bq = &batch_quals[0];
+            let col_name = &col_names[bq.col_idx];
+            let is_orderable = matches!(
+                bq.type_oid,
+                pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+                | pg_sys::FLOAT4OID | pg_sys::FLOAT8OID
+                | pg_sys::DATEOID | pg_sys::TIMESTAMPOID | pg_sys::TIMESTAMPTZOID
+            );
+            if bq.op == BatchCompareOp::Eq
+                && is_orderable
+                && col_name != time_column
+                && !segment_by.contains(col_name)
+                && col_not_null.get(bq.col_idx).copied().unwrap_or(false)
+                && let Some(ci) = col_idx_map[bq.col_idx]
+                && let Some(value) = encode_datum_to_i64(bq.const_datum, bq.type_oid)
+            {
+                Some((ci as i16, value))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some((filter_col_idx, filter_value)) = point_lookup_filter {
+            let colstats_name = format!("{}_colstats", partition_name);
+            let colstats_cname = std::ffi::CString::new(colstats_name).unwrap();
+            let colstats_oid = pg_sys::get_relname_relid(colstats_cname.as_ptr(), meta_ns_oid);
+            if colstats_oid != pg_sys::InvalidOid
+                && let Some(mut point_segments) = lookup_point_segments_by_minmax_index(
+                    colstats_oid,
+                    filter_col_idx,
+                    filter_value,
+                    num_blob_cols,
+                )
+            {
+                for seg in &mut point_segments {
+                    seg.companion_oid = meta_oid;
+                }
+                let total_segments = reltuples_as_u64(meta_oid)
+                    .unwrap_or_else(|| crate::scan::cost::get_segment_count(meta_oid).max(0) as u64);
+                let kept = point_segments.len() as u64;
+                let skipped = total_segments.saturating_sub(kept);
+
+                (*(*rel).rd_tableam).scan_end.unwrap()(scan);
+                pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+                let (t1_hit, t1_read) = shared_buf_snapshot();
+                buf_stats.meta_hit = t1_hit - t0_hit;
+                buf_stats.meta_read = t1_read - t0_read;
+                accumulate_scan_buf_stats(&buf_stats);
+
+                return (
+                    point_segments,
+                    skipped,
+                    skipped,
+                    0,
+                    0,
+                    0,
+                );
             }
         }
 
