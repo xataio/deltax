@@ -951,3 +951,136 @@ class TestTier3Sweep:
             f"HINT missing recipe for {label}"
         )
         db.rollback()
+
+
+# ---------------------------------------------------------------------------
+# OWNER / GRANT / REVOKE cascade to companion tables
+#
+# `ALTER TABLE deltatable OWNER TO …` and `GRANT/REVOKE … ON TABLE
+# deltatable …` apply only to the parent in PG. Our ALTER policy hook
+# mirrors them onto every companion table in `_deltax_compressed.*` so
+# admin-level operations on a deltatable behave the way users expect.
+# ---------------------------------------------------------------------------
+
+
+def companion_tables(conn, deltatable_name="metrics"):
+    """Return the list of companion FQNs that exist for the given deltatable."""
+    return [
+        r[0]
+        for r in conn.execute(
+            "SELECT n.nspname || '.' || c.relname FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = '_deltax_compressed' "
+            "  AND c.relkind = 'r' "
+            "  AND EXISTS (SELECT 1 FROM deltax.deltax_partition p "
+            "              JOIN deltax.deltax_deltatable h ON h.id = p.deltatable_id "
+            "              WHERE h.table_name = %s "
+            "                AND (c.relname LIKE p.table_name || '\\_%%'))",
+            (deltatable_name,),
+        ).fetchall()
+    ]
+
+
+class TestCascadeToCompanions:
+    def test_change_owner_cascades_to_companions(self, db):
+        part_name, _ = setup_and_compress(db)
+        db.execute("CREATE ROLE deltax_test_owner")
+        db.execute("ALTER TABLE metrics OWNER TO deltax_test_owner")
+        db.commit()
+
+        # Parent + every companion should now be owned by the new role.
+        parent_owner = db.execute(
+            "SELECT pg_get_userbyid(relowner) FROM pg_class "
+            "WHERE oid = 'metrics'::regclass"
+        ).fetchone()[0]
+        assert parent_owner == "deltax_test_owner"
+
+        comps = companion_tables(db)
+        assert len(comps) > 0, "expected at least one companion table"
+        for fqn in comps:
+            owner = db.execute(
+                f"SELECT pg_get_userbyid(relowner) FROM pg_class "
+                f"WHERE oid = '{fqn}'::regclass"
+            ).fetchone()[0]
+            assert owner == "deltax_test_owner", (
+                f"{fqn} owner is {owner}, expected deltax_test_owner"
+            )
+
+    def test_grant_select_cascades_to_companions(self, db):
+        part_name, _ = setup_and_compress(db)
+        db.execute("CREATE ROLE deltax_test_reader")
+        db.execute("GRANT SELECT ON TABLE metrics TO deltax_test_reader")
+        db.commit()
+
+        # has_table_privilege returns true if the named role has the
+        # specified privilege on the table.
+        for fqn in companion_tables(db):
+            has = db.execute(
+                "SELECT has_table_privilege(%s, %s, 'SELECT')",
+                ("deltax_test_reader", fqn),
+            ).fetchone()[0]
+            assert has, f"deltax_test_reader missing SELECT on {fqn}"
+
+    def test_revoke_select_cascades_to_companions(self, db):
+        setup_and_compress(db)
+        db.execute("CREATE ROLE deltax_test_reader2")
+        db.execute("GRANT SELECT ON TABLE metrics TO deltax_test_reader2")
+        db.commit()
+        # Sanity: companions have it.
+        for fqn in companion_tables(db):
+            assert db.execute(
+                "SELECT has_table_privilege(%s, %s, 'SELECT')",
+                ("deltax_test_reader2", fqn),
+            ).fetchone()[0]
+
+        db.execute("REVOKE SELECT ON TABLE metrics FROM deltax_test_reader2")
+        db.commit()
+
+        for fqn in companion_tables(db):
+            has = db.execute(
+                "SELECT has_table_privilege(%s, %s, 'SELECT')",
+                ("deltax_test_reader2", fqn),
+            ).fetchone()[0]
+            assert not has, f"deltax_test_reader2 still has SELECT on {fqn}"
+
+    def test_grant_all_cascades_to_companions(self, db):
+        """`GRANT ALL` should cascade as ALL (not get translated to a
+        specific privilege list)."""
+        setup_and_compress(db)
+        db.execute("CREATE ROLE deltax_test_admin")
+        db.execute("GRANT ALL ON TABLE metrics TO deltax_test_admin")
+        db.commit()
+
+        for fqn in companion_tables(db):
+            for priv in ("SELECT", "INSERT", "UPDATE", "DELETE"):
+                has = db.execute(
+                    "SELECT has_table_privilege(%s, %s, %s)",
+                    ("deltax_test_admin", fqn, priv),
+                ).fetchone()[0]
+                assert has, f"deltax_test_admin missing {priv} on {fqn}"
+
+    def test_grant_public_cascades_to_companions(self, db):
+        """`GRANT … TO PUBLIC` must cascade — public is rendered with
+        the PUBLIC keyword, not as a quoted role name."""
+        setup_and_compress(db)
+        db.execute("GRANT SELECT ON TABLE metrics TO PUBLIC")
+        db.commit()
+
+        for fqn in companion_tables(db):
+            has = db.execute(
+                f"SELECT has_table_privilege('public', '{fqn}', 'SELECT')"
+            ).fetchone()[0]
+            assert has, f"public missing SELECT on {fqn}"
+
+    def test_column_level_grant_does_not_cascade(self, db):
+        """Column-level grants reference user-facing column names that
+        don't exist on companions; the hook should pass through with no
+        cascade attempt (otherwise we'd error trying to grant on a
+        nonexistent column)."""
+        setup_and_compress(db)
+        db.execute("CREATE ROLE deltax_test_colreader")
+        # No exception: the hook leaves column-level grants alone.
+        db.execute(
+            "GRANT SELECT (temperature) ON TABLE metrics TO deltax_test_colreader"
+        )
+        db.commit()

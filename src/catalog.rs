@@ -623,6 +623,47 @@ pub fn rename_deltatable(
     Ok(())
 }
 
+/// Return the fully-qualified names of every companion table that
+/// exists for any partition of the given deltatable. Looks them up by
+/// scanning `pg_class` in the `_deltax_compressed` schema and matching
+/// on the partition-name prefix recorded in `deltax_partition`. Used
+/// by the ALTER policy hook to cascade `OWNER TO` and `GRANT`/`REVOKE`
+/// from the parent deltatable onto its companions (otherwise the
+/// companions stay owned by / accessible to whoever created the
+/// extension).
+pub fn compressed_companion_tables(
+    client: &SpiClient,
+    deltatable_id: i32,
+) -> spi::SpiResult<Vec<String>> {
+    let result = client.select(
+        "SELECT n.nspname::text || '.' || quote_ident(c.relname)
+         FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = '_deltax_compressed'
+           AND c.relkind IN ('r', 't')
+           AND EXISTS (
+               SELECT 1 FROM deltax.deltax_partition p
+               WHERE p.deltatable_id = $1
+                 AND (
+                     c.relname = p.table_name || '_meta'
+                     OR c.relname = p.table_name || '_colstats'
+                     OR c.relname = p.table_name || '_blobs'
+                     OR c.relname = p.table_name || '_blooms'
+                     OR c.relname = p.table_name || '_text_lengths'
+                     OR c.relname = p.table_name || '_valbitmap'
+                 )
+           )",
+        None,
+        &[deltatable_id.into()],
+    )?;
+    let mut names = Vec::new();
+    for row in result {
+        let fqn: String = row.get_datum_by_ordinal(1)?.value::<String>()?.unwrap();
+        names.push(fqn);
+    }
+    Ok(names)
+}
+
 /// Mirror a Tier 2 `DROP COLUMN col` into every child partition's
 /// `compressed_columns` descriptor by flipping `dropped: true` on the
 /// matching entry. Orphan rows in `_blobs` / `_colstats` / `_blooms` /

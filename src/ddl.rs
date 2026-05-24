@@ -113,6 +113,25 @@ pub(crate) enum PostAction {
         ht_id: i32,
         column_name: String,
     },
+    /// `OWNER TO new_owner` on a deltatable: PG only re-owners the
+    /// parent; cascade to every companion table in `_deltax_compressed.*`
+    /// so admins don't have to chase the per-partition tables manually.
+    /// `new_owner_sql` is the role spec as a quoted SQL fragment (e.g.
+    /// `"alice"` or `CURRENT_USER`).
+    CascadeOwnerToCompanions {
+        ht_id: i32,
+        new_owner_sql: String,
+    },
+    /// `GRANT … ON TABLE deltatable TO …` / `REVOKE …`: PG applies the
+    /// privilege change to the parent only; cascade onto every companion
+    /// table so a role granted SELECT on `metrics` can also read the
+    /// compressed companions. `prefix` and `suffix` are pre-built SQL
+    /// fragments — the table name is substituted at apply time.
+    CascadeGrantToCompanions {
+        ht_id: i32,
+        grant_prefix: String,
+        grant_suffix: String,
+    },
 }
 
 /// Run the post-success bookkeeping for a Tier 1 disposition. Called by
@@ -165,9 +184,75 @@ pub(crate) fn apply_post_actions(actions: Vec<PostAction>) {
                         );
                     }
                 }
+                PostAction::CascadeOwnerToCompanions {
+                    ht_id,
+                    new_owner_sql,
+                } => {
+                    if let Err(e) = cascade_owner(client, ht_id, &new_owner_sql) {
+                        pgrx::warning!(
+                            "pg_deltax: failed to cascade OWNER TO {} onto companions \
+                             (ht={}): {:?}",
+                            new_owner_sql, ht_id, e,
+                        );
+                    }
+                }
+                PostAction::CascadeGrantToCompanions {
+                    ht_id,
+                    grant_prefix,
+                    grant_suffix,
+                } => {
+                    if let Err(e) =
+                        cascade_grant(client, ht_id, &grant_prefix, &grant_suffix)
+                    {
+                        pgrx::warning!(
+                            "pg_deltax: failed to cascade GRANT/REVOKE onto companions \
+                             (ht={}, sql={}<companion>{}): {:?}",
+                            ht_id, grant_prefix, grant_suffix, e,
+                        );
+                    }
+                }
             }
         }
     });
+}
+
+/// Issue `ALTER TABLE companion OWNER TO new_owner_sql` against every
+/// companion table for the given deltatable. The
+/// `crate::ddl::with_bypass` wrap stops our own ALTER from tripping
+/// the policy hook recursively.
+fn cascade_owner(
+    client: &mut pgrx::spi::SpiClient,
+    ht_id: i32,
+    new_owner_sql: &str,
+) -> pgrx::spi::SpiResult<()> {
+    let companions = catalog::compressed_companion_tables(client, ht_id)?;
+    for fqn in companions {
+        with_bypass(|| {
+            client.update(
+                &format!("ALTER TABLE {} OWNER TO {}", fqn, new_owner_sql),
+                None,
+                &[],
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Re-issue a `GRANT` or `REVOKE` SQL fragment against every companion
+/// table for the given deltatable. `prefix` ends with `ON TABLE ` and
+/// `suffix` starts with ` TO ` / ` FROM ` — the companion FQN is
+/// concatenated between them per call.
+fn cascade_grant(
+    client: &mut pgrx::spi::SpiClient,
+    ht_id: i32,
+    prefix: &str,
+    suffix: &str,
+) -> pgrx::spi::SpiResult<()> {
+    let companions = catalog::compressed_companion_tables(client, ht_id)?;
+    for fqn in companions {
+        client.update(&format!("{}{}{}", prefix, fqn, suffix), None, &[])?;
+    }
+    Ok(())
 }
 
 /// Format and raise the Tier 3 error. Never returns.
@@ -394,6 +479,155 @@ pub(crate) unsafe fn handle_rename(stmt: *mut pg_sys::RenameStmt) -> AlterDispos
     }
 }
 
+/// Classify a `GRANT` / `REVOKE` statement. We only look at table-level
+/// (`OBJECT_TABLE`) grants whose target list contains at least one
+/// registered deltatable. Each matching target produces a
+/// `PostAction::CascadeGrantToCompanions` so PG's own GRANT runs first
+/// (on the parent) and then we mirror onto every companion table.
+///
+/// Bypassed cases (pass through with no cascade):
+/// - `GRANT ALL ON ALL TABLES IN SCHEMA …` (`ACL_TARGET_ALL_IN_SCHEMA`)
+///   — the companion schema is separate from the user's; we don't second-
+///   guess this.
+/// - column-level grants (any `AccessPriv` carries a non-empty `cols`)
+///   — they reference user-facing column names that aren't on companions.
+/// - non-table object types (functions, schemas, etc.).
+pub(crate) unsafe fn handle_grant(stmt: *mut pg_sys::GrantStmt) -> AlterDisposition {
+    unsafe {
+        if stmt.is_null() || bypass_active() {
+            return AlterDisposition::NotOurTable;
+        }
+        if (*stmt).targtype != pg_sys::GrantTargetType::ACL_TARGET_OBJECT
+            || (*stmt).objtype != ObjectType::OBJECT_TABLE
+        {
+            return AlterDisposition::NotOurTable;
+        }
+
+        // Detect column-level grants and bail. PG's grammar emits one
+        // AccessPriv per priv keyword; cols is NIL for the table-level
+        // form (`GRANT SELECT ...`), non-NIL for the column form
+        // (`GRANT SELECT (col) ...`).
+        let privs = (*stmt).privileges;
+        if !privs.is_null() {
+            let plen = (*privs).length;
+            for i in 0..plen {
+                let p = pg_sys::list_nth(privs, i) as *mut pg_sys::AccessPriv;
+                if !p.is_null() && !(*p).cols.is_null() {
+                    return AlterDisposition::NotOurTable;
+                }
+            }
+        }
+
+        let objects = (*stmt).objects;
+        if objects.is_null() {
+            return AlterDisposition::NotOurTable;
+        }
+
+        // Build the prefix/suffix once — they're the same for every
+        // target deltatable in this statement.
+        let prefix = build_grant_prefix(stmt);
+        let suffix = build_grant_suffix(stmt);
+
+        let mut post_actions: Vec<PostAction> = Vec::new();
+        let olen = (*objects).length;
+        for i in 0..olen {
+            let rv = pg_sys::list_nth(objects, i) as *mut pg_sys::RangeVar;
+            if let Some(target) = lookup_target(rv) {
+                post_actions.push(PostAction::CascadeGrantToCompanions {
+                    ht_id: target.ht.id,
+                    grant_prefix: prefix.clone(),
+                    grant_suffix: suffix.clone(),
+                });
+            }
+        }
+
+        if post_actions.is_empty() {
+            return AlterDisposition::NotOurTable;
+        }
+        AlterDisposition::Tier1 { post_actions }
+    }
+}
+
+/// Build the `GRANT <privs> ON TABLE ` / `REVOKE [GRANT OPTION FOR] <privs> ON TABLE `
+/// prefix (everything up to and including the table-name slot).
+unsafe fn build_grant_prefix(stmt: *mut pg_sys::GrantStmt) -> String {
+    unsafe {
+        let is_grant = (*stmt).is_grant;
+        let revoke_grant_option = !is_grant && (*stmt).grant_option;
+        let privs = render_priv_list((*stmt).privileges);
+        if is_grant {
+            format!("GRANT {} ON TABLE ", privs)
+        } else if revoke_grant_option {
+            format!("REVOKE GRANT OPTION FOR {} ON TABLE ", privs)
+        } else {
+            format!("REVOKE {} ON TABLE ", privs)
+        }
+    }
+}
+
+/// Build the trailing ` TO/FROM <grantees> [WITH GRANT OPTION | CASCADE | RESTRICT]`.
+unsafe fn build_grant_suffix(stmt: *mut pg_sys::GrantStmt) -> String {
+    unsafe {
+        let is_grant = (*stmt).is_grant;
+        let grantees = render_role_list((*stmt).grantees);
+        let mut s = if is_grant {
+            format!(" TO {}", grantees)
+        } else {
+            format!(" FROM {}", grantees)
+        };
+        if is_grant && (*stmt).grant_option {
+            s.push_str(" WITH GRANT OPTION");
+        }
+        if !is_grant {
+            if (*stmt).behavior == pg_sys::DropBehavior::DROP_CASCADE {
+                s.push_str(" CASCADE");
+            } else {
+                s.push_str(" RESTRICT");
+            }
+        }
+        s
+    }
+}
+
+/// Render a `List` of `AccessPriv` as a comma-separated SQL fragment.
+/// NIL → "ALL".
+unsafe fn render_priv_list(privs: *mut pg_sys::List) -> String {
+    unsafe {
+        if privs.is_null() || (*privs).length == 0 {
+            return "ALL".to_string();
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for i in 0..(*privs).length {
+            let p = pg_sys::list_nth(privs, i) as *mut pg_sys::AccessPriv;
+            if p.is_null() {
+                continue;
+            }
+            let name = cstr_to_string((*p).priv_name);
+            if name.is_empty() {
+                parts.push("ALL".to_string());
+            } else {
+                parts.push(name.to_uppercase());
+            }
+        }
+        parts.join(", ")
+    }
+}
+
+/// Render a `List` of `RoleSpec` as a comma-separated SQL fragment.
+unsafe fn render_role_list(roles: *mut pg_sys::List) -> String {
+    unsafe {
+        if roles.is_null() || (*roles).length == 0 {
+            return "PUBLIC".to_string();
+        }
+        let mut parts: Vec<String> = Vec::new();
+        for i in 0..(*roles).length {
+            let r = pg_sys::list_nth(roles, i) as *mut pg_sys::RoleSpec;
+            parts.push(render_rolespec(r));
+        }
+        parts.join(", ")
+    }
+}
+
 /// Classify an `ALTER TABLE ... SET SCHEMA` statement.
 pub(crate) unsafe fn handle_alter_object_schema(
     stmt: *mut pg_sys::AlterObjectSchemaStmt,
@@ -455,10 +689,22 @@ unsafe fn classify_at_subcommand(
         | AlterTableType::AT_ReplicaIdentity
         | AlterTableType::AT_GenericOptions
         | AlterTableType::AT_AlterColumnGenericOptions
-        | AlterTableType::AT_ChangeOwner
         | AlterTableType::AT_ReAddComment
         | AlterTableType::AT_SetLogged
         | AlterTableType::AT_SetUnLogged => SubDisposition::Tier1 { post_action: None },
+
+        // -------- Pass-through with companion cascade --------
+        // OWNER TO: PG re-owns the parent only; mirror onto every
+        // companion table so admins don't have to chase them.
+        AlterTableType::AT_ChangeOwner => unsafe {
+            let owner_sql = render_rolespec((*cmd).newowner);
+            SubDisposition::Tier1 {
+                post_action: Some(PostAction::CascadeOwnerToCompanions {
+                    ht_id: ht.id,
+                    new_owner_sql: owner_sql,
+                }),
+            }
+        },
 
         // -------- Pass-through with caveats --------
         AlterTableType::AT_EnableTrig
@@ -595,6 +841,31 @@ unsafe fn classify_at_subcommand(
         },
     }
     .with_context(ht)
+}
+
+/// Render a `RoleSpec` as the SQL fragment it represents — `"name"` for
+/// a literal role, `CURRENT_USER` / `SESSION_USER` / `CURRENT_ROLE` /
+/// `PUBLIC` for the special role keywords. Used to reconstruct the
+/// `OWNER TO` clause when cascading to companion tables.
+unsafe fn render_rolespec(rv: *mut pg_sys::RoleSpec) -> String {
+    unsafe {
+        if rv.is_null() {
+            return "CURRENT_USER".to_string();
+        }
+        match (*rv).roletype {
+            pg_sys::RoleSpecType::ROLESPEC_CSTRING => {
+                let name = cstr_to_string((*rv).rolename);
+                // Quote the identifier so role names with mixed case or
+                // special chars round-trip correctly.
+                format!("\"{}\"", name.replace('"', "\"\""))
+            }
+            pg_sys::RoleSpecType::ROLESPEC_CURRENT_USER => "CURRENT_USER".to_string(),
+            pg_sys::RoleSpecType::ROLESPEC_CURRENT_ROLE => "CURRENT_ROLE".to_string(),
+            pg_sys::RoleSpecType::ROLESPEC_SESSION_USER => "SESSION_USER".to_string(),
+            pg_sys::RoleSpecType::ROLESPEC_PUBLIC => "PUBLIC".to_string(),
+            _ => "CURRENT_USER".to_string(),
+        }
+    }
 }
 
 /// Classify `ADD COLUMN`. Plain nullable + constant-shape default passes

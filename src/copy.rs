@@ -288,6 +288,10 @@ unsafe extern "C-unwind" fn deltax_process_utility(
                 Some(crate::ddl::handle_alter_object_schema(
                     utility_stmt as *mut pg_sys::AlterObjectSchemaStmt,
                 ))
+            } else if pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_GrantStmt) {
+                Some(crate::ddl::handle_grant(
+                    utility_stmt as *mut pg_sys::GrantStmt,
+                ))
             } else {
                 None
             }
