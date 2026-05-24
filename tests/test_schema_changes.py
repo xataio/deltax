@@ -72,6 +72,66 @@ def get_descriptor(conn, part_name):
 
 
 # ---------------------------------------------------------------------------
+# Helper sanity check — everything below depends on `setup_and_compress`
+# producing one compressed partition with the expected row count. If this
+# fails, the downstream tier sweeps all fail in confusing ways; pin the
+# invariants here so the failure points at the right thing.
+# ---------------------------------------------------------------------------
+
+
+class TestSetupAndCompress:
+    def test_setup_produces_one_compressed_partition_with_expected_state(self, db):
+        part_name, expected_rows = setup_and_compress(db, n_devices=3, n_points=20)
+
+        # Expected row count matches what the helper claims.
+        assert expected_rows == 3 * 20
+
+        # The deltatable is registered with the configured shape.
+        ht = db.execute(
+            "SELECT schema_name, table_name, time_column, segment_by, order_by "
+            "FROM deltax.deltax_deltatable WHERE table_name = 'metrics'"
+        ).fetchone()
+        assert ht == ("public", "metrics", "ts", ["device_id"], ["ts"]), ht
+
+        # Exactly one partition row exists for the metrics deltatable, it's
+        # the one the helper returned, and it's marked compressed.
+        rows = db.execute(
+            "SELECT p.table_name, p.is_compressed "
+            "FROM deltax.deltax_partition p "
+            "JOIN deltax.deltax_deltatable h ON h.id = p.deltatable_id "
+            "WHERE h.table_name = 'metrics' AND p.is_compressed"
+        ).fetchall()
+        assert rows == [(part_name, True)], rows
+
+        # SELECT count via the partition returns the expected rows; the
+        # compressed scan path is exercised here so a regression that
+        # corrupted decompression would surface immediately.
+        partition_count = db.execute(
+            f'SELECT count(*) FROM "{part_name}"'
+        ).fetchone()[0]
+        assert partition_count == expected_rows
+
+        # Companion `_meta` table exists in `_deltax_compressed`.
+        meta_exists = db.execute(
+            "SELECT EXISTS (SELECT 1 FROM pg_tables "
+            "WHERE schemaname = '_deltax_compressed' AND tablename = %s)",
+            (f"{part_name}_meta",),
+        ).fetchone()[0]
+        assert meta_exists
+
+        # Descriptor was populated at compression time.
+        desc = get_descriptor(db, part_name)
+        assert isinstance(desc, list)
+        assert len(desc) == 4  # ts, device_id, temperature, pressure
+        assert {e["name"] for e in desc} == {
+            "ts",
+            "device_id",
+            "temperature",
+            "pressure",
+        }
+
+
+# ---------------------------------------------------------------------------
 # Descriptor shape
 # ---------------------------------------------------------------------------
 
@@ -600,3 +660,271 @@ class TestTier2DropColumn:
             "  AND attnum > 0 AND NOT attisdropped"
         ).fetchall()
         assert "device_id" not in {r[0] for r in cols}
+
+
+# ---------------------------------------------------------------------------
+# Per-subcommand sweep — one-line assertion per AlterTableType discriminant
+#
+# The sweeps verify the classifier in `src/ddl.rs` produces the expected
+# disposition for each `AT_*` subcommand. Each parametrize entry has
+# (subtype_label, setup_sql_or_None, alter_sql). All entries assume an
+# already-compressed deltatable from `setup_and_compress` so the Tier 3
+# `has_compressed_partitions` gate is active.
+# ---------------------------------------------------------------------------
+
+
+class TestTier1Sweep:
+    """Subcommands that should pass through `standard_ProcessUtility`.
+
+    Each entry verifies (a) the ALTER doesn't raise, and (b) PG actually
+    applied the change — checked by a follow-up SELECT against the system
+    catalogs whose expected value is the parametrize tuple's 4th element.
+    """
+
+    @pytest.mark.parametrize(
+        "label,setup_sql,alter_sql,verify_sql,expected",
+        [
+            (
+                "AT_DropNotNull",
+                None,
+                "ALTER TABLE metrics ALTER COLUMN device_id DROP NOT NULL",
+                "SELECT attnotnull FROM pg_attribute "
+                "WHERE attrelid = 'metrics'::regclass AND attname = 'device_id'",
+                False,
+            ),
+            (
+                "AT_SetStatistics",
+                None,
+                "ALTER TABLE metrics ALTER COLUMN temperature SET STATISTICS 100",
+                "SELECT attstattarget FROM pg_attribute "
+                "WHERE attrelid = 'metrics'::regclass AND attname = 'temperature'",
+                100,
+            ),
+            (
+                "AT_SetOptions",
+                None,
+                "ALTER TABLE metrics ALTER COLUMN temperature SET (n_distinct = 1000)",
+                "SELECT 'n_distinct=1000' = ANY(attoptions) FROM pg_attribute "
+                "WHERE attrelid = 'metrics'::regclass AND attname = 'temperature'",
+                True,
+            ),
+            (
+                "AT_ResetOptions",
+                "ALTER TABLE metrics ALTER COLUMN temperature SET (n_distinct = 1000)",
+                "ALTER TABLE metrics ALTER COLUMN temperature RESET (n_distinct)",
+                "SELECT attoptions IS NULL FROM pg_attribute "
+                "WHERE attrelid = 'metrics'::regclass AND attname = 'temperature'",
+                True,
+            ),
+            # AT_SetRelOptions / AT_ResetRelOptions are pass-through in the
+            # classifier but PG itself rejects them on partitioned parents
+            # ("cannot specify storage parameters for a partitioned table").
+            # Coverage instead falls to per-partition tests in test_compression.py
+            # where compress.rs sets autovacuum_enabled=off on each leaf.
+            (
+                "AT_ReplicaIdentity",
+                None,
+                "ALTER TABLE metrics REPLICA IDENTITY FULL",
+                # 'f' = FULL in pg_class.relreplident
+                "SELECT relreplident::text FROM pg_class WHERE oid = 'metrics'::regclass",
+                "f",
+            ),
+            (
+                "AT_ChangeOwner",
+                None,
+                "ALTER TABLE metrics OWNER TO postgres",
+                # Owner is `postgres` (already was, and stays). The fact
+                # that the statement reached `pg_class` at all means our
+                # hook chained through standard_ProcessUtility — a hook
+                # that wrongly raised would skip the chain entirely.
+                "SELECT pg_get_userbyid(relowner) FROM pg_class "
+                "WHERE oid = 'metrics'::regclass",
+                "postgres",
+            ),
+            (
+                "AT_ColumnDefault_SET",
+                None,
+                "ALTER TABLE metrics ALTER COLUMN temperature SET DEFAULT 99.9",
+                "SELECT atthasdef FROM pg_attribute "
+                "WHERE attrelid = 'metrics'::regclass AND attname = 'temperature'",
+                True,
+            ),
+            (
+                "AT_ColumnDefault_DROP",
+                "ALTER TABLE metrics ALTER COLUMN temperature SET DEFAULT 99.9",
+                "ALTER TABLE metrics ALTER COLUMN temperature DROP DEFAULT",
+                "SELECT atthasdef FROM pg_attribute "
+                "WHERE attrelid = 'metrics'::regclass AND attname = 'temperature'",
+                False,
+            ),
+            (
+                "AT_AddConstraint_check_not_valid",
+                None,
+                "ALTER TABLE metrics ADD CONSTRAINT chk_p "
+                "CHECK (pressure > 0) NOT VALID",
+                "SELECT count(*)::int FROM pg_constraint "
+                "WHERE conrelid = 'metrics'::regclass AND conname = 'chk_p'",
+                1,
+            ),
+            # AT_AddConstraint FOREIGN KEY NOT VALID — pass-through in
+            # the classifier (skip_validation=true), but PG itself rejects
+            # NOT VALID FKs on partitioned parents pre-PG18. The CHECK
+            # NOT VALID case above already exercises the same classifier
+            # branch.
+            (
+                "AT_DropConstraint",
+                "ALTER TABLE metrics ADD CONSTRAINT c CHECK (pressure > 0) NOT VALID",
+                "ALTER TABLE metrics DROP CONSTRAINT c",
+                "SELECT count(*)::int FROM pg_constraint "
+                "WHERE conrelid = 'metrics'::regclass AND conname = 'c'",
+                0,
+            ),
+            (
+                "AT_EnableTrig_user_trigger",
+                "CREATE FUNCTION u_trg_fn() RETURNS trigger LANGUAGE plpgsql AS "
+                "$$ BEGIN RETURN NEW; END; $$; "
+                "CREATE TRIGGER u_trg BEFORE INSERT ON metrics "
+                "FOR EACH ROW EXECUTE FUNCTION u_trg_fn(); "
+                "ALTER TABLE metrics DISABLE TRIGGER u_trg",
+                "ALTER TABLE metrics ENABLE TRIGGER u_trg",
+                # 'O' = enabled (Origin), 'D' = disabled.
+                "SELECT tgenabled::text FROM pg_trigger "
+                "WHERE tgrelid = 'metrics'::regclass AND tgname = 'u_trg'",
+                "O",
+            ),
+            (
+                "AT_DisableTrig_user_trigger",
+                "CREATE FUNCTION u2_trg_fn() RETURNS trigger LANGUAGE plpgsql AS "
+                "$$ BEGIN RETURN NEW; END; $$; "
+                "CREATE TRIGGER u2_trg BEFORE INSERT ON metrics "
+                "FOR EACH ROW EXECUTE FUNCTION u2_trg_fn()",
+                "ALTER TABLE metrics DISABLE TRIGGER u2_trg",
+                "SELECT tgenabled::text FROM pg_trigger "
+                "WHERE tgrelid = 'metrics'::regclass AND tgname = 'u2_trg'",
+                "D",
+            ),
+        ],
+    )
+    def test_passes_through(
+        self, db, label, setup_sql, alter_sql, verify_sql, expected
+    ):
+        setup_and_compress(db)
+        if setup_sql:
+            db.execute(setup_sql)
+            db.commit()
+        # No exception → pass-through.
+        db.execute(alter_sql)
+        db.commit()
+        # Verify the ALTER actually applied (not just that the hook
+        # didn't error).
+        actual = db.execute(verify_sql).fetchone()[0]
+        assert actual == expected, (
+            f"{label}: post-ALTER state mismatch — expected {expected!r}, got {actual!r}"
+        )
+
+
+class TestTier3Sweep:
+    """Subcommands that should raise FeatureNotSupported with the recipe HINT."""
+
+    @pytest.mark.parametrize(
+        "label,setup_sql,alter_sql",
+        [
+            # -------- ALTER COLUMN --------
+            (
+                "AT_SetNotNull",
+                None,
+                "ALTER TABLE metrics ALTER COLUMN temperature SET NOT NULL",
+            ),
+            (
+                "AT_SetCompression",
+                None,
+                "ALTER TABLE metrics ALTER COLUMN device_id SET COMPRESSION lz4",
+            ),
+            # -------- Constraints --------
+            (
+                "AT_AddConstraint_check_validating",
+                None,
+                "ALTER TABLE metrics ADD CONSTRAINT chk CHECK (pressure > 0)",
+            ),
+            (
+                "AT_AddConstraint_unique",
+                None,
+                "ALTER TABLE metrics ADD CONSTRAINT u UNIQUE (ts, device_id)",
+            ),
+            (
+                "AT_ValidateConstraint",
+                "ALTER TABLE metrics ADD CONSTRAINT vc CHECK (pressure > 0) NOT VALID",
+                "ALTER TABLE metrics VALIDATE CONSTRAINT vc",
+            ),
+            # -------- Identity / generated --------
+            (
+                "AT_AddIdentity",
+                None,
+                "ALTER TABLE metrics ALTER COLUMN temperature "
+                "ADD GENERATED ALWAYS AS IDENTITY",
+            ),
+            (
+                "AT_AddColumn_generated",
+                None,
+                "ALTER TABLE metrics ADD COLUMN gen INT "
+                "GENERATED ALWAYS AS (1) STORED",
+            ),
+            # -------- Row-level security --------
+            (
+                "AT_EnableRowSecurity",
+                None,
+                "ALTER TABLE metrics ENABLE ROW LEVEL SECURITY",
+            ),
+            (
+                "AT_DisableRowSecurity",
+                None,
+                "ALTER TABLE metrics DISABLE ROW LEVEL SECURITY",
+            ),
+            (
+                "AT_ForceRowSecurity",
+                None,
+                "ALTER TABLE metrics FORCE ROW LEVEL SECURITY",
+            ),
+            (
+                "AT_NoForceRowSecurity",
+                None,
+                "ALTER TABLE metrics NO FORCE ROW LEVEL SECURITY",
+            ),
+            # -------- Triggers (the ALL forms; specific-trigger DISABLE
+            # on `deltax_reject_compressed_dml` is in TestTier1Transparent).
+            (
+                "AT_EnableTrigAll",
+                None,
+                "ALTER TABLE metrics ENABLE TRIGGER ALL",
+            ),
+            # -------- Cluster / storage location --------
+            (
+                "AT_DropCluster",
+                None,
+                "ALTER TABLE metrics SET WITHOUT CLUSTER",
+            ),
+            (
+                "AT_SetTableSpace",
+                None,
+                "ALTER TABLE metrics SET TABLESPACE pg_default",
+            ),
+            # -------- Inheritance / OF type --------
+            (
+                "AT_AddInherit",
+                "CREATE TABLE inherit_target ()",
+                "ALTER TABLE metrics INHERIT inherit_target",
+            ),
+        ],
+    )
+    def test_blocks_with_feature_not_supported(self, db, label, setup_sql, alter_sql):
+        setup_and_compress(db)
+        if setup_sql:
+            db.execute(setup_sql)
+            db.commit()
+        with pytest.raises(psycopg.errors.FeatureNotSupported) as exc:
+            db.execute(alter_sql)
+        # Recipe HINT must be present so users know what to do.
+        assert "decompress" in (exc.value.diag.message_hint or "").lower(), (
+            f"HINT missing recipe for {label}"
+        )
+        db.rollback()

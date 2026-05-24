@@ -607,26 +607,32 @@ unsafe fn classify_add_column(cmd: *mut pg_sys::AlterTableCmd) -> SubDisposition
         if def.is_null() {
             return SubDisposition::Tier1 { post_action: None };
         }
-        if (*def).identity != 0 || (*def).generated != 0 {
+
+        // PG's parser attaches NOT NULL / DEFAULT / GENERATED / IDENTITY
+        // as entries in `ColumnDef.constraints` (a List of Constraint
+        // nodes); the `is_not_null` / `raw_default` / `identity` /
+        // `generated` fields are populated by
+        // `transformColumnDefinition` during analysis, which runs AFTER
+        // our ProcessUtility hook fires. So we have to walk the
+        // constraints list to know what the user actually wrote.
+        let cols = read_column_constraints(def);
+
+        if cols.is_generated || (*def).generated != 0 {
             return SubDisposition::Tier3 {
-                op_name: "ADD COLUMN ... GENERATED / IDENTITY",
+                op_name: "ADD COLUMN ... GENERATED",
             };
         }
-
-        // PG's parser attaches NOT NULL and DEFAULT as entries in
-        // `ColumnDef.constraints` (a List of Constraint nodes), not on
-        // `is_not_null`/`raw_default` directly — those latter fields are
-        // populated by `transformColumnDefinition` during analysis, which
-        // runs AFTER our ProcessUtility hook fires. So we have to walk
-        // the constraints list to know what the user actually wrote.
-        let (has_not_null, default_expr) = read_column_constraints(def);
-
-        if has_not_null && default_expr.is_null() {
+        if cols.is_identity || (*def).identity != 0 {
+            return SubDisposition::Tier3 {
+                op_name: "ADD COLUMN ... IDENTITY",
+            };
+        }
+        if cols.has_not_null && cols.default_expr.is_null() {
             return SubDisposition::Tier3 {
                 op_name: "ADD COLUMN ... NOT NULL without DEFAULT",
             };
         }
-        if !default_expr.is_null() && !is_constant_shape(default_expr) {
+        if !cols.default_expr.is_null() && !is_constant_shape(cols.default_expr) {
             return SubDisposition::Tier3 {
                 op_name: "ADD COLUMN ... DEFAULT <non-constant expression>",
             };
@@ -665,17 +671,29 @@ unsafe fn classify_drop_column(
     }
 }
 
-/// Read `ColumnDef.constraints` and return `(has_not_null, default_expr)`.
-/// `default_expr` is NULL if no DEFAULT was specified.
-unsafe fn read_column_constraints(
-    def: *const pg_sys::ColumnDef,
-) -> (bool, *mut pg_sys::Node) {
+/// Parsed view of a `ColumnDef` for `ADD COLUMN` classification.
+struct ColumnDefAnalysis {
+    has_not_null: bool,
+    default_expr: *mut pg_sys::Node,
+    is_generated: bool,
+    is_identity: bool,
+}
+
+/// Walk `ColumnDef.constraints` and surface the bits the classifier
+/// needs. The parser stores NOT NULL / DEFAULT / GENERATED / IDENTITY
+/// here as `Constraint{contype = CONSTR_*}` entries; the analyzed
+/// `is_not_null` / `raw_default` / `generated` / `identity` fields
+/// don't get populated until `transformColumnDefinition` runs, which is
+/// AFTER our ProcessUtility hook fires.
+unsafe fn read_column_constraints(def: *const pg_sys::ColumnDef) -> ColumnDefAnalysis {
     unsafe {
         let mut has_not_null = (*def).is_not_null;
         let mut default_expr: *mut pg_sys::Node = (*def).raw_default;
         if default_expr.is_null() {
             default_expr = (*def).cooked_default;
         }
+        let mut is_generated = (*def).generated != 0;
+        let mut is_identity = (*def).identity != 0;
         let cons = (*def).constraints;
         if !cons.is_null() {
             let len = (*cons).length;
@@ -689,11 +707,18 @@ unsafe fn read_column_constraints(
                     ConstrType::CONSTR_DEFAULT if default_expr.is_null() => {
                         default_expr = (*c).raw_expr;
                     }
+                    ConstrType::CONSTR_GENERATED => is_generated = true,
+                    ConstrType::CONSTR_IDENTITY => is_identity = true,
                     _ => {}
                 }
             }
         }
-        (has_not_null, default_expr)
+        ColumnDefAnalysis {
+            has_not_null,
+            default_expr,
+            is_generated,
+            is_identity,
+        }
     }
 }
 
