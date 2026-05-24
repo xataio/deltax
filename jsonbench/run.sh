@@ -8,6 +8,14 @@ cat queries.sql | while read -r query; do
 
     echo "$query";
     for i in $(seq 1 $TRIES); do
-        sudo -u postgres psql bluesky -t -c '\timing' -c "$query" 2>&1 | grep -P 'Time|psql: error' | tail -n1
+        # ON_ERROR_STOP=on so psql exits non-zero on PG ERROR (e.g. OOM).
+        # Without it, `\timing` still prints "Time: X.XX ms" (time-to-error)
+        # and the parser would accept failed queries as fast successes.
+        out=$(sudo -u postgres psql -v ON_ERROR_STOP=on bluesky -t -c '\timing' -c "$query" 2>&1)
+        if [ $? -ne 0 ]; then
+            echo "QUERY_ERROR"
+        else
+            echo "$out" | grep -P 'Time' | tail -n1
+        fi
     done;
 done;

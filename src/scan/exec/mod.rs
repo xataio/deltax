@@ -1,11 +1,11 @@
-mod batch_qual;
-pub(in crate::scan) mod datum_utils;
-pub(in crate::scan) mod segments;
-mod count_minmax;
 mod agg;
 mod agg_wire;
 mod append_wire;
+mod batch_qual;
+mod count_minmax;
+pub(in crate::scan) mod datum_utils;
 mod decompress;
+pub(in crate::scan) mod segments;
 mod text_col;
 
 use pgrx::pg_sys;
@@ -13,13 +13,15 @@ use pgrx::pg_sys;
 use super::SyncStatic;
 
 // Re-exports for explain.rs
-pub(crate) use decompress::DecompressState;
-pub(crate) use count_minmax::{CountScanState, MinMaxScanState};
 pub(crate) use agg::AggScanState;
+pub(crate) use count_minmax::{CountScanState, MinMaxScanState};
+pub(crate) use decompress::DecompressState;
 
 // Re-exports for hook.rs
-pub(crate) use agg::{AggType, AggExpr, GroupByExpr, GroupByColSpec, HavingOp, HavingFilter,
-    CaseWhenSpec, CaseWhenClause, CaseWhenCondition, CaseWhenOp, CaseWhenValue, OutputTransform};
+pub(crate) use agg::{
+    AggExpr, AggType, CaseWhenClause, CaseWhenCondition, CaseWhenOp, CaseWhenSpec, CaseWhenValue,
+    GroupByColSpec, GroupByExpr, HavingFilter, HavingOp, OutputTransform,
+};
 
 // Re-export for cost.rs (parallel-agg worker recommendation needs the slot cap).
 pub(crate) use agg::MAX_AGG_WORKER_SLOTS;
@@ -28,19 +30,19 @@ pub(crate) use agg::MAX_AGG_WORKER_SLOTS;
 pub(crate) use agg::can_use_compact_keys_path;
 
 // Re-exports for path.rs (create_*_state callbacks referenced in CustomScanMethods)
-pub(crate) use decompress::{create_custom_scan_state, create_deltax_append_state};
-pub(crate) use count_minmax::{create_count_scan_state, create_minmax_scan_state};
 pub(crate) use agg::create_agg_scan_state;
+pub(crate) use count_minmax::{create_count_scan_state, create_minmax_scan_state};
+pub(crate) use decompress::{create_custom_scan_state, create_deltax_append_state};
 
 // Callback imports for static method tables
-use decompress::{begin_custom_scan, exec_custom_scan, end_custom_scan, rescan_custom_scan};
+use count_minmax::{begin_count_scan, end_count_scan, exec_count_scan, rescan_count_scan};
+use count_minmax::{begin_minmax_scan, end_minmax_scan, exec_minmax_scan, rescan_minmax_scan};
 use decompress::begin_deltax_append;
+use decompress::{begin_custom_scan, end_custom_scan, exec_custom_scan, rescan_custom_scan};
 use decompress::{
-    estimate_dsm_deltax_append, initialize_dsm_deltax_append, reinit_dsm_deltax_append,
-    init_worker_deltax_append, shutdown_deltax_append,
+    estimate_dsm_deltax_append, init_worker_deltax_append, initialize_dsm_deltax_append,
+    reinit_dsm_deltax_append, shutdown_deltax_append,
 };
-use count_minmax::{begin_count_scan, exec_count_scan, end_count_scan, rescan_count_scan};
-use count_minmax::{begin_minmax_scan, exec_minmax_scan, end_minmax_scan, rescan_minmax_scan};
 
 /// Static CustomExecMethods struct for DeltaXDecompress.
 pub(crate) static CUSTOM_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
@@ -124,14 +126,14 @@ const PG_EPOCH_OFFSET_DAYS: i32 = 10_957;
 mod tests {
     use pgrx::prelude::*;
 
-    use super::{PG_EPOCH_OFFSET_USEC, PG_EPOCH_OFFSET_DAYS};
+    use super::{PG_EPOCH_OFFSET_DAYS, PG_EPOCH_OFFSET_USEC};
 
     #[pg_test]
     fn test_pg_epoch_offset_usec() {
         // PG_EPOCH_OFFSET_USEC must equal the number of microseconds between
         // the Unix epoch (1970-01-01) and the PostgreSQL epoch (2000-01-01).
         let pg_val: i64 = Spi::get_one(
-            "SELECT (EXTRACT(EPOCH FROM '2000-01-01 00:00:00+00'::timestamptz) * 1000000)::bigint"
+            "SELECT (EXTRACT(EPOCH FROM '2000-01-01 00:00:00+00'::timestamptz) * 1000000)::bigint",
         )
         .unwrap()
         .unwrap();
@@ -146,11 +148,9 @@ mod tests {
     fn test_pg_epoch_offset_days() {
         // PG_EPOCH_OFFSET_DAYS must equal the number of days between
         // the Unix epoch (1970-01-01) and the PostgreSQL epoch (2000-01-01).
-        let pg_val: i32 = Spi::get_one(
-            "SELECT ('2000-01-01'::date - '1970-01-01'::date)::int"
-        )
-        .unwrap()
-        .unwrap();
+        let pg_val: i32 = Spi::get_one("SELECT ('2000-01-01'::date - '1970-01-01'::date)::int")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             pg_val, PG_EPOCH_OFFSET_DAYS,
             "PG_EPOCH_OFFSET_DAYS ({}) does not match PG's value ({})",
@@ -200,7 +200,7 @@ mod tests {
     fn test_date_datum_matches_pg() {
         // PG stores dates as days since 2000-01-01.
         let test_cases = [
-            ("1970-01-01", -10957),  // -PG_EPOCH_OFFSET_DAYS
+            ("1970-01-01", -10957), // -PG_EPOCH_OFFSET_DAYS
             ("2000-01-01", 0),
             ("2025-01-15", 9146),
             ("1969-12-31", -10958),
@@ -244,8 +244,15 @@ mod tests {
         use crate::compression::gorilla;
 
         let test_values: Vec<f64> = vec![
-            0.0, -0.0, 1.0, -1.0, std::f64::consts::PI,
-            1e308, -1e308, 1e-307, f64::MIN_POSITIVE,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            std::f64::consts::PI,
+            1e308,
+            -1e308,
+            1e-307,
+            f64::MIN_POSITIVE,
         ];
 
         let encoded = gorilla::encode_floats(&test_values);
@@ -253,17 +260,21 @@ mod tests {
 
         for (orig, dec) in test_values.iter().zip(decoded.iter()) {
             assert_eq!(
-                orig.to_bits(), dec.to_bits(),
+                orig.to_bits(),
+                dec.to_bits(),
                 "float bit mismatch: orig={} (0x{:016x}) decoded={} (0x{:016x})",
-                orig, orig.to_bits(), dec, dec.to_bits()
+                orig,
+                orig.to_bits(),
+                dec,
+                dec.to_bits()
             );
         }
     }
 
     #[test]
     fn test_reinsert_nulls_datum() {
-        use pgrx::pg_sys;
         use super::datum_utils::reinsert_nulls_datum;
+        use pgrx::pg_sys;
 
         // No nulls: empty bitmap
         let datums = vec![
@@ -287,16 +298,13 @@ mod tests {
 
         // Alternating: null at 0, 2 (bits 0 and 2 set)
         let bitmap = vec![0b00000101u8];
-        let datums = vec![
-            pg_sys::Datum::from(10usize),
-            pg_sys::Datum::from(30usize),
-        ];
+        let datums = vec![pg_sys::Datum::from(10usize), pg_sys::Datum::from(30usize)];
         let result = reinsert_nulls_datum(&datums, &bitmap, 4);
         assert_eq!(result.len(), 4);
-        assert!(result[0].1);   // null
-        assert!(!result[1].1);  // 10
-        assert!(result[2].1);   // null
-        assert!(!result[3].1);  // 30
+        assert!(result[0].1); // null
+        assert!(!result[1].1); // 10
+        assert!(result[2].1); // null
+        assert!(!result[3].1); // 30
         assert_eq!(result[1].0, pg_sys::Datum::from(10usize));
         assert_eq!(result[3].0, pg_sys::Datum::from(30usize));
 
@@ -336,8 +344,8 @@ mod tests {
 
     #[test]
     fn test_compare_datums() {
-        use pgrx::pg_sys;
         use super::datum_utils::compare_datums;
+        use pgrx::pg_sys;
         use std::cmp::Ordering;
 
         // int4
@@ -368,8 +376,8 @@ mod tests {
 
     #[test]
     fn test_pg_type_oid_and_name() {
+        use super::datum_utils::{pg_type_name, pg_type_oid};
         use pgrx::pg_sys;
-        use super::datum_utils::{pg_type_oid, pg_type_name};
 
         assert_eq!(pg_type_oid("int4"), pg_sys::INT4OID);
         assert_eq!(pg_type_oid("int8"), pg_sys::INT8OID);
@@ -386,13 +394,18 @@ mod tests {
     }
 
     /// Helper: build a compressed blob from a CompressionType tag and encoded data.
-    fn make_blob(tag: crate::compression::CompressionType, row_count: u32, data: Vec<u8>) -> Vec<u8> {
+    fn make_blob(
+        tag: crate::compression::CompressionType,
+        row_count: u32,
+        data: Vec<u8>,
+    ) -> Vec<u8> {
         crate::compression::CompressedColumn {
             type_tag: tag,
             row_count,
             null_bitmap: Vec::new(),
             data,
-        }.to_bytes()
+        }
+        .to_bytes()
     }
 
     /// Helper: build a compressed blob with a null bitmap.
@@ -407,7 +420,8 @@ mod tests {
             row_count,
             null_bitmap,
             data,
-        }.to_bytes()
+        }
+        .to_bytes()
     }
 
     #[pg_test]
@@ -681,9 +695,8 @@ mod tests {
         let values: Vec<i64> = (0..20).collect();
         let data = bitpacked::encode_for_i64(&values);
         let blob = make_blob(CompressionType::ForBitpacked, 20, data);
-        let result = unsafe {
-            decompress_blob_to_datums_truncated(&blob, "bigint", pg_sys::INT8OID, -1, 2)
-        };
+        let result =
+            unsafe { decompress_blob_to_datums_truncated(&blob, "bigint", pg_sys::INT8OID, -1, 2) };
         assert_eq!(result.len(), 3);
         for (i, (d, is_null)) in result.iter().enumerate() {
             assert!(!is_null);
@@ -696,7 +709,9 @@ mod tests {
         use super::datum_utils::decompress_blob_to_datums_truncated;
         use crate::compression::{CompressionType, boolean};
 
-        let values: Vec<bool> = vec![true, false, true, false, true, false, true, false, true, false];
+        let values: Vec<bool> = vec![
+            true, false, true, false, true, false, true, false, true, false,
+        ];
         let data = boolean::encode(&values);
         let blob = make_blob(CompressionType::BooleanBitmap, 10, data);
         let result = unsafe {
@@ -768,9 +783,173 @@ mod tests {
     fn test_decompress_truncated_empty_blob() {
         use super::datum_utils::decompress_blob_to_datums_truncated;
 
-        let result = unsafe {
-            decompress_blob_to_datums_truncated(&[], "integer", pg_sys::INT4OID, -1, 5)
-        };
+        let result =
+            unsafe { decompress_blob_to_datums_truncated(&[], "integer", pg_sys::INT4OID, -1, 5) };
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_is_null_at() {
+        use super::datum_utils::is_null_at;
+
+        // Bit 0 set, bit 1 clear, bit 2 set
+        let bitmap = vec![0b00000101u8];
+        assert!(is_null_at(&bitmap, 0));
+        assert!(!is_null_at(&bitmap, 1));
+        assert!(is_null_at(&bitmap, 2));
+        assert!(!is_null_at(&bitmap, 3));
+
+        // Across byte boundary (bit 8 = first bit of second byte)
+        let bitmap = vec![0u8, 0b00000001u8];
+        assert!(!is_null_at(&bitmap, 7));
+        assert!(is_null_at(&bitmap, 8));
+        assert!(!is_null_at(&bitmap, 9));
+    }
+
+    #[test]
+    fn test_merge_with_placeholder() {
+        use super::datum_utils::merge_with_placeholder;
+
+        // All pass: every position takes the next matched datum
+        let matched = vec![pg_sys::Datum::from(1usize), pg_sys::Datum::from(2usize)];
+        let sel = vec![true, true];
+        let out = merge_with_placeholder(&matched, &sel);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].value(), 1);
+        assert_eq!(out[1].value(), 2);
+
+        // Mixed: placeholders at non-passing positions
+        let matched = vec![pg_sys::Datum::from(42usize)];
+        let sel = vec![false, true, false];
+        let out = merge_with_placeholder(&matched, &sel);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].value(), 0);
+        assert_eq!(out[1].value(), 42);
+        assert_eq!(out[2].value(), 0);
+
+        // Empty
+        let out = merge_with_placeholder(&[], &[]);
+        assert!(out.is_empty());
+    }
+
+    #[pg_test]
+    fn test_decompress_text_eq_filter_dict() {
+        use super::datum_utils::decompress_text_blob_with_eq_filter;
+        use crate::compression::{CompressionType, dictionary};
+
+        // 6 rows, dictionary-compressed; only rows 0, 3 == "cat".
+        let values: Vec<&str> = vec!["cat", "dog", "fish", "cat", "dog", "bird"];
+        let data = dictionary::encode(&values);
+        let blob = make_blob(CompressionType::Dictionary, 6, data);
+        let (datums, sel) = unsafe {
+            decompress_text_blob_with_eq_filter(
+                &blob,
+                pg_sys::TEXTOID,
+                -1,
+                "cat",
+                false, // eq, not ne
+                None,
+            )
+        };
+        assert_eq!(datums.len(), 6);
+        assert_eq!(sel, vec![true, false, false, true, false, false]);
+        // Matched rows hold real varlenas; placeholders are Datum(0).
+        assert!(datums[0].0.value() != 0);
+        assert!(datums[3].0.value() != 0);
+        assert_eq!(datums[1].0.value(), 0);
+        assert_eq!(datums[2].0.value(), 0);
+    }
+
+    #[pg_test]
+    fn test_decompress_text_eq_filter_ne_dict() {
+        use super::datum_utils::decompress_text_blob_with_eq_filter;
+        use crate::compression::{CompressionType, dictionary};
+
+        // != "dog" should flag rows 0, 2, 3, 5.
+        let values: Vec<&str> = vec!["cat", "dog", "fish", "cat", "dog", "bird"];
+        let data = dictionary::encode(&values);
+        let blob = make_blob(CompressionType::Dictionary, 6, data);
+        let (_datums, sel) = unsafe {
+            decompress_text_blob_with_eq_filter(
+                &blob,
+                pg_sys::TEXTOID,
+                -1,
+                "dog",
+                true, // ne
+                None,
+            )
+        };
+        assert_eq!(sel, vec![true, false, true, true, false, true]);
+    }
+
+    #[pg_test]
+    fn test_decompress_text_in_filter_dict() {
+        use super::datum_utils::decompress_text_blob_with_in_filter;
+        use crate::compression::{CompressionType, dictionary};
+
+        let values: Vec<&str> = vec!["a", "b", "c", "a", "d", "b"];
+        let data = dictionary::encode(&values);
+        let blob = make_blob(CompressionType::Dictionary, 6, data);
+        let const_strs = vec!["a".to_string(), "c".to_string()];
+        let (_datums, sel) = unsafe {
+            decompress_text_blob_with_in_filter(
+                &blob,
+                pg_sys::TEXTOID,
+                -1,
+                &const_strs,
+                false, // IN, not NOT IN
+                None,
+            )
+        };
+        assert_eq!(sel, vec![true, false, true, true, false, false]);
+    }
+
+    #[pg_test]
+    fn test_decompress_text_in_filter_lz4() {
+        use super::datum_utils::decompress_text_blob_with_in_filter;
+        use crate::compression::{CompressionType, lz4};
+
+        let values: Vec<&str> = vec!["alpha", "beta", "gamma", "alpha"];
+        let data = lz4::encode(&values);
+        let blob = make_blob(CompressionType::Lz4, 4, data);
+        let const_strs = vec!["alpha".to_string()];
+        let (datums, sel) = unsafe {
+            decompress_text_blob_with_in_filter(
+                &blob,
+                pg_sys::TEXTOID,
+                -1,
+                &const_strs,
+                false,
+                None,
+            )
+        };
+        assert_eq!(sel, vec![true, false, false, true]);
+        assert_eq!(datums.len(), 4);
+        assert!(datums[0].0.value() != 0);
+        assert!(datums[3].0.value() != 0);
+    }
+
+    #[pg_test]
+    fn test_decompress_text_like_contains_lz4() {
+        use super::batch_qual::LikeStrategy;
+        use super::datum_utils::decompress_text_blob_with_like_filter;
+        use crate::compression::{CompressionType, lz4};
+
+        // Contains "oo" → "good" and "fool" match, "bar" doesn't.
+        let values: Vec<&str> = vec!["good", "bar", "fool", "ham"];
+        let data = lz4::encode(&values);
+        let blob = make_blob(CompressionType::Lz4, 4, data);
+        let strategy = LikeStrategy::Contains("oo".to_string());
+        let (_datums, sel) = unsafe {
+            decompress_text_blob_with_like_filter(
+                &blob,
+                pg_sys::TEXTOID,
+                -1,
+                &strategy,
+                false,
+                None,
+            )
+        };
+        assert_eq!(sel, vec![true, false, true, false]);
     }
 }

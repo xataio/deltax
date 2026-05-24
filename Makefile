@@ -11,7 +11,7 @@ QUERY_CONTAINER = pg_deltax_query
 PG_VERSIONS ?= 17 18
 VENV         = .venv
 
-.PHONY: dev-image image image-fresh correctness-image test build clippy coverage coverage-all run psql cargo clean \
+.PHONY: dev-image image image-fresh correctness-image test build clippy fmt fmt-check coverage coverage-all run psql cargo clean \
        integration-test \
        correctness-smoke correctness correctness-fuzz correctness-clean \
        bench-clickbench bench-clickbench-keep bench-clickbench-full bench-clean \
@@ -40,6 +40,24 @@ build: dev-image
 clippy: dev-image
 	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
 		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) cargo clippy --features pg$(PG_MAJOR) --no-default-features --tests
+
+# Format code with rustfmt. Pass FILE=... to scope to a single file (per-session cleanup style).
+#   make fmt                       # format the whole tree
+#   make fmt FILE=src/foo.rs       # format just that file
+#
+# `cargo fmt` is whole-workspace and ignores positional file args; and
+# `rustfmt <file>` recurses into `mod ...;` children by default. So when
+# FILE= is set we invoke `rustfmt` directly with `skip_children=true` so the
+# scope really is just that one file. Edition matches Cargo.toml.
+fmt: dev-image
+	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
+		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) \
+		$(if $(FILE),rustfmt --edition 2024 --config skip_children=true $(FILE),cargo fmt)
+
+# Verify formatting without modifying files. Whole-tree only.
+fmt-check: dev-image
+	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \
+		-v $(CARGO_VOL):/usr/local/cargo/registry $(DEV_IMAGE) cargo fmt -- --check
 
 coverage: dev-image
 	docker run --rm -v $(CURDIR):/build/pg_deltax -v $(TARGET_VOL):/build/pg_deltax/target \

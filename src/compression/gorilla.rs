@@ -422,7 +422,11 @@ mod tests {
         let decoded = decode_floats(&encoded, values.len());
         assert_eq!(decoded, values);
         // All-same should compress very well
-        assert!(encoded.len() < 30, "all-same should compress to ~20 bytes, got {}", encoded.len());
+        assert!(
+            encoded.len() < 30,
+            "all-same should compress to ~20 bytes, got {}",
+            encoded.len()
+        );
     }
 
     #[test]
@@ -468,7 +472,11 @@ mod tests {
         }
 
         let ratio = raw_size as f64 / encoded.len() as f64;
-        assert!(ratio > 1.0, "expected >1x compression on sensor data, got {:.1}x", ratio);
+        assert!(
+            ratio > 1.0,
+            "expected >1x compression on sensor data, got {:.1}x",
+            ratio
+        );
     }
 
     #[test]
@@ -530,6 +538,10 @@ mod tests {
         assert_eq!(decoded, values);
 
         let ratio = raw_size as f64 / encoded.len() as f64;
-        assert!(ratio > 10.0, "constant-delta timestamps should compress >10x, got {:.1}x", ratio);
+        assert!(
+            ratio > 10.0,
+            "constant-delta timestamps should compress >10x, got {:.1}x",
+            ratio
+        );
     }
 }

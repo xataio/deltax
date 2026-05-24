@@ -26,11 +26,11 @@ def _seed(db, n_partitions=4, rows_per_partition=50_000, high_card=5000):
         ")"
     )
     db.execute(
-        "SELECT deltax_create_table('events', 'ts', '1 day', %s)",
+        "SELECT deltax.deltax_create_table('events', 'ts', '1 day', %s)",
         (n_partitions - 1,),
     )
     db.execute(
-        "SELECT deltax_enable_compression('events', order_by => ARRAY['ts'])"
+        "SELECT deltax.deltax_enable_compression('events', order_by => ARRAY['ts'])"
     )
     db.commit()
 
@@ -58,18 +58,18 @@ def _seed(db, n_partitions=4, rows_per_partition=50_000, high_card=5000):
     assert db.execute("SELECT count(*) FROM events_default").fetchone()[0] == 0
 
     for (name,) in db.execute(
-        "SELECT partition_name FROM deltax_partition_info('events') "
+        "SELECT partition_name FROM deltax.deltax_partition_info('events') "
         "ORDER BY range_start"
     ).fetchall():
         cnt = db.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]
         if cnt > 0:
-            db.execute("SELECT deltax_compress_partition(%s)", (name,))
+            db.execute("SELECT deltax.deltax_compress_partition(%s)", (name,))
     db.commit()
 
 
 def _first_compressed_partition(db):
     row = db.execute(
-        "SELECT table_name FROM deltax_partition WHERE is_compressed = true "
+        "SELECT table_name FROM deltax.deltax_partition WHERE is_compressed = true "
         "ORDER BY range_start LIMIT 1"
     ).fetchone()
     assert row is not None, "no compressed partitions"
@@ -184,7 +184,7 @@ def test_deltax_analyze_partition_is_idempotent(db):
     part = _first_compressed_partition(db)
 
     before = _stats_for(db, part, "uid")
-    db.execute("SELECT deltax_analyze_partition(%s)", (part,))
+    db.execute("SELECT deltax.deltax_analyze_partition(%s)", (part,))
     db.commit()
     after = _stats_for(db, part, "uid")
 

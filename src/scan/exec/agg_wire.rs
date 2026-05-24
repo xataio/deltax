@@ -140,9 +140,15 @@ pub(super) enum SerError {
 #[derive(Debug, PartialEq)]
 #[allow(dead_code)] // exercised by tests + future error reporting
 pub(super) enum DeError {
-    Truncated { needed: u32, have: u64 },
+    Truncated {
+        needed: u32,
+        have: u64,
+    },
     MagicMismatch,
-    VersionMismatch { got: u32, expected: u32 },
+    VersionMismatch {
+        got: u32,
+        expected: u32,
+    },
     /// Sender's layout disagrees with receiver's reconstruction. Indicates
     /// `CompactAccLayout::new(agg_specs)` is non-deterministic or the receiver
     /// was given a different `agg_specs` than the sender.
@@ -275,11 +281,7 @@ pub(super) unsafe fn serialize_partial_into(
             let entry = slots_ptr.add(i * SLOT_RECORD_BYTES as usize);
             // [u32 offset][u8 kind][u8 _pad0][u8 _pad1][u8 _pad2]
             let off_u32 = *off as u32;
-            std::ptr::copy_nonoverlapping(
-                &off_u32 as *const u32 as *const u8,
-                entry,
-                4,
-            );
+            std::ptr::copy_nonoverlapping(&off_u32 as *const u32 as *const u8, entry, 4);
             *entry.add(4) = kind.wire_tag();
         }
 
@@ -287,16 +289,8 @@ pub(super) unsafe fn serialize_partial_into(
         let gm_ptr = slab.add(layout.group_map_off as usize);
         for (i, (key, idx)) in result.compact_map.iter().enumerate() {
             let entry = gm_ptr.add(i * GROUP_MAP_ENTRY_BYTES as usize);
-            std::ptr::copy_nonoverlapping(
-                key as *const u128 as *const u8,
-                entry,
-                16,
-            );
-            std::ptr::copy_nonoverlapping(
-                idx as *const u32 as *const u8,
-                entry.add(16),
-                4,
-            );
+            std::ptr::copy_nonoverlapping(key as *const u128 as *const u8, entry, 16);
+            std::ptr::copy_nonoverlapping(idx as *const u32 as *const u8, entry.add(16), 4);
         }
 
         // ---------------- Storage buf ----------------
@@ -396,10 +390,8 @@ pub(super) unsafe fn deserialize_partial(
         // Group map.
         let gm_ptr = slab.add(hdr.group_map_off as usize);
         let num_groups = hdr.num_groups as usize;
-        let mut compact_map = CompactGroupMap::with_capacity_and_hasher(
-            num_groups,
-            BuildHasherDefault::default(),
-        );
+        let mut compact_map =
+            CompactGroupMap::with_capacity_and_hasher(num_groups, BuildHasherDefault::default());
         for i in 0..num_groups {
             let entry = gm_ptr.add(i * GROUP_MAP_ENTRY_BYTES as usize);
             let mut key_bytes = [0u8; 16];
@@ -449,7 +441,8 @@ pub(super) unsafe fn deserialize_partial(
             None
         };
 
-        let compact_storage = CompactAccStorage::from_parts(recv_layout, storage_buf, str_arena_buf);
+        let compact_storage =
+            CompactAccStorage::from_parts(recv_layout, storage_buf, str_arena_buf);
 
         // cd_sidecar is empty in V1 (Phase D wires it up).
         let cd_sidecar = CountDistinctSideCar::new(agg_specs);
@@ -532,19 +525,20 @@ mod tests {
             let idx = r.compact_storage.alloc_group();
             r.cd_sidecar.alloc_group();
             r.compact_map.insert(key, idx);
-            unsafe { *r.compact_storage.count_mut(idx, 0) = count; }
+            r.compact_storage.set_count(idx, 0, count);
         }
         r
     }
 
-    #[pgrx::pg_test]
-    fn pg_test_partial_wire_empty() {
+    #[test]
+    fn partial_wire_empty() {
         let specs = count_star_specs();
         let r = ParallelCompactResult::empty(&specs);
         let layout = layout_partial(&r, &specs);
         let mut buf = vec![0u8; layout.total_size as usize];
         unsafe {
-            let written = serialize_partial_into(buf.as_mut_ptr(), buf.len() as u32, &r, &specs).unwrap();
+            let written =
+                serialize_partial_into(buf.as_mut_ptr(), buf.len() as u32, &r, &specs).unwrap();
             assert_eq!(written, layout.total_size);
             let back = deserialize_partial(buf.as_ptr(), written as u64, &specs).unwrap();
             assert_eq!(back.compact_map.len(), 0);
@@ -554,8 +548,8 @@ mod tests {
         }
     }
 
-    #[pgrx::pg_test]
-    fn pg_test_partial_wire_single_group() {
+    #[test]
+    fn partial_wire_single_group() {
         let specs = count_star_specs();
         let mut r = mk_count_result(&[(0xCAFE, 42)]);
         r.segments_processed = 7;
@@ -575,8 +569,8 @@ mod tests {
         }
     }
 
-    #[pgrx::pg_test]
-    fn pg_test_partial_wire_multi_group_with_strings() {
+    #[test]
+    fn partial_wire_multi_group_with_strings() {
         let specs = min_text_specs();
         let mut r = ParallelCompactResult::empty(&specs);
         // Three groups, each carrying a MIN(text) value.
@@ -585,7 +579,7 @@ mod tests {
             r.cd_sidecar.alloc_group();
             r.compact_map.insert(key, idx);
             let (off, len) = r.compact_storage.str_arena.alloc(s);
-            unsafe { r.compact_storage.write_min_max_str(idx, 0, off, len); }
+            r.compact_storage.write_min_max_str(idx, 0, off, len);
         }
         let layout = layout_partial(&r, &specs);
         let mut buf = vec![0u8; layout.total_size as usize];
@@ -601,8 +595,8 @@ mod tests {
         }
     }
 
-    #[pgrx::pg_test]
-    fn pg_test_partial_wire_topk_present() {
+    #[test]
+    fn partial_wire_topk_present() {
         let specs = sum_int4_count_specs();
         let mut r = ParallelCompactResult::empty(&specs);
         let idx = r.compact_storage.alloc_group();
@@ -621,20 +615,15 @@ mod tests {
         }
     }
 
-    #[pgrx::pg_test]
-    fn pg_test_partial_wire_overflow() {
+    #[test]
+    fn partial_wire_overflow() {
         let specs = count_star_specs();
         let r = mk_count_result(&[(1, 1), (2, 2), (3, 3)]);
         let layout = layout_partial(&r, &specs);
         // Cap one byte short of needed.
         let mut buf = vec![0u8; layout.total_size as usize];
         unsafe {
-            let res = serialize_partial_into(
-                buf.as_mut_ptr(),
-                layout.total_size - 1,
-                &r,
-                &specs,
-            );
+            let res = serialize_partial_into(buf.as_mut_ptr(), layout.total_size - 1, &r, &specs);
             match res {
                 Err(SerError::Overflow { needed, have }) => {
                     assert_eq!(needed, layout.total_size);
@@ -645,8 +634,8 @@ mod tests {
         }
     }
 
-    #[pgrx::pg_test]
-    fn pg_test_partial_wire_magic_mismatch() {
+    #[test]
+    fn partial_wire_magic_mismatch() {
         let specs = count_star_specs();
         let buf = vec![0u8; HEADER_SIZE as usize];
         unsafe {
@@ -655,8 +644,8 @@ mod tests {
         }
     }
 
-    #[pgrx::pg_test]
-    fn pg_test_partial_wire_telemetry_roundtrip() {
+    #[test]
+    fn partial_wire_telemetry_roundtrip() {
         let specs = count_star_specs();
         let mut r = mk_count_result(&[(0x1, 1), (0x2, 2), (0x3, 3), (0x4, 4)]);
         r.segments_processed = 13;
@@ -675,6 +664,76 @@ mod tests {
                 let gidx = *back.compact_map.get(&k).unwrap();
                 assert_eq!(back.compact_storage.read_count(gidx, 0), expected);
             }
+        }
+    }
+
+    #[test]
+    fn round_up_handles_alignment() {
+        // 8-byte align (storage region must be u64-aligned).
+        assert_eq!(round_up(0, 8), 0);
+        assert_eq!(round_up(1, 8), 8);
+        assert_eq!(round_up(7, 8), 8);
+        assert_eq!(round_up(8, 8), 8);
+        assert_eq!(round_up(9, 8), 16);
+        // 16-byte align (i128 accumulator first-field constraint).
+        assert_eq!(round_up(15, 16), 16);
+        assert_eq!(round_up(16, 16), 16);
+        assert_eq!(round_up(17, 16), 32);
+    }
+
+    #[test]
+    fn partial_wire_version_mismatch_rejected() {
+        // Serialise V1, hand-corrupt the version field, attach must fail.
+        // Without this guard, a future V2 leader feeds a V1 worker garbage.
+        let specs = count_star_specs();
+        let r = mk_count_result(&[(1, 1)]);
+        let layout = layout_partial(&r, &specs);
+        let mut buf = vec![0u8; layout.total_size as usize];
+        unsafe {
+            serialize_partial_into(buf.as_mut_ptr(), buf.len() as u32, &r, &specs).unwrap();
+            // Bump version to provoke the mismatch path.
+            let hdr = buf.as_mut_ptr() as *mut PartialMeta;
+            (*hdr).version = PARTIAL_VERSION.wrapping_add(1);
+            let res = deserialize_partial(buf.as_ptr(), layout.total_size as u64, &specs);
+            match res {
+                Err(DeError::VersionMismatch { got, expected }) => {
+                    assert_eq!(got, PARTIAL_VERSION.wrapping_add(1));
+                    assert_eq!(expected, PARTIAL_VERSION);
+                }
+                Err(other) => panic!("expected VersionMismatch, got {:?}", other),
+                Ok(_) => panic!("expected VersionMismatch, got Ok"),
+            }
+        }
+    }
+
+    #[test]
+    fn partial_wire_truncated_buffer_rejected() {
+        // Slab shorter than the header must surface as Truncated rather
+        // than reading past the buffer.
+        let specs = count_star_specs();
+        let short_buf = vec![0u8; (HEADER_SIZE - 1) as usize];
+        unsafe {
+            let res = deserialize_partial(short_buf.as_ptr(), short_buf.len() as u64, &specs);
+            assert!(matches!(res, Err(DeError::Truncated { .. })));
+        }
+    }
+
+    #[test]
+    fn partial_wire_slot_count_mismatch_rejected() {
+        // Sender + receiver must agree on agg_specs.len(). If a worker
+        // started with 1 spec and the leader reconstructs with 2, the
+        // accumulator layout is incompatible and the merge step would
+        // silently overrun group storage.
+        let sender_specs = count_star_specs();
+        let r = mk_count_result(&[(1, 1)]);
+        let layout = layout_partial(&r, &sender_specs);
+        let mut buf = vec![0u8; layout.total_size as usize];
+        unsafe {
+            serialize_partial_into(buf.as_mut_ptr(), buf.len() as u32, &r, &sender_specs).unwrap();
+            // Receiver tries to decode with sum+count specs (2 slots, not 1).
+            let receiver_specs = sum_int4_count_specs();
+            let res = deserialize_partial(buf.as_ptr(), layout.total_size as u64, &receiver_specs);
+            assert_eq!(res.err(), Some(DeError::LayoutMismatch));
         }
     }
 }

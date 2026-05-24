@@ -34,6 +34,21 @@ pub(super) struct BatchQual {
     pub(super) in_list_text: Option<Vec<String>>,   // constant values for text IN list
 }
 
+impl Default for BatchQual {
+    fn default() -> Self {
+        Self {
+            col_idx: 0,
+            op: BatchCompareOp::Eq,
+            const_datum: pg_sys::Datum::from(0usize),
+            type_oid: pg_sys::InvalidOid,
+            like_strategy: None,
+            text_const: None,
+            in_list_i64: None,
+            in_list_text: None,
+        }
+    }
+}
+
 // SAFETY: BatchQual is shared across threads only via immutable references
 // during parallel aggregation, and only when all quals reference numeric types
 // (verified by batch_quals_all_numeric). For numeric types, const_datum
@@ -96,15 +111,23 @@ pub(super) fn parse_compare_op(opname: &str) -> Option<BatchCompareOp> {
     }
 }
 
-// Monomorphized batch filter functions.  Each ANDs the comparison result
-// into the selection vector so that multiple quals compose correctly.
+// Batch filter primitives. Each ANDs the comparison result into the
+// selection vector so that multiple quals compose correctly. The generic
+// inner helper takes a `decode` closure that turns a `Datum` into the
+// column's native Rust type — Rust monomorphises one tight inner loop per
+// callsite, so generic-ising doesn't cost auto-vectorisation.
 
-pub(super) fn apply_batch_filter_i64(
+#[inline]
+fn apply_batch_filter_typed<T, F>(
     col: &[(pg_sys::Datum, bool)],
     sel: &mut [bool],
     op: BatchCompareOp,
-    constant: i64,
-) {
+    constant: T,
+    decode: F,
+) where
+    T: PartialOrd,
+    F: Fn(pg_sys::Datum) -> T,
+{
     for (i, &(datum, is_null)) in col.iter().enumerate() {
         if !sel[i] {
             continue;
@@ -113,7 +136,7 @@ pub(super) fn apply_batch_filter_i64(
             sel[i] = false;
             continue;
         }
-        let v = datum.value() as i64;
+        let v = decode(datum);
         sel[i] = match op {
             BatchCompareOp::Eq => v == constant,
             BatchCompareOp::Ne => v != constant,
@@ -126,6 +149,15 @@ pub(super) fn apply_batch_filter_i64(
             }
         };
     }
+}
+
+pub(super) fn apply_batch_filter_i64(
+    col: &[(pg_sys::Datum, bool)],
+    sel: &mut [bool],
+    op: BatchCompareOp,
+    constant: i64,
+) {
+    apply_batch_filter_typed(col, sel, op, constant, |d| d.value() as i64);
 }
 
 pub(super) fn apply_batch_filter_i32(
@@ -134,27 +166,7 @@ pub(super) fn apply_batch_filter_i32(
     op: BatchCompareOp,
     constant: i32,
 ) {
-    for (i, &(datum, is_null)) in col.iter().enumerate() {
-        if !sel[i] {
-            continue;
-        }
-        if is_null {
-            sel[i] = false;
-            continue;
-        }
-        let v = datum.value() as i32;
-        sel[i] = match op {
-            BatchCompareOp::Eq => v == constant,
-            BatchCompareOp::Ne => v != constant,
-            BatchCompareOp::Lt => v < constant,
-            BatchCompareOp::Le => v <= constant,
-            BatchCompareOp::Gt => v > constant,
-            BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => {
-                unreachable!()
-            }
-        };
-    }
+    apply_batch_filter_typed(col, sel, op, constant, |d| d.value() as i32);
 }
 
 pub(super) fn apply_batch_filter_i16(
@@ -163,27 +175,7 @@ pub(super) fn apply_batch_filter_i16(
     op: BatchCompareOp,
     constant: i16,
 ) {
-    for (i, &(datum, is_null)) in col.iter().enumerate() {
-        if !sel[i] {
-            continue;
-        }
-        if is_null {
-            sel[i] = false;
-            continue;
-        }
-        let v = datum.value() as i16;
-        sel[i] = match op {
-            BatchCompareOp::Eq => v == constant,
-            BatchCompareOp::Ne => v != constant,
-            BatchCompareOp::Lt => v < constant,
-            BatchCompareOp::Le => v <= constant,
-            BatchCompareOp::Gt => v > constant,
-            BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => {
-                unreachable!()
-            }
-        };
-    }
+    apply_batch_filter_typed(col, sel, op, constant, |d| d.value() as i16);
 }
 
 pub(super) fn apply_batch_filter_f64(
@@ -192,27 +184,7 @@ pub(super) fn apply_batch_filter_f64(
     op: BatchCompareOp,
     constant: f64,
 ) {
-    for (i, &(datum, is_null)) in col.iter().enumerate() {
-        if !sel[i] {
-            continue;
-        }
-        if is_null {
-            sel[i] = false;
-            continue;
-        }
-        let v = f64::from_bits(datum.value() as u64);
-        sel[i] = match op {
-            BatchCompareOp::Eq => v == constant,
-            BatchCompareOp::Ne => v != constant,
-            BatchCompareOp::Lt => v < constant,
-            BatchCompareOp::Le => v <= constant,
-            BatchCompareOp::Gt => v > constant,
-            BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => {
-                unreachable!()
-            }
-        };
-    }
+    apply_batch_filter_typed(col, sel, op, constant, |d| f64::from_bits(d.value() as u64));
 }
 
 pub(super) fn apply_batch_filter_f32(
@@ -221,27 +193,7 @@ pub(super) fn apply_batch_filter_f32(
     op: BatchCompareOp,
     constant: f32,
 ) {
-    for (i, &(datum, is_null)) in col.iter().enumerate() {
-        if !sel[i] {
-            continue;
-        }
-        if is_null {
-            sel[i] = false;
-            continue;
-        }
-        let v = f32::from_bits(datum.value() as u32);
-        sel[i] = match op {
-            BatchCompareOp::Eq => v == constant,
-            BatchCompareOp::Ne => v != constant,
-            BatchCompareOp::Lt => v < constant,
-            BatchCompareOp::Le => v <= constant,
-            BatchCompareOp::Gt => v > constant,
-            BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => {
-                unreachable!()
-            }
-        };
-    }
+    apply_batch_filter_typed(col, sel, op, constant, |d| f32::from_bits(d.value() as u32));
 }
 
 pub(super) fn apply_batch_filter_bool(
@@ -250,6 +202,8 @@ pub(super) fn apply_batch_filter_bool(
     op: BatchCompareOp,
     constant: bool,
 ) {
+    // Bool only supports `=` / `<>`; the generic helper's PartialOrd
+    // arithmetic comparisons are meaningless here, so this stays inline.
     for (i, &(datum, is_null)) in col.iter().enumerate() {
         if !sel[i] {
             continue;
@@ -260,12 +214,11 @@ pub(super) fn apply_batch_filter_bool(
         }
         let v = datum.value() != 0;
         sel[i] = match op {
-            BatchCompareOp::Eq => v == constant,
             BatchCompareOp::Ne => v != constant,
             BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => {
                 unreachable!()
             }
-            _ => v == constant, // bool only supports = / <>
+            _ => v == constant, // Eq, Lt, Le, Gt, Ge all degrade to equality
         };
     }
 }
@@ -526,13 +479,9 @@ pub(super) unsafe fn extract_batch_quals(
                     if col_types[col_idx] == pg_sys::BOOLOID {
                         batch_quals.push(BatchQual {
                             col_idx,
-                            op: BatchCompareOp::Eq,
                             const_datum: pg_sys::Datum::from(1usize), // true
                             type_oid: pg_sys::BOOLOID,
-                            like_strategy: None,
-                            text_const: None,
-                            in_list_i64: None,
-                            in_list_text: None,
+                            ..Default::default()
                         });
                     }
                 }
@@ -554,13 +503,9 @@ pub(super) unsafe fn extract_batch_quals(
                                 if col_types[col_idx] == pg_sys::BOOLOID {
                                     batch_quals.push(BatchQual {
                                         col_idx,
-                                        op: BatchCompareOp::Eq,
                                         const_datum: pg_sys::Datum::from(0usize), // false
                                         type_oid: pg_sys::BOOLOID,
-                                        like_strategy: None,
-                                        text_const: None,
-                                        in_list_i64: None,
-                                        in_list_text: None,
+                                        ..Default::default()
                                     });
                                 }
                             }
@@ -694,12 +639,18 @@ pub(super) unsafe fn extract_batch_quals(
                 batch_quals.push(BatchQual {
                     col_idx: sa_col_idx,
                     op: BatchCompareOp::InList,
-                    const_datum: pg_sys::Datum::from(0usize), // unused
                     type_oid: sa_type_oid,
-                    like_strategy: None,
-                    text_const: None,
-                    in_list_i64: if is_numeric_in { Some(in_values_i64) } else { None },
-                    in_list_text: if is_text_in { Some(in_values_text) } else { None },
+                    in_list_i64: if is_numeric_in {
+                        Some(in_values_i64)
+                    } else {
+                        None
+                    },
+                    in_list_text: if is_text_in {
+                        Some(in_values_text)
+                    } else {
+                        None
+                    },
+                    ..Default::default()
                 });
                 continue;
             }
@@ -818,9 +769,7 @@ pub(super) unsafe fn extract_batch_quals(
                     const_datum: (*const_node).constvalue,
                     type_oid,
                     like_strategy: Some(strategy),
-                    text_const: None,
-                    in_list_i64: None,
-                    in_list_text: None,
+                    ..Default::default()
                 });
             } else if matches!(type_oid, pg_sys::TEXTOID | pg_sys::VARCHAROID)
                 && matches!(cmp_op, BatchCompareOp::Eq | BatchCompareOp::Ne)
@@ -845,10 +794,8 @@ pub(super) unsafe fn extract_batch_quals(
                     op: cmp_op,
                     const_datum: (*const_node).constvalue,
                     type_oid,
-                    like_strategy: None,
                     text_const: Some(const_str),
-                    in_list_i64: None,
-                    in_list_text: None,
+                    ..Default::default()
                 });
             } else {
                 if !is_batch_comparable_type(type_oid) {
@@ -866,10 +813,7 @@ pub(super) unsafe fn extract_batch_quals(
                     op,
                     const_datum: (*const_node).constvalue,
                     type_oid,
-                    like_strategy: None,
-                    text_const: None,
-                    in_list_i64: None,
-                    in_list_text: None,
+                    ..Default::default()
                 });
             }
 
@@ -881,4 +825,278 @@ pub(super) unsafe fn extract_batch_quals(
     }
 
     (batch_quals, handled_count)
+}
+
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_compare_op_recognised_set() {
+        assert_eq!(parse_compare_op("="), Some(BatchCompareOp::Eq));
+        assert_eq!(parse_compare_op("<>"), Some(BatchCompareOp::Ne));
+        assert_eq!(parse_compare_op("!="), Some(BatchCompareOp::Ne));
+        assert_eq!(parse_compare_op("<"), Some(BatchCompareOp::Lt));
+        assert_eq!(parse_compare_op("<="), Some(BatchCompareOp::Le));
+        assert_eq!(parse_compare_op(">"), Some(BatchCompareOp::Gt));
+        assert_eq!(parse_compare_op(">="), Some(BatchCompareOp::Ge));
+    }
+
+    #[test]
+    fn parse_compare_op_rejects_non_comparisons() {
+        // LIKE / NOT LIKE / IN have their own paths and must NOT round-trip
+        // through `parse_compare_op` — the caller dispatches them separately.
+        assert_eq!(parse_compare_op("~~"), None);
+        assert_eq!(parse_compare_op("!~~"), None);
+        assert_eq!(parse_compare_op("+"), None);
+        assert_eq!(parse_compare_op(""), None);
+    }
+
+    #[test]
+    fn flip_compare_op_is_involutive_for_symmetric_ops() {
+        // = and <> stay put; <, <=, >, >= swap; LIKE / NotLike / InList
+        // are non-commutative — calling `flip` on them is meaningless in
+        // the planner but the function still returns them as-is.
+        for op in [BatchCompareOp::Eq, BatchCompareOp::Ne] {
+            assert_eq!(flip_compare_op(op), op);
+        }
+        assert_eq!(flip_compare_op(BatchCompareOp::Lt), BatchCompareOp::Gt);
+        assert_eq!(flip_compare_op(BatchCompareOp::Gt), BatchCompareOp::Lt);
+        assert_eq!(flip_compare_op(BatchCompareOp::Le), BatchCompareOp::Ge);
+        assert_eq!(flip_compare_op(BatchCompareOp::Ge), BatchCompareOp::Le);
+    }
+
+    #[test]
+    fn flip_compare_op_is_involutive() {
+        for op in [
+            BatchCompareOp::Eq,
+            BatchCompareOp::Ne,
+            BatchCompareOp::Lt,
+            BatchCompareOp::Le,
+            BatchCompareOp::Gt,
+            BatchCompareOp::Ge,
+            BatchCompareOp::Like,
+            BatchCompareOp::NotLike,
+            BatchCompareOp::InList,
+        ] {
+            assert_eq!(flip_compare_op(flip_compare_op(op)), op);
+        }
+    }
+
+    fn assert_like_eq(actual: LikeStrategy, expected: LikeStrategy) {
+        // LikeStrategy doesn't derive PartialEq (it carries Strings); compare via Debug.
+        assert_eq!(format!("{:?}", actual), format!("{:?}", expected));
+    }
+
+    #[test]
+    fn compile_like_pattern_classifies_simple_shapes() {
+        // No wildcards → Exact.
+        assert_like_eq(
+            compile_like_pattern("hello"),
+            LikeStrategy::Exact("hello".into()),
+        );
+        // Bare % → Contains("").
+        assert_like_eq(
+            compile_like_pattern("%"),
+            LikeStrategy::Contains(String::new()),
+        );
+        // foo% → StartsWith("foo").
+        assert_like_eq(
+            compile_like_pattern("foo%"),
+            LikeStrategy::StartsWith("foo".into()),
+        );
+        // %foo → EndsWith("foo").
+        assert_like_eq(
+            compile_like_pattern("%foo"),
+            LikeStrategy::EndsWith("foo".into()),
+        );
+        // %foo% → Contains("foo").
+        assert_like_eq(
+            compile_like_pattern("%foo%"),
+            LikeStrategy::Contains("foo".into()),
+        );
+    }
+
+    #[test]
+    fn compile_like_pattern_falls_back_to_general() {
+        // Backslash → General regardless of % positions.
+        assert_like_eq(
+            compile_like_pattern("foo\\%"),
+            LikeStrategy::General("foo\\%".into()),
+        );
+        // Underscore → General.
+        assert_like_eq(
+            compile_like_pattern("a_b"),
+            LikeStrategy::General("a_b".into()),
+        );
+        // % in the middle of an otherwise-static pattern → General.
+        assert_like_eq(
+            compile_like_pattern("a%b"),
+            LikeStrategy::General("a%b".into()),
+        );
+        // Three % → General.
+        assert_like_eq(
+            compile_like_pattern("%a%b%"),
+            LikeStrategy::General("%a%b%".into()),
+        );
+    }
+
+    #[test]
+    fn sql_like_match_basic() {
+        // Wildcards: %, _, anchored matches.
+        assert!(sql_like_match("hello world", "hello%"));
+        assert!(sql_like_match("hello world", "%world"));
+        assert!(sql_like_match("hello world", "%lo wo%"));
+        assert!(sql_like_match("hello world", "hello world"));
+        assert!(!sql_like_match("hello world", "hello"));
+        assert!(!sql_like_match("hello", "world"));
+
+        // Single-character `_` matches one character of any kind.
+        assert!(sql_like_match("abc", "a_c"));
+        assert!(!sql_like_match("ac", "a_c"));
+        assert!(sql_like_match("abc", "___"));
+        assert!(!sql_like_match("abcd", "___"));
+    }
+
+    #[test]
+    fn sql_like_match_backslash_escapes_metachars() {
+        // \% matches a literal %; \_ matches a literal _.
+        assert!(sql_like_match("50%", "50\\%"));
+        assert!(!sql_like_match("50X", "50\\%"));
+        assert!(sql_like_match("a_b", "a\\_b"));
+        assert!(!sql_like_match("aXb", "a\\_b"));
+    }
+
+    #[test]
+    fn sql_like_match_empty_strings() {
+        assert!(sql_like_match("", ""));
+        assert!(sql_like_match("", "%"));
+        assert!(sql_like_match("", "%%"));
+        assert!(!sql_like_match("", "_"));
+        assert!(!sql_like_match("x", ""));
+    }
+
+    fn datum_from_i64(v: i64) -> pg_sys::Datum {
+        pg_sys::Datum::from(v as usize)
+    }
+
+    fn datum_from_f64(v: f64) -> pg_sys::Datum {
+        pg_sys::Datum::from(v.to_bits() as usize)
+    }
+
+    #[test]
+    fn apply_batch_filter_i64_ands_into_existing_selection() {
+        // Three rows: [10, 20, 30]; initial sel: [true, false, true].
+        // Apply `> 15`. Expected: [false, false, true].
+        // Row 0 (10 > 15 = false) → cleared.
+        // Row 1 already false → stays false.
+        // Row 2 (30 > 15 = true) → stays true.
+        let col: Vec<(pg_sys::Datum, bool)> = vec![
+            (datum_from_i64(10), false),
+            (datum_from_i64(20), false),
+            (datum_from_i64(30), false),
+        ];
+        let mut sel = vec![true, false, true];
+        apply_batch_filter_i64(&col, &mut sel, BatchCompareOp::Gt, 15);
+        assert_eq!(sel, vec![false, false, true]);
+    }
+
+    #[test]
+    fn apply_batch_filter_i64_null_rows_are_dropped() {
+        // NULL rows are excluded from the result of every comparison
+        // (matches SQL three-valued logic — `NULL op anything` is unknown).
+        let col: Vec<(pg_sys::Datum, bool)> = vec![
+            (datum_from_i64(10), false),
+            (datum_from_i64(0), true), // NULL
+            (datum_from_i64(20), false),
+        ];
+        let mut sel = vec![true, true, true];
+        apply_batch_filter_i64(&col, &mut sel, BatchCompareOp::Ge, 0);
+        // Row 0 passes (10 >= 0), row 1 dropped (NULL), row 2 passes.
+        assert_eq!(sel, vec![true, false, true]);
+    }
+
+    #[test]
+    fn apply_batch_filter_f64_handles_each_op() {
+        let col: Vec<(pg_sys::Datum, bool)> = vec![
+            (datum_from_f64(1.5), false),
+            (datum_from_f64(2.5), false),
+            (datum_from_f64(3.5), false),
+        ];
+        for (op, expected) in [
+            (BatchCompareOp::Eq, vec![false, true, false]),
+            (BatchCompareOp::Ne, vec![true, false, true]),
+            (BatchCompareOp::Lt, vec![true, false, false]),
+            (BatchCompareOp::Le, vec![true, true, false]),
+            (BatchCompareOp::Gt, vec![false, false, true]),
+            (BatchCompareOp::Ge, vec![false, true, true]),
+        ] {
+            let mut sel = vec![true, true, true];
+            apply_batch_filter_f64(&col, &mut sel, op, 2.5);
+            assert_eq!(sel, expected, "op {:?}", op);
+        }
+    }
+
+    #[test]
+    fn apply_batch_filter_in_list_int4() {
+        // INT4 IN list: matches only the values mentioned, drops others
+        // (and drops NULLs unconditionally).
+        let col: Vec<(pg_sys::Datum, bool)> = vec![
+            (datum_from_i64(1), false),
+            (datum_from_i64(7), false),
+            (datum_from_i64(3), false),
+            (datum_from_i64(0), true), // NULL
+        ];
+        let mut sel = vec![true, true, true, true];
+        apply_batch_filter_in_list(&col, &mut sel, &[1, 3], pg_sys::INT4OID);
+        assert_eq!(sel, vec![true, false, true, false]);
+    }
+
+    #[test]
+    fn batch_qual_default_is_safe_neutral() {
+        let q = BatchQual::default();
+        assert_eq!(q.col_idx, 0);
+        assert_eq!(q.op, BatchCompareOp::Eq);
+        assert_eq!(q.type_oid, pg_sys::InvalidOid);
+        assert!(q.like_strategy.is_none());
+        assert!(q.text_const.is_none());
+        assert!(q.in_list_i64.is_none());
+        assert!(q.in_list_text.is_none());
+    }
+
+    #[test]
+    fn is_batch_comparable_type_matrix() {
+        for ok in [
+            pg_sys::INT2OID,
+            pg_sys::INT4OID,
+            pg_sys::INT8OID,
+            pg_sys::FLOAT4OID,
+            pg_sys::FLOAT8OID,
+            pg_sys::BOOLOID,
+            pg_sys::DATEOID,
+            pg_sys::TIMESTAMPOID,
+            pg_sys::TIMESTAMPTZOID,
+        ] {
+            assert!(is_batch_comparable_type(ok));
+        }
+        for bad in [
+            pg_sys::TEXTOID,
+            pg_sys::VARCHAROID,
+            pg_sys::JSONBOID,
+            pg_sys::NUMERICOID,
+        ] {
+            assert!(!is_batch_comparable_type(bad));
+        }
+    }
+
+    #[test]
+    fn is_text_type_matrix() {
+        for ok in [pg_sys::TEXTOID, pg_sys::VARCHAROID, pg_sys::BPCHAROID] {
+            assert!(is_text_type(ok));
+        }
+        for bad in [pg_sys::INT4OID, pg_sys::JSONBOID, pg_sys::BOOLOID] {
+            assert!(!is_text_type(bad));
+        }
+    }
 }

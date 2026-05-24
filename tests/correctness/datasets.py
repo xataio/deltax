@@ -193,13 +193,13 @@ RTABENCH_EVENT_COLUMNS = (
 
 def _compress_non_default_partitions(conn, table_name: str) -> None:
     partitions = conn.execute(
-        f"SELECT partition_name FROM deltax_partition_info('{table_name}') "
+        f"SELECT partition_name FROM deltax.deltax_partition_info('{table_name}') "
         "WHERE partition_name NOT LIKE '%default%' ORDER BY range_start"
     ).fetchall()
     for (partition_name,) in partitions:
         row_count = conn.execute(f'SELECT count(*) FROM "{partition_name}"').fetchone()[0]
         if row_count > 0:
-            conn.execute("SELECT deltax_compress_partition(%s)", (partition_name,))
+            conn.execute("SELECT deltax.deltax_compress_partition(%s)", (partition_name,))
     conn.commit()
 
 
@@ -212,7 +212,7 @@ def _compress_partitions_by_start_date(
         rows = conn.execute(
             f"""
             SELECT partition_name
-            FROM deltax_partition_info('{table_name}')
+            FROM deltax.deltax_partition_info('{table_name}')
             WHERE range_start::date = %s::date
             ORDER BY range_start
             """,
@@ -221,7 +221,7 @@ def _compress_partitions_by_start_date(
         for (partition_name,) in rows:
             row_count = conn.execute(f'SELECT count(*) FROM "{partition_name}"').fetchone()[0]
             if row_count > 0:
-                conn.execute("SELECT deltax_compress_partition(%s)", (partition_name,))
+                conn.execute("SELECT deltax.deltax_compress_partition(%s)", (partition_name,))
     conn.commit()
 
 
@@ -615,9 +615,9 @@ def create_tiny_events_pair(conn, *, segment_size: int = 16) -> tuple[str, str]:
         )
         """
     )
-    conn.execute("SELECT deltax_create_table('events', 'ts', '1 day'::interval, 3)")
+    conn.execute("SELECT deltax.deltax_create_table('events', 'ts', '1 day'::interval, 3)")
     conn.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         "'events', segment_by => ARRAY['device_id'], "
         "order_by => ARRAY['ts', 'id'], segment_size => %s)",
         (segment_size,),
@@ -679,9 +679,9 @@ def create_predicate_matrix_pair(
             """
         )
 
-    conn.execute(f"SELECT deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
+    conn.execute(f"SELECT deltax.deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
     conn.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         f"'{deltax_table}', segment_by => ARRAY['device_id'], "
         f"order_by => ARRAY[{order_by_sql}], segment_size => %s)",
         (segment_size,),
@@ -755,9 +755,9 @@ def create_ordering_edges_pair(
             """
         )
 
-    conn.execute(f"SELECT deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
+    conn.execute(f"SELECT deltax.deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
     conn.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         f"'{deltax_table}', segment_by => ARRAY['device_id'], "
         f"order_by => ARRAY[{order_by_sql}], segment_size => %s)",
         (segment_size,),
@@ -840,9 +840,9 @@ def create_aggregate_matrix_pair(
             """
         )
 
-    conn.execute(f"SELECT deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
+    conn.execute(f"SELECT deltax.deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
     conn.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         f"'{deltax_table}', segment_by => ARRAY[{segment_by_sql}], "
         f"order_by => ARRAY[{order_by_sql}], segment_size => %s)",
         (segment_size,),
@@ -892,9 +892,9 @@ def create_partition_segment_edges_pair(
     for table_name in (plain_table, deltax_table):
         _create_partition_segment_edges_schema(conn, table_name)
 
-    conn.execute(f"SELECT deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
+    conn.execute(f"SELECT deltax.deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
     conn.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         f"'{deltax_table}', segment_by => ARRAY['device_id'], "
         "order_by => ARRAY['ts', 'id'], segment_size => %s)",
         (segment_size,),
@@ -928,9 +928,9 @@ def create_partition_segment_edges_direct_backfill_pair(
     for table_name in (plain_table, deltax_table):
         _create_partition_segment_edges_schema(conn, table_name)
 
-    conn.execute(f"SELECT deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
+    conn.execute(f"SELECT deltax.deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
     conn.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         f"'{deltax_table}', segment_by => ARRAY[]::text[], "
         "order_by => ARRAY['ts', 'id'], segment_size => %s)",
         (segment_size,),
@@ -975,9 +975,9 @@ def create_codec_matrix_pair(
     for table_name in (plain_table, deltax_table):
         _create_codec_matrix_schema(conn, table_name)
 
-    conn.execute(f"SELECT deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
+    conn.execute(f"SELECT deltax.deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
     conn.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         f"'{deltax_table}', segment_by => {segment_by_sql}, "
         f"order_by => ARRAY[{order_by_sql}], segment_size => %s)",
         (segment_size,),
@@ -1042,10 +1042,10 @@ def create_rtabench_synthetic_pair(
     conn.execute(f"SET pg_deltax.mock_now = '{RTABENCH_MOCK_NOW}'")
     _create_rtabench_synthetic_schema(conn, deltax_table, plain_table)
     conn.execute(
-        f"SELECT deltax_create_table('{deltax_table}', 'event_created', '1 day'::interval, 16)"
+        f"SELECT deltax.deltax_create_table('{deltax_table}', 'event_created', '1 day'::interval, 16)"
     )
     conn.execute(
-        "SELECT deltax_enable_compression("
+        "SELECT deltax.deltax_enable_compression("
         f"'{deltax_table}', segment_by => ARRAY[]::text[], "
         "order_by => ARRAY['order_id', 'event_created'], segment_size => %s)",
         (segment_size,),

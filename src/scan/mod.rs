@@ -9,8 +9,8 @@ mod hook;
 pub(crate) mod json_extract;
 mod path;
 
-use std::sync::atomic::{AtomicPtr, Ordering};
 use pgrx::pg_sys;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 /// Previous hook to chain (set_rel_pathlist_hook).
 static PREV_HOOK: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());

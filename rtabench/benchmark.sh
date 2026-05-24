@@ -80,7 +80,7 @@ fi
 # mock_now is set to the start of the dataset's range; 125 partitions of 3 days
 # covers 2024-01-01 → 2025-01-15, comfortably spanning all data.
 sudo -u postgres psql "$DB" -t -c \
-    "SET pg_deltax.mock_now = '2024-01-01 00:00:00'; SELECT deltax_create_table('order_events', 'event_created', '3 days'::interval, 125)"
+    "SET pg_deltax.mock_now = '2024-01-01 00:00:00'; SELECT deltax.deltax_create_table('order_events', 'event_created', '3 days'::interval, 125)"
 
 # Enable compression before loading (required for direct backfill).
 # order_by mirrors the TimescaleDB baseline and matches the dominant query
@@ -93,7 +93,7 @@ echo "Using segment_size=$SEGMENT_SIZE"
 # rewrite chains to synthetic-Var refs and DeltaXAgg picks the queries
 # up directly.
 sudo -u postgres psql "$DB" -t -c \
-    "SELECT deltax_enable_compression('order_events', order_by => ARRAY['order_id','event_created'], segment_size => $SEGMENT_SIZE, \
+    "SELECT deltax.deltax_enable_compression('order_events', order_by => ARRAY['order_id','event_created'], segment_size => $SEGMENT_SIZE, \
         json_extract => '[{\"src\":\"event_payload\",\"path\":[\"terminal\"],\"name\":\"x_terminal\",\"type\":\"text\"}]'::jsonb)"
 
 # Activate the planner_hook walker by default so chain Exprs use the
@@ -127,7 +127,7 @@ VACUUM_END=$(date +%s)
 echo "$((VACUUM_END - VACUUM_START))s"
 
 # Capture data size = deltax(order_events) + plain(other 4 tables)
-DELTAX_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT deltax_table_size('order_events')")
+DELTAX_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT deltax.deltax_table_size('order_events')")
 PLAIN_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT coalesce(sum(pg_total_relation_size(c.oid))::bigint, 0) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname IN ('customers','products','orders','order_items')")
 DATA_SIZE=$((DELTAX_SIZE + PLAIN_SIZE))
 echo "Data size: $DATA_SIZE bytes ($(echo "$DATA_SIZE / 1024 / 1024 / 1024" | bc -l | xargs printf '%.2f') GB)"
@@ -153,7 +153,7 @@ sudo -u postgres psql -c "ALTER DATABASE $DB SET jit TO off"
 sudo systemctl restart postgresql
 
 # Report partition / compression info and check for default-partition pollution
-sudo -u postgres psql "$DB" -c "SELECT * FROM deltax_partition_info('order_events')"
+sudo -u postgres psql "$DB" -c "SELECT * FROM deltax.deltax_partition_info('order_events')"
 sudo -u postgres psql "$DB" -c "SELECT count(*) AS default_partition_rows FROM order_events_default"
 
 echo "Setup complete. Database '$DB' is ready."

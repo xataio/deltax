@@ -3,7 +3,6 @@
 //! Replaces SPI round-trips to PostgreSQL for converting between text
 //! representations and Unix-epoch microseconds.
 
-
 /// Parse a PostgreSQL text-format timestamp/date to Unix epoch microseconds.
 ///
 /// Supported formats:

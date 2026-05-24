@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: 'Version tag (e.g., v0.1.0)'
+        required: true
+        default: 'v0.0.1-test'
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Create release
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: tag
+        run: echo "tag=${{ github.event.inputs.version_tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
+
+  build:
+    name: Build .deb (pg${{ matrix.pg }}, ${{ matrix.arch }})
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [17, 18]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build .deb
+        run: make -f packaging.mk build ARCH=${{ matrix.arch }} PGVER=${{ matrix.pg }} TAG=${{ needs.release.outputs.tag_name }}
+      - name: Upload artifact for smoke test
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-pg${{ matrix.pg }}-${{ matrix.arch }}
+          path: pkgout/*.deb
+          if-no-files-found: error
+      - name: Upload .deb to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release.outputs.tag_name }}
+          files: pkgout/*.deb
+          fail_on_unmatched_files: true
+
+  smoke-test:
+    name: Smoke test (pg${{ matrix.pg }}, ${{ matrix.arch }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [17, 18]
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: deb-pg${{ matrix.pg }}-${{ matrix.arch }}
+          path: ./pkgout
+      - name: Install + CREATE EXTENSION in CNPG image
+        run: |
+          DEB=$(ls pkgout/pg-deltax-pg${{ matrix.pg }}_*_${{ matrix.arch }}.deb)
+          echo "Smoke-testing $DEB"
+          make -f packaging.mk verify DEB="$DEB" PGVER=${{ matrix.pg }}

@@ -1,9 +1,217 @@
 # Blob cache — shared-memory cache for detoasted compressed blobs
 
-> **Status: design proposal (2026-05).** Not started. This doc captures the
-> design, trade-offs, and implementation plan at the level of detail needed
-> to pick it up and ship without rediscovering things. Builds on the
-> findings in PARALLEL_AGG.md about where time goes on JSONBench warm runs.
+> **Status: DSA approach working end-to-end (2026-05-13).**
+> Postmaster creates the in-place DSA, backends attach lazily, three
+> scans round-trip cleanly with hits incrementing. Two bugs that
+> previously made this look like a dead end are documented in
+> [DSA: what bit us, and the fix](#dsa-what-bit-us-and-the-fix) below
+> for future readers; both are gotchas in how PG 17's DSA contract
+> interacts with extension shmem hooks, not bugs in pgrx or PG.
+
+## DSA: what bit us, and the fix
+
+The earlier write-up of this section called for abandoning DSA and
+hand-rolling a size-class allocator. That was wrong. Two distinct
+bugs in our DSA setup looked like one fatal "DSA can't work here"
+problem; once both were named they were one-line fixes each. We're
+keeping DSA.
+
+**Bug 1 — `dsa_create_in_place_ext(place, size, tranche, NULL, 0, 0)`
+violates the DSA contract.** PG 17 exposes only the 6-arg `_ext`
+form; the 4-arg `dsa_create_in_place` is a macro (`dsa.h:122-125`)
+that fills in `DSA_DEFAULT_INIT_SEGMENT_SIZE` (1 MB) and
+`DSA_MAX_SEGMENT_SIZE` for the segment-size knobs. `create_internal`
+asserts `init_segment_size >= DSA_MIN_SEGMENT_SIZE` (`dsa.c:1233`),
+but in a release build the assertion is stripped — `create_internal`
+silently writes `control->init_segment_size = 0;
+control->max_segment_size = 0;` into shmem (`dsa.c:1268-1269`), and a
+subsequent `dsa_allocate_extended` walks into garbage when
+`make_new_segment` multiplies through those zeros (`dsa.c:2125-2127`).
+The gdb dump where `area->control` appeared to point into the backend
+heap was the post-corruption state, not a binding mismatch — the
+binding is fine.
+
+Fix: pass the documented defaults explicitly and cap actual usage
+with `dsa_set_size_limit` after create, the way `pgstat_shmem.c`
+(`pgstat_shmem.c:163-196`) does it. Specifically: in
+`shmem_startup_hook`, after `dsa_create_in_place_ext(..., DSA_DEFAULT_INIT_SEGMENT_SIZE,
+DSA_MAX_SEGMENT_SIZE)`, call `dsa_pin` → `dsa_set_size_limit(area,
+dsa_size)` → `dsa_detach(area)`. The pin keeps the in-shmem control
+block alive across all-backends-detached; the limit caps total
+allocations to the in-place chunk so the DSA never tries to allocate
+a fresh DSM segment (which is exactly what blew up the "lazy
+create-from-first-backend" attempt under Docker Desktop tmpfs); the
+detach releases the postmaster-local `dsa_area*` since backends build
+their own via `dsa_attach_in_place`.
+
+**Bug 2 — `dsa_attach_in_place` palloc's the backend-local
+`dsa_area*` in `CurrentMemoryContext`.** Our backend `attach()` ran
+lazily from inside `get_pinned`/`insert`, i.e. inside whatever
+memory context the executor had active (typically a per-portal or
+per-transaction context). End-of-transaction destroys that context,
+freeing the `dsa_area` struct underneath us. The next query's
+`get_pinned` reads the stale `dsa_area*` from our process-local
+`OnceLock`, dereferences a freed `area->control`, and segfaults. This
+is the bug that masqueraded as "second-scan crash" even with the
+size-knob fix in place.
+
+Fix: switch to `TopMemoryContext` around the `dsa_attach_in_place` +
+`dsa_pin_mapping` pair, again mirroring `pgstat_shmem.c:225-234`.
+`dsa_pin_mapping` makes the *segment mappings* survive resource-owner
+release, but the `dsa_area` struct itself lives in whatever context
+was current when `palloc` ran — so the context switch is the missing
+half.
+
+Together those changes fit in `src/blob_cache/storage.rs`:
+
+- Add module-local constants `DSA_DEFAULT_INIT_SEGMENT_SIZE = 1 <<
+  20` and `DSA_MAX_SEGMENT_SIZE = 1usize << 40` (pgrx doesn't bind
+  `#define` macros).
+- In `dsa_create_in_place_compat`, pass those constants instead of
+  `0, 0`.
+- In `my_shmem_startup_hook`, after a successful create: `dsa_pin` →
+  `dsa_set_size_limit(area, dsa_size)` → `dsa_detach(area)`.
+- In `attach()`, wrap `dsa_attach_in_place` + `dsa_pin_mapping` with
+  `MemoryContextSwitchTo(TopMemoryContext)` / back.
+
+## Implementation status
+
+### Done (2026-05-13)
+
+- GUCs `pg_deltax.blob_cache_mb` (default `1024`) and
+  `pg_deltax.blob_cache_shards` (default `64`) registered in `_PG_init`.
+  Context is `Postmaster` for both since the shmem reservation is
+  decided at startup.
+- Module `blob_cache` (`src/blob_cache/mod.rs`, `src/blob_cache/storage.rs`).
+  Public API in `mod.rs`: `BlobCacheKey`, `BlobCachePin` (Drop-based pin
+  release), `BlobCacheStats`, `get_pinned`, `insert`, `stats`,
+  `register_hooks`, `configured_bytes`, `configured_shards`. All
+  `unsafe` / raw PG-binding code is confined to `storage.rs`.
+- Integration site wired: `detoast_lazy_blobs` and
+  `detoast_lazy_blobs_selective` in `src/scan/exec/segments.rs` now try
+  the cache first, fall back to `pg_detoast_datum`, and insert on miss.
+  Both functions return a new `DetoastLazyStats` (cache_hits /
+  cache_misses / cache_bytes_served) for EXPLAIN aggregation.
+- `SegmentData` carries a `cached_blob_pins: Vec<BlobCachePin>`. Pins
+  live until `end_custom_scan` drops `DecompressState`, guaranteeing the
+  DSA bytes outlive every read of `compressed_blobs` (including
+  worker-thread reads, since detoast runs on the leader before
+  `std::thread::scope` dispatch).
+- Build green on PG 17 (default). `make clippy` clean on new code.
+  All 382 pgrx unit tests still pass.
+- DSA create + attach working end-to-end (2026-05-13). Smoke test
+  (`SELECT count(*), sum(length(body))` twice over a 5K-row table of
+  32 KB rows compressed by `deltax_compress_partition`) shows
+  `misses_total=1`, `hits_total=1` after the second scan, no
+  crashes. Root causes were the two DSA gotchas documented in [DSA:
+  what bit us, and the fix](#dsa-what-bit-us-and-the-fix).
+- `DSA_ALLOC_NO_OOM` flag on every `dsa_allocate_extended` call
+  (2026-05-13). Without it, DSA throws `ereport(ERROR)` on
+  out-of-space ("Failed on DSA request of size 56") and kills the
+  query. With it, insert just returns gracefully — letting eviction
+  or the insert-failure counter take over.
+- **Per-shard LRU eviction (2026-05-13).** Each `Shard` carries
+  `lru_head` / `lru_tail` dsa_pointers; each `Entry` has
+  `lru_prev` / `lru_next` pointers. Inserts prepend at the head;
+  evictions walk from the tail skipping pinned entries (`pin_count >
+  0`). Two eviction triggers: (a) `total_bytes + needed > max_bytes`
+  (soft cap), (b) `dsa_allocate_extended` returning 0 (DSA itself
+  is out of space — happens before soft cap because of DSA's
+  per-page overhead). On either trigger, `insert` evicts and retries
+  in a loop until both allocations succeed or there's nothing left
+  to evict locally. Verified end-to-end: 50 random-bytes tables
+  (~5 MB blobs total) against a 4 MB cache + 1 shard → 91 evictions,
+  0 insert failures.
+- **EXPLAIN ANALYZE shows per-query cache stats (2026-05-14).**
+  Both `DeltaXAgg` and `DeltaXDecompress` custom scan nodes now
+  emit a `DeltaX Blob Cache: hits=H misses=M bytes_served=B` line
+  whenever `H + M > 0`. The counters live on `ScanTiming` and on
+  `ScanTimingShmem` so parallel workers fold their per-process
+  counts into the leader's total via the existing
+  `flush_timing_to_shmem` path. `DetoastLazyStats` returned by
+  `detoast_lazy_blobs` and `detoast_lazy_blobs_selective` is now
+  consumed at every call site (10 in `decompress.rs`, 10 in
+  `agg.rs`). Example output on a warm 2nd scan of a 30k-row text
+  table: `DeltaX Blob Cache: hits=1 misses=0 bytes_served=1263144`.
+- **`to_vec()` elimination on cache hits (Phase 5, 2026-05-14).**
+  `SegmentData::compressed_blobs` switched from `Vec<Vec<u8>>` to
+  `Vec<BlobBytes>`, a small enum: `Owned(Vec<u8>)` for freshly
+  detoasted blobs, `Cached { data: *const u8, len: u32 }` for
+  cache hits. `Cached` borrows directly from the corresponding
+  `BlobCachePin` in `cached_blob_pins`; no memcpy on the hit path.
+  Safe because `compressed_blobs` is declared before
+  `cached_blob_pins` in the struct, so Rust drops the raw pointers
+  before the pins release the cache entries. `BlobBytes:
+  Deref<Target = [u8]>` so existing consumers (`&[u8]` consumers)
+  needed no changes. Measured warm-scan detoast cost on a ~1.2 MB
+  blob dropped from 0.082 ms → 0.006 ms (~13×); MB-scale blobs on
+  JSONBench / RTABench will save proportionally more.
+- **Per-shard diagnostic SRF (2026-05-14).**
+  `pg_deltax_blob_cache_shard_stats()` walks every shard's LRU list
+  under shared lock and returns `(shard_id, n_entries, bytes_used,
+  lru_walk_count, pinned_count, unpinned_count, lru_head_dp,
+  lru_tail_dp)`. Added to debug a stuck-cache scenario where the
+  bench showed `evictions_total=0` alongside 895k insert failures;
+  the SRF immediately confirmed LRU invariants were intact and
+  redirected the investigation to sizing instead.
+- **Cache sizing validated (2026-05-14).** Running JSONBench on
+  m6i.8xlarge with `pg_deltax.blob_cache_mb` bumped from 1024 to
+  8192: hit ratio jumped from 52% → 91%, evictions and
+  insert_failures both went to 0, working set fit at 2.3 GB / 8 GB
+  cap. Warm-run wins: Q4 2.30s → 1.52s (−34%), Q5 2.45s → 1.77s
+  (−28%). Q1/Q2 marginal because they were already detoast-light.
+  See [Sizing](#sizing) for the operational story.
+- **Auto-sized default (2026-05-14).** `pg_deltax.blob_cache_mb = -1`
+  (the new default) reads `MemTotal` from `/proc/meminfo` at
+  postmaster start and resolves to `clamp(MemTotal / 4, 256 MiB,
+  4096 MiB)`. Falls back to the floor on non-Linux hosts. Resolved
+  value is observable via `pg_deltax_blob_cache_stats().bytes_max`.
+- **Integration tests (2026-05-14).** `tests/test_blob_cache.py` —
+  6 tests covering: (1) the auto-sized default resolves to a
+  non-zero cap, (2) cold scans populate misses + entries, (3) warm
+  scans produce hits dominantly, (4) two scans return bytewise-
+  identical results (validates the `BlobBytes::Cached` borrow
+  path), (5) no entries are pinned between queries (`pin_count == 0`
+  across all shards after a scan), (6) `EXPLAIN ANALYZE` surfaces
+  the `DeltaX Blob Cache: hits=…` line. Skips cache-on-vs-off parity
+  because `blob_cache_mb` is Postmaster-context — manual EC2
+  validation covered that already (37/43 ClickBench queries
+  hash-identical; 6 differ only in tie-breaking).
+
+### Remaining
+
+1. **Neighbour-shard eviction fallback (v2).** With the default
+   64 shards and a hash-distributed key, a target shard can be empty
+   when eviction is needed; `insert` then bumps
+   `insert_failures_total` (~38 out of 50 attempts in a stress test
+   on 4 MB / 64 shards). In practice this only matters when the
+   cache is significantly smaller than the working set; the
+   auto-sized default + the 4 GiB cap make it a corner case. If a
+   workload ever hits it, try shards `±1, ±2, ...` with
+   `LWLockConditionalAcquire` (avoids deadlock without strict lock
+   ordering).
+2. **`dshash` substitute already in place.** pgrx 0.17 doesn't
+   expose `dshash_*` so the implementation uses a custom per-shard
+   fixed-bucket hashmap (`BUCKETS_PER_SHARD = 256`, separate chaining
+   through `Entry::bucket_next`). Acceptable for the working set
+   sizes we have; reconsider if buckets get long under churn. (Not
+   a remaining task — kept here as a note for future readers.)
+
+### Codebase findings that simplify the original plan
+
+- **`companion_oid` is already on `SegmentData`**, set in
+  `begin_deltax_append` before any detoast happens. The original
+  proposal threaded it through `detoast_lazy_blobs(seg, companion_oid)`;
+  in practice we just read `seg.companion_oid`. No signature change at
+  call sites.
+- **Workers do not call `detoast_lazy_blobs`** — detoast runs on the
+  leader before `std::thread::scope` worker dispatch (in
+  `load_next_segment` and the Top-N paths in
+  `src/scan/exec/decompress.rs`). Workers consume the already-populated
+  `seg.compressed_blobs`. So the cache lookup/insert and pin lifetime
+  live entirely on the leader; no cross-thread pin bookkeeping needed.
+- **No prior shmem hooks** in pg_deltax — we're the first user, so
+  registration is a plain installation rather than chaining.
 
 ## Why
 
@@ -313,12 +521,82 @@ workload.
 
 | GUC | Type | Default | Range | Meaning |
 |---|---|---|---|---|
-| `pg_deltax.blob_cache_mb` | int | `0` | `0..32768` | Cache size in MiB. `0` = disabled. |
-| `pg_deltax.blob_cache_shards` | int | `64` | `1..1024` | Shard count. Powers of 2 only. Restart required. |
+| `pg_deltax.blob_cache_mb` | int | `-1` (auto) | `-1..32768` | `-1` = auto (25% of physical RAM, clamped to [256, 4096] MiB). `0` = disabled. `N > 0` = explicit MiB. Postmaster context. |
+| `pg_deltax.blob_cache_shards` | int | `64` | `1..1024` | Shard count. Powers of two recommended. Postmaster context. |
 
-Start with `default=0` so the cache is opt-in until measured on real
-workloads. Once we've validated benefits and absence of regressions
-(JSONBench, ClickBench, RTABench), flip the default to ~`1024`.
+The auto-size default reads `MemTotal` from `/proc/meminfo` at
+postmaster start. The resolved cap is observable via the SRF
+(`SELECT bytes_max/1024/1024 AS bytes_max_mb FROM
+pg_deltax_blob_cache_stats()`). Heuristic:
+
+- **256 MiB floor.** On a 1 GiB Docker container, you get 256 MiB.
+  On non-Linux hosts (where `/proc/meminfo` doesn't exist) the
+  resolution silently falls back to the floor.
+- **4096 MiB cap.** On a 32+ GiB production box, you get exactly
+  4 GiB regardless of how much RAM is available — that's enough
+  for JSONBench's working set with headroom and ~75-80% of
+  ClickBench's working set. Heavy multi-column OLAP at scale
+  should explicitly bump to `8192` or more.
+- **25% in between.** A 16 GiB box gets 4 GiB. A 4 GiB box gets
+  1 GiB. A 2 GiB box gets 512 MiB.
+
+Set `pg_deltax.blob_cache_mb = 0` to disable the cache entirely
+(e.g. for a baseline measurement). Set to an explicit positive value
+to override the heuristic. See [Sizing](#sizing) for the workload
+side of the story.
+
+## Sizing
+
+The cache is sized for the *working set* of detoasted compressed
+column blobs across the queries you actually run, not the whole
+column-store. Each compressed segment-column is one cache entry; a
+typical ClickBench blob is 30–80 KB, JSONBench's single `data` jsonb
+column is ~MB-scale. The cache only helps for blobs that get touched
+again, so the relevant capacity is "how much hot column data does my
+workload re-read."
+
+**Rough heuristics**, in priority order:
+
+1. **Empirical**: run the workload at the current default, query
+   `pg_deltax_blob_cache_stats()`, and watch `insert_failures_total`.
+   If it stays near zero, the cache fits. If it climbs into the
+   thousands or millions, double the cache and re-test.
+2. **By column**: `(rows_touched_per_query) × (avg_compressed_bytes_per_row)
+   × (num_hot_columns)`. For JSONBench's single jsonb column on
+   100 M rows ≈ 2.3 GB compressed; an 8 GB cache covers it with
+   headroom for variation.
+3. **By RAM budget**: `min(workload_estimate, 25% of physical RAM)`.
+   Leave plenty for `shared_buffers`, `work_mem × parallel_workers`,
+   and OS file cache. On a 128 GB box, 8–16 GB blob cache is
+   comfortable.
+
+**When the cache is too small** — symptom: `insert_failures_total >>
+evictions_total`. The cache fills, then a workload-pattern issue
+prevents eviction from firing reliably: a query that pins many entries
+(via cache hits) during its scan can't evict any of them within the
+same query, so subsequent misses in that query fall through without
+caching. Between queries, pins release and the cache recovers, but
+during a single multi-column heavy query the cache is effectively
+read-only. **The right fix is always "size up"** — once the working
+set fits, evictions never need to fire at all (they don't on JSONBench
+at 8 GB). The neighbour-shard eviction fallback under
+[Remaining](#remaining) would only chip at the margin of this
+behaviour, not solve it.
+
+**Auto-sizing.** The `-1` default reads `MemTotal` from
+`/proc/meminfo` at postmaster start and resolves to `clamp(MemTotal /
+4, 256 MiB, 4096 MiB)`. Falls back to the 256 MiB floor on non-Linux
+hosts or anywhere `/proc/meminfo` isn't readable. The resolved value
+is observable via `pg_deltax_blob_cache_stats().bytes_max` — there's
+no separate startup log line; users querying the SRF immediately see
+what they got. Postmaster context (locked at start, can't change at
+runtime).
+
+The 4 GiB cap is deliberate: it covers JSONBench fully and most of
+ClickBench without surprising operators on memory-rich boxes (a
+128 GiB instance still gets only 4 GiB, not 32). Big-workload users
+who want more should set an explicit value; the floor and cap stay
+where they are.
 
 ## Testing matrix
 
@@ -361,13 +639,19 @@ positive on warm subset. Sanity check: no regression on cold runs.
 
 Each phase is a self-contained PR that compiles and passes tests.
 
-**Phase 1 (3-4 days): bootstrap + scaffolding**
-- `shmem_request_hook`, `shmem_startup_hook` registered.
-- Control struct, DSA + dshash created.
-- GUC `pg_deltax.blob_cache_mb` (default 0).
-- `blob_cache::{get_pinned, insert}` stubs that always miss (no
-  storage yet).
-- Tests: extension loads, GUC visible, no crash, no behaviour change.
+**Phase 1 (landed 2026-05-13): bootstrap + scaffolding**
+- ~~`shmem_request_hook`, `shmem_startup_hook` registered.~~
+  Deferred to the storage backend; `register_hooks` exists and is
+  called from `_PG_init` but is currently a no-op stub.
+- ~~Control struct, DSA + dshash created.~~ Deferred to storage backend.
+- GUCs `pg_deltax.blob_cache_mb` (default `1024`) and
+  `pg_deltax.blob_cache_shards` (default `64`) registered.
+- `blob_cache::{get_pinned, insert}` stubs that always miss — done.
+- `BlobCachePin` with Drop-based pin release — done; `SegmentData`
+  carries `cached_blob_pins`.
+- `detoast_lazy_blobs` / `detoast_lazy_blobs_selective` integrated
+  with cache (miss path is identical to old behaviour).
+- Build clean, clippy clean on new code, 382 unit tests pass.
 
 **Phase 2 (3-4 days): functional cache**
 - DSA allocation, size-class buckets, LRU per shard, pinning.

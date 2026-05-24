@@ -25,8 +25,7 @@ fn time_bucket(
 
     let bucketed = floor_div(ts_usec, width_usec) * width_usec;
 
-    TimestampWithTimeZone::try_from(bucketed)
-        .expect("time_bucket result out of range")
+    TimestampWithTimeZone::try_from(bucketed).expect("time_bucket result out of range")
 }
 
 /// Time bucket with an offset.
@@ -51,8 +50,7 @@ fn time_bucket_offset(
     let shifted = ts_usec - offset_usec;
     let bucketed = floor_div(shifted, width_usec) * width_usec + offset_usec;
 
-    TimestampWithTimeZone::try_from(bucketed)
-        .expect("time_bucket result out of range")
+    TimestampWithTimeZone::try_from(bucketed).expect("time_bucket result out of range")
 }
 
 /// Convert a pgrx Interval to microseconds.
@@ -90,11 +88,7 @@ fn interval_to_usec(interval: &pgrx::datum::Interval) -> i64 {
 fn floor_div(a: i64, b: i64) -> i64 {
     let d = a / b;
     let r = a % b;
-    if (r != 0) && ((r ^ b) < 0) {
-        d - 1
-    } else {
-        d
-    }
+    if (r != 0) && ((r ^ b) < 0) { d - 1 } else { d }
 }
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -105,7 +99,7 @@ mod tests {
     #[pg_test]
     fn test_time_bucket_5min() {
         let result = Spi::get_one::<String>(
-            "SELECT time_bucket('5 minutes'::interval, '2025-01-15 14:23:42+00'::timestamptz)::text",
+            "SELECT deltax.time_bucket('5 minutes'::interval, '2025-01-15 14:23:42+00'::timestamptz)::text",
         )
         .expect("query failed");
         assert!(
@@ -118,7 +112,7 @@ mod tests {
     #[pg_test]
     fn test_time_bucket_1hour() {
         let result = Spi::get_one::<String>(
-            "SELECT time_bucket('1 hour'::interval, '2025-01-15 14:23:42+00'::timestamptz)::text",
+            "SELECT deltax.time_bucket('1 hour'::interval, '2025-01-15 14:23:42+00'::timestamptz)::text",
         )
         .expect("query failed");
         assert!(
@@ -131,7 +125,7 @@ mod tests {
     #[pg_test]
     fn test_time_bucket_1day() {
         let result = Spi::get_one::<String>(
-            "SELECT time_bucket('1 day'::interval, '2025-01-15 14:23:42+00'::timestamptz)::text",
+            "SELECT deltax.time_bucket('1 day'::interval, '2025-01-15 14:23:42+00'::timestamptz)::text",
         )
         .expect("query failed");
         let val = result.as_deref().unwrap();
@@ -145,7 +139,7 @@ mod tests {
     #[pg_test]
     fn test_time_bucket_with_offset() {
         let result = Spi::get_one::<String>(
-            "SELECT time_bucket('1 day'::interval, '2025-01-15 14:23:42+00'::timestamptz, '6 hours'::interval)::text",
+            "SELECT deltax.time_bucket('1 day'::interval, '2025-01-15 14:23:42+00'::timestamptz, '6 hours'::interval)::text",
         )
         .expect("query failed");
         assert!(

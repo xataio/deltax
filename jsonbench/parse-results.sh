@@ -19,8 +19,10 @@ while IFS= read -r line; do
     if [[ "$line" =~ Time:\ ([0-9.]+)\ ms ]]; then
         secs=$(echo "${BASH_REMATCH[1]} / 1000" | bc -l | xargs printf '%.3f')
         timings+=("$secs")
-    elif [[ "$line" =~ psql:\ error ]]; then
-        timings+=("null" "null" "null")
+    elif [[ "$line" =~ ^(QUERY_ERROR|psql:\ error) ]]; then
+        # This try failed — record one null. run.sh emits QUERY_ERROR
+        # on PG ERROR (via ON_ERROR_STOP) or "psql: error" on psql crash.
+        timings+=("null")
     fi
 done
 

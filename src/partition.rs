@@ -4,7 +4,7 @@ use pgrx::spi::SpiClient;
 use crate::catalog;
 
 /// Convert an Interval to microseconds. Errors if months are present.
-fn interval_to_usec(interval: &pgrx::datum::Interval) -> i64 {
+pub(crate) fn interval_to_usec(interval: &pgrx::datum::Interval) -> i64 {
     let months: i32 = interval
         .extract_part(DateTimeParts::Month)
         .and_then(|v| v.try_into().ok())
@@ -35,7 +35,7 @@ fn interval_to_usec(interval: &pgrx::datum::Interval) -> i64 {
 }
 
 /// Format a microsecond epoch timestamp as a PostgreSQL-compatible TIMESTAMPTZ literal.
-fn format_ts(usec: i64) -> String {
+pub(crate) fn format_ts(usec: i64) -> String {
     let epoch_sec = usec as f64 / 1_000_000.0;
     Spi::get_one_with_args::<String>(
         "SELECT to_char(to_timestamp($1), 'YYYY-MM-DD HH24:MI:SS')",
@@ -46,7 +46,11 @@ fn format_ts(usec: i64) -> String {
 }
 
 /// Generate the partition table name from the parent table name and range start.
-fn partition_name(table_name: &str, range_start_usec: i64, interval_usec: i64) -> String {
+pub(crate) fn partition_name(
+    table_name: &str,
+    range_start_usec: i64,
+    interval_usec: i64,
+) -> String {
     let epoch_sec = range_start_usec as f64 / 1_000_000.0;
     let query = if interval_usec >= 86_400_000_000 {
         "SELECT to_char(to_timestamp($1), 'YYYYMMDD')"
@@ -75,7 +79,7 @@ fn align_to_interval(ts_usec: i64, interval_usec: i64) -> i64 {
 
 /// Get current time as microseconds since Unix epoch via SPI.
 /// Respects the `pg_deltax.mock_now` GUC when set.
-fn now_usec() -> i64 {
+pub(crate) fn now_usec() -> i64 {
     if let Some(mock_cstr) = crate::MOCK_NOW.get() {
         let mock_val = mock_cstr.to_str().unwrap_or("");
         if !mock_val.is_empty() {
@@ -93,23 +97,18 @@ fn now_usec() -> i64 {
 }
 
 /// Convert unix-epoch microseconds to a TimestampWithTimeZone via SPI.
-fn usec_to_tstz(usec: i64) -> TimestampWithTimeZone {
+pub(crate) fn usec_to_tstz(usec: i64) -> TimestampWithTimeZone {
     let epoch_sec = usec as f64 / 1_000_000.0;
-    Spi::get_one_with_args::<TimestampWithTimeZone>(
-        "SELECT to_timestamp($1)",
-        &[epoch_sec.into()],
-    )
-    .expect("failed to convert to timestamptz")
-    .unwrap()
+    Spi::get_one_with_args::<TimestampWithTimeZone>("SELECT to_timestamp($1)", &[epoch_sec.into()])
+        .expect("failed to convert to timestamptz")
+        .unwrap()
 }
 
-/// Format a fully-qualified table name.
+/// Format a fully-qualified table name. Always emits "schema"."table" — even
+/// for public — so SPI queries resolve under the bgworker's locked
+/// search_path (pg_catalog, pg_temp) where no user schema is on the path.
 pub fn fqn(schema: &str, table: &str) -> String {
-    if schema == "public" {
-        format!("\"{}\"", table)
-    } else {
-        format!("\"{}\".\"{}\"", schema, table)
-    }
+    format!("\"{}\".\"{}\"", schema, table)
 }
 
 /// Create a single partition via SPI.
@@ -157,12 +156,26 @@ pub fn create_initial_partitions(
         let end_str = format_ts(end_usec);
         let part_name = partition_name(table_name, start_usec, interval_usec);
 
-        create_partition(client, schema_name, table_name, &part_name, &start_str, &end_str)?;
+        create_partition(
+            client,
+            schema_name,
+            table_name,
+            &part_name,
+            &start_str,
+            &end_str,
+        )?;
 
         let start_tstz = usec_to_tstz(start_usec);
         let end_tstz = usec_to_tstz(end_usec);
 
-        catalog::register_partition(client, deltatable_id, schema_name, &part_name, start_tstz, end_tstz)?;
+        catalog::register_partition(
+            client,
+            deltatable_id,
+            schema_name,
+            &part_name,
+            start_tstz,
+            end_tstz,
+        )?;
         count += 1;
     }
 
@@ -171,7 +184,10 @@ pub fn create_initial_partitions(
     let parent = fqn(schema_name, table_name);
     let default_fqn = fqn(schema_name, &default_name);
     client.update(
-        &format!("CREATE TABLE IF NOT EXISTS {} PARTITION OF {} DEFAULT", default_fqn, parent),
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {} PARTITION OF {} DEFAULT",
+            default_fqn, parent
+        ),
         None,
         &[],
     )?;
@@ -197,7 +213,7 @@ pub fn ensure_future_partitions(
 
         // Check if partition already registered
         let exists = client.select(
-            "SELECT 1 FROM deltax_partition WHERE schema_name = $1 AND table_name = $2",
+            "SELECT 1 FROM deltax.deltax_partition WHERE schema_name = $1 AND table_name = $2",
             None,
             &[ht.schema_name.as_str().into(), part_name.as_str().into()],
         )?;
@@ -205,12 +221,26 @@ pub fn ensure_future_partitions(
         if exists.is_empty() {
             let start_str = format_ts(start_usec);
             let end_str = format_ts(end_usec);
-            create_partition(client, &ht.schema_name, &ht.table_name, &part_name, &start_str, &end_str)?;
+            create_partition(
+                client,
+                &ht.schema_name,
+                &ht.table_name,
+                &part_name,
+                &start_str,
+                &end_str,
+            )?;
 
             let start_tstz = usec_to_tstz(start_usec);
             let end_tstz = usec_to_tstz(end_usec);
 
-            catalog::register_partition(client, ht.id, &ht.schema_name, &part_name, start_tstz, end_tstz)?;
+            catalog::register_partition(
+                client,
+                ht.id,
+                &ht.schema_name,
+                &part_name,
+                start_tstz,
+                end_tstz,
+            )?;
             created += 1;
         }
     }
@@ -277,25 +307,14 @@ fn deltax_create_table(
         }
 
         // 7. Register in catalog
-        let ht_id = catalog::register_deltatable(
-            client,
-            &schema,
-            &table,
-            time_column,
-            &partition_interval,
-        )
-        .expect("failed to register deltatable");
+        let ht_id =
+            catalog::register_deltatable(client, &schema, &table, time_column, &partition_interval)
+                .expect("failed to register deltatable");
 
         // 8. Create initial partitions
-        let count = create_initial_partitions(
-            client,
-            &schema,
-            &table,
-            ht_id,
-            &partition_interval,
-            premake,
-        )
-        .expect("failed to create initial partitions");
+        let count =
+            create_initial_partitions(client, &schema, &table, ht_id, &partition_interval, premake)
+                .expect("failed to create initial partitions");
 
         format!(
             "Created deltax table {}.{} with {} partitions",
@@ -371,12 +390,7 @@ fn check_partitioned(_client: &SpiClient, schema: &str, table: &str) -> bool {
 }
 
 /// Convert a regular (empty) table to a partitioned table.
-fn convert_to_partitioned(
-    client: &mut SpiClient,
-    schema: &str,
-    table: &str,
-    time_column: &str,
-) {
+fn convert_to_partitioned(client: &mut SpiClient, schema: &str, table: &str, time_column: &str) {
     let table_fqn = fqn(schema, table);
     let tmp_name = format!("_deltax_tmp_{}", table);
     let tmp_fqn = fqn(schema, &tmp_name);
@@ -429,10 +443,15 @@ fn deltax_partition_info(
         let ht = catalog::get_deltatable(client, &schema, &table)
             .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
+                pgrx::error!(
+                    "pg_deltax: table {}.{} is not a deltax table",
+                    schema,
+                    table
+                )
             });
 
-        let partitions = catalog::get_partitions(client, ht.id).expect("failed to query partitions");
+        let partitions =
+            catalog::get_partitions(client, ht.id).expect("failed to query partitions");
         partitions
             .into_iter()
             .map(|p| (p.table_name, p.range_start, p.range_end, p.is_compressed))
@@ -460,10 +479,15 @@ fn deltax_deltatable_info(
         let ht = catalog::get_deltatable(client, &schema, &table)
             .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
+                pgrx::error!(
+                    "pg_deltax: table {}.{} is not a deltax table",
+                    schema,
+                    table
+                )
             });
 
-        let partitions = catalog::get_partitions(client, ht.id).expect("failed to query partitions");
+        let partitions =
+            catalog::get_partitions(client, ht.id).expect("failed to query partitions");
         let num_partitions = partitions.len() as i64;
 
         vec![(
@@ -478,6 +502,39 @@ fn deltax_deltatable_info(
     TableIterator::new(rows)
 }
 
+/// Drain rows that landed in `<table>_default` into proper, time-aligned
+/// partitions on demand. The background worker performs the same step every
+/// 60 seconds; calling this explicitly is useful right after a bulk load
+/// (or in the README quickstart) so the rows are eligible for
+/// `deltax_compress_all_partitions` without waiting for the next worker tick.
+#[pg_extern]
+fn deltax_drain_default_partition(relation: &str) -> String {
+    Spi::connect_mut(|client| {
+        let (schema, table) = resolve_relation(client, relation);
+        let ht = catalog::get_deltatable(client, &schema, &table)
+            .expect("failed to query deltatable")
+            .unwrap_or_else(|| {
+                pgrx::error!(
+                    "pg_deltax: table {}.{} is not a deltax table",
+                    schema,
+                    table
+                )
+            });
+
+        let drained = crate::worker::drain_default_partition(client, &ht)
+            .expect("failed to drain default partition");
+
+        if drained.rows_moved == 0 {
+            format!("{}.{}_default is empty; nothing to drain", schema, table)
+        } else {
+            format!(
+                "Drained {} row(s) from {}.{}_default into {} new partition(s)",
+                drained.rows_moved, schema, table, drained.partitions_created
+            )
+        }
+    })
+}
+
 /// Set a retention policy on a deltatable.
 #[pg_extern]
 fn deltax_set_retention(relation: &str, drop_after: pgrx::datum::Interval) -> String {
@@ -486,7 +543,11 @@ fn deltax_set_retention(relation: &str, drop_after: pgrx::datum::Interval) -> St
         let ht = catalog::get_deltatable(client, &schema, &table)
             .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
+                pgrx::error!(
+                    "pg_deltax: table {}.{} is not a deltax table",
+                    schema,
+                    table
+                )
             });
 
         catalog::set_drop_after(client, ht.id, &drop_after)
@@ -507,11 +568,14 @@ fn deltax_remove_retention(relation: &str) -> String {
         let ht = catalog::get_deltatable(client, &schema, &table)
             .expect("failed to query deltatable")
             .unwrap_or_else(|| {
-                pgrx::error!("pg_deltax: table {}.{} is not a deltax table", schema, table)
+                pgrx::error!(
+                    "pg_deltax: table {}.{} is not a deltax table",
+                    schema,
+                    table
+                )
             });
 
-        catalog::clear_drop_after(client, ht.id)
-            .expect("failed to remove retention policy");
+        catalog::clear_drop_after(client, ht.id).expect("failed to remove retention policy");
 
         format!("Retention policy removed from {}.{}", schema, table)
     })
@@ -532,7 +596,7 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
     // Find partitions eligible for dropping: range_end < now() - drop_after
     let eligible = client
         .select(
-            "SELECT schema_name, table_name, is_compressed FROM deltax_partition
+            "SELECT schema_name, table_name, is_compressed FROM deltax.deltax_partition
              WHERE deltatable_id = $1 AND range_end < $2::timestamptz - $3::interval",
             None,
             &[ht.id.into(), now.into(), (*drop_after).into()],
@@ -541,37 +605,37 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
 
     let mut partitions: Vec<(String, String, bool)> = Vec::new();
     for row in eligible {
-        let schema: String = row.get_datum_by_ordinal(1).unwrap().value::<String>().unwrap().unwrap();
-        let name: String = row.get_datum_by_ordinal(2).unwrap().value::<String>().unwrap().unwrap();
-        let is_compressed: bool = row.get_datum_by_ordinal(3).unwrap().value::<bool>().unwrap().unwrap_or(false);
+        let schema: String = row
+            .get_datum_by_ordinal(1)
+            .unwrap()
+            .value::<String>()
+            .unwrap()
+            .unwrap();
+        let name: String = row
+            .get_datum_by_ordinal(2)
+            .unwrap()
+            .value::<String>()
+            .unwrap()
+            .unwrap();
+        let is_compressed: bool = row
+            .get_datum_by_ordinal(3)
+            .unwrap()
+            .value::<bool>()
+            .unwrap()
+            .unwrap_or(false);
         partitions.push((schema, name, is_compressed));
     }
 
     let parent_fqn = fqn(&ht.schema_name, &ht.table_name);
 
     for (schema, name, is_compressed) in &partitions {
-        // If compressed, drop the meta + blobs tables
         if *is_compressed {
-            let blobs_table = format!("\"_deltax_compressed\".\"{}_blobs\"", name);
-            let blooms_table = format!("\"_deltax_compressed\".\"{}_blooms\"", name);
-            let colstats_table = format!("\"_deltax_compressed\".\"{}_colstats\"", name);
-            let meta_table = format!("\"_deltax_compressed\".\"{}_meta\"", name);
-            let text_lengths_table = format!("\"_deltax_compressed\".\"{}_text_lengths\"", name);
-            client
-                .update(&format!("DROP TABLE IF EXISTS {}", blobs_table), None, &[])
-                .expect("failed to drop compressed blobs table");
-            client
-                .update(&format!("DROP TABLE IF EXISTS {}", blooms_table), None, &[])
-                .expect("failed to drop compressed blooms table");
-            client
-                .update(&format!("DROP TABLE IF EXISTS {}", text_lengths_table), None, &[])
-                .expect("failed to drop compressed text_lengths table");
-            client
-                .update(&format!("DROP TABLE IF EXISTS {}", colstats_table), None, &[])
-                .expect("failed to drop compressed colstats table");
-            client
-                .update(&format!("DROP TABLE IF EXISTS {}", meta_table), None, &[])
-                .expect("failed to drop compressed meta table");
+            for suffix in ["blobs", "blooms", "text_lengths", "colstats", "meta"] {
+                let fqn = format!("\"_deltax_compressed\".\"{}_{}\"", name, suffix);
+                client
+                    .update(&format!("DROP TABLE IF EXISTS {}", fqn), None, &[])
+                    .expect("failed to drop companion table");
+            }
         }
 
         let part_fqn = fqn(schema, name);
@@ -593,7 +657,7 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
         // Remove from catalog
         client
             .update(
-                "DELETE FROM deltax_partition WHERE schema_name = $1 AND table_name = $2",
+                "DELETE FROM deltax.deltax_partition WHERE schema_name = $1 AND table_name = $2",
                 None,
                 &[schema.as_str().into(), name.as_str().into()],
             )
@@ -601,4 +665,53 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
     }
 
     partitions.len() as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DAY: i64 = 86_400_000_000;
+    const HOUR: i64 = 3_600_000_000;
+
+    #[test]
+    fn fqn_always_schema_qualifies() {
+        // Always emit "schema"."table" — the bgworker runs under a locked
+        // search_path (pg_catalog, pg_temp) so user-schema names must be
+        // explicitly qualified to resolve.
+        assert_eq!(fqn("public", "foo"), "\"public\".\"foo\"");
+        assert_eq!(fqn("myschema", "foo"), "\"myschema\".\"foo\"");
+        // Embedded uppercase + reserved-ish names — quoting is required.
+        assert_eq!(fqn("S", "Tbl"), "\"S\".\"Tbl\"");
+    }
+
+    #[test]
+    fn align_to_interval_floors_to_boundary() {
+        // Aligned timestamps are unchanged.
+        assert_eq!(align_to_interval(0, DAY), 0);
+        assert_eq!(align_to_interval(DAY, DAY), DAY);
+        assert_eq!(align_to_interval(2 * DAY, DAY), 2 * DAY);
+        // Mid-day timestamps floor down to the start-of-day.
+        assert_eq!(align_to_interval(DAY + 1, DAY), DAY);
+        assert_eq!(align_to_interval(DAY + HOUR, DAY), DAY);
+        assert_eq!(align_to_interval(2 * DAY - 1, DAY), DAY);
+    }
+
+    #[test]
+    fn align_to_interval_handles_negative_timestamps() {
+        // Pre-epoch values exercise the `r < 0` arm. Plain integer division
+        // truncates toward zero, which would land on the *later* boundary for
+        // negatives — the explicit `(d - 1) * interval` keeps the floor
+        // semantics consistent with the positive case.
+        assert_eq!(align_to_interval(-1, DAY), -DAY);
+        assert_eq!(align_to_interval(-DAY, DAY), -DAY);
+        assert_eq!(align_to_interval(-DAY - 1, DAY), -2 * DAY);
+        assert_eq!(align_to_interval(-2 * DAY + 1, DAY), -2 * DAY);
+    }
+
+    #[test]
+    fn align_to_interval_handles_subday_intervals() {
+        assert_eq!(align_to_interval(HOUR + 1, HOUR), HOUR);
+        assert_eq!(align_to_interval(3 * HOUR + HOUR / 2, HOUR), 3 * HOUR);
+    }
 }

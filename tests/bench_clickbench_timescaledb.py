@@ -25,9 +25,14 @@ from clickbench_data import (
     query_results_to_dict,
     run_queries,
     save_bench_results,
+)
+from clickbench_queries import (
+    LIMIT_TIE_QUERIES,
+    NONDET_SORT_INFO,
+    NONDETERMINISTIC_QUERIES,
+    QUERIES,
     validate_nondet_query,
 )
-from clickbench_queries import NONDETERMINISTIC_QUERIES, NONDET_SORT_INFO, LIMIT_TIE_QUERIES, QUERIES
 
 # ---------------------------------------------------------------------------
 # Configuration

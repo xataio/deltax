@@ -486,6 +486,45 @@ the meta table rows became TOAST-heavy — even queries with no equality
 predicates paid the cost of larger heap pages. Moving blooms to a separate
 table keeps the meta table TOAST-free.
 
+### Skipping `COMPRESSION lz4` on companion BYTEA columns
+The columnar payloads in `_blobs._data`, `_blooms._data`, `_text_lengths._data`,
+and `_valbitmap._bits` are already maximally compressed by the Rust codecs
+before PostgreSQL ever sees them, so the `COMPRESSION lz4` column attribute
+looked like dead weight. We A/B-tested three configurations on the full
+ClickBench dataset (100M rows × 105 columns, c6a.4xlarge, 2026-05-21):
+
+|                            |  Load |    Size | Cold sum | Hot sum |
+|----------------------------|------:|--------:|---------:|--------:|
+| `COMPRESSION lz4` (default)| 328 s | 14.59 GB|   317 s  | 59.8 s  |
+| no clause (pglz fallback)  | 656 s | 14.51 GB|   327 s  | 60.0 s  |
+| `STORAGE EXTERNAL`         | 415 s | 21.34 GB|   354 s  | 59.6 s  |
+
+`COMPRESSION lz4` wins on every dimension that matters: storage is unchanged
+vs. either alternative, hot queries are identical (the blob cache absorbs
+detoast cost), cold queries are fastest, and the load is roughly half the
+pglz-fallback time. The reasoning ended up being the opposite of the original
+hypothesis:
+
+- The lz4 TOAST pass is *not* shrinking the bytes (they're already lz4-flex
+  output). What it's doing is exiting fast on uncompressible data via lz4's
+  cheap "skip" check.
+- With no clause, PostgreSQL falls back to **pglz**, which has no equivalent
+  fast-skip path. It grinds through the full bytes, fails to compress, and
+  stores raw — paying full pglz CPU on every blob write. That's where the
+  2× load-time blowup comes from.
+- `STORAGE EXTERNAL` skips compression entirely (good) but forces every
+  blob out-of-line into TOAST regardless of size (bad). For us, many
+  per-segment blobs are small (constant-encoded numeric columns,
+  low-cardinality valbitmaps, tiny bloom payloads); `EXTENDED` with
+  uncompressible data keeps those inline, while `EXTERNAL` pays a TOAST
+  chunk's worth of overhead per blob. Worst-hit cold queries (Q7 +147%,
+  Q11 +52%, Q10 +43%) are exactly the scan-many-small-blobs shapes.
+
+Net: keep `COMPRESSION lz4` as the default; fall back to letting pglz
+attempt-then-give-up only when the running PostgreSQL was built without
+`--with-lz4`. The fallback's storage and read costs are negligible — the
+real price of a missing `--with-lz4` build is the doubled load time.
+
 ## Open Questions
 
 1. **TOAST chunk size**: PostgreSQL's default TOAST chunk size is ~2000 bytes.

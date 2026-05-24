@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV PATH="/usr/lib/postgresql/${PG_MAJOR}/bin:${PATH}"
 ENV PG_MAJOR=${PG_MAJOR}
 
-RUN rustup component add clippy llvm-tools-preview \
+RUN rustup component add clippy rustfmt llvm-tools-preview \
     && cargo install cargo-pgrx --version "0.17.0" --locked \
     && cargo install cargo-llvm-cov --locked
 

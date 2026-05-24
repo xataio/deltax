@@ -179,7 +179,11 @@ mod tests {
         assert_eq!(decoded, values);
 
         let ratio = (values.len() * 8) as f64 / encoded.len() as f64;
-        assert!(ratio > 2.0, "constant-step i64 should compress >2x, got {:.1}x", ratio);
+        assert!(
+            ratio > 2.0,
+            "constant-step i64 should compress >2x, got {:.1}x",
+            ratio
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ def _setup(conn, table_name="events"):
             data JSONB NOT NULL
         )
     """)
-    conn.execute(f"SELECT deltax_create_table('{table_name}', 'ts', '1 day'::interval)")
+    conn.execute(f"SELECT deltax.deltax_create_table('{table_name}', 'ts', '1 day'::interval)")
     conn.commit()
 
 
@@ -86,7 +86,7 @@ def _enable_extracts(conn, table_name="events", segment_size=200):
         {"src": "data", "path": ["commit", "operation"], "name": "x_operation", "type": "text"},
     ])
     conn.execute(f"""
-        SELECT deltax_enable_compression(
+        SELECT deltax.deltax_enable_compression(
             '{table_name}',
             order_by => ARRAY['ts'],
             segment_size => {segment_size},
@@ -250,7 +250,7 @@ class TestJsonExtractCorrectness:
         _setup(db)
         # Enable with one path.
         db.execute("""
-            SELECT deltax_enable_compression(
+            SELECT deltax.deltax_enable_compression(
                 'events',
                 order_by => ARRAY['ts'],
                 segment_size => 100,
@@ -269,14 +269,14 @@ class TestJsonExtractCorrectness:
         db.execute(f"INSERT INTO events (ts, data) VALUES {rows}")
         db.commit()
         db.execute(
-            "SELECT deltax_compress_partition(table_name) FROM deltax_partition "
-            "WHERE deltatable_id = (SELECT id FROM deltax_deltatable WHERE table_name = 'events') "
+            "SELECT deltax.deltax_compress_partition(table_name) FROM deltax.deltax_partition "
+            "WHERE deltatable_id = (SELECT id FROM deltax.deltax_deltatable WHERE table_name = 'events') "
             "AND row_count > 0"
         )
         db.commit()
         # Re-enable with an extra path — bumps json_extract_added_at.
         db.execute("""
-            SELECT deltax_enable_compression(
+            SELECT deltax.deltax_enable_compression(
                 'events',
                 order_by => ARRAY['ts'],
                 segment_size => 100,
@@ -332,13 +332,13 @@ class TestJsonExtractCorrectness:
         # Force a compression so we have segments populated under the
         # initial spec list. Then clear the spec.
         db.execute(
-            "SELECT deltax_compress_partition(table_name) FROM deltax_partition "
-            "WHERE deltatable_id = (SELECT id FROM deltax_deltatable WHERE table_name = 'events') "
+            "SELECT deltax.deltax_compress_partition(table_name) FROM deltax.deltax_partition "
+            "WHERE deltatable_id = (SELECT id FROM deltax.deltax_deltatable WHERE table_name = 'events') "
             "AND row_count > 0"
         )
         db.commit()
         db.execute("""
-            SELECT deltax_enable_compression(
+            SELECT deltax.deltax_enable_compression(
                 'events', order_by => ARRAY['ts'],
                 json_extract => '[]'::jsonb
             )
@@ -369,7 +369,7 @@ class TestJsonExtractCorrectness:
 
         # Bump json_extract: add a path the prepared plan didn't see.
         db.execute("""
-            SELECT deltax_enable_compression(
+            SELECT deltax.deltax_enable_compression(
                 'events', order_by => ARRAY['ts'],
                 json_extract => '[
                     {"src":"data","path":["kind"],"name":"x_kind","type":"text"},
@@ -397,6 +397,78 @@ class TestJsonExtractCorrectness:
             f"prepared plan returned stale results after enable_compression change: "
             f"{second} vs control {control}"
         )
+
+    def test_groupby_physical_ts_extract_with_synthetic(self, db):
+        """Regression for issue #4: mixing a physical-column EXTRACT and a
+        JSONB chain in GROUP BY crashed planning with `cache lookup
+        failed for attribute N of relation X`. The Extract shape (a) over
+        the physical `ts` Var sets `group_by_relid` to the parent rel;
+        the chain synthetic group spec carries `col_idx` past the
+        parent's pg_attribute count, so resolving its name via
+        `get_attname(group_by_relid, col_idx + 1)` errored out.
+
+        The bug fires only when the planner's ndistinct heuristic block
+        runs, which is gated on `companion_oids` being non-empty (i.e.
+        the partition is compressed). Use the direct-backfill COPY so
+        the compression happens deterministically without depending on
+        the background worker."""
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE events (
+                ts TIMESTAMPTZ NOT NULL,
+                data JSONB NOT NULL
+            )
+        """)
+        db.execute(
+            "SELECT deltax.deltax_create_table('events', 'ts', '1 day'::interval, 5)"
+        )
+        _enable_extracts(db, segment_size=50)
+        db.execute("SET pg_deltax.json_extract_mode = 'fields'")
+        db.commit()
+
+        # Direct-backfill into the first-day partition. Generates 200
+        # rows across two hours so EXTRACT(HOUR FROM ts) yields >1 group.
+        collections = [
+            "app.bsky.feed.post",
+            "app.bsky.feed.repost",
+            "app.bsky.feed.like",
+        ]
+        rows = []
+        for i in range(200):
+            ts = f"2025-01-15 {(i // 100):02d}:{(i % 60):02d}:00+00"
+            payload = {
+                "kind": "commit",
+                "did": f"did:plc:{i % 10:03d}",
+                "time_us": 1700000000000000 + i * 1000,
+                "commit": {
+                    "collection": collections[i % 3],
+                    "operation": "create",
+                    "rkey": f"rec{i}",
+                },
+            }
+            rows.append((ts, json.dumps(payload)))
+        text = "\n".join(f"{ts}\t{payload}" for ts, payload in rows) + "\n"
+        with db.cursor() as cur:
+            with cur.copy(
+                "COPY events FROM STDIN WITH (FORMAT deltax_compress)"
+            ) as cp:
+                cp.write(text)
+        db.commit()
+
+        none, fields = _ab(db, """
+            SELECT data->'commit'->>'collection' AS event,
+                   EXTRACT(HOUR FROM ts) AS hour_of_day,
+                   COUNT(*) AS count
+            FROM events
+            WHERE data->>'kind' = 'commit'
+              AND data->'commit'->>'operation' = 'create'
+              AND data->'commit'->>'collection' IN
+                  ('app.bsky.feed.post', 'app.bsky.feed.repost', 'app.bsky.feed.like')
+            GROUP BY event, hour_of_day
+            ORDER BY hour_of_day, event
+        """)
+        assert none == fields
+        assert len(fields) >= 1
 
     def test_chain_in_in_clause(self, db):
         """`ScalarArrayOpExpr` is `chain IN ('a', 'b', 'c')` after PG's
@@ -535,9 +607,9 @@ class TestWalkerForwarderGate:
                 data JSONB NOT NULL
             )
         """)
-        db.execute("SELECT deltax_create_table('events', 'ts', '1 day'::interval, 5)")
+        db.execute("SELECT deltax.deltax_create_table('events', 'ts', '1 day'::interval, 5)")
         db.execute(
-            "SELECT deltax_enable_compression('events', "
+            "SELECT deltax.deltax_enable_compression('events', "
             "order_by => ARRAY['ts'], segment_size => 50, "
             "json_extract => '[{\"src\":\"data\","
             "\"path\":[\"terminal\"],\"name\":\"x_terminal\",\"type\":\"text\"}]'::jsonb)"
@@ -589,9 +661,9 @@ class TestWalkerForwarderGate:
             )
         """)
         db.execute("CREATE TABLE oi (order_id integer NOT NULL, amount integer NOT NULL)")
-        db.execute("SELECT deltax_create_table('oe', 'event_created', '1 day'::interval, 5)")
+        db.execute("SELECT deltax.deltax_create_table('oe', 'event_created', '1 day'::interval, 5)")
         db.execute(
-            "SELECT deltax_enable_compression('oe', "
+            "SELECT deltax.deltax_enable_compression('oe', "
             "order_by => ARRAY['order_id','event_created'], segment_size => 50, "
             "json_extract => '[{\"src\":\"data\","
             "\"path\":[\"terminal\"],\"name\":\"x_terminal\",\"type\":\"text\"}]'::jsonb)"
@@ -642,10 +714,10 @@ class TestWalkerForwarderGate:
             )
         """)
         db.execute(
-            "SELECT deltax_create_table('events_gs', 'ts', '1 day'::interval, 5)"
+            "SELECT deltax.deltax_create_table('events_gs', 'ts', '1 day'::interval, 5)"
         )
         db.execute(
-            "SELECT deltax_enable_compression('events_gs', "
+            "SELECT deltax.deltax_enable_compression('events_gs', "
             "order_by => ARRAY['ts'], segment_size => 50, "
             "json_extract => '[{\"src\":\"data\","
             "\"path\":[\"terminal\"],\"name\":\"x_terminal\",\"type\":\"text\"}]'::jsonb)"
@@ -706,13 +778,13 @@ class TestMixedPartitionGate:
             )
         """)
         db.execute(
-            "SELECT deltax_create_table('events', 'ts', '1 day'::interval, 365)"
+            "SELECT deltax.deltax_create_table('events', 'ts', '1 day'::interval, 365)"
         )
         db.commit()
 
         # 1) compression enabled without json_extract.
         db.execute("""
-            SELECT deltax_enable_compression(
+            SELECT deltax.deltax_enable_compression(
                 'events', order_by => ARRAY['ts'], segment_size => 100
             )
         """)
@@ -729,15 +801,15 @@ class TestMixedPartitionGate:
         db.commit()
         # Compress all partitions that contain rows so far.
         db.execute(
-            "SELECT deltax_compress_partition(table_name) FROM deltax_partition "
-            "WHERE deltatable_id = (SELECT id FROM deltax_deltatable WHERE table_name = 'events') "
+            "SELECT deltax.deltax_compress_partition(table_name) FROM deltax.deltax_partition "
+            "WHERE deltatable_id = (SELECT id FROM deltax.deltax_deltatable WHERE table_name = 'events') "
             "AND row_count > 0"
         )
         db.commit()
 
         # 3) re-enable_compression with json_extract added.
         db.execute("""
-            SELECT deltax_enable_compression(
+            SELECT deltax.deltax_enable_compression(
                 'events',
                 order_by => ARRAY['ts'],
                 segment_size => 100,
@@ -760,8 +832,8 @@ class TestMixedPartitionGate:
         db.execute(f"INSERT INTO events (ts, data) VALUES {new_rows}")
         db.commit()
         db.execute(
-            "SELECT deltax_compress_partition(table_name) FROM deltax_partition "
-            "WHERE deltatable_id = (SELECT id FROM deltax_deltatable WHERE table_name = 'events') "
+            "SELECT deltax.deltax_compress_partition(table_name) FROM deltax.deltax_partition "
+            "WHERE deltatable_id = (SELECT id FROM deltax.deltax_deltatable WHERE table_name = 'events') "
             "AND row_count > 0 AND NOT is_compressed"
         )
         db.commit()

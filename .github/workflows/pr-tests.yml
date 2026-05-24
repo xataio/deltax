@@ -12,6 +12,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check formatting
+        run: make fmt-check
+
+      - name: Run clippy
+        run: make clippy
+
   unit:
     name: Unit Tests (PG ${{ matrix.pg }})
     runs-on: ubuntu-latest

@@ -1,8 +1,8 @@
 use pgrx::pg_sys;
 
-use crate::compression::{self, CompressionType, CompressedColumnRef};
-use super::{PG_EPOCH_OFFSET_USEC, PG_EPOCH_OFFSET_DAYS};
-use super::batch_qual::{BatchQual, BatchCompareOp, LikeStrategy, sql_like_match};
+use super::batch_qual::{BatchCompareOp, BatchQual, LikeStrategy, sql_like_match};
+use super::{PG_EPOCH_OFFSET_DAYS, PG_EPOCH_OFFSET_USEC};
+use crate::compression::{self, CompressedColumnRef, CompressionType};
 
 // ============================================================================
 // Inline PG executor helpers (these are static inline in C headers,
@@ -12,7 +12,9 @@ use super::batch_qual::{BatchQual, BatchCompareOp, LikeStrategy, sql_like_match}
 pub(super) const TTS_FLAG_EMPTY: u16 = 1 << 1;
 
 /// Re-implementation of PostgreSQL's static inline `ExecProject`.
-pub(super) unsafe fn exec_project(proj_info: *mut pg_sys::ProjectionInfo) -> *mut pg_sys::TupleTableSlot {
+pub(super) unsafe fn exec_project(
+    proj_info: *mut pg_sys::ProjectionInfo,
+) -> *mut pg_sys::TupleTableSlot {
     unsafe {
         let econtext = (*proj_info).pi_exprContext;
         let state = &mut (*proj_info).pi_state;
@@ -37,7 +39,10 @@ pub(super) unsafe fn exec_project(proj_info: *mut pg_sys::ProjectionInfo) -> *mu
 }
 
 /// Re-implementation of PostgreSQL's static inline `ExecQual`.
-pub(super) unsafe fn exec_qual(state: *mut pg_sys::ExprState, econtext: *mut pg_sys::ExprContext) -> bool {
+pub(super) unsafe fn exec_qual(
+    state: *mut pg_sys::ExprState,
+    econtext: *mut pg_sys::ExprContext,
+) -> bool {
     unsafe {
         if state.is_null() {
             return true;
@@ -58,17 +63,12 @@ pub(super) unsafe fn exec_qual(state: *mut pg_sys::ExprState, econtext: *mut pg_
 }
 
 // ============================================================================
-// TupleDesc attribute access (PG14–17 vs PG18)
+// TupleDesc attribute access (PG17 vs PG18)
 // ============================================================================
 
 /// Get a pointer to the i-th `FormData_pg_attribute` from a TupleDesc.
-/// PG14–17 store attrs directly; PG18 stores CompactAttribute first, then attrs.
-#[cfg(any(
-    feature = "pg14",
-    feature = "pg15",
-    feature = "pg16",
-    feature = "pg17"
-))]
+/// PG17 stores attrs directly; PG18 stores CompactAttribute first, then attrs.
+#[cfg(feature = "pg17")]
 #[inline]
 pub(in crate::scan) unsafe fn tupdesc_get_attr(
     tupdesc: pg_sys::TupleDesc,
@@ -169,8 +169,7 @@ unsafe fn decode_compressed_datums(
     match cc.type_tag {
         CompressionType::Gorilla => {
             if dt.contains("timestamp") || dt == "date" {
-                let timestamps =
-                    compression::gorilla::decode_timestamps(cc.data, non_null_count);
+                let timestamps = compression::gorilla::decode_timestamps(cc.data, non_null_count);
                 if dt == "date" {
                     timestamps
                         .iter()
@@ -190,15 +189,13 @@ unsafe fn decode_compressed_datums(
                         .collect()
                 }
             } else if dt == "real" || dt.contains("float4") {
-                let floats =
-                    compression::gorilla::decode_floats_f32(cc.data, non_null_count);
+                let floats = compression::gorilla::decode_floats_f32(cc.data, non_null_count);
                 floats
                     .iter()
                     .map(|&v| pg_sys::Datum::from(v.to_bits() as usize))
                     .collect()
             } else {
-                let floats =
-                    compression::gorilla::decode_floats(cc.data, non_null_count);
+                let floats = compression::gorilla::decode_floats(cc.data, non_null_count);
                 floats
                     .iter()
                     .map(|&v| pg_sys::Datum::from(v.to_bits() as usize))
@@ -235,7 +232,8 @@ unsafe fn decode_compressed_datums(
             if type_oid == pg_sys::JSONBOID {
                 // Skip UTF-8 validation — stored dictionary entries are binary
                 // jsonb varlena payloads, not UTF-8 text.
-                let byte_slices = compression::dictionary::decode_to_byte_slices(dict_data, non_null_count);
+                let byte_slices =
+                    compression::dictionary::decode_to_byte_slices(dict_data, non_null_count);
                 unsafe { byte_slices_to_jsonb_datums_arena(&byte_slices) }
             } else {
                 let slices = compression::dictionary::decode_to_slices(dict_data, non_null_count);
@@ -263,7 +261,8 @@ unsafe fn decode_compressed_datums(
             }
         }
         CompressionType::Lz4Blocked => {
-            let (buf, ranges) = compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
+            let (buf, ranges) =
+                compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
             if type_oid == pg_sys::JSONBOID {
                 let byte_slices: Vec<&[u8]> = ranges
                     .iter()
@@ -349,7 +348,13 @@ pub(super) unsafe fn decompress_blob_to_datums(
     let total_count = cc.row_count as usize;
     let non_null_count = count_non_null(cc.null_bitmap, total_count);
     let datums = unsafe {
-        decode_compressed_datums(&cc, &data_type.to_lowercase(), type_oid, typmod, non_null_count)
+        decode_compressed_datums(
+            &cc,
+            &data_type.to_lowercase(),
+            type_oid,
+            typmod,
+            non_null_count,
+        )
     };
     reinsert_nulls_datum(&datums, cc.null_bitmap, total_count)
 }
@@ -380,7 +385,13 @@ pub(super) unsafe fn decompress_blob_to_datums_truncated(
 
     let non_null_count = count_non_null(cc.null_bitmap, truncated_count);
     let datums = unsafe {
-        decode_compressed_datums(&cc, &data_type.to_lowercase(), type_oid, typmod, non_null_count)
+        decode_compressed_datums(
+            &cc,
+            &data_type.to_lowercase(),
+            type_oid,
+            typmod,
+            non_null_count,
+        )
     };
     reinsert_nulls_datum(&datums, cc.null_bitmap, truncated_count)
 }
@@ -445,28 +456,21 @@ pub(super) unsafe fn decompress_text_blob_with_like_filter(
             let dict_matches: Vec<bool> = dict_entries.iter().map(|s| matches_like(s)).collect();
 
             // Collect matched slices for arena allocation
-            let sel: Vec<bool> = indices.iter().map(|&idx| dict_matches[idx as usize]).collect();
+            let sel: Vec<bool> = indices
+                .iter()
+                .map(|&idx| dict_matches[idx as usize])
+                .collect();
             let matched_slices: Vec<&str> = indices
                 .iter()
                 .zip(sel.iter())
                 .filter(|&(_, &pass)| pass)
                 .map(|(&idx, _)| dict_entries[idx as usize])
                 .collect();
-            let matched_datums = unsafe {
-                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
-            };
+            let matched_datums =
+                unsafe { str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod) };
 
             // Merge matched datums back with dummy datums for non-matching rows
-            let mut datums = Vec::with_capacity(non_null_count);
-            let mut match_idx = 0;
-            for &pass in &sel {
-                if pass {
-                    datums.push(matched_datums[match_idx]);
-                    match_idx += 1;
-                } else {
-                    datums.push(pg_sys::Datum::from(0));
-                }
-            }
+            let datums = merge_with_placeholder(&matched_datums, &sel);
             (datums, sel)
         }
         CompressionType::Lz4 | CompressionType::Lz4Blocked => {
@@ -558,36 +562,22 @@ pub(super) unsafe fn decompress_text_blob_with_like_filter(
                 .zip(sel.iter())
                 .filter(|&(_, &pass)| pass)
                 .map(|(&(off, len), _)| {
-                    std::str::from_utf8(&buf[off..off + len])
-                        .expect("invalid UTF-8 in LZ4 data")
+                    std::str::from_utf8(&buf[off..off + len]).expect("invalid UTF-8 in LZ4 data")
                 })
                 .collect();
-            let matched_datums = unsafe {
-                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
-            };
+            let matched_datums =
+                unsafe { str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod) };
 
             // Merge matched datums back
-            let mut datums = Vec::with_capacity(non_null_count);
-            let mut match_idx = 0;
-            for &pass in &sel {
-                if pass {
-                    datums.push(matched_datums[match_idx]);
-                    match_idx += 1;
-                } else {
-                    datums.push(pg_sys::Datum::from(0));
-                }
-            }
+            let datums = merge_with_placeholder(&matched_datums, &sel);
             (datums, sel)
         }
         _ => {
             // Unexpected compression type for text — fall back to full decompression
             return {
-                let full = unsafe { decompress_blob_to_datums(
-                    blob,
-                    &pg_type_name(type_oid),
-                    type_oid,
-                    typmod,
-                ) };
+                let full = unsafe {
+                    decompress_blob_to_datums(blob, &pg_type_name(type_oid), type_oid, typmod)
+                };
                 let sel = vec![true; full.len()];
                 (full, sel)
             };
@@ -598,14 +588,15 @@ pub(super) unsafe fn decompress_text_blob_with_like_filter(
     let null_bitmap = cc.null_bitmap;
     if null_bitmap.is_empty() {
         // No nulls — pair up directly
-        let datums: Vec<(pg_sys::Datum, bool)> = nn_datums.into_iter().map(|d| (d, false)).collect();
+        let datums: Vec<(pg_sys::Datum, bool)> =
+            nn_datums.into_iter().map(|d| (d, false)).collect();
         (datums, nn_sel)
     } else {
         let mut datums = Vec::with_capacity(total_count);
         let mut sel = Vec::with_capacity(total_count);
         let mut val_idx = 0;
         for i in 0..total_count {
-            let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            let is_null = is_null_at(null_bitmap, i);
             if is_null {
                 datums.push((pg_sys::Datum::from(0), true));
                 sel.push(false); // NULLs don't match LIKE
@@ -642,9 +633,7 @@ pub(super) fn decompress_text_blob_to_raw_strings(
 
     // Check for Ne '' filter on this column
     let has_ne_empty = batch_quals.iter().any(|bq| {
-        bq.col_idx == col_idx
-            && bq.text_const.as_deref() == Some("")
-            && bq.op == BatchCompareOp::Ne
+        bq.col_idx == col_idx && bq.text_const.as_deref() == Some("") && bq.op == BatchCompareOp::Ne
     });
 
     let (nn_strings, nn_sel): (Vec<String>, Vec<bool>) = match cc.type_tag {
@@ -659,7 +648,10 @@ pub(super) fn decompress_text_blob_to_raw_strings(
             let (dict_entries, indices) =
                 compression::dictionary::decode_dict_and_indices(dict_data, non_null_count);
 
-            let strings: Vec<String> = indices.iter().map(|&idx| dict_entries[idx as usize].to_string()).collect();
+            let strings: Vec<String> = indices
+                .iter()
+                .map(|&idx| dict_entries[idx as usize].to_string())
+                .collect();
             let sel: Vec<bool> = if has_ne_empty {
                 compression::dictionary::check_ne_empty(dict_data, non_null_count)
             } else {
@@ -669,9 +661,14 @@ pub(super) fn decompress_text_blob_to_raw_strings(
         }
         CompressionType::Lz4 => {
             let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
-            let strings: Vec<String> = ranges.iter().map(|&(off, len)| {
-                std::str::from_utf8(&buf[off..off + len]).unwrap_or("").to_string()
-            }).collect();
+            let strings: Vec<String> = ranges
+                .iter()
+                .map(|&(off, len)| {
+                    std::str::from_utf8(&buf[off..off + len])
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect();
             let sel: Vec<bool> = if has_ne_empty {
                 ranges.iter().map(|&(_off, len)| len > 0).collect()
             } else {
@@ -680,10 +677,16 @@ pub(super) fn decompress_text_blob_to_raw_strings(
             (strings, sel)
         }
         CompressionType::Lz4Blocked => {
-            let (buf, ranges) = compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
-            let strings: Vec<String> = ranges.iter().map(|&(off, len)| {
-                std::str::from_utf8(&buf[off..off + len]).unwrap_or("").to_string()
-            }).collect();
+            let (buf, ranges) =
+                compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
+            let strings: Vec<String> = ranges
+                .iter()
+                .map(|&(off, len)| {
+                    std::str::from_utf8(&buf[off..off + len])
+                        .unwrap_or("")
+                        .to_string()
+                })
+                .collect();
             let sel: Vec<bool> = if has_ne_empty {
                 ranges.iter().map(|&(_off, len)| len > 0).collect()
             } else {
@@ -693,7 +696,11 @@ pub(super) fn decompress_text_blob_to_raw_strings(
         }
         _ => {
             let strings = vec![String::new(); non_null_count];
-            let sel = if has_ne_empty { vec![false; non_null_count] } else { Vec::new() };
+            let sel = if has_ne_empty {
+                vec![false; non_null_count]
+            } else {
+                Vec::new()
+            };
             (strings, sel)
         }
     };
@@ -704,16 +711,24 @@ pub(super) fn decompress_text_blob_to_raw_strings(
         (strings, nn_sel)
     } else {
         let mut strings = Vec::with_capacity(total_count);
-        let mut sel = if has_ne_empty { Vec::with_capacity(total_count) } else { Vec::new() };
+        let mut sel = if has_ne_empty {
+            Vec::with_capacity(total_count)
+        } else {
+            Vec::new()
+        };
         let mut val_idx = 0;
         for i in 0..total_count {
-            let is_null = (cc.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            let is_null = is_null_at(cc.null_bitmap, i);
             if is_null {
                 strings.push(None);
-                if has_ne_empty { sel.push(false); }
+                if has_ne_empty {
+                    sel.push(false);
+                }
             } else {
                 strings.push(Some(nn_strings[val_idx].clone()));
-                if has_ne_empty { sel.push(nn_sel[val_idx]); }
+                if has_ne_empty {
+                    sel.push(nn_sel[val_idx]);
+                }
                 val_idx += 1;
             }
         }
@@ -767,7 +782,8 @@ pub(super) unsafe fn decompress_text_blob_with_eq_filter(
             let hdr = compression::dictionary::parse_header(dict_data);
 
             // Fast path for empty-string comparison: use precomputed empty_string_idx
-            let dict_matches: Vec<bool> = if const_str.is_empty() && hdr.empty_string_idx != 0xFFFF {
+            let dict_matches: Vec<bool> = if const_str.is_empty() && hdr.empty_string_idx != 0xFFFF
+            {
                 let mut m = vec![is_ne; hdr.dict.len()];
                 m[hdr.empty_string_idx as usize] = !is_ne;
                 m
@@ -780,30 +796,28 @@ pub(super) unsafe fn decompress_text_blob_with_eq_filter(
 
             let mut indices = Vec::with_capacity(non_null_count);
             for i in 0..non_null_count {
-                indices.push(compression::dictionary::read_index(dict_data, hdr.indices_start, hdr.index_width, i));
+                indices.push(compression::dictionary::read_index(
+                    dict_data,
+                    hdr.indices_start,
+                    hdr.index_width,
+                    i,
+                ));
             }
 
-            let sel: Vec<bool> = indices.iter().map(|&idx| dict_matches[idx as usize]).collect();
+            let sel: Vec<bool> = indices
+                .iter()
+                .map(|&idx| dict_matches[idx as usize])
+                .collect();
             let matched_slices: Vec<&str> = indices
                 .iter()
                 .zip(sel.iter())
                 .filter(|&(_, &pass)| pass)
                 .map(|(&idx, _)| hdr.dict[idx as usize])
                 .collect();
-            let matched_datums = unsafe {
-                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
-            };
+            let matched_datums =
+                unsafe { str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod) };
 
-            let mut datums = Vec::with_capacity(non_null_count);
-            let mut match_idx = 0;
-            for &pass in &sel {
-                if pass {
-                    datums.push(matched_datums[match_idx]);
-                    match_idx += 1;
-                } else {
-                    datums.push(pg_sys::Datum::from(0));
-                }
-            }
+            let datums = merge_with_placeholder(&matched_datums, &sel);
             (datums, sel)
         }
         CompressionType::Lz4 | CompressionType::Lz4Blocked => {
@@ -816,8 +830,7 @@ pub(super) unsafe fn decompress_text_blob_with_eq_filter(
             let slices: Vec<&str> = ranges
                 .iter()
                 .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len])
-                        .expect("invalid UTF-8 in LZ4 data")
+                    std::str::from_utf8(&buf[off..off + len]).expect("invalid UTF-8 in LZ4 data")
                 })
                 .collect();
             let sel: Vec<bool> = slices.iter().map(|s| matches_eq(s)).collect();
@@ -828,31 +841,18 @@ pub(super) unsafe fn decompress_text_blob_with_eq_filter(
                 .filter(|&(_, &pass)| pass)
                 .map(|(&s, _)| s)
                 .collect();
-            let matched_datums = unsafe {
-                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
-            };
+            let matched_datums =
+                unsafe { str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod) };
 
-            let mut datums = Vec::with_capacity(non_null_count);
-            let mut match_idx = 0;
-            for &pass in &sel {
-                if pass {
-                    datums.push(matched_datums[match_idx]);
-                    match_idx += 1;
-                } else {
-                    datums.push(pg_sys::Datum::from(0));
-                }
-            }
+            let datums = merge_with_placeholder(&matched_datums, &sel);
             (datums, sel)
         }
         _ => {
             // Unexpected compression type — fall back to full decompression
             return {
-                let full = unsafe { decompress_blob_to_datums(
-                    blob,
-                    &pg_type_name(type_oid),
-                    type_oid,
-                    typmod,
-                ) };
+                let full = unsafe {
+                    decompress_blob_to_datums(blob, &pg_type_name(type_oid), type_oid, typmod)
+                };
                 let sel = vec![true; full.len()];
                 (full, sel)
             };
@@ -862,14 +862,15 @@ pub(super) unsafe fn decompress_text_blob_with_eq_filter(
     // Reinsert nulls into both datums and selection vectors
     let null_bitmap = cc.null_bitmap;
     if null_bitmap.is_empty() {
-        let datums: Vec<(pg_sys::Datum, bool)> = nn_datums.into_iter().map(|d| (d, false)).collect();
+        let datums: Vec<(pg_sys::Datum, bool)> =
+            nn_datums.into_iter().map(|d| (d, false)).collect();
         (datums, nn_sel)
     } else {
         let mut datums = Vec::with_capacity(total_count);
         let mut sel = Vec::with_capacity(total_count);
         let mut val_idx = 0;
         for i in 0..total_count {
-            let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            let is_null = is_null_at(null_bitmap, i);
             if is_null {
                 datums.push((pg_sys::Datum::from(0), true));
                 sel.push(false); // NULLs don't match equality
@@ -941,27 +942,20 @@ pub(super) unsafe fn decompress_text_blob_with_in_filter(
                 ));
             }
 
-            let sel: Vec<bool> = indices.iter().map(|&idx| dict_matches[idx as usize]).collect();
+            let sel: Vec<bool> = indices
+                .iter()
+                .map(|&idx| dict_matches[idx as usize])
+                .collect();
             let matched_slices: Vec<&str> = indices
                 .iter()
                 .zip(sel.iter())
                 .filter(|&(_, &pass)| pass)
                 .map(|(&idx, _)| hdr.dict[idx as usize])
                 .collect();
-            let matched_datums = unsafe {
-                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
-            };
+            let matched_datums =
+                unsafe { str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod) };
 
-            let mut datums = Vec::with_capacity(non_null_count);
-            let mut match_idx = 0;
-            for &pass in &sel {
-                if pass {
-                    datums.push(matched_datums[match_idx]);
-                    match_idx += 1;
-                } else {
-                    datums.push(pg_sys::Datum::from(0));
-                }
-            }
+            let datums = merge_with_placeholder(&matched_datums, &sel);
             (datums, sel)
         }
         CompressionType::Lz4 | CompressionType::Lz4Blocked => {
@@ -974,8 +968,7 @@ pub(super) unsafe fn decompress_text_blob_with_in_filter(
             let slices: Vec<&str> = ranges
                 .iter()
                 .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len])
-                        .expect("invalid UTF-8 in LZ4 data")
+                    std::str::from_utf8(&buf[off..off + len]).expect("invalid UTF-8 in LZ4 data")
                 })
                 .collect();
             let sel: Vec<bool> = slices.iter().map(|s| matches_in(s)).collect();
@@ -986,30 +979,17 @@ pub(super) unsafe fn decompress_text_blob_with_in_filter(
                 .filter(|&(_, &pass)| pass)
                 .map(|(&s, _)| s)
                 .collect();
-            let matched_datums = unsafe {
-                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
-            };
+            let matched_datums =
+                unsafe { str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod) };
 
-            let mut datums = Vec::with_capacity(non_null_count);
-            let mut match_idx = 0;
-            for &pass in &sel {
-                if pass {
-                    datums.push(matched_datums[match_idx]);
-                    match_idx += 1;
-                } else {
-                    datums.push(pg_sys::Datum::from(0));
-                }
-            }
+            let datums = merge_with_placeholder(&matched_datums, &sel);
             (datums, sel)
         }
         _ => {
             return {
-                let full = unsafe { decompress_blob_to_datums(
-                    blob,
-                    &pg_type_name(type_oid),
-                    type_oid,
-                    typmod,
-                ) };
+                let full = unsafe {
+                    decompress_blob_to_datums(blob, &pg_type_name(type_oid), type_oid, typmod)
+                };
                 let sel = vec![true; full.len()];
                 (full, sel)
             };
@@ -1026,7 +1006,7 @@ pub(super) unsafe fn decompress_text_blob_with_in_filter(
         let mut sel = Vec::with_capacity(total_count);
         let mut val_idx = 0;
         for i in 0..total_count {
-            let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            let is_null = is_null_at(null_bitmap, i);
             if is_null {
                 datums.push((pg_sys::Datum::from(0), true));
                 sel.push(false);
@@ -1077,9 +1057,15 @@ pub(super) fn decompress_text_blob_to_lengths(
                 compression::dictionary::decode_dict_and_indices(dict_data, non_null_count);
 
             // Pre-compute lengths (character count, not byte count) for each dict entry
-            let dict_lengths: Vec<i32> = dict_entries.iter().map(|s| s.chars().count() as i32).collect();
+            let dict_lengths: Vec<i32> = dict_entries
+                .iter()
+                .map(|s| s.chars().count() as i32)
+                .collect();
 
-            let lengths: Vec<i32> = indices.iter().map(|&idx| dict_lengths[idx as usize]).collect();
+            let lengths: Vec<i32> = indices
+                .iter()
+                .map(|&idx| dict_lengths[idx as usize])
+                .collect();
             let sel: Vec<bool> = if filter_empty {
                 compression::dictionary::check_ne_empty(dict_data, non_null_count)
             } else {
@@ -1090,10 +1076,13 @@ pub(super) fn decompress_text_blob_to_lengths(
         }
         CompressionType::Lz4 => {
             let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
-            let lengths: Vec<i32> = ranges.iter().map(|&(off, len)| {
-                let s = std::str::from_utf8(&buf[off..off + len]).unwrap_or("");
-                s.chars().count() as i32
-            }).collect();
+            let lengths: Vec<i32> = ranges
+                .iter()
+                .map(|&(off, len)| {
+                    let s = std::str::from_utf8(&buf[off..off + len]).unwrap_or("");
+                    s.chars().count() as i32
+                })
+                .collect();
             let sel: Vec<bool> = if filter_empty {
                 ranges.iter().map(|&(_off, len)| len > 0).collect()
             } else {
@@ -1102,11 +1091,15 @@ pub(super) fn decompress_text_blob_to_lengths(
             (lengths, sel)
         }
         CompressionType::Lz4Blocked => {
-            let (buf, ranges) = compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
-            let lengths: Vec<i32> = ranges.iter().map(|&(off, len)| {
-                let s = std::str::from_utf8(&buf[off..off + len]).unwrap_or("");
-                s.chars().count() as i32
-            }).collect();
+            let (buf, ranges) =
+                compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
+            let lengths: Vec<i32> = ranges
+                .iter()
+                .map(|&(off, len)| {
+                    let s = std::str::from_utf8(&buf[off..off + len]).unwrap_or("");
+                    s.chars().count() as i32
+                })
+                .collect();
             let sel: Vec<bool> = if filter_empty {
                 ranges.iter().map(|&(_off, len)| len > 0).collect()
             } else {
@@ -1117,7 +1110,11 @@ pub(super) fn decompress_text_blob_to_lengths(
         _ => {
             // Unexpected compression type for text — return zeros
             let lengths = vec![0i32; non_null_count];
-            let sel = if filter_empty { vec![false; non_null_count] } else { Vec::new() };
+            let sel = if filter_empty {
+                vec![false; non_null_count]
+            } else {
+                Vec::new()
+            };
             (lengths, sel)
         }
     };
@@ -1132,10 +1129,14 @@ pub(super) fn decompress_text_blob_to_lengths(
         (datums, nn_sel)
     } else {
         let mut datums = Vec::with_capacity(total_count);
-        let mut sel = if filter_empty { Vec::with_capacity(total_count) } else { Vec::new() };
+        let mut sel = if filter_empty {
+            Vec::with_capacity(total_count)
+        } else {
+            Vec::new()
+        };
         let mut val_idx = 0;
         for i in 0..total_count {
-            let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            let is_null = is_null_at(null_bitmap, i);
             if is_null {
                 datums.push((pg_sys::Datum::from(0usize), true));
                 if filter_empty {
@@ -1179,7 +1180,7 @@ pub(super) unsafe fn decompress_text_blob_with_selection(
     } else {
         let mut nn_sel = Vec::with_capacity(non_null_count);
         for (i, &sel) in selection.iter().enumerate().take(total_count) {
-            let is_null = (cc.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            let is_null = is_null_at(cc.null_bitmap, i);
             if !is_null {
                 nn_sel.push(sel);
             }
@@ -1206,32 +1207,19 @@ pub(super) unsafe fn decompress_text_blob_with_selection(
                 .filter(|&(_, &sel)| sel)
                 .map(|(&idx, _)| dict_entries[idx as usize])
                 .collect();
-            let matched_datums = unsafe {
-                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
-            };
+            let matched_datums =
+                unsafe { str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod) };
 
             // Merge back: selected rows get real datums, others get placeholder
-            let mut datums = Vec::with_capacity(non_null_count);
-            let mut match_idx = 0;
-            for &sel in &nn_selection {
-                if sel {
-                    datums.push(matched_datums[match_idx]);
-                    match_idx += 1;
-                } else {
-                    datums.push(pg_sys::Datum::from(0));
-                }
-            }
-            datums
+            merge_with_placeholder(&matched_datums, &nn_selection)
         }
         CompressionType::Lz4 => {
-            let (buf, ranges) =
-                compression::lz4::decode_to_ranges(cc.data, non_null_count);
+            let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
 
             let slices: Vec<&str> = ranges
                 .iter()
                 .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len])
-                        .expect("invalid UTF-8 in LZ4 data")
+                    std::str::from_utf8(&buf[off..off + len]).expect("invalid UTF-8 in LZ4 data")
                 })
                 .collect();
 
@@ -1242,26 +1230,18 @@ pub(super) unsafe fn decompress_text_blob_with_selection(
                 .filter(|&(_, &sel)| sel)
                 .map(|(&s, _)| s)
                 .collect();
-            let matched_datums = unsafe {
-                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
-            };
+            let matched_datums =
+                unsafe { str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod) };
 
-            let mut datums = Vec::with_capacity(non_null_count);
-            let mut match_idx = 0;
-            for &sel in &nn_selection {
-                if sel {
-                    datums.push(matched_datums[match_idx]);
-                    match_idx += 1;
-                } else {
-                    datums.push(pg_sys::Datum::from(0));
-                }
-            }
-            datums
+            merge_with_placeholder(&matched_datums, &nn_selection)
         }
         CompressionType::Lz4Blocked => {
             // Partial decompression: only decode blocks containing selected rows
-            let (buf, ranges) =
-                compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, Some(&nn_selection));
+            let (buf, ranges) = compression::lz4::decode_to_ranges_blocked(
+                cc.data,
+                non_null_count,
+                Some(&nn_selection),
+            );
 
             // Collect only selected slices for arena allocation
             let matched_slices: Vec<&str> = ranges
@@ -1269,25 +1249,13 @@ pub(super) unsafe fn decompress_text_blob_with_selection(
                 .zip(nn_selection.iter())
                 .filter(|&(_, &sel)| sel)
                 .map(|(&(off, len), _)| {
-                    std::str::from_utf8(&buf[off..off + len])
-                        .expect("invalid UTF-8 in LZ4 data")
+                    std::str::from_utf8(&buf[off..off + len]).expect("invalid UTF-8 in LZ4 data")
                 })
                 .collect();
-            let matched_datums = unsafe {
-                str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod)
-            };
+            let matched_datums =
+                unsafe { str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod) };
 
-            let mut datums = Vec::with_capacity(non_null_count);
-            let mut match_idx = 0;
-            for &sel in &nn_selection {
-                if sel {
-                    datums.push(matched_datums[match_idx]);
-                    match_idx += 1;
-                } else {
-                    datums.push(pg_sys::Datum::from(0));
-                }
-            }
-            datums
+            merge_with_placeholder(&matched_datums, &nn_selection)
         }
         _ => {
             // Unexpected compression type — fall back to full decompression
@@ -1305,7 +1273,7 @@ pub(super) unsafe fn decompress_text_blob_with_selection(
         let mut result = Vec::with_capacity(total_count);
         let mut val_idx = 0;
         for i in 0..total_count {
-            let is_null = (cc.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            let is_null = is_null_at(cc.null_bitmap, i);
             if is_null {
                 result.push((pg_sys::Datum::from(0), true));
             } else {
@@ -1350,7 +1318,7 @@ pub(super) unsafe fn decompress_jsonb_blob_with_selection(
     } else {
         let mut nn_sel = Vec::with_capacity(non_null_count);
         for (i, &sel) in selection.iter().enumerate().take(total_count) {
-            let is_null = (cc.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            let is_null = is_null_at(cc.null_bitmap, i);
             if !is_null {
                 nn_sel.push(sel);
             }
@@ -1379,21 +1347,10 @@ pub(super) unsafe fn decompress_jsonb_blob_with_selection(
                 .collect();
             let matched_datums = unsafe { byte_slices_to_jsonb_datums_arena(&matched_slices) };
 
-            let mut datums = Vec::with_capacity(non_null_count);
-            let mut match_idx = 0;
-            for &sel in &nn_selection {
-                if sel {
-                    datums.push(matched_datums[match_idx]);
-                    match_idx += 1;
-                } else {
-                    datums.push(pg_sys::Datum::from(0));
-                }
-            }
-            datums
+            merge_with_placeholder(&matched_datums, &nn_selection)
         }
         CompressionType::Lz4 => {
-            let (buf, ranges) =
-                compression::lz4::decode_to_ranges(cc.data, non_null_count);
+            let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
 
             let matched_slices: Vec<&[u8]> = ranges
                 .iter()
@@ -1403,17 +1360,7 @@ pub(super) unsafe fn decompress_jsonb_blob_with_selection(
                 .collect();
             let matched_datums = unsafe { byte_slices_to_jsonb_datums_arena(&matched_slices) };
 
-            let mut datums = Vec::with_capacity(non_null_count);
-            let mut match_idx = 0;
-            for &sel in &nn_selection {
-                if sel {
-                    datums.push(matched_datums[match_idx]);
-                    match_idx += 1;
-                } else {
-                    datums.push(pg_sys::Datum::from(0));
-                }
-            }
-            datums
+            merge_with_placeholder(&matched_datums, &nn_selection)
         }
         CompressionType::Lz4Blocked => {
             // Partial decompression: only decode blocks containing selected rows.
@@ -1431,23 +1378,11 @@ pub(super) unsafe fn decompress_jsonb_blob_with_selection(
                 .collect();
             let matched_datums = unsafe { byte_slices_to_jsonb_datums_arena(&matched_slices) };
 
-            let mut datums = Vec::with_capacity(non_null_count);
-            let mut match_idx = 0;
-            for &sel in &nn_selection {
-                if sel {
-                    datums.push(matched_datums[match_idx]);
-                    match_idx += 1;
-                } else {
-                    datums.push(pg_sys::Datum::from(0));
-                }
-            }
-            datums
+            merge_with_placeholder(&matched_datums, &nn_selection)
         }
         _ => {
             // Unexpected compression type — fall back to full decompression.
-            let full = unsafe {
-                decompress_blob_to_datums(blob, "jsonb", pg_sys::JSONBOID, -1)
-            };
+            let full = unsafe { decompress_blob_to_datums(blob, "jsonb", pg_sys::JSONBOID, -1) };
             return full;
         }
     };
@@ -1459,7 +1394,7 @@ pub(super) unsafe fn decompress_jsonb_blob_with_selection(
         let mut result = Vec::with_capacity(total_count);
         let mut val_idx = 0;
         for i in 0..total_count {
-            let is_null = (cc.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+            let is_null = is_null_at(cc.null_bitmap, i);
             if is_null {
                 result.push((pg_sys::Datum::from(0), true));
             } else {
@@ -1488,7 +1423,11 @@ pub(super) unsafe fn collation_strcmp(a: &str, b: &str) -> i32 {
     }
 }
 
-pub(super) unsafe fn str_to_text_datum(s: &str, type_oid: pg_sys::Oid, typmod: i32) -> pg_sys::Datum {
+pub(super) unsafe fn str_to_text_datum(
+    s: &str,
+    type_oid: pg_sys::Oid,
+    typmod: i32,
+) -> pg_sys::Datum {
     unsafe {
         // bpchar needs the type input function for padding; jsonb stores
         // as canonical text and needs the input function to produce a real
@@ -1519,10 +1458,6 @@ pub(super) unsafe fn str_slices_to_text_datums_arena(
     type_oid: pg_sys::Oid,
     typmod: i32,
 ) -> Vec<pg_sys::Datum> {
-    if slices.is_empty() {
-        return Vec::new();
-    }
-
     // bpchar needs the input function for padding. jsonb should normally go
     // through `byte_slices_to_jsonb_datums_arena` (the bytes are binary, not
     // UTF-8); this branch is only a safety net for any caller that still
@@ -1535,40 +1470,11 @@ pub(super) unsafe fn str_slices_to_text_datums_arena(
                 .collect()
         };
     }
-
-    unsafe {
-        const VARHDRSZ: usize = pg_sys::VARHDRSZ;
-        const MAXALIGN: usize = 8; // 64-bit alignment
-
-        // Calculate total arena size
-        let total_size: usize = slices
-            .iter()
-            .map(|s| {
-                let varlena_size = VARHDRSZ + s.len();
-                // Align each varlena to MAXALIGN for safe pointer access
-                (varlena_size + MAXALIGN - 1) & !(MAXALIGN - 1)
-            })
-            .sum();
-
-        let arena = pg_sys::palloc(total_size) as *mut u8;
-        let mut datums = Vec::with_capacity(slices.len());
-        let mut offset = 0;
-
-        for s in slices {
-            let varlena_ptr = arena.add(offset) as *mut pg_sys::varlena;
-            let total_len = (VARHDRSZ + s.len()) as i32;
-            pgrx::set_varsize_4b(varlena_ptr, total_len);
-            std::ptr::copy_nonoverlapping(
-                s.as_ptr(),
-                (varlena_ptr as *mut u8).add(VARHDRSZ),
-                s.len(),
-            );
-            datums.push(pg_sys::Datum::from(varlena_ptr as usize));
-            offset += ((total_len as usize) + MAXALIGN - 1) & !(MAXALIGN - 1);
-        }
-
-        datums
-    }
+    // SAFETY: `&str` is guaranteed to be valid UTF-8, hence valid `&[u8]`.
+    // The arena allocator copies bytes verbatim into a fresh varlena; PG
+    // text consumers don't re-validate UTF-8.
+    let byte_slices: Vec<&[u8]> = slices.iter().map(|s| s.as_bytes()).collect();
+    unsafe { varlena_arena_alloc(&byte_slices) }
 }
 
 /// Build jsonb Datums from raw byte slices already in PG's binary jsonb
@@ -1576,27 +1482,28 @@ pub(super) unsafe fn str_slices_to_text_datums_arena(
 /// header). Each slice is wrapped in a fresh short-varlena header and
 /// returned as a `pg_sys::Datum`. This is the hot path that replaces the
 /// per-row `jsonb_in` parse — parsing happened once at ingest.
+pub(super) unsafe fn byte_slices_to_jsonb_datums_arena(slices: &[&[u8]]) -> Vec<pg_sys::Datum> {
+    unsafe { varlena_arena_alloc(slices) }
+}
+
+/// Arena-allocate a contiguous palloc block holding one varlena per input
+/// slice, returning the resulting Datums. Each varlena is laid out with a
+/// 4-byte length header followed by the slice bytes; entries are padded to
+/// MAXALIGN so each varlena pointer is naturally aligned.
 ///
-/// Arena-allocates a single contiguous palloc block for all varlenas to
-/// keep cache locality good on large row batches (mirrors
-/// `str_slices_to_text_datums_arena`).
-pub(super) unsafe fn byte_slices_to_jsonb_datums_arena(
-    slices: &[&[u8]],
-) -> Vec<pg_sys::Datum> {
+/// Single contiguous allocation keeps cache locality good on large row
+/// batches — the per-row emit loop walks the resulting Datums in order.
+unsafe fn varlena_arena_alloc(slices: &[&[u8]]) -> Vec<pg_sys::Datum> {
     if slices.is_empty() {
         return Vec::new();
     }
-
     unsafe {
         const VARHDRSZ: usize = pg_sys::VARHDRSZ;
         const MAXALIGN: usize = 8;
 
         let total_size: usize = slices
             .iter()
-            .map(|b| {
-                let varlena_size = VARHDRSZ + b.len();
-                (varlena_size + MAXALIGN - 1) & !(MAXALIGN - 1)
-            })
+            .map(|b| (VARHDRSZ + b.len() + MAXALIGN - 1) & !(MAXALIGN - 1))
             .sum();
 
         let arena = pg_sys::palloc(total_size) as *mut u8;
@@ -1637,7 +1544,7 @@ pub(super) fn reinsert_nulls_datum(
     let mut result = Vec::with_capacity(total_count);
     let mut val_idx = 0;
     for i in 0..total_count {
-        let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+        let is_null = is_null_at(null_bitmap, i);
         if is_null {
             result.push((pg_sys::Datum::from(0), true));
         } else {
@@ -1650,8 +1557,15 @@ pub(super) fn reinsert_nulls_datum(
 
 /// Compare two Datums of the same type. Returns Ordering for min/max computation.
 /// Only supports pass-by-value orderable types (int, float, date, timestamp).
-pub(super) fn compare_datums(d1: pg_sys::Datum, d2: pg_sys::Datum, type_oid: pg_sys::Oid) -> std::cmp::Ordering {
-    if type_oid == pg_sys::TIMESTAMPTZOID || type_oid == pg_sys::TIMESTAMPOID || type_oid == pg_sys::INT8OID {
+pub(super) fn compare_datums(
+    d1: pg_sys::Datum,
+    d2: pg_sys::Datum,
+    type_oid: pg_sys::Oid,
+) -> std::cmp::Ordering {
+    if type_oid == pg_sys::TIMESTAMPTZOID
+        || type_oid == pg_sys::TIMESTAMPOID
+        || type_oid == pg_sys::INT8OID
+    {
         (d1.value() as i64).cmp(&(d2.value() as i64))
     } else if type_oid == pg_sys::DATEOID || type_oid == pg_sys::INT4OID {
         (d1.value() as i32).cmp(&(d2.value() as i32))
@@ -1668,6 +1582,36 @@ pub(super) fn compare_datums(d1: pg_sys::Datum, d2: pg_sys::Datum, type_oid: pg_
     } else {
         std::cmp::Ordering::Equal
     }
+}
+
+/// Returns true if row `i` is null per a compressed-column null bitmap. A bit
+/// set means null. Empty bitmaps imply "no nulls at all" — callers always
+/// gate on `null_bitmap.is_empty()` before calling this.
+#[inline]
+pub(super) fn is_null_at(null_bitmap: &[u8], i: usize) -> bool {
+    (null_bitmap[i / 8] >> (i % 8)) & 1 == 1
+}
+
+/// For each `pass` in `sel`, push the next matched datum if true, otherwise a
+/// zero placeholder. Caller's matched array must have exactly
+/// `sel.iter().filter(|&&p| p).count()` entries. Used by the filter-pushdown
+/// family to interleave real varlena datums (only allocated for matched rows)
+/// back into a full-length output.
+pub(super) fn merge_with_placeholder(
+    matched: &[pg_sys::Datum],
+    sel: &[bool],
+) -> Vec<pg_sys::Datum> {
+    let mut out = Vec::with_capacity(sel.len());
+    let mut idx = 0;
+    for &pass in sel {
+        if pass {
+            out.push(matched[idx]);
+            idx += 1;
+        } else {
+            out.push(pg_sys::Datum::from(0));
+        }
+    }
+    out
 }
 
 pub(super) fn count_non_null(null_bitmap: &[u8], total_count: usize) -> usize {

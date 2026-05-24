@@ -1,5 +1,6 @@
 /target
 /coverage
+/pkgout
 /.venv
 __pycache__/
 *.py[cod]

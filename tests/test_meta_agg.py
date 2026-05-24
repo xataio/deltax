@@ -27,11 +27,11 @@ def _seed(db, n_partitions=3, rows_per_partition=30_000, n_devices=50, n_kinds=5
         ")"
     )
     db.execute(
-        "SELECT deltax_create_table('events', 'ts', '1 day', %s)",
+        "SELECT deltax.deltax_create_table('events', 'ts', '1 day', %s)",
         (n_partitions - 1,),
     )
     db.execute(
-        "SELECT deltax_enable_compression('events', "
+        "SELECT deltax.deltax_enable_compression('events', "
         "  segment_by => ARRAY['device_id'], "
         "  order_by => ARRAY['ts'])"
     )
@@ -57,12 +57,12 @@ def _seed(db, n_partitions=3, rows_per_partition=30_000, n_devices=50, n_kinds=5
     db.commit()
 
     for (name,) in db.execute(
-        "SELECT partition_name FROM deltax_partition_info('events') "
+        "SELECT partition_name FROM deltax.deltax_partition_info('events') "
         "ORDER BY range_start"
     ).fetchall():
         cnt = db.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]
         if cnt > 0:
-            db.execute("SELECT deltax_compress_partition(%s)", (name,))
+            db.execute("SELECT deltax.deltax_compress_partition(%s)", (name,))
     db.commit()
 
     db.rollback()
@@ -265,11 +265,11 @@ def _seed_low_card_text(db, n_partitions=3, rows_per_partition=30_000, n_kinds=5
         ")"
     )
     db.execute(
-        "SELECT deltax_create_table('events_d', 'ts', '1 day', %s)",
+        "SELECT deltax.deltax_create_table('events_d', 'ts', '1 day', %s)",
         (n_partitions - 1,),
     )
     db.execute(
-        "SELECT deltax_enable_compression('events_d', "
+        "SELECT deltax.deltax_enable_compression('events_d', "
         "  order_by => ARRAY['ts'])"
     )
     db.commit()
@@ -294,12 +294,12 @@ def _seed_low_card_text(db, n_partitions=3, rows_per_partition=30_000, n_kinds=5
     db.commit()
 
     for (name,) in db.execute(
-        "SELECT partition_name FROM deltax_partition_info('events_d') "
+        "SELECT partition_name FROM deltax.deltax_partition_info('events_d') "
         "ORDER BY range_start"
     ).fetchall():
         cnt = db.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]
         if cnt > 0:
-            db.execute("SELECT deltax_compress_partition(%s)", (name,))
+            db.execute("SELECT deltax.deltax_compress_partition(%s)", (name,))
     db.commit()
     db.rollback()
     db.autocommit = True
@@ -448,8 +448,8 @@ def test_phase_d_null_count_distinct(db):
         "  tag TEXT"
         ")"
     )
-    db.execute("SELECT deltax_create_table('events_dn', 'ts', '1 day', 2)")
-    db.execute("SELECT deltax_enable_compression('events_dn', order_by => ARRAY['ts'])")
+    db.execute("SELECT deltax.deltax_create_table('events_dn', 'ts', '1 day', 2)")
+    db.execute("SELECT deltax.deltax_enable_compression('events_dn', order_by => ARRAY['ts'])")
     db.commit()
 
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -472,11 +472,11 @@ def test_phase_d_null_count_distinct(db):
         )
     db.commit()
     for (name,) in db.execute(
-        "SELECT partition_name FROM deltax_partition_info('events_dn') ORDER BY range_start"
+        "SELECT partition_name FROM deltax.deltax_partition_info('events_dn') ORDER BY range_start"
     ).fetchall():
         cnt = db.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]
         if cnt > 0:
-            db.execute("SELECT deltax_compress_partition(%s)", (name,))
+            db.execute("SELECT deltax.deltax_compress_partition(%s)", (name,))
     db.commit()
 
     sql = (
@@ -531,11 +531,11 @@ def test_mixed_path_pipeline_detoast_covers_full_first_batch(db):
         ")"
     )
     db.execute(
-        "SELECT deltax_create_table('pipe_events', 'ts', '1 day', %s)",
+        "SELECT deltax.deltax_create_table('pipe_events', 'ts', '1 day', %s)",
         (n_partitions - 1,),
     )
     db.execute(
-        "SELECT deltax_enable_compression('pipe_events', "
+        "SELECT deltax.deltax_enable_compression('pipe_events', "
         "  order_by => ARRAY['ts'], segment_size => %s)",
         (segment_size,),
     )
@@ -563,12 +563,12 @@ def test_mixed_path_pipeline_detoast_covers_full_first_batch(db):
     db.commit()
 
     for (name,) in db.execute(
-        "SELECT partition_name FROM deltax_partition_info('pipe_events') "
+        "SELECT partition_name FROM deltax.deltax_partition_info('pipe_events') "
         "ORDER BY range_start"
     ).fetchall():
         cnt = db.execute(f'SELECT count(*) FROM "{name}"').fetchone()[0]
         if cnt > 0:
-            db.execute("SELECT deltax_compress_partition(%s)", (name,))
+            db.execute("SELECT deltax.deltax_compress_partition(%s)", (name,))
     db.commit()
     db.rollback()
     db.autocommit = True
@@ -580,7 +580,7 @@ def test_mixed_path_pipeline_detoast_covers_full_first_batch(db):
     # silently stops exercising the bug — make it loud.
     seg_count = 0
     for (name,) in db.execute(
-        "SELECT partition_name FROM deltax_partition_info('pipe_events')"
+        "SELECT partition_name FROM deltax.deltax_partition_info('pipe_events')"
     ).fetchall():
         meta_name = f"_deltax_compressed.{name}_meta"
         if db.execute(

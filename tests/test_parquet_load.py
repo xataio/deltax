@@ -36,11 +36,11 @@ def _setup_table(db, table_name="pqtest", interval="3 days", segment_by=None):
         "ts TIMESTAMPTZ NOT NULL, device TEXT, value FLOAT8, count INT)"
     )
     db.commit()
-    db.execute(f"SELECT deltax_create_table('{table_name}', 'ts', '{interval}')")
+    db.execute(f"SELECT deltax.deltax_create_table('{table_name}', 'ts', '{interval}')")
     db.commit()
     seg_by = f"ARRAY{segment_by}" if segment_by else "ARRAY[]::text[]"
     db.execute(
-        f"SELECT deltax_enable_compression('{table_name}', "
+        f"SELECT deltax.deltax_enable_compression('{table_name}', "
         f"segment_by => {seg_by}, order_by => ARRAY['ts'])"
     )
     db.commit()
@@ -126,7 +126,7 @@ def test_parquet_multi_partition(db):
 
         # Should have multiple compressed partitions
         stats = db.execute(
-            "SELECT COUNT(*) FROM deltax_compression_stats('pqtest') "
+            "SELECT COUNT(*) FROM deltax.deltax_compression_stats('pqtest') "
             "WHERE is_compressed = true"
         ).fetchone()
         assert stats[0] >= 2

@@ -244,7 +244,7 @@ def setup_schema(conn):
     conn.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
     conn.execute(SCHEMA_SQL)
     conn.execute(
-        f"SELECT deltax_create_table('order_events', 'event_created', "
+        f"SELECT deltax.deltax_create_table('order_events', 'event_created', "
         f"'{PARTITION_INTERVAL}'::interval, {PARTITIONS_AHEAD})"
     )
     # `event_payload->>'terminal'` is the only chain RTABench queries
@@ -252,7 +252,7 @@ def setup_schema(conn):
     # rewrites chains to synthetic-Var refs at query time. Mode is set
     # per-session by the bench fixture in `bench_rtabench.py`.
     conn.execute(
-        "SELECT deltax_enable_compression('order_events', "
+        "SELECT deltax.deltax_enable_compression('order_events', "
         f"order_by => ARRAY['order_id','event_created'], "
         f"segment_size => {SEGMENT_SIZE}, "
         "json_extract => '[{\"src\":\"event_payload\","

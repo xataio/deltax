@@ -28,9 +28,8 @@ from clickbench_data import (
     query_results_to_dict,
     run_queries,
     save_bench_results,
-    validate_nondet_query,
 )
-from clickbench_queries import NONDETERMINISTIC_QUERIES, NONDET_SORT_INFO, LIMIT_TIE_QUERIES, QUERIES
+from clickbench_queries import QUERIES, compare_results
 
 
 # ---------------------------------------------------------------------------
@@ -43,7 +42,7 @@ def setup_clickbench(conn, n_files: int):
     conn.execute("SET pg_deltax.mock_now = '2013-07-01 12:00:00+00'")
     conn.execute(CREATE_TABLE_SQL)
     conn.execute(
-        "SELECT deltax_create_table('hits', 'eventtime', '3 days'::interval, 15)"
+        "SELECT deltax.deltax_create_table('hits', 'eventtime', '3 days'::interval, 15)"
     )
     conn.commit()
 
@@ -59,7 +58,7 @@ def enable_compression(conn):
     """Enable compression matching ClickBench TimescaleDB config."""
     segment_size = int(os.environ.get("SEGMENT_SIZE", "30000"))
     conn.execute(
-        "SELECT deltax_enable_compression('hits', "
+        "SELECT deltax.deltax_enable_compression('hits', "
         "order_by => ARRAY['counterid', 'userid', 'eventtime'], "
         f"segment_size => {segment_size})"
     )
@@ -70,7 +69,7 @@ def enable_compression(conn):
 def compress_all_partitions(conn):
     """Compress all non-empty, non-default partitions. Returns per-partition stats."""
     partitions = conn.execute(
-        "SELECT partition_name FROM deltax_partition_info('hits') "
+        "SELECT partition_name FROM deltax.deltax_partition_info('hits') "
         "WHERE partition_name NOT LIKE '%default%' "
         "ORDER BY partition_name"
     ).fetchall()
@@ -84,7 +83,7 @@ def compress_all_partitions(conn):
             continue
 
         t0 = time.monotonic()
-        conn.execute(f"SELECT deltax_compress_partition('{part_name}')")
+        conn.execute(f"SELECT deltax.deltax_compress_partition('{part_name}')")
         conn.commit()
         elapsed = time.monotonic() - t0
 
@@ -265,7 +264,7 @@ def print_compression_stats(conn):
     """Print markdown table of per-partition compression stats."""
     stats = conn.execute(
         "SELECT partition_name, raw_size, compressed_size, compression_ratio, row_count "
-        "FROM deltax_compression_stats('hits') "
+        "FROM deltax.deltax_compression_stats('hits') "
         "WHERE compressed_size IS NOT NULL "
         "ORDER BY partition_name"
     ).fetchall()
@@ -491,72 +490,14 @@ class TestClickBench:
                     print(f"  {qid}: SKIP (query errored)")
                     continue
 
-                if qid in NONDETERMINISTIC_QUERIES:
-                    if len(u_rows) != len(c_rows):
-                        mismatches.append(qid)
-                        print(f"  {qid}: MISMATCH (row count: uncompr={len(u_rows)}, compr={len(c_rows)})")
-                    else:
-                        ok, detail = validate_nondet_query(
-                            qid, u_rows, c_rows, NONDET_SORT_INFO.get(qid)
-                        )
-                        if ok:
-                            print(f"  {qid}: OK ({detail})")
-                        else:
-                            mismatches.append(qid)
-                            print(f"  {qid}: MISMATCH ({detail})")
-                elif qid in LIMIT_TIE_QUERIES:
-                    # Tie-tolerant: strip rows at the tail (and head for OFFSET
-                    # queries) that share a sort-key value with the boundary row,
-                    # then exact-match the stable interior.
-                    sk = LIMIT_TIE_QUERIES[qid]
-                    if len(u_rows) != len(c_rows):
-                        mismatches.append(qid)
-                        print(f"  {qid}: MISMATCH (row count: uncompr={len(u_rows)}, compr={len(c_rows)})")
-                    elif len(u_rows) == 0:
-                        print(f"  {qid}: OK (0 rows)")
-                    else:
-                        # Strip tail ties (LIMIT boundary)
-                        u_tail = u_rows[-1][sk]
-                        c_tail = c_rows[-1][sk]
-                        u_stable = [r for r in u_rows if r[sk] != u_tail]
-                        c_stable = [r for r in c_rows if r[sk] != c_tail]
-                        # Strip head ties too (OFFSET boundary)
-                        u_head = u_rows[0][sk]
-                        c_head = c_rows[0][sk]
-                        u_stable = sorted([r for r in u_stable if r[sk] != u_head])
-                        c_stable = sorted([r for r in c_stable if r[sk] != c_head])
-                        if u_stable == c_stable:
-                            n_tied = len(u_rows) - len(u_stable)
-                            print(f"  {qid}: OK ({len(u_stable)} exact + {n_tied} tied rows)")
-                        else:
-                            mismatches.append(qid)
-                            print(f"  {qid}: MISMATCH (non-tied rows differ)!")
-                            print(f"    uncompressed stable: {len(u_stable)} rows, first={u_stable[:2]}")
-                            print(f"    compressed stable:   {len(c_stable)} rows, first={c_stable[:2]}")
-                elif sorted(u_rows) == sorted(c_rows):
-                    print(f"  {qid}: OK ({len(u_rows)} rows match)")
+                outcome = compare_results(qid, u_rows, c_rows)
+                if outcome.ok:
+                    print(f"  {qid}: OK ({outcome.detail})")
                 else:
                     mismatches.append(qid)
-                    print(f"  {qid}: MISMATCH!")
-                    print(f"    uncompressed: {len(u_rows)} rows, first={u_rows[:2]}")
-                    print(f"    compressed:   {len(c_rows)} rows, first={c_rows[:2]}")
-                    # Detailed diff for debugging
-                    u_sorted = sorted(u_rows)
-                    c_sorted = sorted(c_rows)
-                    if len(u_sorted) == len(c_sorted):
-                        for i, (ur, cr) in enumerate(zip(u_sorted, c_sorted)):
-                            if ur != cr:
-                                print(f"    row {i} diff: uncompr={ur}")
-                                print(f"                  compr  ={cr}")
-                    else:
-                        u_set = set(map(tuple, u_sorted))
-                        c_set = set(map(tuple, c_sorted))
-                        only_u = u_set - c_set
-                        only_c = c_set - u_set
-                        if only_u:
-                            print(f"    only in uncompressed ({len(only_u)}): {list(only_u)[:5]}")
-                        if only_c:
-                            print(f"    only in compressed ({len(only_c)}): {list(only_c)[:5]}")
+                    print(f"  {qid}: MISMATCH ({outcome.detail})")
+                    for line in outcome.extra_lines:
+                        print(f"    {line}")
 
         # Phase 6: Print results
         print("\n\n" + "=" * 72)
@@ -570,7 +511,7 @@ class TestClickBench:
         # Save results for cross-system comparison
         totals = conn.execute(
             "SELECT sum(raw_size), sum(compressed_size) "
-            "FROM deltax_compression_stats('hits') "
+            "FROM deltax.deltax_compression_stats('hits') "
             "WHERE compressed_size IS NOT NULL"
         ).fetchone()
         raw_bytes = int(totals[0] or 0)

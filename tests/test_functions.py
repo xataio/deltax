@@ -16,7 +16,7 @@ def _setup_topn_table(db):
             val INT NOT NULL
         )
     """)
-    db.execute("SELECT deltax_create_table('topn_test', 'ts', '1 day'::interval)")
+    db.execute("SELECT deltax.deltax_create_table('topn_test', 'ts', '1 day'::interval)")
     db.commit()
 
     # Insert data: 5 categories with different row counts
@@ -35,18 +35,18 @@ def _setup_topn_table(db):
 
     # Enable compression and compress
     db.execute(
-        "SELECT deltax_enable_compression('topn_test', "
+        "SELECT deltax.deltax_enable_compression('topn_test', "
         "segment_by => ARRAY['category'], order_by => ARRAY['ts'])"
     )
     db.commit()
 
     partitions = db.execute(
-        "SELECT partition_name FROM deltax_partition_info('topn_test') "
+        "SELECT partition_name FROM deltax.deltax_partition_info('topn_test') "
         "WHERE range_start <= '2025-01-15'::timestamptz "
         "AND range_end > '2025-01-15'::timestamptz"
     ).fetchall()
     for row in partitions:
-        db.execute(f"SELECT deltax_compress_partition('{row[0]}')")
+        db.execute(f"SELECT deltax.deltax_compress_partition('{row[0]}')")
     db.commit()
 
 
@@ -57,7 +57,7 @@ def _setup_metrics(db):
     )
     db.commit()
 
-    db.execute("SELECT deltax_create_table('metrics', 'ts')")
+    db.execute("SELECT deltax.deltax_create_table('metrics', 'ts')")
     db.commit()
 
     now = datetime.now(timezone.utc)
@@ -76,17 +76,17 @@ def _setup_metrics(db):
 
 
 def test_time_bucket_5min(db):
-    """time_bucket('5 minutes', ts) truncates to 5-min boundary."""
+    """deltax.time_bucket('5 minutes', ts) truncates to 5-min boundary."""
     row = db.execute(
-        "SELECT time_bucket('5 minutes'::interval, '2025-06-15 14:23:42+00'::timestamptz)"
+        "SELECT deltax.time_bucket('5 minutes'::interval, '2025-06-15 14:23:42+00'::timestamptz)"
     ).fetchone()
     assert row[0] == datetime(2025, 6, 15, 14, 20, 0, tzinfo=timezone.utc)
 
 
 def test_time_bucket_1hour(db):
-    """time_bucket('1 hour', ts) truncates to hour boundary."""
+    """deltax.time_bucket('1 hour', ts) truncates to hour boundary."""
     row = db.execute(
-        "SELECT time_bucket('1 hour'::interval, '2025-06-15 14:23:42+00'::timestamptz)"
+        "SELECT deltax.time_bucket('1 hour'::interval, '2025-06-15 14:23:42+00'::timestamptz)"
     ).fetchone()
     assert row[0] == datetime(2025, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
 
@@ -94,20 +94,20 @@ def test_time_bucket_1hour(db):
 def test_time_bucket_with_offset(db):
     """time_bucket with offset shifts the bucket boundary."""
     row = db.execute(
-        "SELECT time_bucket('1 day'::interval, '2025-06-15 14:23:42+00'::timestamptz, '6 hours'::interval)"
+        "SELECT deltax.time_bucket('1 day'::interval, '2025-06-15 14:23:42+00'::timestamptz, '6 hours'::interval)"
     ).fetchone()
     # Bucket starts at 06:00 UTC on 2025-06-15
     assert row[0] == datetime(2025, 6, 15, 6, 0, 0, tzinfo=timezone.utc)
 
 
 def test_first_last(db):
-    """first(value, ts) and last(value, ts) return correct values."""
+    """deltax.first(value, ts) and deltax.last(value, ts) return correct values."""
     db.execute(
         "CREATE TABLE fl (ts TIMESTAMPTZ NOT NULL, value FLOAT8)"
     )
     db.commit()
 
-    db.execute("SELECT deltax_create_table('fl', 'ts')")
+    db.execute("SELECT deltax.deltax_create_table('fl', 'ts')")
     db.commit()
 
     db.execute(
@@ -120,7 +120,7 @@ def test_first_last(db):
     )
     db.commit()
 
-    row = db.execute("SELECT first(value, ts), last(value, ts) FROM fl").fetchone()
+    row = db.execute("SELECT deltax.first(value, ts), deltax.last(value, ts) FROM fl").fetchone()
     assert row[0] == 100.0  # earliest ts
     assert row[1] == 300.0  # latest ts
 
@@ -132,7 +132,7 @@ def test_first_last_with_groups(db):
     )
     db.commit()
 
-    db.execute("SELECT deltax_create_table('grouped', 'ts')")
+    db.execute("SELECT deltax.deltax_create_table('grouped', 'ts')")
     db.commit()
 
     db.execute(
@@ -147,7 +147,7 @@ def test_first_last_with_groups(db):
     db.commit()
 
     rows = db.execute(
-        "SELECT device, first(value, ts), last(value, ts) "
+        "SELECT device, deltax.first(value, ts), deltax.last(value, ts) "
         "FROM grouped GROUP BY device ORDER BY device"
     ).fetchall()
 
@@ -236,7 +236,7 @@ def _setup_bare_limit_table(db):
     # Short partition window so we get multiple partitions (and thus
     # multiple segments) over our data span.
     db.execute(
-        "SELECT deltax_create_table('bare_limit_test', 'ts', '1 hour'::interval)"
+        "SELECT deltax.deltax_create_table('bare_limit_test', 'ts', '1 hour'::interval)"
     )
     db.commit()
 
@@ -263,7 +263,7 @@ def _setup_bare_limit_table(db):
     db.commit()
 
     db.execute(
-        "SELECT deltax_enable_compression('bare_limit_test', "
+        "SELECT deltax.deltax_enable_compression('bare_limit_test', "
         "segment_by => ARRAY[]::text[], order_by => ARRAY['ts'])"
     )
     db.commit()
@@ -273,14 +273,14 @@ def _setup_bare_limit_table(db):
     # noon MOCK_NOW, matched no real partition — leaving all data
     # uncompressed and defeating the F8 plan check.
     partitions = db.execute(
-        "SELECT partition_name FROM deltax_partition_info('bare_limit_test') "
+        "SELECT partition_name FROM deltax.deltax_partition_info('bare_limit_test') "
         "WHERE range_start < '2025-01-15 15:00:00+00'::timestamptz "
         "AND range_end > '2025-01-15 11:00:00+00'::timestamptz"
     ).fetchall()
     for row in partitions:
         cnt = db.execute(f'SELECT count(*) FROM "{row[0]}"').fetchone()[0]
         if cnt > 0:
-            db.execute(f"SELECT deltax_compress_partition('{row[0]}')")
+            db.execute(f"SELECT deltax.deltax_compress_partition('{row[0]}')")
     db.commit()
 
     # ANALYZE populates reltuples so collect_compressed_children() can

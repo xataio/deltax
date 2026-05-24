@@ -43,7 +43,7 @@ pub fn register_deltatable(
     partition_interval: &pgrx::datum::Interval,
 ) -> spi::SpiResult<i32> {
     let result = client.update(
-        "INSERT INTO deltax_deltatable (schema_name, table_name, time_column, partition_interval)
+        "INSERT INTO deltax.deltax_deltatable (schema_name, table_name, time_column, partition_interval)
          VALUES ($1, $2, $3, $4)
          RETURNING id",
         None,
@@ -67,7 +67,7 @@ pub fn register_partition(
     range_end: TimestampWithTimeZone,
 ) -> spi::SpiResult<()> {
     client.update(
-        "INSERT INTO deltax_partition (deltatable_id, schema_name, table_name, range_start, range_end)
+        "INSERT INTO deltax.deltax_partition (deltatable_id, schema_name, table_name, range_start, range_end)
          VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (schema_name, table_name) DO NOTHING",
         None,
@@ -90,7 +90,7 @@ pub fn get_deltatable(
 ) -> spi::SpiResult<Option<DeltatableInfo>> {
     let result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval
-         FROM deltax_deltatable
+         FROM deltax.deltax_deltatable
          WHERE schema_name = $1 AND table_name = $2",
         None,
         &[schema_name.into(), table_name.into()],
@@ -110,15 +110,12 @@ pub fn get_deltatable(
 }
 
 /// Look up a deltatable by its catalog id.
-pub fn get_deltatable_by_id(
-    client: &SpiClient,
-    id: i32,
-) -> spi::SpiResult<Option<DeltatableInfo>> {
+pub fn get_deltatable_by_id(client: &SpiClient, id: i32) -> spi::SpiResult<Option<DeltatableInfo>> {
     let mut result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval,
                 segment_by, order_by, compress_after, drop_after, segment_size,
                 json_extract
-         FROM deltax_deltatable
+         FROM deltax.deltax_deltatable
          WHERE id = $1",
         None,
         &[id.into()],
@@ -129,7 +126,10 @@ pub fn get_deltatable_by_id(
         let s: String = row.get_datum_by_ordinal(2)?.value::<String>()?.unwrap();
         let t: String = row.get_datum_by_ordinal(3)?.value::<String>()?.unwrap();
         let tc: String = row.get_datum_by_ordinal(4)?.value::<String>()?.unwrap();
-        let pi: pgrx::datum::Interval = row.get_datum_by_ordinal(5)?.value::<pgrx::datum::Interval>()?.unwrap();
+        let pi: pgrx::datum::Interval = row
+            .get_datum_by_ordinal(5)?
+            .value::<pgrx::datum::Interval>()?
+            .unwrap();
         let segment_by: Vec<String> = row
             .get_datum_by_ordinal(6)?
             .value::<Vec<String>>()?
@@ -138,11 +138,16 @@ pub fn get_deltatable_by_id(
             .get_datum_by_ordinal(7)?
             .value::<Vec<String>>()?
             .unwrap_or_default();
-        let compress_after: Option<pgrx::datum::Interval> =
-            row.get_datum_by_ordinal(8)?.value::<pgrx::datum::Interval>()?;
-        let drop_after: Option<pgrx::datum::Interval> =
-            row.get_datum_by_ordinal(9)?.value::<pgrx::datum::Interval>()?;
-        let segment_size: i32 = row.get_datum_by_ordinal(10)?.value::<i32>()?.unwrap_or(30000);
+        let compress_after: Option<pgrx::datum::Interval> = row
+            .get_datum_by_ordinal(8)?
+            .value::<pgrx::datum::Interval>()?;
+        let drop_after: Option<pgrx::datum::Interval> = row
+            .get_datum_by_ordinal(9)?
+            .value::<pgrx::datum::Interval>()?;
+        let segment_size: i32 = row
+            .get_datum_by_ordinal(10)?
+            .value::<i32>()?
+            .unwrap_or(30000);
         let json_extract: Option<serde_json::Value> = row
             .get_datum_by_ordinal(11)?
             .value::<pgrx::datum::JsonB>()?
@@ -166,14 +171,12 @@ pub fn get_deltatable_by_id(
 }
 
 /// Get all deltatables.
-pub fn get_all_deltatables(
-    client: &SpiClient,
-) -> spi::SpiResult<Vec<DeltatableInfo>> {
+pub fn get_all_deltatables(client: &SpiClient) -> spi::SpiResult<Vec<DeltatableInfo>> {
     let result = client.select(
         "SELECT id, schema_name, table_name, time_column, partition_interval,
                 segment_by, order_by, compress_after, drop_after, segment_size,
                 json_extract
-         FROM deltax_deltatable",
+         FROM deltax.deltax_deltatable",
         None,
         &[],
     )?;
@@ -185,12 +188,28 @@ pub fn get_all_deltatables(
             schema_name: row.get_datum_by_ordinal(2)?.value::<String>()?.unwrap(),
             table_name: row.get_datum_by_ordinal(3)?.value::<String>()?.unwrap(),
             time_column: row.get_datum_by_ordinal(4)?.value::<String>()?.unwrap(),
-            partition_interval: row.get_datum_by_ordinal(5)?.value::<pgrx::datum::Interval>()?.unwrap(),
-            segment_by: row.get_datum_by_ordinal(6)?.value::<Vec<String>>()?.unwrap_or_default(),
-            order_by: row.get_datum_by_ordinal(7)?.value::<Vec<String>>()?.unwrap_or_default(),
-            compress_after: row.get_datum_by_ordinal(8)?.value::<pgrx::datum::Interval>()?,
-            drop_after: row.get_datum_by_ordinal(9)?.value::<pgrx::datum::Interval>()?,
-            segment_size: row.get_datum_by_ordinal(10)?.value::<i32>()?.unwrap_or(30000),
+            partition_interval: row
+                .get_datum_by_ordinal(5)?
+                .value::<pgrx::datum::Interval>()?
+                .unwrap(),
+            segment_by: row
+                .get_datum_by_ordinal(6)?
+                .value::<Vec<String>>()?
+                .unwrap_or_default(),
+            order_by: row
+                .get_datum_by_ordinal(7)?
+                .value::<Vec<String>>()?
+                .unwrap_or_default(),
+            compress_after: row
+                .get_datum_by_ordinal(8)?
+                .value::<pgrx::datum::Interval>()?,
+            drop_after: row
+                .get_datum_by_ordinal(9)?
+                .value::<pgrx::datum::Interval>()?,
+            segment_size: row
+                .get_datum_by_ordinal(10)?
+                .value::<i32>()?
+                .unwrap_or(30000),
             json_extract: row
                 .get_datum_by_ordinal(11)?
                 .value::<pgrx::datum::JsonB>()?
@@ -207,7 +226,7 @@ pub fn get_partitions(
 ) -> spi::SpiResult<Vec<PartitionInfo>> {
     let result = client.select(
         "SELECT id, deltatable_id, schema_name, table_name, range_start, range_end, is_compressed
-         FROM deltax_partition
+         FROM deltax.deltax_partition
          WHERE deltatable_id = $1
          ORDER BY range_start",
         None,
@@ -221,9 +240,18 @@ pub fn get_partitions(
             deltatable_id: row.get_datum_by_ordinal(2)?.value::<i32>()?.unwrap(),
             schema_name: row.get_datum_by_ordinal(3)?.value::<String>()?.unwrap(),
             table_name: row.get_datum_by_ordinal(4)?.value::<String>()?.unwrap(),
-            range_start: row.get_datum_by_ordinal(5)?.value::<TimestampWithTimeZone>()?.unwrap(),
-            range_end: row.get_datum_by_ordinal(6)?.value::<TimestampWithTimeZone>()?.unwrap(),
-            is_compressed: row.get_datum_by_ordinal(7)?.value::<bool>()?.unwrap_or(false),
+            range_start: row
+                .get_datum_by_ordinal(5)?
+                .value::<TimestampWithTimeZone>()?
+                .unwrap(),
+            range_end: row
+                .get_datum_by_ordinal(6)?
+                .value::<TimestampWithTimeZone>()?
+                .unwrap(),
+            is_compressed: row
+                .get_datum_by_ordinal(7)?
+                .value::<bool>()?
+                .unwrap_or(false),
         });
     }
     Ok(partitions)
@@ -250,7 +278,7 @@ pub fn update_deltatable_compression(
         // are missing the synthetic columns and must fall through to the slow
         // path.
         client.update(
-            "UPDATE deltax_deltatable
+            "UPDATE deltax.deltax_deltatable
              SET segment_by = $1, order_by = $2, segment_size = $3,
                  json_extract = $4, json_extract_added_at = now()
              WHERE id = $5",
@@ -265,11 +293,16 @@ pub fn update_deltatable_compression(
         )?;
     } else {
         client.update(
-            "UPDATE deltax_deltatable
+            "UPDATE deltax.deltax_deltatable
              SET segment_by = $1, order_by = $2, segment_size = $3
              WHERE id = $4",
             None,
-            &[seg_vec.into(), ord_vec.into(), segment_size.into(), deltatable_id.into()],
+            &[
+                seg_vec.into(),
+                ord_vec.into(),
+                segment_size.into(),
+                deltatable_id.into(),
+            ],
         )?;
     }
     Ok(())
@@ -282,7 +315,7 @@ pub fn set_compress_after(
     compress_after: &pgrx::datum::Interval,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE deltax_deltatable SET compress_after = $1 WHERE id = $2",
+        "UPDATE deltax.deltax_deltatable SET compress_after = $1 WHERE id = $2",
         None,
         &[(*compress_after).into(), deltatable_id.into()],
     )?;
@@ -296,7 +329,7 @@ pub fn set_drop_after(
     drop_after: &pgrx::datum::Interval,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE deltax_deltatable SET drop_after = $1 WHERE id = $2",
+        "UPDATE deltax.deltax_deltatable SET drop_after = $1 WHERE id = $2",
         None,
         &[(*drop_after).into(), deltatable_id.into()],
     )?;
@@ -304,12 +337,9 @@ pub fn set_drop_after(
 }
 
 /// Clear the drop_after interval for a deltatable (remove retention policy).
-pub fn clear_drop_after(
-    client: &mut SpiClient,
-    deltatable_id: i32,
-) -> spi::SpiResult<()> {
+pub fn clear_drop_after(client: &mut SpiClient, deltatable_id: i32) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE deltax_deltatable SET drop_after = NULL WHERE id = $1",
+        "UPDATE deltax.deltax_deltatable SET drop_after = NULL WHERE id = $1",
         None,
         &[deltatable_id.into()],
     )?;
@@ -325,7 +355,7 @@ pub fn mark_partition_compressed(
     row_count: i64,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE deltax_partition
+        "UPDATE deltax.deltax_partition
          SET is_compressed = true, compressed_size = $1, raw_size = $2,
              row_count = $3, compressed_at = now()
          WHERE id = $4",
@@ -342,7 +372,7 @@ pub fn mark_partition_compressed(
 
 /// Write a pre-computed per-column ndistinct map (typically from
 /// HLL sketches merged across segments during compression) to the
-/// `deltax_partition.column_ndistinct` JSONB column.
+/// `deltax.deltax_partition.column_ndistinct` JSONB column.
 pub fn update_partition_column_ndistinct_from_map(
     client: &mut SpiClient,
     partition_id: i32,
@@ -352,14 +382,12 @@ pub fn update_partition_column_ndistinct_from_map(
     let mut names: Vec<&String> = col_ndistinct.keys().collect();
     names.sort();
     for name in names {
-        let nd_val = col_ndistinct[name];
-        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-        parts.push(format!("\"{}\":{}", escaped, nd_val));
+        parts.push(format!("\"{}\":{}", json_escape(name), col_ndistinct[name]));
     }
     let json = format!("{{{}}}", parts.join(","));
 
     client.update(
-        "UPDATE deltax_partition SET column_ndistinct = $1::jsonb WHERE id = $2",
+        "UPDATE deltax.deltax_partition SET column_ndistinct = $1::jsonb WHERE id = $2",
         None,
         &[json.into(), partition_id.into()],
     )?;
@@ -395,7 +423,7 @@ pub fn update_partition_column_valmap(
     let json = format!("{{{}}}", parts.join(","));
 
     client.update(
-        "UPDATE deltax_partition SET column_valmap = $1::jsonb WHERE id = $2",
+        "UPDATE deltax.deltax_partition SET column_valmap = $1::jsonb WHERE id = $2",
         None,
         &[json.into(), partition_id.into()],
     )?;
@@ -427,7 +455,7 @@ fn json_escape(s: &str) -> String {
 }
 
 /// Compute per-column max ndistinct from the meta table and store the
-/// result as a JSONB map on `deltax_partition.column_ndistinct`. Called
+/// result as a JSONB map on `deltax.deltax_partition.column_ndistinct`. Called
 /// once at the end of compression so that planner-time cost estimation
 /// (see `scan::cost::get_column_ndistinct`) can do a catalog lookup
 /// instead of a cold full-scan of the wide meta table on every fresh
@@ -463,18 +491,21 @@ pub fn update_partition_column_ndistinct(
             .ok()
             .and_then(|d| d.value::<i64>().ok().flatten());
 
-        if col_idx >= 0 && (col_idx as usize) < col_names.len()
+        if col_idx >= 0
+            && (col_idx as usize) < col_names.len()
             && let Some(nd_val) = nd
         {
-            let name = &col_names[col_idx as usize];
-            let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
-            parts.push(format!("\"{}\":{}", escaped, nd_val));
+            parts.push(format!(
+                "\"{}\":{}",
+                json_escape(&col_names[col_idx as usize]),
+                nd_val,
+            ));
         }
     }
     let json = format!("{{{}}}", parts.join(","));
 
     client.update(
-        "UPDATE deltax_partition SET column_ndistinct = $1::jsonb WHERE id = $2",
+        "UPDATE deltax.deltax_partition SET column_ndistinct = $1::jsonb WHERE id = $2",
         None,
         &[json.into(), partition_id.into()],
     )?;
@@ -487,7 +518,7 @@ pub fn mark_partition_decompressed(
     partition_id: i32,
 ) -> spi::SpiResult<()> {
     client.update(
-        "UPDATE deltax_partition
+        "UPDATE deltax.deltax_partition
          SET is_compressed = false, compressed_size = NULL, raw_size = NULL,
              row_count = NULL, compressed_at = NULL
          WHERE id = $1",
@@ -507,20 +538,16 @@ pub fn install_compressed_dml_trigger(
     schema: &str,
     table: &str,
 ) -> spi::SpiResult<()> {
+    // PG 14+ supports `CREATE OR REPLACE TRIGGER`, so we can avoid the
+    // `DROP TRIGGER IF EXISTS` step that otherwise emits a noisy
+    // `NOTICE: trigger "..." does not exist, skipping` on the first
+    // compression of a partition.
     let partition_fqn = crate::partition::fqn(schema, table);
     client.update(
         &format!(
-            "DROP TRIGGER IF EXISTS deltax_reject_compressed_dml ON {}",
-            partition_fqn
-        ),
-        None,
-        &[],
-    )?;
-    client.update(
-        &format!(
-            "CREATE TRIGGER deltax_reject_compressed_dml
+            "CREATE OR REPLACE TRIGGER deltax_reject_compressed_dml
              BEFORE INSERT OR UPDATE OR DELETE ON {}
-             FOR EACH ROW EXECUTE FUNCTION deltax_reject_compressed_partition_dml()",
+             FOR EACH ROW EXECUTE FUNCTION deltax.deltax_reject_compressed_partition_dml()",
             partition_fqn
         ),
         None,
@@ -555,7 +582,7 @@ pub fn get_partition_by_name(
 ) -> spi::SpiResult<Option<PartitionInfo>> {
     let mut result = client.select(
         "SELECT id, deltatable_id, schema_name, table_name, range_start, range_end, is_compressed
-         FROM deltax_partition
+         FROM deltax.deltax_partition
          WHERE schema_name = $1 AND table_name = $2",
         None,
         &[schema_name.into(), table_name.into()],
@@ -567,11 +594,60 @@ pub fn get_partition_by_name(
             deltatable_id: row.get_datum_by_ordinal(2)?.value::<i32>()?.unwrap(),
             schema_name: row.get_datum_by_ordinal(3)?.value::<String>()?.unwrap(),
             table_name: row.get_datum_by_ordinal(4)?.value::<String>()?.unwrap(),
-            range_start: row.get_datum_by_ordinal(5)?.value::<TimestampWithTimeZone>()?.unwrap(),
-            range_end: row.get_datum_by_ordinal(6)?.value::<TimestampWithTimeZone>()?.unwrap(),
-            is_compressed: row.get_datum_by_ordinal(7)?.value::<bool>()?.unwrap_or(false),
+            range_start: row
+                .get_datum_by_ordinal(5)?
+                .value::<TimestampWithTimeZone>()?
+                .unwrap(),
+            range_end: row
+                .get_datum_by_ordinal(6)?
+                .value::<TimestampWithTimeZone>()?
+                .unwrap(),
+            is_compressed: row
+                .get_datum_by_ordinal(7)?
+                .value::<bool>()?
+                .unwrap_or(false),
         }));
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_escape_passes_through_plain_ascii() {
+        assert_eq!(json_escape(""), "");
+        assert_eq!(json_escape("hello"), "hello");
+        assert_eq!(json_escape("col_42"), "col_42");
+    }
+
+    #[test]
+    fn json_escape_handles_mandatory_escapes() {
+        assert_eq!(json_escape("a\"b"), "a\\\"b");
+        assert_eq!(json_escape("a\\b"), "a\\\\b");
+        assert_eq!(json_escape("a\nb"), "a\\nb");
+        assert_eq!(json_escape("a\rb"), "a\\rb");
+        assert_eq!(json_escape("a\tb"), "a\\tb");
+        assert_eq!(json_escape("a\x08b"), "a\\bb");
+        assert_eq!(json_escape("a\x0cb"), "a\\fb");
+    }
+
+    #[test]
+    fn json_escape_uses_unicode_for_other_control_chars() {
+        // Anything below 0x20 without a short form falls through to \uXXXX —
+        // omitting this would emit unparseable JSON for raw control bytes.
+        assert_eq!(json_escape("\x00"), "\\u0000");
+        assert_eq!(json_escape("\x01"), "\\u0001");
+        assert_eq!(json_escape("\x1f"), "\\u001f");
+    }
+
+    #[test]
+    fn json_escape_leaves_high_unicode_alone() {
+        // The JSON spec allows any non-control codepoint verbatim, so we
+        // don't bloat output for accented or CJK column names.
+        assert_eq!(json_escape("héllo"), "héllo");
+        assert_eq!(json_escape("日本語"), "日本語");
+    }
 }

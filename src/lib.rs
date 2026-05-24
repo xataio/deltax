@@ -9,6 +9,7 @@ use pgrx::prelude::*;
 #[cfg(test)]
 extern crate pg_deltax_test_stubs as _;
 
+mod blob_cache;
 mod bloom;
 mod catalog;
 mod compress;
@@ -25,8 +26,7 @@ mod worker;
 
 pg_module_magic!();
 
-pub(crate) static MOCK_NOW: GucSetting<Option<CString>> =
-    GucSetting::<Option<CString>>::new(None);
+pub(crate) static MOCK_NOW: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
 pub(crate) static PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(0);
 
@@ -34,14 +34,12 @@ pub(crate) static PARALLEL_REGEX: GucSetting<bool> = GucSetting::<bool>::new(tru
 
 pub(crate) static BLOOM_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(true);
 
-pub(crate) static MAX_PARALLEL_WORKERS_PER_SCAN: GucSetting<i32> =
-    GucSetting::<i32>::new(-1);
+pub(crate) static MAX_PARALLEL_WORKERS_PER_SCAN: GucSetting<i32> = GucSetting::<i32>::new(-1);
 
 /// When true, the hook skips `DeltaXCount`/`DeltaXMinMax` fast paths for
 /// queries with WHERE clauses. Used by tests and operators to force the
 /// generic `DeltaXAgg` path for A/B correctness comparisons.
-pub(crate) static DISABLE_META_AGG_FASTPATH: GucSetting<bool> =
-    GucSetting::<bool>::new(false);
+pub(crate) static DISABLE_META_AGG_FASTPATH: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// When true, `add_agg_partial_path` returns early and the planner only
 /// sees the complete CustomScan DeltaXAgg path. Escape hatch for the
@@ -50,8 +48,7 @@ pub(crate) static DISABLE_META_AGG_FASTPATH: GucSetting<bool> =
 /// partial path or comparing the two paths' end-to-end timings on the
 /// same query. The complete path's internal-rayon parallelism still
 /// runs — this only disables the PG-level partial-path activation.
-pub(crate) static DISABLE_PARALLEL_AGG: GucSetting<bool> =
-    GucSetting::<bool>::new(false);
+pub(crate) static DISABLE_PARALLEL_AGG: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// Controls how COPY ... FORMAT deltax_compress extracts JSON paths into
 /// extra columnar columns alongside the original JSONB, and whether the
@@ -67,6 +64,30 @@ pub(crate) static DISABLE_PARALLEL_AGG: GucSetting<bool> =
 /// Default is `none` until Step 5 (executor synthetic slot population) lands.
 pub(crate) static JSON_EXTRACT_MODE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"none"));
+
+/// Size of the process-shared blob cache, in MiB. `0` disables the cache.
+/// Default `-1` means auto: 25% of physical RAM, clamped to
+/// [256, 4096] MiB. Explicit positive values override; `0` disables
+/// the cache entirely. See `dev/docs/BLOB_CACHE.md#sizing`.
+pub(crate) static BLOB_CACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(-1);
+
+/// Number of shards (power of two) in the blob cache. More shards reduce
+/// LWLock contention; fewer save shmem overhead. Default `64` is a good
+/// fit for typical OLAP workloads. Restart required to change.
+pub(crate) static BLOB_CACHE_SHARDS: GucSetting<i32> = GucSetting::<i32>::new(64);
+
+/// When ON, internal columnar-blob companion tables (`_blobs`, `_blooms`,
+/// `_text_lengths`, `_valbitmap`) are declared with `BYTEA COMPRESSION lz4`.
+/// The actual columnar compression happens in Rust regardless; this flag
+/// only controls the Postgres TOAST-pass attribute on those BYTEA columns.
+///
+/// Defaults to ON. If the running PostgreSQL was not built with
+/// `--with-lz4`, the DDL is emitted without the `COMPRESSION lz4` clause
+/// (so `CREATE TABLE` doesn't fail) and a one-shot WARNING is raised on
+/// the first `deltax_enable_compression` call per backend. Users can
+/// also set this to OFF explicitly to suppress the lz4 attribute on
+/// lz4-capable builds (e.g., for testing the fallback path).
+pub(crate) static USE_LZ4: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 /// Resolve the effective number of parallel workers.
 /// 0 = auto (num_cpus, capped at 16), 1 = single-threaded, 2..=64 = explicit.
@@ -107,7 +128,10 @@ pub(crate) enum JsonExtractMode {
 #[allow(dead_code)] // Wired up incrementally across the json-extract feature.
 pub(crate) fn get_json_extract_mode() -> JsonExtractMode {
     let raw = JSON_EXTRACT_MODE.get();
-    let s = raw.as_ref().and_then(|c| c.to_str().ok()).unwrap_or("fields");
+    let s = raw
+        .as_ref()
+        .and_then(|c| c.to_str().ok())
+        .unwrap_or("fields");
     match s {
         "none" => JsonExtractMode::None,
         "fields" => JsonExtractMode::Fields,
@@ -123,7 +147,7 @@ extension_sql!(
     r#"
 CREATE SCHEMA IF NOT EXISTS _deltax_compressed;
 
-CREATE TABLE IF NOT EXISTS deltax_deltatable (
+CREATE TABLE IF NOT EXISTS deltax.deltax_deltatable (
     id              SERIAL PRIMARY KEY,
     schema_name     TEXT NOT NULL,
     table_name      TEXT NOT NULL,
@@ -138,9 +162,9 @@ CREATE TABLE IF NOT EXISTS deltax_deltatable (
     UNIQUE(schema_name, table_name)
 );
 
-CREATE TABLE IF NOT EXISTS deltax_partition (
+CREATE TABLE IF NOT EXISTS deltax.deltax_partition (
     id              SERIAL PRIMARY KEY,
-    deltatable_id   INT REFERENCES deltax_deltatable(id) ON DELETE CASCADE,
+    deltatable_id   INT REFERENCES deltax.deltax_deltatable(id) ON DELETE CASCADE,
     schema_name     TEXT NOT NULL,
     table_name      TEXT NOT NULL,
     range_start     TIMESTAMPTZ NOT NULL,
@@ -155,11 +179,11 @@ CREATE TABLE IF NOT EXISTS deltax_partition (
     UNIQUE(schema_name, table_name)
 );
 
-ALTER TABLE deltax_partition ADD COLUMN IF NOT EXISTS column_valmap JSONB;
-ALTER TABLE deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract JSONB;
-ALTER TABLE deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract_added_at TIMESTAMPTZ;
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_valmap JSONB;
+ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract JSONB;
+ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract_added_at TIMESTAMPTZ;
 
-CREATE OR REPLACE FUNCTION deltax_reject_compressed_partition_dml()
+CREATE OR REPLACE FUNCTION deltax.deltax_reject_compressed_partition_dml()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -245,10 +269,45 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Userset,
         GucFlags::default(),
     );
+    GucRegistry::define_int_guc(
+        c"pg_deltax.blob_cache_mb",
+        c"Size of the process-shared blob cache, in MiB. -1 = auto (25% of physical RAM, clamped to [256, 4096]); 0 = disabled; N > 0 = explicit MiB.",
+        c"The blob cache stores detoasted compressed segment blobs keyed by (companion_oid, segment_id, col_idx). Repeated queries against the same segments skip the pg_detoast_datum path. -1 (default) auto-sizes at postmaster start from /proc/meminfo, falling back to the 256 MB floor if it can't be read. Explicit values override the auto heuristic. See dev/docs/BLOB_CACHE.md. Restart required — the shmem reservation is captured at postmaster start.",
+        &BLOB_CACHE_MB,
+        -1,
+        32768,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"pg_deltax.blob_cache_shards",
+        c"Number of shards (power of two) in the blob cache. Restart required.",
+        c"Each shard owns an LWLock and an LRU list. More shards reduce contention under high concurrency; fewer save shmem overhead. Must be a power of two between 1 and 1024.",
+        &BLOB_CACHE_SHARDS,
+        1,
+        1024,
+        GucContext::Postmaster,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.use_lz4",
+        c"Declare internal columnar BYTEA companion columns with COMPRESSION lz4",
+        c"Default ON. Set OFF (or run on a PG built without --with-lz4) and the companion-table DDL is emitted without the lz4 attribute; the actual columnar compression in Rust is unaffected. On an lz4-less build with this ON, deltax_enable_compression raises a one-shot WARNING and the DDL falls back automatically.",
+        &USE_LZ4,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    blob_cache::register_hooks();
     worker::register_bgworker();
-    unsafe { scan::register_hook(); }
-    unsafe { scan::register_executor_start_hook(); }
-    unsafe { copy::register_process_utility_hook(); }
+    unsafe {
+        scan::register_hook();
+    }
+    unsafe {
+        scan::register_executor_start_hook();
+    }
+    unsafe {
+        copy::register_process_utility_hook();
+    }
 }
 
 #[cfg(any(test, feature = "pg_test"))]
