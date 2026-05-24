@@ -215,6 +215,55 @@ class TestAddColumnTransparent:
         assert len(rows) == total
         assert all(r[0] == 7 for r in rows)
 
+    def test_add_column_stable_default_now(self, db):
+        """`DEFAULT now()` is stable: PG evaluates it once at ALTER time
+        and stores the result in `attmissingval`. Every compressed row
+        reads back that same captured timestamp."""
+        part_name, total = setup_and_compress(db)
+
+        db.execute("ALTER TABLE metrics ADD COLUMN ts_added TIMESTAMPTZ DEFAULT now()")
+        db.commit()
+
+        # Direct SELECT goes through the basic decompress path (already
+        # blob_idx-aware from Session 1). Every row reads back the same
+        # captured timestamp; the partition has `total` rows.
+        rows = db.execute(
+            f'SELECT ts_added FROM "{part_name}" LIMIT 5'
+        ).fetchall()
+        assert len(rows) == 5
+        assert all(r[0] == rows[0][0] for r in rows), "timestamps should be equal"
+        # Filter pushdown on the captured constant.
+        matches = db.execute(
+            f"SELECT count(*) FROM \"{part_name}\" WHERE ts_added = (SELECT ts_added FROM \"{part_name}\" LIMIT 1)"
+        ).fetchone()[0]
+        assert matches == total
+
+    def test_add_column_stable_default_current_date(self, db):
+        part_name, total = setup_and_compress(db)
+        db.execute("ALTER TABLE metrics ADD COLUMN d DATE DEFAULT current_date")
+        db.commit()
+
+        # Read the synthesized date from a non-aggregating SELECT.
+        first = db.execute(
+            f'SELECT d FROM "{part_name}" LIMIT 1'
+        ).fetchone()[0]
+        assert first is not None
+        cnt = db.execute(
+            f"SELECT count(*) FROM \"{part_name}\" WHERE d = '{first}'::date"
+        ).fetchone()[0]
+        assert cnt == total
+
+    def test_add_column_immutable_function_default(self, db):
+        """Immutable functions (`abs(-5)`) are deterministic and PG
+        evaluates them once at ALTER time."""
+        part_name, total = setup_and_compress(db)
+        db.execute("ALTER TABLE metrics ADD COLUMN x INT DEFAULT abs(-5)")
+        db.commit()
+
+        rows = db.execute(f'SELECT x FROM "{part_name}"').fetchall()
+        assert len(rows) == total
+        assert all(r[0] == 5 for r in rows)
+
     def test_filter_on_added_column(self, db):
         part_name, total = setup_and_compress(db)
 
@@ -498,6 +547,28 @@ class TestTier3Blocking:
         with pytest.raises(psycopg.errors.FeatureNotSupported):
             db.execute(
                 "ALTER TABLE metrics ADD COLUMN rnd DOUBLE PRECISION DEFAULT random()"
+            )
+        db.rollback()
+
+    def test_add_column_clock_timestamp_default_blocked(self, db):
+        """`clock_timestamp()` is volatile (changes per call within a
+        transaction, unlike the stable `now()`)."""
+        setup_and_compress(db)
+        with pytest.raises(psycopg.errors.FeatureNotSupported):
+            db.execute(
+                "ALTER TABLE metrics ADD COLUMN tick TIMESTAMPTZ "
+                "DEFAULT clock_timestamp()"
+            )
+        db.rollback()
+
+    def test_add_column_nextval_default_blocked(self, db):
+        setup_and_compress(db)
+        db.execute("CREATE SEQUENCE deltax_test_seq")
+        db.commit()
+        with pytest.raises(psycopg.errors.FeatureNotSupported):
+            db.execute(
+                "ALTER TABLE metrics ADD COLUMN n BIGINT "
+                "DEFAULT nextval('deltax_test_seq')"
             )
         db.rollback()
 

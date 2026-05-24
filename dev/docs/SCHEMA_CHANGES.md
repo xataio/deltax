@@ -225,7 +225,6 @@ Per-operation tests, each parametrized over the partition state (uncompressed, c
 
 ## Future work
 
-- **Looser volatile-default detection for ADD COLUMN.** The current classifier blocks ADD COLUMN whose default expression isn't a `T_A_Const` or `TypeCast(T_A_Const)` — i.e. anything other than a literal or cast-of-literal. This rejects technically-safe stable defaults like `DEFAULT current_date` even though PG would set `attmissingval` for them. To soften the rule we'd need to transform the raw expression via `pg_sys::transformExpr` inside the hook, then call `pg_sys::contain_volatile_functions` on the analyzed form. Users hit by this today fall back to the recipe.
 - Auto-running the decompress/recompress recipe in the background for Tier 3 operations (move from "block" to "do it for you").
 - A `deltax_alter_table(...)` convenience wrapper that performs the recipe atomically per partition.
 - GC of orphan blob rows after DROP COLUMN (right now they linger until the next recompression).

@@ -903,9 +903,9 @@ unsafe fn classify_add_column(cmd: *mut pg_sys::AlterTableCmd) -> SubDisposition
                 op_name: "ADD COLUMN ... NOT NULL without DEFAULT",
             };
         }
-        if !cols.default_expr.is_null() && !is_constant_shape(cols.default_expr) {
+        if !cols.default_expr.is_null() && default_is_volatile(cols.default_expr) {
             return SubDisposition::Tier3 {
-                op_name: "ADD COLUMN ... DEFAULT <non-constant expression>",
+                op_name: "ADD COLUMN ... DEFAULT <volatile expression>",
             };
         }
         SubDisposition::Tier1 { post_action: None }
@@ -993,26 +993,53 @@ unsafe fn read_column_constraints(def: *const pg_sys::ColumnDef) -> ColumnDefAna
     }
 }
 
-/// Is the (raw or analyzed) expression a constant or cast-of-constant?
-/// Used as a conservative "safe default" heuristic — accepts `DEFAULT 42`,
-/// `DEFAULT 'x'::text`, `DEFAULT 3.14::float8`; rejects anything that
-/// might evaluate non-deterministically (`random()`, `now()`,
-/// `nextval(...)`). Stable functions like `current_date` are rejected
-/// too, which is more conservative than strictly necessary but safe —
-/// users can apply via the decompress→ALTER→recompress recipe.
-unsafe fn is_constant_shape(node: *mut pg_sys::Node) -> bool {
+/// Does the raw `ADD COLUMN ... DEFAULT` expression contain a volatile
+/// function? Volatile defaults are unsafe because PG would normally
+/// rewrite every existing row evaluating the expression per-row — but
+/// pg_deltax partition heaps are empty post-compression, so the rewrite
+/// silently no-ops and the column appears unset on compressed rows.
+/// Constants, immutable functions, and stable functions (`now()`,
+/// `current_date`, etc.) are all fine: PG evaluates them once at ALTER
+/// time and stores the result in `pg_attribute.attmissingval`, which
+/// the scan path's `getmissingattr` synthesis already reads correctly.
+///
+/// The check transforms the raw parse-tree default via PG's
+/// `transformExpr` (so function references get resolved against
+/// `pg_proc`) and then asks `contain_volatile_functions`. If
+/// transformation itself errors (e.g. a default referencing an unknown
+/// function), that error propagates as the ALTER's failure — same as
+/// it would without our hook.
+unsafe fn default_is_volatile(raw_default: *mut pg_sys::Node) -> bool {
     unsafe {
-        if node.is_null() {
-            return true;
+        if raw_default.is_null() {
+            return false;
         }
-        match (*node).type_ {
-            pg_sys::NodeTag::T_A_Const | pg_sys::NodeTag::T_Const => true,
-            pg_sys::NodeTag::T_TypeCast => {
-                let tc = node as *mut pg_sys::TypeCast;
-                is_constant_shape((*tc).arg)
-            }
-            _ => false,
-        }
+        // Build the analysis in a short-lived memory context so all the
+        // intermediate allocations (ParseState, transformed Node tree,
+        // RTE bookkeeping) are reclaimed in one MemoryContextDelete —
+        // without polluting the outer ProcessUtility context that PG's
+        // own ALTER analyzer will then run in.
+        let mcxt = pg_sys::AllocSetContextCreateInternal(
+            pg_sys::CurrentMemoryContext,
+            c"deltax_volatile_check".as_ptr(),
+            pg_sys::ALLOCSET_SMALL_MINSIZE as usize,
+            pg_sys::ALLOCSET_SMALL_INITSIZE as usize,
+            pg_sys::ALLOCSET_SMALL_MAXSIZE as usize,
+        );
+        let old = pg_sys::MemoryContextSwitchTo(mcxt);
+
+        let pstate = pg_sys::make_parsestate(std::ptr::null_mut());
+        let analyzed = pg_sys::transformExpr(
+            pstate,
+            raw_default,
+            pg_sys::ParseExprKind::EXPR_KIND_COLUMN_DEFAULT,
+        );
+        let is_volatile = !analyzed.is_null()
+            && pg_sys::contain_volatile_functions(analyzed);
+
+        pg_sys::MemoryContextSwitchTo(old);
+        pg_sys::MemoryContextDelete(mcxt);
+        is_volatile
     }
 }
 
