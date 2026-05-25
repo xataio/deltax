@@ -1427,6 +1427,77 @@ pub(super) unsafe fn load_segments_heap(
             }
         }
 
+        // General point-lookup prefilter: use `_colstats(_col_idx, _min, _max)`
+        // to get candidate segment ids before the meta heap scan. Unlike the
+        // skip-blob fast return above, this still loads normal metadata/blobs
+        // for the surviving segments, so additional quals (time range, text
+        // filters, etc.) remain evaluated by the regular path.
+        let mut point_prefilter_cols: std::collections::HashSet<i16> =
+            std::collections::HashSet::new();
+        let point_prefilter = if segment_by.is_empty() {
+            let filters: Vec<(i16, i64)> = batch_quals
+                .iter()
+                .filter_map(|bq| {
+                    if bq.op != BatchCompareOp::Eq {
+                        return None;
+                    }
+                    let col_name = &col_names[bq.col_idx];
+                    let is_orderable = matches!(
+                        bq.type_oid,
+                        pg_sys::INT2OID
+                            | pg_sys::INT4OID
+                            | pg_sys::INT8OID
+                            | pg_sys::FLOAT4OID
+                            | pg_sys::FLOAT8OID
+                            | pg_sys::DATEOID
+                            | pg_sys::TIMESTAMPOID
+                            | pg_sys::TIMESTAMPTZOID
+                    );
+                    if !is_orderable
+                        || col_name == time_column
+                        || segment_by.contains(col_name)
+                        || !col_not_null.get(bq.col_idx).copied().unwrap_or(false)
+                    {
+                        return None;
+                    }
+                    let ci = col_idx_map[bq.col_idx]?;
+                    let value = encode_datum_to_i64(bq.const_datum, bq.type_oid)?;
+                    Some((ci as i16, value))
+                })
+                .collect();
+
+            if filters.is_empty() {
+                None
+            } else {
+                let colstats_oid = sibling_table_oid(meta_oid, "_colstats");
+                if colstats_oid == pg_sys::InvalidOid {
+                    None
+                } else {
+                    let candidates = lookup_segments_by_minmax_index(colstats_oid, &filters);
+                    if candidates.is_some() {
+                        point_prefilter_cols.extend(filters.iter().map(|(ci, _)| *ci));
+                    }
+                    candidates
+                }
+            }
+        } else {
+            None
+        };
+
+        if point_prefilter.as_ref().is_some_and(|ids| ids.is_empty()) {
+            (*(*rel).rd_tableam).scan_end.unwrap()(scan);
+            pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+            let total_segments = reltuples_as_u64(meta_oid)
+                .unwrap_or_else(|| crate::scan::cost::get_segment_count(meta_oid).max(0) as u64);
+            let (t1_hit, t1_read) = shared_buf_snapshot();
+            buf_stats.meta_hit = t1_hit - t0_hit;
+            buf_stats.meta_read = t1_read - t0_read;
+            accumulate_scan_buf_stats(&buf_stats);
+
+            return (Vec::new(), total_segments, total_segments, 0, 0, 0);
+        }
+
         // Build bloom filter checks from batch quals (Eq and InList on numeric types)
         struct BloomCheck {
             col_idx: u16,
@@ -1545,6 +1616,13 @@ pub(super) unsafe fn load_segments_heap(
                 Some(attno) if !nulls[attno] => values[attno].value() as i32,
                 _ => 0,
             };
+            if let Some(ref candidate_ids) = point_prefilter
+                && !candidate_ids.contains(&segment_id)
+            {
+                segments_skipped += 1;
+                segments_minmax_skipped += 1;
+                continue;
+            }
 
             // Extract segment_by values
             let mut segment_values: Vec<Option<String>> = Vec::new();
@@ -1832,6 +1910,9 @@ pub(super) unsafe fn load_segments_heap(
                         Some(ci) => ci as i16,
                         None => continue,
                     };
+                    if point_prefilter_cols.contains(&ci) {
+                        continue;
+                    }
 
                     let const_i64 = match encode_datum_to_i64(bq.const_datum, bq.type_oid) {
                         Some(v) => v,
