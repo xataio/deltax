@@ -328,10 +328,7 @@ unsafe fn lookup_point_segments_by_minmax_index(
     num_blob_cols: usize,
 ) -> Option<Vec<SegmentData>> {
     unsafe {
-        let cs_rel = pg_sys::table_open(
-            colstats_oid,
-            pg_sys::AccessShareLock as pg_sys::LOCKMODE,
-        );
+        let cs_rel = pg_sys::table_open(colstats_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
 
         let mut minmax_idx_oid = pg_sys::InvalidOid;
         let index_list = pg_sys::RelationGetIndexList(cs_rel);
@@ -386,8 +383,7 @@ unsafe fn lookup_point_segments_by_minmax_index(
                 _ => {}
             }
         }
-        let (Some(sid_att), Some(max_att), Some(nonnull_att)) =
-            (sid_att, max_att, nonnull_att)
+        let (Some(sid_att), Some(max_att), Some(nonnull_att)) = (sid_att, max_att, nonnull_att)
         else {
             pg_sys::table_close(cs_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
             return None;
@@ -417,25 +413,19 @@ unsafe fn lookup_point_segments_by_minmax_index(
         #[cfg(feature = "pg17")]
         let scan = pg_sys::index_beginscan(cs_rel, idx_rel, snapshot, 2, 0);
         #[cfg(feature = "pg18")]
-        let scan =
-            pg_sys::index_beginscan(cs_rel, idx_rel, snapshot, std::ptr::null_mut(), 2, 0);
+        let scan = pg_sys::index_beginscan(cs_rel, idx_rel, snapshot, std::ptr::null_mut(), 2, 0);
         pg_sys::index_rescan(scan, skey.as_mut_ptr(), 2, std::ptr::null_mut(), 0);
 
         let mut segments = Vec::new();
         loop {
-            if !pg_sys::index_getnext_slot(
-                scan,
-                pg_sys::ScanDirection::ForwardScanDirection,
-                slot,
-            ) {
+            if !pg_sys::index_getnext_slot(scan, pg_sys::ScanDirection::ForwardScanDirection, slot)
+            {
                 break;
             }
             pg_sys::slot_getallattrs(slot);
             let tts_values = (*slot).tts_values;
             let tts_isnull = (*slot).tts_isnull;
-            if *tts_isnull.add(sid_att)
-                || *tts_isnull.add(max_att)
-                || *tts_isnull.add(nonnull_att)
+            if *tts_isnull.add(sid_att) || *tts_isnull.add(max_att) || *tts_isnull.add(nonnull_att)
             {
                 continue;
             }
@@ -1410,8 +1400,9 @@ pub(super) unsafe fn load_segments_heap(
                 for seg in &mut point_segments {
                     seg.companion_oid = meta_oid;
                 }
-                let total_segments = reltuples_as_u64(meta_oid)
-                    .unwrap_or_else(|| crate::scan::cost::get_segment_count(meta_oid).max(0) as u64);
+                let total_segments = reltuples_as_u64(meta_oid).unwrap_or_else(|| {
+                    crate::scan::cost::get_segment_count(meta_oid).max(0) as u64
+                });
                 let kept = point_segments.len() as u64;
                 let skipped = total_segments.saturating_sub(kept);
 

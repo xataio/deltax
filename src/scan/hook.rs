@@ -3765,7 +3765,10 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         // 1. Bail out on high-cardinality columns (only when no WHERE)
         // 2. Provide accurate row estimates (always)
         let mut ndistinct_estimated_groups: Option<f64> = None;
-        if !group_specs.is_empty() && group_by_relid != pg_sys::InvalidOid {
+        let needs_ndistinct_stats = group_specs
+            .iter()
+            .any(|gs| matches!(gs.expr, GroupByExpr::Column | GroupByExpr::AddConst { .. }));
+        if needs_ndistinct_stats && group_by_relid != pg_sys::InvalidOid {
             let total_uncompressed_rows: f64 = companion_oids
                 .iter()
                 .map(|&oid| {

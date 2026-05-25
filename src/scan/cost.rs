@@ -81,7 +81,7 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
         return cached;
     }
 
-    let name = unsafe {
+    let companion_name = unsafe {
         let name_ptr = pg_sys::get_rel_name(companion_oid);
         if name_ptr.is_null() {
             return (0, 0);
@@ -91,23 +91,75 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
             .into_owned()
     };
     // Strip _meta suffix to get the partition name for catalog lookup
-    let partition_name = name.strip_suffix("_meta").unwrap_or(&name);
+    let partition_name = companion_name
+        .strip_suffix("_meta")
+        .unwrap_or(&companion_name);
 
-    let result = Spi::get_one_with_args::<i64>(
-        "SELECT row_count FROM deltax.deltax_partition WHERE table_name = $1 AND is_compressed = true",
-        &[partition_name.into()],
-    );
+    // Planning touches partition stats in several hooks. Loading the whole
+    // deltatable's compressed-partition stats on the first miss avoids one SPI
+    // round trip per partition on wide partitioned scans.
+    let loaded = Spi::connect(|client| {
+        let rows = client
+            .select(
+                "WITH target AS (
+                     SELECT deltatable_id
+                       FROM deltax.deltax_partition
+                      WHERE table_name = $1
+                      LIMIT 1
+                 )
+                 SELECT p.table_name, p.row_count, h.segment_size
+                   FROM deltax.deltax_partition p
+                   JOIN target t ON t.deltatable_id = p.deltatable_id
+                   JOIN deltax.deltax_deltatable h ON h.id = p.deltatable_id
+                  WHERE p.is_compressed",
+                None,
+                &[partition_name.into()],
+            )
+            .ok()?;
 
-    match result {
-        Ok(Some(row_count)) => {
-            let segments = (row_count / 100_000).max(1);
-            let stats = (row_count, segments);
-            PARTITION_STATS_CACHE.with(|cache| cache.borrow_mut().insert(companion_oid, stats));
-            stats
+        let compressed_ns_oid =
+            unsafe { pg_sys::get_namespace_oid(c"_deltax_compressed".as_ptr(), true) };
+        if compressed_ns_oid == pg_sys::InvalidOid {
+            return None;
         }
-        // Do not cache misses: companion lookups can race with partition creation.
-        _ => (0, 0),
+
+        let mut loaded_any = false;
+        for row in rows {
+            let table_name: Option<String> = row.get(1).ok().flatten();
+            let row_count: Option<i64> = row.get(2).ok().flatten();
+            let segment_size: Option<i32> = row.get(3).ok().flatten();
+            let (Some(table_name), Some(row_count), Some(segment_size)) =
+                (table_name, row_count, segment_size)
+            else {
+                continue;
+            };
+            let meta_name = format!("{}_meta", table_name);
+            let Ok(meta_cname) = std::ffi::CString::new(meta_name) else {
+                continue;
+            };
+            let oid = unsafe { pg_sys::get_relname_relid(meta_cname.as_ptr(), compressed_ns_oid) };
+            if oid == pg_sys::InvalidOid {
+                continue;
+            }
+            let seg_size = (segment_size as i64).max(1);
+            let segments = ((row_count + seg_size - 1) / seg_size).max(1);
+            PARTITION_STATS_CACHE.with(|cache| {
+                cache.borrow_mut().insert(oid, (row_count, segments));
+            });
+            loaded_any = true;
+        }
+        Some(loaded_any)
+    });
+
+    if loaded == Some(true)
+        && let Some(cached) =
+            PARTITION_STATS_CACHE.with(|cache| cache.borrow().get(&companion_oid).copied())
+    {
+        return cached;
     }
+
+    // Do not cache misses: companion lookups can race with partition creation.
+    (0, 0)
 }
 
 /// Get relpages from pg_class for a relation OID.
