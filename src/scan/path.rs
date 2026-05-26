@@ -108,6 +108,7 @@ unsafe fn append_qual_list_as_bytes(
     qual_list: *mut pg_sys::List,
 ) -> *mut pg_sys::List {
     unsafe {
+        let _profile = super::plan_profile::scope("serialize_quals");
         if qual_list.is_null() {
             return pg_sys::lappend_int(private_list, 0);
         }
@@ -119,6 +120,79 @@ unsafe fn append_qual_list_as_bytes(
         }
         pg_sys::pfree(s as *mut _);
         list
+    }
+}
+
+unsafe fn qual_list_contains_json_extract_op(list: *mut pg_sys::List) -> bool {
+    unsafe {
+        if list.is_null() {
+            return false;
+        }
+        for i in 0..(*list).length {
+            let node = pg_sys::list_nth(list, i) as *const pg_sys::Node;
+            if qual_contains_json_extract_op(node) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+unsafe fn qual_contains_json_extract_op(node: *const pg_sys::Node) -> bool {
+    unsafe {
+        if node.is_null() {
+            return false;
+        }
+        match (*node).type_ {
+            pg_sys::NodeTag::T_OpExpr => {
+                let op = node as *const pg_sys::OpExpr;
+                if (*op).opno == super::json_extract::JSONB_OBJECT_FIELD_OPNO
+                    || (*op).opno == super::json_extract::JSONB_OBJECT_FIELD_TEXT_OPNO
+                {
+                    return true;
+                }
+                qual_list_contains_json_extract_op((*op).args)
+            }
+            pg_sys::NodeTag::T_BoolExpr => {
+                let b = node as *const pg_sys::BoolExpr;
+                qual_list_contains_json_extract_op((*b).args)
+            }
+            pg_sys::NodeTag::T_FuncExpr => {
+                let f = node as *const pg_sys::FuncExpr;
+                qual_list_contains_json_extract_op((*f).args)
+            }
+            pg_sys::NodeTag::T_CoerceViaIO => {
+                let c = node as *const pg_sys::CoerceViaIO;
+                qual_contains_json_extract_op((*c).arg as *const pg_sys::Node)
+            }
+            pg_sys::NodeTag::T_RelabelType => {
+                let r = node as *const pg_sys::RelabelType;
+                qual_contains_json_extract_op((*r).arg as *const pg_sys::Node)
+            }
+            pg_sys::NodeTag::T_NullTest => {
+                let n = node as *const pg_sys::NullTest;
+                qual_contains_json_extract_op((*n).arg as *const pg_sys::Node)
+            }
+            pg_sys::NodeTag::T_CaseExpr => {
+                let c = node as *const pg_sys::CaseExpr;
+                qual_list_contains_json_extract_op((*c).args)
+                    || qual_contains_json_extract_op((*c).defresult as *const pg_sys::Node)
+            }
+            pg_sys::NodeTag::T_CaseWhen => {
+                let c = node as *const pg_sys::CaseWhen;
+                qual_contains_json_extract_op((*c).expr as *const pg_sys::Node)
+                    || qual_contains_json_extract_op((*c).result as *const pg_sys::Node)
+            }
+            pg_sys::NodeTag::T_Aggref => {
+                let a = node as *const pg_sys::Aggref;
+                qual_list_contains_json_extract_op((*a).args)
+            }
+            pg_sys::NodeTag::T_ScalarArrayOpExpr => {
+                let s = node as *const pg_sys::ScalarArrayOpExpr;
+                qual_list_contains_json_extract_op((*s).args)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -211,6 +285,7 @@ pub unsafe fn add_decompress_path(
     topn_nulls_first: bool,
 ) {
     unsafe {
+        let _profile = super::plan_profile::scope("add_decompress_path");
         let cpath =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomPath>()) as *mut pg_sys::CustomPath;
 
@@ -219,7 +294,13 @@ pub unsafe fn add_decompress_path(
         (*cpath).path.parent = rel;
         (*cpath).path.pathtarget = (*rel).reltarget;
 
-        let (startup_cost, total_cost, rows) = cost::estimate_cost(companion_oid, 0);
+        let row_hint = if (*rel).tuples > 0.0 {
+            Some((*rel).tuples)
+        } else {
+            None
+        };
+        let (startup_cost, total_cost, rows) =
+            cost::estimate_cost_from_pg_class(companion_oid, 0, row_hint);
         // Prefer PG's filter-aware `rel->rows` estimate when it's
         // meaningful — we now write accurate `pg_class.reltuples` and
         // `pg_statistic` at compress time (see `src/stats.rs`), so the
@@ -441,6 +522,7 @@ pub unsafe extern "C-unwind" fn plan_custom_path(
     _custom_plans: *mut pg_sys::List,
 ) -> *mut pg_sys::Plan {
     unsafe {
+        let _profile = super::plan_profile::scope("plan_decompress_path");
         let cscan =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScan>()) as *mut pg_sys::CustomScan;
 
@@ -562,6 +644,7 @@ pub unsafe fn add_count_star_path(
     qual_list: *mut pg_sys::List,
 ) {
     unsafe {
+        let _profile = super::plan_profile::scope("add_count_path");
         let cpath =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomPath>()) as *mut pg_sys::CustomPath;
 
@@ -607,6 +690,7 @@ pub unsafe extern "C-unwind" fn plan_count_star_path(
     _custom_plans: *mut pg_sys::List,
 ) -> *mut pg_sys::Plan {
     unsafe {
+        let _profile = super::plan_profile::scope("plan_count_path");
         let cscan =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScan>()) as *mut pg_sys::CustomScan;
 
@@ -751,6 +835,7 @@ pub unsafe fn add_minmax_path(
     qual_list: *mut pg_sys::List,
 ) {
     unsafe {
+        let _profile = super::plan_profile::scope("add_minmax_path");
         let cpath =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomPath>()) as *mut pg_sys::CustomPath;
 
@@ -825,6 +910,7 @@ pub unsafe extern "C-unwind" fn plan_minmax_path(
     _custom_plans: *mut pg_sys::List,
 ) -> *mut pg_sys::Plan {
     unsafe {
+        let _profile = super::plan_profile::scope("plan_minmax_path");
         let cscan =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScan>()) as *mut pg_sys::CustomScan;
 
@@ -1065,6 +1151,7 @@ unsafe fn build_agg_path_private(
     is_partial: bool,
 ) -> *mut pg_sys::List {
     unsafe {
+        let _profile = super::plan_profile::scope("build_agg_private");
         let mut private_list = append_oids_as_ints(std::ptr::null_mut(), companion_oids);
         private_list = pg_sys::lappend_int(private_list, -1); // sentinel
         private_list = pg_sys::lappend_int(private_list, agg_specs.len() as i32);
@@ -1331,6 +1418,7 @@ pub unsafe fn add_agg_partial_path(
     extra: *mut pg_sys::GroupPathExtraData,
 ) {
     unsafe {
+        let _profile = super::plan_profile::scope("add_agg_partial_path");
         // -------- Eligibility --------
         // Operator escape hatch: when `pg_deltax.disable_parallel_agg = on`,
         // the planner only sees the complete CustomScan DeltaXAgg path.
@@ -1480,6 +1568,7 @@ pub unsafe fn add_agg_path(
     pathkeys: *mut pg_sys::List,
 ) {
     unsafe {
+        let _profile = super::plan_profile::scope("add_agg_path");
         let cpath =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomPath>()) as *mut pg_sys::CustomPath;
 
@@ -1607,6 +1696,7 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
     _custom_plans: *mut pg_sys::List,
 ) -> *mut pg_sys::Plan {
     unsafe {
+        let _profile = super::plan_profile::scope("plan_agg_path");
         let cscan =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScan>()) as *mut pg_sys::CustomScan;
 
@@ -2385,6 +2475,7 @@ pub unsafe extern "C-unwind" fn plan_agg_path(
         // touch them after the fact. Doing it here, while the parse tree is
         // still in scope, is the natural fit.
         if !qual_list.is_null()
+            && qual_list_contains_json_extract_op(qual_list)
             && let Some(ctx) = super::json_extract::AggChainCtx::from_root(root)
         {
             qual_list = super::json_extract::rewrite_chains_in_list(
@@ -2506,6 +2597,7 @@ pub unsafe fn add_deltax_append_path(
     topn_nulls_first: bool,
 ) {
     unsafe {
+        let _profile = super::plan_profile::scope("add_deltax_append_path");
         // Store Top-N info once — consumed by both the serial and partial
         // plan callbacks. Partial-path emission suppresses Top-N at the
         // hook level, but the thread-local is the mechanism plan_* uses
@@ -2589,7 +2681,7 @@ unsafe fn build_deltax_append_path(
         let mut total_cost = 0.0f64;
         let mut total_rows = 0.0f64;
         for &oid in companion_oids {
-            let (startup, cost, rows) = cost::estimate_cost(oid, w);
+            let (startup, cost, rows) = cost::estimate_cost_from_pg_class(oid, w, None);
             total_startup += startup;
             total_cost += cost;
             total_rows += rows;
@@ -2645,6 +2737,7 @@ pub unsafe extern "C-unwind" fn plan_deltax_append_path(
     _custom_plans: *mut pg_sys::List,
 ) -> *mut pg_sys::Plan {
     unsafe {
+        let _profile = super::plan_profile::scope("plan_deltax_append_path");
         let cscan =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScan>()) as *mut pg_sys::CustomScan;
 

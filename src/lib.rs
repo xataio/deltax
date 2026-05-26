@@ -89,6 +89,10 @@ pub(crate) static BLOB_CACHE_SHARDS: GucSetting<i32> = GucSetting::<i32>::new(64
 /// lz4-capable builds (e.g., for testing the fallback path).
 pub(crate) static USE_LZ4: GucSetting<bool> = GucSetting::<bool>::new(true);
 
+/// Emit per-phase DeltaX planner timing as NOTICE at the end of planning.
+/// Intended for ad-hoc profiling; default off to avoid benchmark noise.
+pub(crate) static PROFILE_PLANNING: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 /// Resolve the effective number of parallel workers.
 /// 0 = auto (num_cpus, capped at 16), 1 = single-threaded, 2..=64 = explicit.
 pub(crate) fn get_parallel_workers() -> usize {
@@ -294,6 +298,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"Declare internal columnar BYTEA companion columns with COMPRESSION lz4",
         c"Default ON. Set OFF (or run on a PG built without --with-lz4) and the companion-table DDL is emitted without the lz4 attribute; the actual columnar compression in Rust is unaffected. On an lz4-less build with this ON, deltax_enable_compression raises a one-shot WARNING and the DDL falls back automatically.",
         &USE_LZ4,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.profile_planning",
+        c"Emit per-phase DeltaX planner timing notices",
+        c"When ON, each planned query emits a NOTICE with cumulative time spent in DeltaX planner hooks and custom path planning callbacks. Intended for ad-hoc profiling only.",
+        &PROFILE_PLANNING,
         GucContext::Userset,
         GucFlags::default(),
     );

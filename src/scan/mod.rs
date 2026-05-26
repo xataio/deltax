@@ -8,6 +8,7 @@ mod explain;
 mod hook;
 pub(crate) mod json_extract;
 mod path;
+mod plan_profile;
 
 use pgrx::pg_sys;
 use std::sync::atomic::{AtomicPtr, Ordering};

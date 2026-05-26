@@ -3,6 +3,12 @@ use pgrx::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+/// Planning-only fallback when we have the companion meta-table row count
+/// (one row per segment) but not the exact partition row count. This matches
+/// the historic fallback in `estimate_cost`; it only affects path costing,
+/// never executor-visible row counts.
+const ESTIMATED_ROWS_PER_SEGMENT: f64 = 10_000.0;
+
 thread_local! {
     /// Cache of companion_oid → (row_count, segment_count) from deltax.deltax_partition.
     /// Only populated on successful lookups; misses are not cached because
@@ -35,6 +41,7 @@ pub(super) fn invalidate_caches() {
 ///
 /// When `workers > 0`, applies PG's parallel divisor to non-startup cost and
 /// row count so callers building a partial path see per-worker values.
+#[allow(dead_code)]
 pub unsafe fn estimate_cost(companion_oid: pg_sys::Oid, workers: usize) -> (f64, f64, f64) {
     let (total_rows, segment_count) = get_partition_stats(companion_oid);
 
@@ -65,6 +72,51 @@ pub unsafe fn estimate_cost(companion_oid: pg_sys::Oid, workers: usize) -> (f64,
     (startup, total, rows)
 }
 
+/// Planning-only cost estimate that avoids the `deltax.deltax_partition` SPI
+/// lookup. `row_hint` should be the compressed child partition's `pg_class`
+/// row estimate when the caller has it; otherwise we estimate rows from the
+/// companion meta table's reltuples (one tuple per segment).
+pub unsafe fn estimate_cost_from_pg_class(
+    companion_oid: pg_sys::Oid,
+    workers: usize,
+    row_hint: Option<f64>,
+) -> (f64, f64, f64) {
+    let rows = row_hint
+        .filter(|r| *r > 0.0)
+        .unwrap_or_else(|| estimate_companion_rows(companion_oid));
+    let segs = estimate_companion_segments(companion_oid).max(1.0);
+
+    let startup = 10.0;
+    let per_segment = 100.0;
+    let per_row = 0.1;
+    let total = startup + segs * per_segment + rows * per_row;
+
+    if workers > 0 {
+        let div = parallel_divisor(workers);
+        let non_startup = total - startup;
+        return (startup, startup + non_startup / div, rows / div);
+    }
+
+    (startup, total, rows)
+}
+
+/// Planning-only approximate row count from companion-table pg_class stats.
+/// The companion table has one heap row per compressed segment.
+pub(super) fn estimate_companion_rows(companion_oid: pg_sys::Oid) -> f64 {
+    let segments = estimate_companion_segments(companion_oid);
+    if segments > 0.0 {
+        segments * ESTIMATED_ROWS_PER_SEGMENT
+    } else {
+        ESTIMATED_ROWS_PER_SEGMENT
+    }
+}
+
+/// Planning-only approximate segment count from the companion meta table.
+pub(super) fn estimate_companion_segments(companion_oid: pg_sys::Oid) -> f64 {
+    let reltuples = unsafe { get_reltuples(companion_oid) };
+    if reltuples > 0.0 { reltuples } else { 1.0 }
+}
+
 /// Mirror PG's `get_parallel_divisor` in `costsize.c`: workers contribute
 /// fully, leader contribution decays at 0.3/worker, clamped to ≥ 0.
 pub(crate) fn parallel_divisor(workers: usize) -> f64 {
@@ -78,8 +130,10 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
     if let Some(cached) =
         PARTITION_STATS_CACHE.with(|cache| cache.borrow().get(&companion_oid).copied())
     {
+        super::plan_profile::count("cost_partition_stats_hit");
         return cached;
     }
+    let _profile = super::plan_profile::scope("cost_partition_stats_miss");
 
     let companion_name = unsafe {
         let name_ptr = pg_sys::get_rel_name(companion_oid);
@@ -98,6 +152,7 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
     // Planning touches partition stats in several hooks. Loading the whole
     // deltatable's compressed-partition stats on the first miss avoids one SPI
     // round trip per partition on wide partitioned scans.
+    let bulk_load_start = std::time::Instant::now();
     let loaded = Spi::connect(|client| {
         let rows = client
             .select(
@@ -150,11 +205,13 @@ fn get_partition_stats(companion_oid: pg_sys::Oid) -> (i64, i64) {
         }
         Some(loaded_any)
     });
+    super::plan_profile::record("cost_partition_stats_bulk_load", bulk_load_start.elapsed());
 
     if loaded == Some(true)
         && let Some(cached) =
             PARTITION_STATS_CACHE.with(|cache| cache.borrow().get(&companion_oid).copied())
     {
+        super::plan_profile::count("cost_partition_stats_loaded_hit");
         return cached;
     }
 
@@ -230,7 +287,7 @@ pub(super) fn estimate_agg_cost(
 
     let total_rows: f64 = companion_oids
         .iter()
-        .map(|&oid| get_row_count(oid).unwrap_or(0) as f64)
+        .map(|&oid| estimate_companion_rows(oid))
         .sum();
 
     let num_partitions = companion_oids.len() as f64;
@@ -268,7 +325,7 @@ pub(super) fn estimate_agg_cost(
 pub(super) fn recommend_agg_workers(companion_oids: &[pg_sys::Oid]) -> i32 {
     let total_segments: i64 = companion_oids
         .iter()
-        .map(|&oid| get_segment_count(oid))
+        .map(|&oid| estimate_companion_segments(oid).round() as i64)
         .sum();
     let pg_cap = unsafe { pg_sys::max_parallel_workers_per_gather };
     recommend_agg_workers_inner(total_segments, pg_cap)
@@ -306,6 +363,7 @@ pub(super) fn get_segment_count(companion_oid: pg_sys::Oid) -> i64 {
 pub(super) fn get_column_ndistinct(
     companion_oid: pg_sys::Oid,
 ) -> std::collections::HashMap<String, i64> {
+    let _profile = super::plan_profile::scope("cost_ndistinct");
     if let Some(cached) = NDISTINCT_CACHE.with(|cache| cache.borrow().get(&companion_oid).cloned())
     {
         return cached;
@@ -350,6 +408,7 @@ pub(super) fn get_column_ndistinct(
 pub(crate) fn get_column_valmap(
     companion_oid: pg_sys::Oid,
 ) -> std::collections::HashMap<String, Vec<String>> {
+    let _profile = super::plan_profile::scope("cost_valmap");
     if let Some(cached) = VALMAP_CACHE.with(|cache| cache.borrow().get(&companion_oid).cloned()) {
         return cached;
     }

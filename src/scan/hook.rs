@@ -479,9 +479,11 @@ unsafe fn extract_topn_info(
 /// `WHERE order_id = N` as returning "maybe 1 row" even though
 /// pg_statistic.stadistinct is populated correctly.
 ///
-/// Injecting the true row count here (from `deltax.deltax_partition.row_count`
-/// via `cost::get_row_count`) feeds the post-hook selectivity math
-/// properly: `rel->rows = row_count * eq_selectivity`.
+/// Injecting the true row count here feeds the post-hook selectivity math
+/// properly: `rel->rows = row_count * eq_selectivity`. Compression writes
+/// this into the child partition's `pg_class.reltuples`, so use the cheap
+/// syscache value first and otherwise fall back to a companion-meta estimate,
+/// avoiding the exact DeltaX catalog SPI lookup during planning.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn deltax_get_relation_info(
     root: *mut pg_sys::PlannerInfo,
@@ -505,6 +507,7 @@ pub unsafe extern "C-unwind" fn deltax_get_relation_info(
                 f(root, relation_object_id, inh_parent, rel);
             }
         }
+        let _profile = super::plan_profile::scope("get_relation_info");
 
         // Only interested in base relations (partitioned children show
         // up as RELOPT_OTHER_MEMBER_REL during partition expansion).
@@ -520,9 +523,13 @@ pub unsafe extern "C-unwind" fn deltax_get_relation_info(
             return;
         }
 
-        let row_count = match cost::get_row_count(companion_oid) {
-            Some(rc) if rc > 0 => rc as f64,
-            _ => return,
+        let row_count = {
+            let reltuples = cost::get_reltuples(relation_object_id);
+            if reltuples > 0.0 {
+                reltuples
+            } else {
+                cost::estimate_companion_rows(companion_oid)
+            }
         };
 
         // Override with the true row count from our catalog. Keep
@@ -563,6 +570,7 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
                 f(root, rel, rti, rte);
             }
         }
+        let _profile = super::plan_profile::scope("set_rel_pathlist");
 
         // Only handle regular tables
         if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
@@ -631,7 +639,7 @@ pub unsafe extern "C-unwind" fn deltax_set_rel_pathlist(
                     let per_scan_cap = cap.min(pg_cap);
                     let total_segments: i64 = companion_oids
                         .iter()
-                        .map(|&oid| cost::get_segment_count(oid))
+                        .map(|&oid| cost::estimate_companion_segments(oid).round() as i64)
                         .sum();
                     // Mirror PG's compute_parallel_worker(): don't spawn a
                     // worker unless it has a meaningful amount of work.
@@ -798,6 +806,51 @@ fn is_minmax_meta_type(col_type_oid: pg_sys::Oid) -> bool {
             | pg_sys::TIMESTAMPOID
             | pg_sys::TIMESTAMPTZOID
     )
+}
+
+fn could_be_json_extract_agg_arg(node: *const pg_sys::Node) -> bool {
+    unsafe {
+        if node.is_null() {
+            return false;
+        }
+        matches!(
+            (*node).type_,
+            pg_sys::NodeTag::T_OpExpr
+                | pg_sys::NodeTag::T_CoerceViaIO
+                | pg_sys::NodeTag::T_RelabelType
+        )
+    }
+}
+
+unsafe fn resolve_var_or_json_extract_type(
+    root: *mut pg_sys::PlannerInfo,
+    node: *const pg_sys::Node,
+    json_extract_ctx: &mut Option<Option<super::json_extract::AggChainCtx>>,
+) -> Option<pg_sys::Oid> {
+    unsafe {
+        if node.is_null() {
+            return None;
+        }
+
+        let node = unwrap_relabel_node(node);
+        if (*node).type_ == pg_sys::NodeTag::T_Var {
+            return Some((*(node as *const pg_sys::Var)).vartype);
+        }
+        if !could_be_json_extract_agg_arg(node) {
+            return None;
+        }
+
+        if json_extract_ctx.is_none() {
+            *json_extract_ctx = Some(super::json_extract::AggChainCtx::from_root(root));
+        }
+        json_extract_ctx
+            .as_ref()
+            .and_then(|ctx| ctx.as_ref())
+            .and_then(|ctx| {
+                ctx.match_to_synthetic(node)
+                    .map(|(_idx, type_oid)| type_oid)
+            })
+    }
 }
 
 /// Half-open time interval `[lo, hi)` in PG-epoch microseconds
@@ -1888,6 +1941,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         if stage != pg_sys::UpperRelationKind::UPPERREL_GROUP_AGG {
             return;
         }
+        let _profile = super::plan_profile::scope("create_upper_paths");
 
         let parse = (*root).parse;
 
@@ -2106,29 +2160,33 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 // synthetic column. This must come BEFORE the OpExpr branch
                 // below (which expects `Var + Const` shapes) — a chain like
                 // `data->>'did'` is itself an OpExpr but with the JSONB ->>
-                // operator, so the Var+Const matcher would reject it.
-                if json_extract_ctx.is_none() {
-                    json_extract_ctx = Some(super::json_extract::AggChainCtx::from_root(root));
-                }
-                if let Some(ctx) = json_extract_ctx.as_ref().unwrap()
-                    && let Some((col_idx, type_oid)) = ctx.match_to_synthetic(arg_expr)
-                {
-                    break 'resolve (col_idx, type_oid, AggExpr::Column);
-                }
+                // operator, so the Var+Const matcher would reject it. Avoid
+                // constructing the JSON context for plain Var/length(Var)
+                // aggregates, since that costs catalog lookups during planning.
+                if could_be_json_extract_agg_arg(arg_expr) {
+                    if json_extract_ctx.is_none() {
+                        json_extract_ctx = Some(super::json_extract::AggChainCtx::from_root(root));
+                    }
+                    if let Some(ctx) = json_extract_ctx.as_ref().unwrap()
+                        && let Some((col_idx, type_oid)) = ctx.match_to_synthetic(arg_expr)
+                    {
+                        break 'resolve (col_idx, type_oid, AggExpr::Column);
+                    }
 
-                // H.2: monotonic timestamptz-pl-interval recognizer for MIN/MAX.
-                // Match the JSONBench Q3/Q4 shape:
-                //   timestamptz_pl_interval(<const_tstz>, interval_mul(<const_iv>, float8(int8(chain))))
-                // and lift it to MIN/MAX over the bigint synthetic with an
-                // OutputTransform::PgUsShift applied at finalize. Only fires
-                // when the inner chain resolves via the synthetic-Var path
-                // and the constants reduce to an exact i64 µs delta.
-                if let Some(ctx) = json_extract_ctx.as_ref().unwrap()
-                    && let Some((c_idx, type_oid, delta)) =
-                        try_match_timestamp_interval_min_max(ctx, arg_expr)
-                {
-                    agg_output_transform = super::exec::OutputTransform::PgUsShift { delta };
-                    break 'resolve (c_idx, type_oid, AggExpr::Column);
+                    // H.2: monotonic timestamptz-pl-interval recognizer for MIN/MAX.
+                    // Match the JSONBench Q3/Q4 shape:
+                    //   timestamptz_pl_interval(<const_tstz>, interval_mul(<const_iv>, float8(int8(chain))))
+                    // and lift it to MIN/MAX over the bigint synthetic with an
+                    // OutputTransform::PgUsShift applied at finalize. Only fires
+                    // when the inner chain resolves via the synthetic-Var path
+                    // and the constants reduce to an exact i64 µs delta.
+                    if let Some(ctx) = json_extract_ctx.as_ref().unwrap()
+                        && let Some((c_idx, type_oid, delta)) =
+                            try_match_timestamp_interval_min_max(ctx, arg_expr)
+                    {
+                        agg_output_transform = super::exec::OutputTransform::PgUsShift { delta };
+                        break 'resolve (c_idx, type_oid, AggExpr::Column);
+                    }
                 }
 
                 let (var_node, ek): (*const pg_sys::Var, AggExpr) =
@@ -2660,23 +2718,10 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         // execution time `extract_batch_quals` sees a real
                         // Var; this validator just confirms the shape is
                         // pushable.
-                        if json_extract_ctx.is_none() {
-                            json_extract_ctx =
-                                Some(super::json_extract::AggChainCtx::from_root(root));
-                        }
-                        let ctx_ref = json_extract_ctx.as_ref().unwrap().as_ref();
-
-                        let resolve_side = |node: *const pg_sys::Node| -> Option<pg_sys::Oid> {
-                            if (*node).type_ == pg_sys::NodeTag::T_Var {
-                                return Some((*(node as *const pg_sys::Var)).vartype);
-                            }
-                            ctx_ref
-                                .and_then(|c| c.match_to_synthetic(node))
-                                .map(|(_idx, type_oid)| type_oid)
-                        };
-
-                        let lhs_type = resolve_side(a0);
-                        let rhs_type = resolve_side(a1);
+                        let lhs_type =
+                            resolve_var_or_json_extract_type(root, a0, &mut json_extract_ctx);
+                        let rhs_type =
+                            resolve_var_or_json_extract_type(root, a1, &mut json_extract_ctx);
 
                         let (type_oid, var_on_left, const_node) = if let Some(ty) = lhs_type
                             && (*a1).type_ == pg_sys::NodeTag::T_Const
@@ -2785,17 +2830,9 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                         if (*sa_const).constisnull {
                             return;
                         }
-                        if json_extract_ctx.is_none() {
-                            json_extract_ctx =
-                                Some(super::json_extract::AggChainCtx::from_root(root));
-                        }
-                        let sa_type_oid = if (*sa_a0).type_ == pg_sys::NodeTag::T_Var {
-                            (*(sa_a0 as *const pg_sys::Var)).vartype
-                        } else if let Some(Some(ctx)) = json_extract_ctx.as_ref()
-                            && let Some((_idx, ty)) = ctx.match_to_synthetic(sa_a0)
-                        {
-                            ty
-                        } else {
+                        let Some(sa_type_oid) =
+                            resolve_var_or_json_extract_type(root, sa_a0, &mut json_extract_ctx)
+                        else {
                             return;
                         };
                         if !matches!(
@@ -2851,18 +2888,20 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 // ndistinct heuristic below would mis-resolve them. Falling
                 // through to the pathlist's row estimate is fine for now;
                 // synthetic-column ndistinct is a follow-up.
-                if json_extract_ctx.is_none() {
-                    json_extract_ctx = Some(super::json_extract::AggChainCtx::from_root(root));
-                }
-                if let Some(ctx) = json_extract_ctx.as_ref().unwrap()
-                    && let Some((col_idx, type_oid)) = ctx.match_to_synthetic(expr)
-                {
-                    group_specs.push(super::exec::GroupByColSpec {
-                        col_idx,
-                        type_oid,
-                        expr: GroupByExpr::Column,
-                    });
-                    continue;
+                if could_be_json_extract_agg_arg(expr) {
+                    if json_extract_ctx.is_none() {
+                        json_extract_ctx = Some(super::json_extract::AggChainCtx::from_root(root));
+                    }
+                    if let Some(ctx) = json_extract_ctx.as_ref().unwrap()
+                        && let Some((col_idx, type_oid)) = ctx.match_to_synthetic(expr)
+                    {
+                        group_specs.push(super::exec::GroupByColSpec {
+                            col_idx,
+                            type_oid,
+                            expr: GroupByExpr::Column,
+                        });
+                        continue;
+                    }
                 }
 
                 if (*expr).type_ == pg_sys::NodeTag::T_Const {
@@ -3771,10 +3810,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         if needs_ndistinct_stats && group_by_relid != pg_sys::InvalidOid {
             let total_uncompressed_rows: f64 = companion_oids
                 .iter()
-                .map(|&oid| {
-                    let (_, _, rows) = cost::estimate_cost(oid, 0);
-                    rows
-                })
+                .map(|&oid| cost::estimate_companion_rows(oid))
                 .sum();
 
             if total_uncompressed_rows > 0.0 {
@@ -4252,6 +4288,7 @@ unsafe fn extract_companion_oids(
     path: *const pg_sys::Path,
 ) -> Option<Vec<pg_sys::Oid>> {
     unsafe {
+        let _profile = super::plan_profile::scope("extract_companion_oids");
         // Unwrap wrapper paths the planner might place above our scan:
         // - ProjectionPath: wraps input when the GROUP BY target list contains
         //   expressions (e.g. regexp_replace) that need evaluation.
@@ -4435,6 +4472,7 @@ unsafe fn collect_compressed_children(
     parent_rti: pg_sys::Index,
 ) -> Option<Vec<pg_sys::Oid>> {
     unsafe {
+        let _profile = super::plan_profile::scope("collect_compressed_children");
         let list = (*root).append_rel_list;
         if list.is_null() {
             return None;
@@ -4632,8 +4670,10 @@ pub unsafe extern "C-unwind" fn deltax_planner(
     bound_params: pg_sys::ParamListInfo,
 ) -> *mut pg_sys::PlannedStmt {
     unsafe {
+        let outer_profile = super::plan_profile::begin();
         // Chain to previous hook (if installed) or fall back to standard_planner.
         let prev = PREV_PLANNER_HOOK.load(Ordering::SeqCst);
+        let standard_start = std::time::Instant::now();
         let pstmt: *mut pg_sys::PlannedStmt = if !prev.is_null() {
             let prev_fn: unsafe extern "C-unwind" fn(
                 *mut pg_sys::Query,
@@ -4645,15 +4685,26 @@ pub unsafe extern "C-unwind" fn deltax_planner(
         } else {
             pg_sys::standard_planner(parse, query_string, cursor_options, bound_params)
         };
+        super::plan_profile::record(
+            if outer_profile {
+                "standard_planner"
+            } else {
+                "nested_planner"
+            },
+            standard_start.elapsed(),
+        );
 
         if !pstmt.is_null() && !(*pstmt).planTree.is_null() {
             // Walk the final plan tree and rewrite chain Exprs in upper plans
             // to point at the synthetic columns produced by DeltaXDecompress.
             // The walker is a no-op when no DeltaXDecompress with json_extract
             // is found in the tree.
+            let rewrite_start = std::time::Instant::now();
             super::json_extract::rewrite_plan_tree((*pstmt).planTree, (*pstmt).rtable);
+            super::plan_profile::record("json_plan_rewrite", rewrite_start.elapsed());
         }
 
+        super::plan_profile::finish();
         pstmt
     }
 }
