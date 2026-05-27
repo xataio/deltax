@@ -27,6 +27,14 @@ struct ParallelCdConfig<'a> {
     col_names: &'a [String],
     col_types: &'a [pg_sys::Oid],
     segment_by: &'a [String],
+    /// Persisted `_col_idx` map (see `MetadataInfo.blob_idx`). `Some(slot)`
+    /// → read from `compressed_blobs[slot]`. `None` → segment_by (read
+    /// from `_meta`) or column added after compression (synthesized via
+    /// `missing_values`).
+    blob_idx: &'a [Option<u16>],
+    /// Pre-computed missing-value datums for columns added after the
+    /// partition was compressed.
+    missing_values: &'a [Option<(pg_sys::Datum, bool)>],
     needed_cols: &'a [bool],
     seg_filters: &'a [(usize, String)],
     time_min: Option<i64>,
@@ -84,19 +92,21 @@ fn process_cd_segments(segments: &[SegmentData], config: &ParallelCdConfig) -> P
 
         segments_processed += 1;
 
-        // Process each needed column's compressed blob
-        let mut blob_idx = 0;
+        // Process each needed column's compressed blob. `config.blob_idx`
+        // gives the persisted `_col_idx` per column: Some → read from
+        // `compressed_blobs[slot]`; None → segment_by (handled via
+        // `_seg_val_idx`) or column added after compression (synthesize
+        // from `missing_values`).
         let mut _seg_val_idx = 0;
         for (col_idx, col_name) in config.col_names.iter().enumerate() {
+            let is_segment_by = config.segment_by.contains(col_name);
             if !config.needed_cols[col_idx] {
-                if config.segment_by.contains(col_name) {
+                if is_segment_by {
                     _seg_val_idx += 1;
-                } else {
-                    blob_idx += 1;
                 }
                 continue;
             }
-            if config.segment_by.contains(col_name) {
+            if is_segment_by {
                 // Segment-by column: one value per segment, from segment_values
                 let spec_idx = config
                     .agg_specs
@@ -115,9 +125,48 @@ fn process_cd_segments(segments: &[SegmentData], config: &ParallelCdConfig) -> P
                 continue;
             }
 
-            let blob = &seg.compressed_blobs[blob_idx];
+            let blob_slot = config.blob_idx.get(col_idx).copied().flatten();
             let type_oid = config.col_types[col_idx];
-            blob_idx += 1;
+
+            // Column added after this partition was compressed → no blob,
+            // just one constant Datum to record. count-distinct on a
+            // column with a constant value contributes one distinct entry
+            // (regardless of seg.row_count).
+            let Some(slot) = blob_slot else {
+                let spec_idx = config
+                    .agg_specs
+                    .iter()
+                    .position(|s| s.col_idx as usize == col_idx);
+                if let Some(si) = spec_idx
+                    && let Some((datum, is_null)) =
+                        config.missing_values.get(col_idx).copied().flatten()
+                    && !is_null
+                {
+                    if config.count_distinct_only_str[col_idx] {
+                        // For text columns the Datum points at a
+                        // varlena; hash the bytes once since every row
+                        // would yield the same value.
+                        unsafe {
+                            let s = pg_sys::pg_detoast_datum_packed(
+                                datum.cast_mut_ptr::<pg_sys::varlena>(),
+                            );
+                            let len = pgrx::varlena::varsize_any_exhdr(s);
+                            // `vardata_any` returns `*const c_char`,
+                            // which is `i8` on some platforms (e.g.
+                            // x86_64-linux) and `u8` on others
+                            // (aarch64-darwin). `cast::<u8>()` makes the
+                            // resulting slice type portable.
+                            let body: *const u8 = pgrx::varlena::vardata_any(s).cast();
+                            let slice = std::slice::from_raw_parts(body, len);
+                            str_sets[si].insert(hash128_str(slice));
+                        }
+                    } else if config.count_distinct_only_int[col_idx] {
+                        int_sets[si].insert(datum.value() as i64);
+                    }
+                }
+                continue;
+            };
+            let blob = &seg.compressed_blobs[slot as usize];
 
             // Find the agg spec for this column
             let spec_idx = config
@@ -329,6 +378,8 @@ pub(super) unsafe fn dispatch_parallel_count_distinct_path(
         col_names: &meta.col_names,
         col_types: &meta.col_types,
         segment_by: &meta.segment_by,
+        blob_idx: &meta.blob_idx,
+        missing_values: &meta.missing_values,
         needed_cols,
         seg_filters,
         time_min,

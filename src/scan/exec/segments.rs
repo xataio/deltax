@@ -779,8 +779,7 @@ pub(super) struct ColSum {
 /// Returns `true` if the segment should be skipped.
 pub(super) fn segment_skippable_by_dict(
     batch_quals: &[BatchQual],
-    col_names: &[String],
-    segment_by: &[String],
+    blob_idx_map: &[Option<u16>],
     compressed_blobs: &[BlobBytes],
 ) -> bool {
     for bq in batch_quals {
@@ -793,16 +792,14 @@ pub(super) fn segment_skippable_by_dict(
             _ => continue,
         };
 
-        // Compute blob index for this column
-        let mut blob_idx = 0;
-        for (ci, cn) in col_names.iter().enumerate() {
-            if ci == bq.col_idx {
-                break;
-            }
-            if !segment_by.contains(cn) {
-                blob_idx += 1;
-            }
-        }
+        // Look up the persisted `_col_idx` for the queried column. None
+        // means either segment_by (no blob to check) or ADD-COLUMN-after-
+        // compression (no blob exists, so dict pruning can't help — fall
+        // through to qual eval which handles the synthesized value).
+        let Some(blob_idx) = blob_idx_map.get(bq.col_idx).copied().flatten() else {
+            continue;
+        };
+        let blob_idx = blob_idx as usize;
 
         let blob = &compressed_blobs[blob_idx];
         if blob.len() < 6 {
@@ -958,12 +955,50 @@ pub(super) struct MetadataInfo {
     pub(super) segment_by: Vec<String>,
     pub(super) order_by: Vec<String>,
     pub(super) time_column: String,
+    /// Parallel to `col_names`. `Some(i)` = read this column's data from
+    /// `_blobs`/`_colstats`/etc. at `_col_idx = i`. `None` means either
+    /// the column is `segment_by` (lives in `_meta`, not in the blob path)
+    /// or the column was added to the parent after this partition was
+    /// compressed (decompress synthesizes the value via
+    /// `pg_sys::getmissingattr`). For legacy partitions whose
+    /// `compressed_columns` descriptor is NULL, this is identical to the
+    /// positional mapping the scan path used to compute locally.
+    /// See `dev/docs/SCHEMA_CHANGES.md`.
+    pub(super) blob_idx: Vec<Option<u16>>,
+    /// Parallel to `col_names`. Current `pg_attribute.attnum` for physical
+    /// columns, or `0` for json-extract synthetic columns (which have no
+    /// pg_attribute row). Used inside `load_metadata` to call
+    /// `pg_sys::getmissingattr` for columns added after compression;
+    /// kept on `MetadataInfo` for future descriptor-shape resolution
+    /// that needs to join by attnum rather than name.
+    #[allow(dead_code)] // surfaced for downstream consumers; unused today
+    pub(super) attnums: Vec<i32>,
+    /// Parallel to `col_names`. `Some((datum, is_null))` = pre-computed
+    /// missing value via `pg_sys::getmissingattr` for a column that was
+    /// added to the parent after this partition was compressed. `None`
+    /// means either the column has a blob OR is segment_by (read from
+    /// `_meta`). Decompress overlays these onto the output slot.
+    /// SAFETY: For pass-by-reference types the Datum points into the
+    /// partition relation's tupdesc and is only valid while the relation
+    /// remains open (PG's relcache keeps it live for the query duration).
+    pub(super) missing_values: Vec<Option<(pg_sys::Datum, bool)>>,
 }
+
+// SAFETY: `MetadataInfo` is shared across threads only during parallel
+// aggregation (see `agg::metadata::accumulate_segment_decompressed`), and
+// only via immutable reference. The `Datum` values in `missing_values`
+// point into the partition's relcache descriptor whose lifetime exceeds
+// the scoped-thread join boundary (relcache entries pinned for the
+// query duration). No worker writes to these fields.
+unsafe impl Send for MetadataInfo {}
+unsafe impl Sync for MetadataInfo {}
 
 thread_local! {
     /// Backend-local cache: companion (`_meta`) table OID → MetadataInfo.
     /// Populated lazily by `load_metadata_cached`. Cleared wholesale on any
-    /// relcache invalidation (see `metadata_relcache_callback`).
+    /// relcache invalidation (see `metadata_relcache_callback`) — that
+    /// covers ALTER TABLE on the parent (which invalidates the Datums in
+    /// `missing_values`) plus partition compress/decompress.
     static METADATA_CACHE: RefCell<HashMap<pg_sys::Oid, MetadataInfo>> =
         RefCell::new(HashMap::new());
     /// Tracks whether we've registered the relcache callback yet in this
@@ -1042,7 +1077,7 @@ pub(super) fn load_metadata(
     let mut ht_result = client
         .select(
             "SELECT h.segment_by, h.order_by, h.time_column, h.schema_name, h.table_name,
-                    h.json_extract
+                    h.json_extract, p.compressed_columns
              FROM deltax.deltax_partition p
              JOIN deltax.deltax_deltatable h ON h.id = p.deltatable_id
              WHERE p.table_name = $1 AND p.is_compressed = true",
@@ -1094,29 +1129,168 @@ pub(super) fn load_metadata(
         .value::<pgrx::datum::JsonB>()
         .unwrap()
         .map(|j| j.0);
+    let compressed_columns: Option<serde_json::Value> = ht_row
+        .get_datum_by_ordinal(7)
+        .unwrap()
+        .value::<pgrx::datum::JsonB>()
+        .unwrap()
+        .map(|j| j.0);
 
-    // Get column info via direct relcache walk on the parent table — avoids
-    // running a 4-table SPI join + name→OID translation, which costs ~0.8 ms
-    // per call on the fresh-connection path that the bench measures.
-    let (mut col_names, mut col_types, mut col_typmods, mut col_not_null) =
-        load_parent_columns(&parent_schema, &parent_table);
+    // Get column info via a direct relcache walk on the parent table —
+    // avoids the 4-table `pg_attribute ⋈ pg_type ⋈ pg_class ⋈ pg_namespace`
+    // SPI + name→OID translation that this used to do (~0.8 ms saved per
+    // miss on the fresh-connection path the bench measures). `attnum` is
+    // returned so the decompress path can call `pg_sys::getmissingattr` for
+    // columns added after compression (see SCHEMA_CHANGES.md).
+    let ParentColumnLayout {
+        names: mut col_names,
+        types: mut col_types,
+        typmods: mut col_typmods,
+        not_null: mut col_not_null,
+        attnums: mut col_attnums,
+    } = load_parent_columns(&parent_schema, &parent_table);
+    // Descriptor-compat: `compressed_columns.type_oid` was persisted as i64.
+    let col_atttypids: Vec<i64> =
+        col_types.iter().map(|oid| u32::from(*oid) as i64).collect();
+
+    // Resolve each physical column's `_col_idx` against the persisted
+    // descriptor. None descriptor → legacy positional mapping (today's
+    // behavior): non-segment_by columns counted in attnum order starting
+    // at 0. Present descriptor → look up by attnum and use the historical
+    // `compressed_col_idx`. Mismatch on type/typmod is a defensive error.
+    let mut blob_idx: Vec<Option<u16>> = Vec::with_capacity(col_names.len());
+    let descriptor_entries: Option<Vec<DescriptorEntry>> = compressed_columns
+        .as_ref()
+        .and_then(parse_compressed_columns);
+    if let Some(entries) = descriptor_entries.as_ref() {
+        for i in 0..col_names.len() {
+            let attnum = col_attnums[i];
+            match entries.iter().find(|e| e.attnum == attnum) {
+                Some(entry) => {
+                    if entry.dropped {
+                        blob_idx.push(None);
+                        continue;
+                    }
+                    if entry.type_oid != col_atttypids[i] || entry.typmod != col_typmods[i] {
+                        pgrx::error!(
+                            "pg_deltax: column {:?} on partition {} has type/typmod \
+                             ({}, {}) that differs from compressed snapshot ({}, {}); \
+                             decompress and recompress the partition to apply the change",
+                            col_names[i],
+                            companion_name,
+                            col_atttypids[i],
+                            col_typmods[i],
+                            entry.type_oid,
+                            entry.typmod,
+                        );
+                    }
+                    blob_idx.push(entry.compressed_col_idx);
+                }
+                None => {
+                    // Column added after this partition was compressed —
+                    // decompress synthesizes via getmissingattr.
+                    blob_idx.push(None);
+                }
+            }
+        }
+    } else {
+        // Legacy partition (no descriptor): identity mapping from
+        // segment_by names, identical to the historical local
+        // computation in run_segments_scan.
+        let mut next_idx: u16 = 0;
+        for name in &col_names {
+            if segment_by.contains(name) {
+                blob_idx.push(None);
+            } else {
+                blob_idx.push(Some(next_idx));
+                next_idx += 1;
+            }
+        }
+    }
 
     // Append synthetic columns from json_extract (in spec order). These map
     // 1-to-1 with the extracted ColumnMeta entries that were appended at
-    // compress time, so their `_col_idx` slots are physical_count + i. The
-    // executor uses col_names/col_types indexed by `_col_idx`, so they need
-    // to be visible here too.
+    // compress time, so their `_col_idx` slots are physical_count_at_compress + i.
+    // The executor uses col_names/col_types indexed by `_col_idx`, so they
+    // need to be visible here too. json_extract gating against partitions
+    // compressed before the feature was added is handled separately in
+    // scan::path::is_json_extract_safe_for_rel.
     if let Some(jx) = json_extract {
         let specs = crate::compress::parse_extract_specs(&jx);
-        for spec in specs {
+        // For json-extract columns the historical `_col_idx` was computed at
+        // compress time as `non_segment_by_physical_count + i`. Recover that
+        // count from the descriptor when present (more accurate when columns
+        // have been added since), and fall back to live count otherwise.
+        let non_segment_by_physical_count: u16 = if let Some(entries) = descriptor_entries.as_ref()
+        {
+            entries
+                .iter()
+                .filter(|e| !e.dropped && e.compressed_col_idx.is_some())
+                .count() as u16
+        } else {
+            blob_idx.iter().filter(|b| b.is_some()).count() as u16
+        };
+        for (i, spec) in specs.iter().enumerate() {
             col_names.push(spec.target_name.clone());
             col_types.push(crate::scan::json_extract::kind_to_type_oid(
                 spec.target_kind,
             ));
             col_typmods.push(-1);
             col_not_null.push(false);
+            col_attnums.push(0); // synthetic — no pg_attribute row
+            blob_idx.push(Some(non_segment_by_physical_count + i as u16));
         }
     }
+
+    // Compute missing values for columns that exist in current pg_attribute
+    // but have no entry in the persisted descriptor (added after this
+    // partition was compressed). PG's fast-default machinery populates
+    // `pg_attribute.attmissingval` for those — we call `getmissingattr` on
+    // the partition's own tupdesc (partitions inherit from parent so the
+    // missingval is the same). Only populated when a descriptor was found;
+    // legacy partitions (descriptor IS NULL) treat all attnums as present
+    // in the legacy positional mapping, so no synthesis is needed.
+    let mut missing_values: Vec<Option<(pg_sys::Datum, bool)>> = vec![None; col_names.len()];
+    if descriptor_entries.is_some() {
+        // PG sets `pg_attribute.attmissingval` on each leaf partition (not
+        // the parent — the parent has no heap and pg_attribute.atthasmissing
+        // stays false). Use the partition's own OID so `getmissingattr`
+        // reads the per-partition default that PG populated when ALTER
+        // TABLE ADD COLUMN propagated to this leaf.
+        let part_fqn = format!("{}.{}", parent_schema, partition_name);
+        let part_rel_oid: pg_sys::Oid = client
+            .select(&format!("SELECT '{}'::regclass::oid", part_fqn), None, &[])
+            .ok()
+            .and_then(|r| r.first().get_one::<pg_sys::Oid>().ok().flatten())
+            .unwrap_or(pg_sys::InvalidOid);
+        if part_rel_oid != pg_sys::InvalidOid {
+            for i in 0..col_names.len() {
+                let attnum = col_attnums[i];
+                if attnum <= 0 {
+                    continue; // synthetic json-extract column
+                }
+                if blob_idx[i].is_some() {
+                    continue; // has a blob, no synthesis needed
+                }
+                if segment_by.contains(&col_names[i]) {
+                    continue; // segment_by values come from _meta
+                }
+                // Descriptor present + no blob_idx + not segment_by =
+                // column added after this partition was compressed.
+                let (datum, is_null) = unsafe {
+                    crate::scan::exec::datum_utils::missing_attr_for_relation(part_rel_oid, attnum)
+                };
+                missing_values[i] = Some((datum, is_null));
+            }
+        }
+    }
+
+    debug_assert_eq!(col_names.len(), col_types.len());
+    debug_assert_eq!(col_names.len(), col_typmods.len());
+    debug_assert_eq!(col_names.len(), col_not_null.len());
+    debug_assert_eq!(col_names.len(), col_attnums.len());
+    debug_assert_eq!(col_names.len(), blob_idx.len());
+    debug_assert_eq!(col_names.len(), missing_values.len());
 
     MetadataInfo {
         col_names,
@@ -1126,19 +1300,30 @@ pub(super) fn load_metadata(
         segment_by,
         order_by,
         time_column,
+        blob_idx,
+        attnums: col_attnums,
+        missing_values,
     }
 }
 
-/// Read the parent table's column layout directly from the relcache.
-/// Returns `(col_names, col_types, col_typmods, col_not_null)` in physical
-/// (attno) order, skipping dropped attributes.
+/// Parallel-vector view of one parent table's physical columns. Returned
+/// by `load_parent_columns` in attnum order, skipping dropped attributes.
+struct ParentColumnLayout {
+    names: Vec<String>,
+    types: Vec<pg_sys::Oid>,
+    typmods: Vec<i32>,
+    not_null: Vec<bool>,
+    attnums: Vec<i32>,
+}
+
+/// Walk the parent table's relcache `TupleDesc` and return its physical
+/// column layout. Replaces the 4-table `pg_attribute ⋈ pg_type ⋈ pg_class ⋈
+/// pg_namespace` SPI that the executor used to do here — saves ~0.8 ms per
+/// `load_metadata` miss on fresh-connection paths.
 ///
 /// Errors out if the schema or relation can't be resolved (e.g. the parent
 /// has been dropped between planning and execution).
-fn load_parent_columns(
-    parent_schema: &str,
-    parent_table: &str,
-) -> (Vec<String>, Vec<pg_sys::Oid>, Vec<i32>, Vec<bool>) {
+fn load_parent_columns(parent_schema: &str, parent_table: &str) -> ParentColumnLayout {
     let schema_cstr = std::ffi::CString::new(parent_schema)
         .expect("pg_deltax: parent schema name contained NUL");
     let table_cstr = std::ffi::CString::new(parent_table)
@@ -1164,6 +1349,7 @@ fn load_parent_columns(
         let mut col_types = Vec::with_capacity(natts);
         let mut col_typmods = Vec::with_capacity(natts);
         let mut col_not_null = Vec::with_capacity(natts);
+        let mut col_attnums = Vec::with_capacity(natts);
         for i in 0..natts {
             let att = &*tupdesc_get_attr(tupdesc, i);
             if att.attisdropped {
@@ -1176,10 +1362,68 @@ fn load_parent_columns(
             col_types.push(att.atttypid);
             col_typmods.push(att.atttypmod);
             col_not_null.push(att.attnotnull);
+            col_attnums.push(att.attnum as i32);
         }
         pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
-        (col_names, col_types, col_typmods, col_not_null)
+        ParentColumnLayout {
+            names: col_names,
+            types: col_types,
+            typmods: col_typmods,
+            not_null: col_not_null,
+            attnums: col_attnums,
+        }
     }
+}
+
+/// Parsed view of one entry in the `compressed_columns` JSONB descriptor.
+/// Field semantics match the JSON shape produced by
+/// `catalog::snapshot_compressed_columns`. See `dev/docs/SCHEMA_CHANGES.md`.
+struct DescriptorEntry {
+    attnum: i32,
+    type_oid: i64,
+    typmod: i32,
+    /// Historical `_col_idx` for non-segment_by columns. `None` for segment_by
+    /// (they live in `_meta`, not in the blob path).
+    compressed_col_idx: Option<u16>,
+    dropped: bool,
+}
+
+/// Parse the `compressed_columns` JSONB array into a list of entries.
+/// Returns `None` if the JSON shape is not the expected array-of-objects —
+/// callers fall back to the legacy positional mapping in that case so a
+/// corrupted descriptor doesn't take a partition offline.
+fn parse_compressed_columns(value: &serde_json::Value) -> Option<Vec<DescriptorEntry>> {
+    let arr = value.as_array()?;
+    let mut out: Vec<DescriptorEntry> = Vec::with_capacity(arr.len());
+    for entry in arr {
+        let obj = entry.as_object()?;
+        let attnum = obj.get("attnum")?.as_i64()? as i32;
+        let type_oid = obj.get("type_oid")?.as_i64()?;
+        let typmod = obj.get("typmod")?.as_i64()? as i32;
+        let compressed_col_idx = match obj.get("compressed_col_idx") {
+            Some(v) if v.is_null() => None,
+            Some(v) => {
+                let n = v.as_i64()?;
+                if !(0..=i64::from(u16::MAX)).contains(&n) {
+                    return None;
+                }
+                Some(n as u16)
+            }
+            None => None,
+        };
+        let dropped = obj
+            .get("dropped")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        out.push(DescriptorEntry {
+            attnum,
+            type_oid,
+            typmod,
+            compressed_col_idx,
+            dropped,
+        });
+    }
+    Some(out)
 }
 
 /// Per-phase shared-buffer counters captured from `pgBufferUsage` deltas,
@@ -1277,6 +1521,11 @@ pub(super) unsafe fn load_segments_heap(
     col_types: &[pg_sys::Oid],
     col_not_null: &[bool],
     needed_minmax_cols: &[String],
+    // Parallel to `col_names`. `Some(i)` = read this column from the
+    // blob/colstats path at `_col_idx = i`. `None` = segment_by (live in
+    // `_meta`) OR a column added to the parent after this partition was
+    // compressed (no blob — decompress synthesizes via getmissingattr).
+    blob_idx: &[Option<u16>],
     // `skip_blob_load = true` skips Phase 2 entirely. Callers that fetch blobs
     // on-claim via `fetch_segment_blobs` pass true — compressed_blobs and
     // toast_pointers stay empty at return.
@@ -1367,23 +1616,15 @@ pub(super) unsafe fn load_segments_heap(
         // most partitions do — the prefilter immediately rules them out.
         // ================================================================
 
-        // Build col_idx mapping: for each col_names[i] that is not segment_by,
-        // compute its col_idx (0-based among non-segment-by columns). Used
-        // by both fast-path lookups below.
-        let mut col_idx_map: Vec<Option<u16>> = Vec::new();
-        let mut num_blob_cols: usize = 0;
-        {
-            let mut ci: u16 = 0;
-            for name in col_names {
-                if segment_by.contains(name) {
-                    col_idx_map.push(None);
-                } else {
-                    col_idx_map.push(Some(ci));
-                    ci += 1;
-                    num_blob_cols += 1;
-                }
-            }
-        }
+        // The authoritative `col_names[i] → _col_idx` mapping is the
+        // `blob_idx` parameter (built from the partition's
+        // `compressed_columns` descriptor in `load_metadata`). For legacy
+        // partitions with no descriptor, `load_metadata` populates `blob_idx`
+        // from the same positional rule we used to compute locally here, so
+        // behavior is unchanged for them. See `dev/docs/SCHEMA_CHANGES.md`.
+        debug_assert_eq!(col_names.len(), blob_idx.len());
+        let col_idx_map: &[Option<u16>] = blob_idx;
+        let num_blob_cols: usize = col_idx_map.iter().filter(|b| b.is_some()).count();
 
         // Phase 0a: skip-meta fast path — `count(*)`-style scans (or any
         // caller that passes `skip_blob_load=true` with a single point qual)
@@ -3019,13 +3260,15 @@ pub(super) unsafe fn load_segments_heap(
                     seg_id_to_idx.insert(sid, idx);
                 }
 
-                // Determine which col_idx values we need
+                // Determine which col_idx values we need. `col_idx_map[i] = None`
+                // for segment_by columns AND for columns added to the parent
+                // after this partition was compressed — both have no blob to
+                // fetch (the latter get synthesized later via getmissingattr).
                 let mut needed_col_indices: Vec<(u16, usize)> = Vec::new(); // (col_idx, blob_slot_idx)
-                for (i, name) in col_names.iter().enumerate() {
-                    if segment_by.contains(name) {
+                for i in 0..col_names.len() {
+                    let Some(ci) = col_idx_map[i] else {
                         continue;
-                    }
-                    let ci = col_idx_map[i].unwrap();
+                    };
                     if needed_cols[i] {
                         needed_col_indices.push((ci, ci as usize));
                     }
@@ -3298,8 +3541,11 @@ pub(super) unsafe fn load_segments_heap(
 pub(super) unsafe fn load_text_length_sidecars(
     meta_oid: pg_sys::Oid,
     col_names: &[String],
-    segment_by: &[String],
     sidecar_cols: &[bool],
+    // Persisted `_col_idx` map — see `load_segments_heap`'s `blob_idx`
+    // parameter. None entries (segment_by or ADD-COLUMN-after-compression)
+    // have no sidecar to load.
+    blob_idx: &[Option<u16>],
     segments: &mut [SegmentData],
 ) -> u64 {
     if segments.is_empty() || !sidecar_cols.iter().any(|&s| s) {
@@ -3313,17 +3559,8 @@ pub(super) unsafe fn load_text_length_sidecars(
             return 0;
         }
 
-        // Build col_idx -> blob_slot mapping (same rule as load_segments_heap)
-        let mut col_idx_map: Vec<Option<u16>> = Vec::new();
-        let mut ci: u16 = 0;
-        for name in col_names {
-            if segment_by.contains(name) {
-                col_idx_map.push(None);
-            } else {
-                col_idx_map.push(Some(ci));
-                ci += 1;
-            }
-        }
+        debug_assert_eq!(col_names.len(), blob_idx.len());
+        let col_idx_map: &[Option<u16>] = blob_idx;
 
         // Determine which col_idx values we need sidecars for
         let mut needed_col_idxs: Vec<u16> = Vec::new();
@@ -3426,17 +3663,19 @@ pub(super) unsafe fn fetch_segment_blobs(
     companion_oid: pg_sys::Oid,
     segment_id: i32,
     col_names: &[String],
-    segment_by: &[String],
     needed_cols: &[bool],
+    // Persisted `_col_idx` map — see `load_segments_heap`'s `blob_idx`
+    // parameter. None entries (segment_by or ADD-COLUMN-after-compression)
+    // have no blob to fetch.
+    blob_idx: &[Option<u16>],
     seg: &mut SegmentData,
 ) -> u64 {
     let t_start = std::time::Instant::now();
     unsafe {
-        // Pre-size blob slots if empty (first fetch).
-        let num_blob_cols = col_names
-            .iter()
-            .filter(|n| !segment_by.contains(*n))
-            .count();
+        debug_assert_eq!(col_names.len(), blob_idx.len());
+        // Pre-size blob slots if empty (first fetch). `num_blob_cols` is the
+        // count of distinct `_col_idx` slots referenced by the descriptor.
+        let num_blob_cols = blob_idx.iter().filter(|b| b.is_some()).count();
         if seg.compressed_blobs.is_empty() {
             seg.compressed_blobs = Vec::with_capacity(num_blob_cols);
             seg.compressed_blobs
@@ -3448,20 +3687,7 @@ pub(super) unsafe fn fetch_segment_blobs(
             return t_start.elapsed().as_micros() as u64;
         }
 
-        // Build col_idx mapping: each non-segment-by col_name → dense col_idx
-        // (used as the first PK column in `_blobs`). Same rule as `load_segments_heap`.
-        let mut col_idx_map: Vec<Option<u16>> = Vec::new();
-        {
-            let mut ci: u16 = 0;
-            for name in col_names {
-                if segment_by.contains(name) {
-                    col_idx_map.push(None);
-                } else {
-                    col_idx_map.push(Some(ci));
-                    ci += 1;
-                }
-            }
-        }
+        let col_idx_map: &[Option<u16>] = blob_idx;
 
         let blob_rel = pg_sys::table_open(blob_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let pk_index_oid = primary_key_index_oid(blob_rel);
@@ -3474,8 +3700,8 @@ pub(super) unsafe fn fetch_segment_blobs(
         let idx_rel = pg_sys::index_open(pk_index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let snapshot = pg_sys::GetActiveSnapshot();
 
-        for (i, name) in col_names.iter().enumerate() {
-            if segment_by.contains(name) || !needed_cols[i] {
+        for i in 0..col_names.len() {
+            if !needed_cols[i] {
                 continue;
             }
             let col_idx = match col_idx_map[i] {

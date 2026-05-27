@@ -240,12 +240,7 @@ pub(super) unsafe fn dispatch_serial_path(
             }
 
             // Dictionary-based LIKE pruning: skip segment if no dict entry matches
-            if segment_skippable_by_dict(
-                batch_quals,
-                &meta.col_names,
-                &meta.segment_by,
-                &seg.compressed_blobs,
-            ) {
+            if segment_skippable_by_dict(batch_quals, &meta.blob_idx, &seg.compressed_blobs) {
                 continue;
             }
 
@@ -289,25 +284,29 @@ pub(super) unsafe fn dispatch_serial_path(
             let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
             // Raw strings for columns that need regexp_replace (parallel to decompressed)
             let mut raw_strings: Vec<Option<Vec<Option<String>>>> = Vec::new();
-            let mut blob_idx = 0;
             let mut seg_val_idx = 0;
             let mut pre_selection: Vec<bool> = Vec::new();
 
             for (col_idx, col_name) in meta.col_names.iter().enumerate() {
                 let type_oid = meta.col_types[col_idx];
+                let is_segment_by = meta.segment_by.contains(col_name);
+                let blob_slot: Option<usize> = meta
+                    .blob_idx
+                    .get(col_idx)
+                    .copied()
+                    .flatten()
+                    .map(|s| s as usize);
 
                 if !needed_cols[col_idx] {
-                    if meta.segment_by.contains(col_name) {
+                    if is_segment_by {
                         seg_val_idx += 1;
-                    } else {
-                        blob_idx += 1;
                     }
                     decompressed.push(Vec::new());
                     raw_strings.push(None);
                     continue;
                 }
 
-                if meta.segment_by.contains(col_name) {
+                if is_segment_by {
                     let val = &seg.segment_values[seg_val_idx];
                     let (datum, is_null) = match val {
                         Some(s) => (string_to_datum(s, type_oid), false),
@@ -318,14 +317,26 @@ pub(super) unsafe fn dispatch_serial_path(
                     decompressed.push(repeated);
                     raw_strings.push(None);
                     seg_val_idx += 1;
+                } else if blob_slot.is_none() {
+                    // Column added after this partition was compressed —
+                    // synthesize from `meta.missing_values`.
+                    let (datum, is_null) = meta
+                        .missing_values
+                        .get(col_idx)
+                        .copied()
+                        .flatten()
+                        .unwrap_or((pg_sys::Datum::from(0), true));
+                    let repeated: Vec<(pg_sys::Datum, bool)> =
+                        (0..seg.row_count).map(|_| (datum, is_null)).collect();
+                    decompressed.push(repeated);
+                    raw_strings.push(None);
                 } else {
-                    let blob = &seg.compressed_blobs[blob_idx];
+                    let blob = &seg.compressed_blobs[blob_slot.unwrap()];
                     let typmod = meta.col_typmods[col_idx];
 
                     if skip_numeric_decompress[col_idx] {
                         decompressed.push(Vec::new());
                         raw_strings.push(None);
-                        blob_idx += 1;
                         continue;
                     }
 
@@ -401,7 +412,6 @@ pub(super) unsafe fn dispatch_serial_path(
                         // Push empty so the row loop skips this column
                         decompressed.push(Vec::new());
                         raw_strings.push(None);
-                        blob_idx += 1;
                         continue;
                     }
 
@@ -486,7 +496,6 @@ pub(super) unsafe fn dispatch_serial_path(
                         // Push empty so the row loop skips this column
                         decompressed.push(Vec::new());
                         raw_strings.push(None);
-                        blob_idx += 1;
                         continue;
                     }
 
@@ -739,7 +748,6 @@ pub(super) unsafe fn dispatch_serial_path(
                         }
                         raw_strings.push(None);
                     }
-                    blob_idx += 1;
                 }
             }
 
@@ -755,7 +763,6 @@ pub(super) unsafe fn dispatch_serial_path(
             seg_text_columns.clear();
             seg_text_columns.resize_with(meta.col_names.len(), || None);
             {
-                let mut blob_idx2 = 0;
                 let mut seg_val_idx2 = 0;
                 for (col_idx, col_name) in meta.col_names.iter().enumerate() {
                     if meta.segment_by.contains(col_name) {
@@ -766,6 +773,19 @@ pub(super) unsafe fn dispatch_serial_path(
                         seg_val_idx2 += 1;
                         continue;
                     }
+                    // Skip columns added to the parent after this partition
+                    // was compressed: there's no blob to decode into a text
+                    // column. (Missing-value synthesis for non-text columns
+                    // happens in the main decompress loop above.)
+                    let blob_slot: Option<usize> = meta
+                        .blob_idx
+                        .get(col_idx)
+                        .copied()
+                        .flatten()
+                        .map(|s| s as usize);
+                    let Some(blob_idx2) = blob_slot else {
+                        continue;
+                    };
                     if needed_cols[col_idx] && text_group_cols[col_idx] {
                         let blob = &seg.compressed_blobs[blob_idx2];
                         if !blob.is_empty() {
@@ -854,15 +874,11 @@ pub(super) unsafe fn dispatch_serial_path(
                                     };
                                     SegTextColumn::Lz4 { buf, row_to_range }
                                 }
-                                _ => {
-                                    blob_idx2 += 1;
-                                    continue;
-                                }
+                                _ => continue,
                             };
                             seg_text_columns[col_idx] = Some(seg_col);
                         }
                     }
-                    blob_idx2 += 1;
                 }
             }
 

@@ -1017,6 +1017,19 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     catalog::update_partition_column_minmax(client, part_info.id, &ddl.colstats_fqn, &columns)
         .expect("failed to update partition column_minmax");
 
+    // Snapshot the physical-column shape so the scan path can decode this
+    // partition's blobs even if the parent's pg_attribute changes later
+    // (e.g. ADD COLUMN with a default). See dev/docs/SCHEMA_CHANGES.md.
+    let cc_json = catalog::snapshot_compressed_columns(
+        client,
+        &ht.schema_name,
+        &ht.table_name,
+        &ht.segment_by,
+    )
+    .expect("failed to snapshot compressed_columns");
+    catalog::update_partition_compressed_columns(client, part_info.id, &cc_json)
+        .expect("failed to update partition compressed_columns");
+
     // Populate pg_class.reltuples + pg_statistic for the compressed
     // child partition so PG's built-in selectivity functions stop
     // falling back to defaults (0.005 equality-sel, ~2.5e-5 text-eq).

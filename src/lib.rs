@@ -17,6 +17,7 @@ mod compression;
 mod copy;
 mod copyparquet;
 mod copyparse;
+mod ddl;
 mod functions;
 mod partition;
 mod scan;
@@ -188,6 +189,7 @@ ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_valmap JSONB
 ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_minmax JSONB;
 ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract JSONB;
 ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract_added_at TIMESTAMPTZ;
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS compressed_columns JSONB;
 
 CREATE OR REPLACE FUNCTION deltax.deltax_reject_compressed_partition_dml()
 RETURNS trigger

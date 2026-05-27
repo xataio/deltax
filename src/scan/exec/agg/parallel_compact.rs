@@ -394,6 +394,11 @@ pub(super) struct ParallelCompactConfig<'a> {
     pub(super) col_names: &'a [String],
     pub(super) col_types: &'a [pg_sys::Oid],
     pub(super) segment_by: &'a [String],
+    /// Persisted `_col_idx` map (see `MetadataInfo.blob_idx`).
+    pub(super) blob_idx: &'a [Option<u16>],
+    /// Pre-computed missing-value datums for columns added after this
+    /// partition was compressed (see `MetadataInfo.missing_values`).
+    pub(super) missing_values: &'a [Option<(pg_sys::Datum, bool)>],
     pub(super) needed_cols: &'a [bool],
     pub(super) batch_quals: &'a [BatchQual],
     pub(super) seg_filters: &'a [(usize, String)],
@@ -403,6 +408,15 @@ pub(super) struct ParallelCompactConfig<'a> {
     /// (sort_slot, k, ascending)
     pub(super) topn_spec: Option<(usize, usize, bool)>,
 }
+
+// SAFETY: ParallelCompactConfig holds a `&[Option<(Datum, bool)>]` for
+// missing-value synthesis. The `Datum` may point into a relcache-pinned
+// tupdesc (for pass-by-reference defaults) or be self-contained (for
+// pass-by-value). Workers only read these values during the agg scope,
+// which is bounded by `thread::scope` — the relcache entry stays
+// pinned for the whole query, so the pointer is valid. No worker writes.
+unsafe impl Send for ParallelCompactConfig<'_> {}
+unsafe impl Sync for ParallelCompactConfig<'_> {}
 
 /// Result of parallel compact aggregation from one worker thread.
 pub(crate) struct ParallelCompactResult {
@@ -483,12 +497,7 @@ pub(super) fn process_segments_compact(
         }
 
         // Dictionary-based LIKE pruning
-        if segment_skippable_by_dict(
-            config.batch_quals,
-            config.col_names,
-            config.segment_by,
-            &seg.compressed_blobs,
-        ) {
+        if segment_skippable_by_dict(config.batch_quals, config.blob_idx, &seg.compressed_blobs) {
             continue;
         }
 
@@ -512,26 +521,30 @@ pub(super) fn process_segments_compact(
 
         segments_processed += 1;
 
-        // Decompress needed columns (pure Rust, no PG calls)
+        // Decompress needed columns (pure Rust, no PG calls). For each
+        // logical column, consult `config.blob_idx` (the persisted
+        // `_col_idx` map): `Some(slot)` → read from
+        // `compressed_blobs[slot]`; `None` AND segment_by → take the
+        // per-segment value from `_meta`; `None` AND not-segment_by →
+        // column was added after this partition was compressed, so
+        // synthesize from `config.missing_values[col_idx]`.
         let t_dec = Instant::now();
         let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
-        let mut blob_idx = 0;
         let mut seg_val_idx = 0;
 
         for (col_idx, col_name) in config.col_names.iter().enumerate() {
             let type_oid = config.col_types[col_idx];
+            let is_segment_by = config.segment_by.contains(col_name);
 
             if !config.needed_cols[col_idx] {
-                if config.segment_by.contains(col_name) {
+                if is_segment_by {
                     seg_val_idx += 1;
-                } else {
-                    blob_idx += 1;
                 }
                 decompressed.push(Vec::new());
                 continue;
             }
 
-            if config.segment_by.contains(col_name) {
+            if is_segment_by {
                 // Parse segment_by string to integer datum directly (no PG calls)
                 let val = &seg.segment_values[seg_val_idx];
                 let (datum, is_null) = match val {
@@ -545,10 +558,22 @@ pub(super) fn process_segments_compact(
                     (0..seg.row_count).map(|_| (datum, is_null)).collect();
                 decompressed.push(repeated);
                 seg_val_idx += 1;
-            } else {
-                let blob = &seg.compressed_blobs[blob_idx];
+            } else if let Some(slot) = config.blob_idx[col_idx] {
+                let blob = &seg.compressed_blobs[slot as usize];
                 decompressed.push(decompress_numeric_blob(blob, type_oid));
-                blob_idx += 1;
+            } else {
+                // Column added to the parent after this partition was
+                // compressed — no blob exists. Synthesize the missing
+                // value (one constant Datum per row).
+                let (datum, is_null) = config
+                    .missing_values
+                    .get(col_idx)
+                    .copied()
+                    .flatten()
+                    .unwrap_or((pg_sys::Datum::from(0usize), true));
+                let repeated: Vec<(pg_sys::Datum, bool)> =
+                    (0..seg.row_count).map(|_| (datum, is_null)).collect();
+                decompressed.push(repeated);
             }
         }
         decompress_us += t_dec.elapsed().as_micros() as u64;
@@ -2428,6 +2453,8 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
             col_names: &meta.col_names,
             col_types: &meta.col_types,
             segment_by: &meta.segment_by,
+            blob_idx: &meta.blob_idx,
+            missing_values: &meta.missing_values,
             needed_cols,
             batch_quals,
             seg_filters,

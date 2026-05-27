@@ -111,6 +111,7 @@ pub(super) unsafe fn build_agg_exec_context_from_plan(plan: ParsedAggPlan) -> Ag
                 &meta.col_types,
                 &meta.col_not_null,
                 /* needed_minmax_cols */ &[],
+                &meta.blob_idx,
                 /* skip_text */ false,
             );
             all_segments.extend(segs);

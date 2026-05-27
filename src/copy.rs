@@ -268,6 +268,62 @@ unsafe extern "C-unwind" fn deltax_process_utility(
         // Fall through to chain so PG executes the (now-filtered) stmt.
     }
 
+    // Intercept DDL targeting pg_deltax-managed tables (see
+    // `src/ddl.rs` and `dev/docs/SCHEMA_CHANGES.md`): classify ALTER
+    // subcommands into Tier 1 (transparent, with optional catalog
+    // bookkeeping after PG runs the statement), Tier 2 (DROP COLUMN —
+    // pass-through with descriptor tombstone), or Tier 3 (block before
+    // PG executes).
+    if !utility_stmt.is_null() {
+        let disposition = unsafe {
+            if pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_AlterTableStmt) {
+                Some(crate::ddl::handle_alter_table(
+                    utility_stmt as *mut pg_sys::AlterTableStmt,
+                ))
+            } else if pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_RenameStmt) {
+                Some(crate::ddl::handle_rename(
+                    utility_stmt as *mut pg_sys::RenameStmt,
+                ))
+            } else if pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_AlterObjectSchemaStmt) {
+                Some(crate::ddl::handle_alter_object_schema(
+                    utility_stmt as *mut pg_sys::AlterObjectSchemaStmt,
+                ))
+            } else if pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_GrantStmt) {
+                Some(crate::ddl::handle_grant(
+                    utility_stmt as *mut pg_sys::GrantStmt,
+                ))
+            } else {
+                None
+            }
+        };
+
+        match disposition {
+            None | Some(crate::ddl::AlterDisposition::NotOurTable) => {}
+            Some(crate::ddl::AlterDisposition::Tier3 { op_name, table }) => {
+                crate::ddl::raise_tier3(op_name, &table);
+            }
+            Some(crate::ddl::AlterDisposition::Tier1 { post_actions }) => {
+                unsafe {
+                    chain_to_prev(
+                        pstmt,
+                        query_string,
+                        read_only_tree,
+                        context,
+                        params,
+                        query_env,
+                        dest,
+                        qc,
+                    );
+                }
+                crate::ddl::apply_post_actions(post_actions);
+                if restore_stats_after_vacuum {
+                    restore_compressed_partition_stats();
+                }
+                return;
+            }
+        }
+    }
+
     if utility_stmt.is_null() || !unsafe { pgrx::is_a(utility_stmt, pg_sys::NodeTag::T_CopyStmt) } {
         unsafe {
             chain_to_prev(
@@ -2862,6 +2918,26 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
             columns,
         )
         .expect("failed to update partition column_minmax");
+
+        // Snapshot the physical-column shape so a later ADD COLUMN on the
+        // parent doesn't desync this partition's blobs. See
+        // dev/docs/SCHEMA_CHANGES.md.
+        let partition_row =
+            catalog::get_partition_by_name(client, &buf.partition_schema, &buf.partition_table)
+                .expect("failed to query partition for compressed_columns snapshot")
+                .expect("partition row missing during finalize");
+        let deltatable = catalog::get_deltatable_by_id(client, partition_row.deltatable_id)
+            .expect("failed to query deltatable for compressed_columns snapshot")
+            .expect("deltatable row missing during finalize");
+        let cc_json = catalog::snapshot_compressed_columns(
+            client,
+            &deltatable.schema_name,
+            &deltatable.table_name,
+            &deltatable.segment_by,
+        )
+        .expect("failed to snapshot compressed_columns");
+        catalog::update_partition_compressed_columns(client, partition_id, &cc_json)
+            .expect("failed to update partition compressed_columns");
     });
 }
 

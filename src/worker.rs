@@ -217,12 +217,16 @@ pub(crate) fn drain_default_partition(
     let parent = partition::fqn(&ht.schema_name, &ht.table_name);
 
     // Detach default first — PG won't allow creating a partition whose
-    // range overlaps with rows already sitting in the default.
-    client.update(
-        &format!("ALTER TABLE {} DETACH PARTITION {}", parent, fq_default),
-        None,
-        &[],
-    )?;
+    // range overlaps with rows already sitting in the default. The
+    // bypass is needed so our own partition-rotation DDL isn't blocked
+    // by the ALTER policy hook (see `src/ddl.rs`).
+    crate::ddl::with_bypass(|| {
+        client.update(
+            &format!("ALTER TABLE {} DETACH PARTITION {}", parent, fq_default),
+            None,
+            &[],
+        )
+    })?;
 
     for &boundary_usec in &boundaries {
         let end_usec = boundary_usec + interval_usec;
@@ -256,14 +260,16 @@ pub(crate) fn drain_default_partition(
         &[],
     )?;
     client.update(&format!("TRUNCATE {}", fq_default), None, &[])?;
-    client.update(
-        &format!(
-            "ALTER TABLE {} ATTACH PARTITION {} DEFAULT",
-            parent, fq_default
-        ),
-        None,
-        &[],
-    )?;
+    crate::ddl::with_bypass(|| {
+        client.update(
+            &format!(
+                "ALTER TABLE {} ATTACH PARTITION {} DEFAULT",
+                parent, fq_default
+            ),
+            None,
+            &[],
+        )
+    })?;
 
     Ok(DrainResult {
         rows_moved: row_count,

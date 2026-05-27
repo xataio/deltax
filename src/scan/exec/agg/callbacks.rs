@@ -465,6 +465,7 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                     &meta.col_types,
                     &meta.col_not_null,
                     &needed_minmax_cols,
+                    &meta.blob_idx,
                     false,
                 );
                 all_segments.extend(segs);
@@ -749,6 +750,7 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 &meta.col_types,
                 &meta.col_not_null,
                 &needed_minmax_cols,
+                &meta.blob_idx,
                 false,
             );
             // Load text-length sidecars for the columns in sidecar-only mode.
@@ -756,8 +758,8 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 let sidecar_detoast_us = load_text_length_sidecars(
                     oid,
                     &meta.col_names,
-                    &meta.segment_by,
                     &sidecar_only_cols,
+                    &meta.blob_idx,
                     &mut segs,
                 );
                 total_detoast_us += sidecar_detoast_us;
@@ -1191,6 +1193,8 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
                 col_names: &ctx.meta.col_names,
                 col_types: &ctx.meta.col_types,
                 segment_by: &ctx.meta.segment_by,
+                blob_idx: &ctx.meta.blob_idx,
+                missing_values: &ctx.meta.missing_values,
                 needed_cols: &ctx.needed_cols,
                 batch_quals: &ctx.batch_quals,
                 seg_filters: &ctx.seg_filters,
@@ -1408,6 +1412,8 @@ unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
                 col_names: &ctx.meta.col_names,
                 col_types: &ctx.meta.col_types,
                 segment_by: &ctx.meta.segment_by,
+                blob_idx: &ctx.meta.blob_idx,
+                missing_values: &ctx.meta.missing_values,
                 needed_cols: &ctx.needed_cols,
                 batch_quals: &ctx.batch_quals,
                 seg_filters: &ctx.seg_filters,
@@ -1516,6 +1522,8 @@ unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
                 col_names: &ctx.meta.col_names,
                 col_types: &ctx.meta.col_types,
                 segment_by: &ctx.meta.segment_by,
+                blob_idx: &ctx.meta.blob_idx,
+                missing_values: &ctx.meta.missing_values,
                 needed_cols: &ctx.needed_cols,
                 batch_quals: &ctx.batch_quals,
                 seg_filters: &ctx.seg_filters,

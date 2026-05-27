@@ -35,6 +35,18 @@ pub(crate) struct DecompressState {
     col_typmods: Vec<i32>,
     /// Segment-by column names.
     segment_by: Vec<String>,
+    /// Parallel to `col_names`. `Some(i)` = read from `_blobs[_col_idx=i]`.
+    /// `None` = segment_by (lives in `_meta`) OR column was added to the
+    /// parent after this partition was compressed (decompress synthesizes
+    /// the value via `missing_values`). Copied verbatim from
+    /// `MetadataInfo.blob_idx`. See `dev/docs/SCHEMA_CHANGES.md`.
+    blob_idx: Vec<Option<u16>>,
+    /// Parallel to `col_names`. `Some((datum, is_null))` = pre-computed
+    /// missing value (from `pg_attribute.attmissingval`) for a column that
+    /// was added to the parent after this partition was compressed. `None`
+    /// = either the column has a blob (use `current_segment`) or the
+    /// column is segment_by (use `current_segment` populated from `_meta`).
+    missing_values: Vec<Option<(pg_sys::Datum, bool)>>,
     /// Decompressed datums for the current segment: outer = column, inner = row.
     /// Each element is (datum, is_null).
     current_segment: Vec<Vec<(pg_sys::Datum, bool)>>,
@@ -635,6 +647,8 @@ fn make_worker_stub_state() -> DecompressState {
         col_types: Vec::new(),
         col_typmods: Vec::new(),
         segment_by: Vec::new(),
+        blob_idx: Vec::new(),
+        missing_values: Vec::new(),
         current_segment: Vec::new(),
         current_row_count: 0,
         row_cursor: 0,
@@ -826,6 +840,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
                     &meta.col_types,
                     &meta.col_not_null,
                     &[],
+                    &meta.blob_idx,
                     skip_blob_load,
                 );
             for s in &mut segs {
@@ -880,6 +895,8 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             col_types: meta.col_types,
             col_typmods: meta.col_typmods,
             segment_by: meta.segment_by,
+            blob_idx: meta.blob_idx,
+            missing_values: meta.missing_values,
             current_segment: Vec::new(),
             current_row_count: 0,
             row_cursor: 0,
@@ -1050,6 +1067,7 @@ fn load_decompress_state(
             &meta.col_types,
             &meta.col_not_null,
             &[],
+            &meta.blob_idx,
             false,
         )
     };
@@ -1077,6 +1095,8 @@ fn load_decompress_state(
         col_types: meta.col_types,
         col_typmods: meta.col_typmods,
         segment_by: meta.segment_by,
+        blob_idx: meta.blob_idx,
+        missing_values: meta.missing_values,
         current_segment: Vec::new(),
         current_row_count: 0,
         row_cursor: 0,
@@ -1497,12 +1517,8 @@ unsafe fn exec_topn_two_pass(
             let seg = &state.segments_data[seg_idx];
 
             // Dictionary-based LIKE pruning
-            if segment_skippable_by_dict(
-                &state.batch_quals,
-                &state.col_names,
-                &state.segment_by,
-                &seg.compressed_blobs,
-            ) {
+            if segment_skippable_by_dict(&state.batch_quals, &state.blob_idx, &seg.compressed_blobs)
+            {
                 state.timing.segments_skipped += 1;
                 continue;
             }
@@ -1586,13 +1602,30 @@ unsafe fn exec_topn_two_pass(
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
                 let type_oid = state.col_types[col_idx];
 
+                let is_missing_from_blob =
+                    state.blob_idx[col_idx].is_none() && !state.segment_by.contains(col_name);
+
                 if !state.needed_cols[col_idx] && col_idx != sort_col {
                     if state.segment_by.contains(col_name) {
                         seg_val_idx += 1;
-                    } else {
+                    } else if !is_missing_from_blob {
                         blob_idx += 1;
                     }
                     decompressed.push(Vec::new());
+                    continue;
+                }
+
+                if is_missing_from_blob {
+                    let (datum, is_null) = state
+                        .missing_values
+                        .get(col_idx)
+                        .copied()
+                        .flatten()
+                        .unwrap_or((pg_sys::Datum::from(0), true));
+                    let repeat_count = cutoff_row.unwrap_or(seg.row_count as usize);
+                    let repeated: Vec<(pg_sys::Datum, bool)> =
+                        (0..repeat_count).map(|_| (datum, is_null)).collect();
+                    decompressed.push(repeated);
                     continue;
                 }
 
@@ -1967,13 +2000,29 @@ unsafe fn exec_topn_two_pass(
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
                 let type_oid = state.col_types[col_idx];
 
+                let is_missing_from_blob =
+                    state.blob_idx[col_idx].is_none() && !state.segment_by.contains(col_name);
+
                 if !state.needed_cols[col_idx] {
                     if state.segment_by.contains(col_name) {
                         seg_val_idx += 1;
-                    } else {
+                    } else if !is_missing_from_blob {
                         blob_idx += 1;
                     }
                     decompressed.push(Vec::new());
+                    continue;
+                }
+
+                if is_missing_from_blob {
+                    let (datum, is_null) = state
+                        .missing_values
+                        .get(col_idx)
+                        .copied()
+                        .flatten()
+                        .unwrap_or((pg_sys::Datum::from(0), true));
+                    let repeated: Vec<(pg_sys::Datum, bool)> =
+                        (0..seg.row_count).map(|_| (datum, is_null)).collect();
+                    decompressed.push(repeated);
                     continue;
                 }
 
@@ -2479,8 +2528,7 @@ unsafe fn exec_topn_text(
             // Dictionary-based pruning (reads compressed blobs, no PG calls)
             if segment_skippable_by_dict(
                 &state.batch_quals,
-                &state.col_names,
-                &state.segment_by,
+                &state.blob_idx,
                 &state.segments_data[seg_idx].compressed_blobs,
             ) {
                 state.timing.segments_skipped += 1;
@@ -2697,13 +2745,29 @@ unsafe fn exec_topn_text(
                 for (col_idx, col_name) in state.col_names.iter().enumerate() {
                     let type_oid = state.col_types[col_idx];
 
+                    let is_missing_from_blob =
+                        state.blob_idx[col_idx].is_none() && !state.segment_by.contains(col_name);
+
                     if !state.needed_cols[col_idx] {
                         if state.segment_by.contains(col_name) {
                             seg_val_idx += 1;
-                        } else {
+                        } else if !is_missing_from_blob {
                             blob_idx += 1;
                         }
                         decompressed.push(Vec::new());
+                        continue;
+                    }
+
+                    if is_missing_from_blob {
+                        let (datum, is_null) = state
+                            .missing_values
+                            .get(col_idx)
+                            .copied()
+                            .flatten()
+                            .unwrap_or((pg_sys::Datum::from(0), true));
+                        let repeated: Vec<(pg_sys::Datum, bool)> =
+                            (0..seg.row_count).map(|_| (datum, is_null)).collect();
+                        decompressed.push(repeated);
                         continue;
                     }
 
@@ -2846,13 +2910,29 @@ unsafe fn exec_topn_text_sequential(
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
                 let type_oid = state.col_types[col_idx];
 
+                let is_missing_from_blob =
+                    state.blob_idx[col_idx].is_none() && !state.segment_by.contains(col_name);
+
                 if !state.needed_cols[col_idx] && col_idx != sort_col {
                     if state.segment_by.contains(col_name) {
                         seg_val_idx += 1;
-                    } else {
+                    } else if !is_missing_from_blob {
                         blob_idx += 1;
                     }
                     decompressed.push(Vec::new());
+                    continue;
+                }
+
+                if is_missing_from_blob {
+                    let (datum, is_null) = state
+                        .missing_values
+                        .get(col_idx)
+                        .copied()
+                        .flatten()
+                        .unwrap_or((pg_sys::Datum::from(0), true));
+                    let repeated: Vec<(pg_sys::Datum, bool)> =
+                        (0..seg.row_count).map(|_| (datum, is_null)).collect();
+                    decompressed.push(repeated);
                     continue;
                 }
 
@@ -3154,13 +3234,29 @@ unsafe fn exec_topn_text_sequential(
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
                 let type_oid = state.col_types[col_idx];
 
+                let is_missing_from_blob =
+                    state.blob_idx[col_idx].is_none() && !state.segment_by.contains(col_name);
+
                 if !state.needed_cols[col_idx] {
                     if state.segment_by.contains(col_name) {
                         seg_val_idx += 1;
-                    } else {
+                    } else if !is_missing_from_blob {
                         blob_idx += 1;
                     }
                     decompressed.push(Vec::new());
+                    continue;
+                }
+
+                if is_missing_from_blob {
+                    let (datum, is_null) = state
+                        .missing_values
+                        .get(col_idx)
+                        .copied()
+                        .flatten()
+                        .unwrap_or((pg_sys::Datum::from(0), true));
+                    let repeated: Vec<(pg_sys::Datum, bool)> =
+                        (0..seg.row_count).map(|_| (datum, is_null)).collect();
+                    decompressed.push(repeated);
                     continue;
                 }
 
@@ -3547,20 +3643,16 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
                 state.segments_data[seg_idx].companion_oid,
                 state.segments_data[seg_idx].segment_id,
                 &state.col_names,
-                &state.segment_by,
                 &state.needed_cols,
+                &state.blob_idx,
                 &mut state.segments_data[seg_idx],
             );
             state.timing.heap_scan_us += fetch_us;
             let seg = &state.segments_data[seg_idx];
 
             // Dictionary-based LIKE pruning
-            if segment_skippable_by_dict(
-                &state.batch_quals,
-                &state.col_names,
-                &state.segment_by,
-                &seg.compressed_blobs,
-            ) {
+            if segment_skippable_by_dict(&state.batch_quals, &state.blob_idx, &seg.compressed_blobs)
+            {
                 state.timing.segments_skipped += 1;
                 continue;
             }
@@ -3589,11 +3681,23 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
             for (col_idx, col_name) in state.col_names.iter().enumerate() {
                 let type_oid = state.col_types[col_idx];
 
+                // Three category check via blob_idx + segment_by membership:
+                //   blob_idx[i] = None && segment_by → read from _meta
+                //   blob_idx[i] = None && !segment_by → missing-from-blob (added later)
+                //   blob_idx[i] = Some(_) → read from compressed_blobs[blob_idx counter]
+                // The local `blob_idx` counter is the position within
+                // `seg.compressed_blobs` (dense, per-blob-column), which is NOT
+                // the persisted `_col_idx` — it's just the index of the next
+                // blob to consume in this loop. Only incremented for columns
+                // that actually had a blob written at compression time.
+                let is_missing_from_blob =
+                    state.blob_idx[col_idx].is_none() && !state.segment_by.contains(col_name);
+
                 if !state.needed_cols[col_idx] {
                     // Column not needed — push null placeholders and advance index
                     if state.segment_by.contains(col_name) {
                         seg_val_idx += 1;
-                    } else {
+                    } else if !is_missing_from_blob {
                         blob_idx += 1;
                     }
                     decompressed.push(Vec::new());
@@ -3610,6 +3714,19 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
                         (0..seg.row_count).map(|_| (datum, is_null)).collect();
                     decompressed.push(repeated);
                     seg_val_idx += 1;
+                } else if is_missing_from_blob {
+                    // Column was added to the parent after this partition was
+                    // compressed — synthesize the default (or NULL) via the
+                    // pre-computed missing_values from getmissingattr.
+                    let (datum, is_null) = state
+                        .missing_values
+                        .get(col_idx)
+                        .copied()
+                        .flatten()
+                        .unwrap_or((pg_sys::Datum::from(0), true));
+                    let repeated: Vec<(pg_sys::Datum, bool)> =
+                        (0..seg.row_count).map(|_| (datum, is_null)).collect();
+                    decompressed.push(repeated);
                 } else {
                     let blob = &seg.compressed_blobs[blob_idx];
                     let typmod = state.col_typmods[col_idx];
@@ -4010,6 +4127,25 @@ pub(super) unsafe extern "C-unwind" fn init_worker_deltax_append(
         state.col_typmods = header.col_typmods;
         state.segment_by = header.segment_by;
         state._time_column = header.time_column;
+
+        // Recompute the positional blob_idx mapping (matches the legacy
+        // load_metadata path). Sessions 2/3 will plumb the persisted
+        // descriptor through the DSM wire so workers see exactly what the
+        // leader saw on ADD-COLUMN-after-compression cases.
+        state.blob_idx = state
+            .col_names
+            .iter()
+            .scan(0u16, |next, name| {
+                if state.segment_by.contains(name) {
+                    Some(None)
+                } else {
+                    let ci = *next;
+                    *next += 1;
+                    Some(Some(ci))
+                }
+            })
+            .collect();
+        state.missing_values = vec![None; state.col_names.len()];
 
         // Pre-decode every SegmentEntry into a process-local `SegmentData`.
         // Each decode is a small memcpy + a UTF-8 validation on segment_values,

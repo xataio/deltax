@@ -32,6 +32,13 @@ pub struct PartitionInfo {
     pub range_start: TimestampWithTimeZone,
     pub range_end: TimestampWithTimeZone,
     pub is_compressed: bool,
+    /// Snapshot of physical-column shape (attnum, name, type_oid, typmod,
+    /// is_segment_by, compressed_col_idx, dropped) at the moment this
+    /// partition was last compressed. `None` for partitions that were
+    /// compressed before this catalog column existed — the scan path falls
+    /// back to positional `pg_attribute` mapping in that case. See
+    /// `dev/docs/SCHEMA_CHANGES.md`.
+    pub compressed_columns: Option<serde_json::Value>,
 }
 
 /// Register a new deltatable in the catalog. Returns the new deltatable id.
@@ -225,7 +232,8 @@ pub fn get_partitions(
     deltatable_id: i32,
 ) -> spi::SpiResult<Vec<PartitionInfo>> {
     let result = client.select(
-        "SELECT id, deltatable_id, schema_name, table_name, range_start, range_end, is_compressed
+        "SELECT id, deltatable_id, schema_name, table_name, range_start, range_end,
+                is_compressed, compressed_columns
          FROM deltax.deltax_partition
          WHERE deltatable_id = $1
          ORDER BY range_start",
@@ -252,6 +260,10 @@ pub fn get_partitions(
                 .get_datum_by_ordinal(7)?
                 .value::<bool>()?
                 .unwrap_or(false),
+            compressed_columns: row
+                .get_datum_by_ordinal(8)?
+                .value::<pgrx::datum::JsonB>()?
+                .map(|j| j.0),
         });
     }
     Ok(partitions)
@@ -493,6 +505,288 @@ pub fn update_partition_column_minmax(
     Ok(())
 }
 
+/// Snapshot the current physical-column shape of the parent (deltatable) at
+/// compression time, returning JSON text suitable for
+/// `deltax_partition.compressed_columns`. One entry per non-dropped
+/// pg_attribute row in ascending attnum order. `compressed_col_idx` is
+/// assigned to non-`segment_by` columns starting at 0 — same order
+/// `scan::exec::segments` expects when indexing `_blobs`/`_colstats`/etc.
+/// Segment-by columns get `compressed_col_idx: null` (they live in `_meta`).
+pub fn snapshot_compressed_columns(
+    client: &SpiClient,
+    parent_schema: &str,
+    parent_table: &str,
+    segment_by: &[String],
+) -> spi::SpiResult<String> {
+    let result = client.select(
+        "SELECT a.attnum::int4, a.attname::text, a.atttypid::int8, a.atttypmod
+         FROM pg_attribute a
+         JOIN pg_class c ON c.oid = a.attrelid
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = $1 AND c.relname = $2
+           AND a.attnum > 0 AND NOT a.attisdropped
+         ORDER BY a.attnum",
+        None,
+        &[parent_schema.into(), parent_table.into()],
+    )?;
+
+    let segment_by_set: std::collections::HashSet<&str> =
+        segment_by.iter().map(|s| s.as_str()).collect();
+
+    let mut entries: Vec<String> = Vec::new();
+    let mut next_compressed_col_idx: i32 = 0;
+    for row in result {
+        let attnum: i32 = row.get_datum_by_ordinal(1)?.value::<i32>()?.unwrap();
+        let attname: String = row.get_datum_by_ordinal(2)?.value::<String>()?.unwrap();
+        let atttypid: i64 = row.get_datum_by_ordinal(3)?.value::<i64>()?.unwrap();
+        let atttypmod: i32 = row.get_datum_by_ordinal(4)?.value::<i32>()?.unwrap();
+
+        let is_segment_by = segment_by_set.contains(attname.as_str());
+        let compressed_col_idx_json = if is_segment_by {
+            "null".to_string()
+        } else {
+            let idx = next_compressed_col_idx;
+            next_compressed_col_idx += 1;
+            idx.to_string()
+        };
+
+        entries.push(format!(
+            "{{\"attnum\":{},\"name\":\"{}\",\"type_oid\":{},\"typmod\":{},\
+             \"is_segment_by\":{},\"compressed_col_idx\":{},\"dropped\":false}}",
+            attnum,
+            json_escape(&attname),
+            atttypid,
+            atttypmod,
+            is_segment_by,
+            compressed_col_idx_json,
+        ));
+    }
+
+    Ok(format!("[{}]", entries.join(",")))
+}
+
+/// Persist the compressed-columns descriptor for a partition. See
+/// `snapshot_compressed_columns` for the shape and rationale.
+pub fn update_partition_compressed_columns(
+    client: &mut SpiClient,
+    partition_id: i32,
+    json: &str,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_partition SET compressed_columns = $1::jsonb WHERE id = $2",
+        None,
+        &[json.into(), partition_id.into()],
+    )?;
+    Ok(())
+}
+
+/// Mirror a `RENAME COLUMN old TO new` into the deltax catalog. Updates
+/// `deltax_deltatable.time_column` (when it equals `old`), replaces `old`
+/// inside the `segment_by` / `order_by` arrays, and rewrites the JSONB
+/// keys in every child partition's `column_ndistinct` / `column_valmap`,
+/// plus the `name` field inside each entry of `compressed_columns`.
+/// The ALTER policy hook blocks renames of any column referenced by
+/// segment_by / order_by / time_column today, so the array/scalar
+/// updates here are defensive — they only fire after a future hook
+/// change that lifts that restriction.
+pub fn rename_column_in_deltatable(
+    client: &mut SpiClient,
+    deltatable_id: i32,
+    old: &str,
+    new: &str,
+) -> spi::SpiResult<()> {
+    if old == new {
+        return Ok(());
+    }
+    // Update deltatable scalar + array references in one statement.
+    client.update(
+        "UPDATE deltax.deltax_deltatable
+         SET time_column = CASE WHEN time_column = $2 THEN $3 ELSE time_column END,
+             segment_by  = COALESCE(
+                 array(SELECT CASE WHEN x = $2 THEN $3 ELSE x END FROM unnest(segment_by) AS x),
+                 segment_by
+             ),
+             order_by    = COALESCE(
+                 array(SELECT CASE WHEN x = $2 THEN $3 ELSE x END FROM unnest(order_by) AS x),
+                 order_by
+             )
+         WHERE id = $1",
+        None,
+        &[deltatable_id.into(), old.into(), new.into()],
+    )?;
+
+    // Rewrite the keys of column_ndistinct and column_valmap JSONB
+    // objects in every child partition. Use a CTE that re-keys with
+    // jsonb_object_agg.
+    client.update(
+        "UPDATE deltax.deltax_partition
+         SET column_ndistinct = CASE
+             WHEN column_ndistinct ? $2 THEN
+                 (SELECT jsonb_object_agg(
+                     CASE WHEN key = $2 THEN $3 ELSE key END,
+                     value
+                 ) FROM jsonb_each(column_ndistinct))
+             ELSE column_ndistinct
+         END,
+         column_valmap = CASE
+             WHEN column_valmap ? $2 THEN
+                 (SELECT jsonb_object_agg(
+                     CASE WHEN key = $2 THEN $3 ELSE key END,
+                     value
+                 ) FROM jsonb_each(column_valmap))
+             ELSE column_valmap
+         END
+         WHERE deltatable_id = $1",
+        None,
+        &[deltatable_id.into(), old.into(), new.into()],
+    )?;
+
+    // Rewrite the `name` field inside each entry of compressed_columns.
+    // The descriptor is a JSONB array of objects; jsonb_set on each
+    // matching entry via jsonb_path expressions is awkward, so unnest +
+    // re-aggregate with jsonb_agg.
+    client.update(
+        "UPDATE deltax.deltax_partition
+         SET compressed_columns = (
+             SELECT jsonb_agg(
+                 CASE WHEN elem ->> 'name' = $2
+                      THEN jsonb_set(elem, '{name}', to_jsonb($3::text))
+                      ELSE elem
+                 END
+                 ORDER BY ord
+             )
+             FROM jsonb_array_elements(compressed_columns) WITH ORDINALITY AS t(elem, ord)
+         )
+         WHERE deltatable_id = $1
+           AND compressed_columns IS NOT NULL
+           AND compressed_columns @> jsonb_build_array(jsonb_build_object('name', $2::text))",
+        None,
+        &[deltatable_id.into(), old.into(), new.into()],
+    )?;
+
+    Ok(())
+}
+
+/// Mirror a `RENAME TO new` into the deltax catalog. Updates
+/// `deltax_deltatable.table_name`. Partition table names in PG don't
+/// auto-rename when the parent renames, so child `deltax_partition.table_name`
+/// rows keep their existing values — `<parent>_pYYYYMMDD` no longer
+/// matches the renamed parent, which is fine because partition rows are
+/// keyed by `id` everywhere except metadata-display contexts.
+pub fn rename_deltatable(
+    client: &mut SpiClient,
+    deltatable_id: i32,
+    new: &str,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_deltatable SET table_name = $2 WHERE id = $1",
+        None,
+        &[deltatable_id.into(), new.into()],
+    )?;
+    Ok(())
+}
+
+/// Return the fully-qualified names of every companion table that
+/// exists for any partition of the given deltatable. Looks them up by
+/// scanning `pg_class` in the `_deltax_compressed` schema and matching
+/// on the partition-name prefix recorded in `deltax_partition`. Used
+/// by the ALTER policy hook to cascade `OWNER TO` and `GRANT`/`REVOKE`
+/// from the parent deltatable onto its companions (otherwise the
+/// companions stay owned by / accessible to whoever created the
+/// extension).
+pub fn compressed_companion_tables(
+    client: &SpiClient,
+    deltatable_id: i32,
+) -> spi::SpiResult<Vec<String>> {
+    let result = client.select(
+        "SELECT n.nspname::text || '.' || quote_ident(c.relname)
+         FROM pg_class c
+         JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = '_deltax_compressed'
+           AND c.relkind IN ('r', 't')
+           AND EXISTS (
+               SELECT 1 FROM deltax.deltax_partition p
+               WHERE p.deltatable_id = $1
+                 AND (
+                     c.relname = p.table_name || '_meta'
+                     OR c.relname = p.table_name || '_colstats'
+                     OR c.relname = p.table_name || '_blobs'
+                     OR c.relname = p.table_name || '_blooms'
+                     OR c.relname = p.table_name || '_text_lengths'
+                     OR c.relname = p.table_name || '_valbitmap'
+                 )
+           )",
+        None,
+        &[deltatable_id.into()],
+    )?;
+    let mut names = Vec::new();
+    for row in result {
+        let fqn: String = row.get_datum_by_ordinal(1)?.value::<String>()?.unwrap();
+        names.push(fqn);
+    }
+    Ok(names)
+}
+
+/// Mirror a Tier 2 `DROP COLUMN col` into every child partition's
+/// `compressed_columns` descriptor by flipping `dropped: true` on the
+/// matching entry. Orphan rows in `_blobs` / `_colstats` / `_blooms` /
+/// `_text_lengths` / `_valbitmap` keyed by that descriptor's
+/// `compressed_col_idx` are left as dead weight until the partition is
+/// recompressed (see `dev/docs/SCHEMA_CHANGES.md` Future Work — GC).
+///
+/// Note: the partition table's `pg_attribute` has already been updated
+/// by PG by the time this runs (this is a post-success PostAction), so
+/// the descriptor and current schema disagree only in the JSON `dropped`
+/// flag. `scan::exec::segments::load_metadata` already filters
+/// `NOT a.attisdropped` in its `pg_attribute` SPI query, so a dropped
+/// column never appears in `col_names`; `entry.dropped` is consulted
+/// only on the unusual flow where a column is dropped then re-added
+/// under the same name (PG assigns a new `attnum`, and the scan path
+/// then synthesizes via `getmissingattr` for the new attnum).
+pub fn tombstone_column_in_descriptor(
+    client: &mut SpiClient,
+    deltatable_id: i32,
+    column_name: &str,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_partition
+         SET compressed_columns = (
+             SELECT jsonb_agg(
+                 CASE WHEN elem ->> 'name' = $2
+                      THEN jsonb_set(elem, '{dropped}', 'true'::jsonb)
+                      ELSE elem
+                 END
+                 ORDER BY ord
+             )
+             FROM jsonb_array_elements(compressed_columns) WITH ORDINALITY AS t(elem, ord)
+         )
+         WHERE deltatable_id = $1
+           AND compressed_columns IS NOT NULL
+           AND compressed_columns @> jsonb_build_array(jsonb_build_object('name', $2::text))",
+        None,
+        &[deltatable_id.into(), column_name.into()],
+    )?;
+    Ok(())
+}
+
+/// Mirror a `SET SCHEMA new` into the deltax catalog. Updates only the
+/// deltatable's `schema_name` — PG does NOT move partitions when the
+/// parent's schema changes (each partition stays in its original
+/// schema), so `deltax_partition.schema_name` rows are left alone.
+/// Companion tables in `_deltax_compressed` likewise stay put.
+pub fn set_deltatable_schema(
+    client: &mut SpiClient,
+    deltatable_id: i32,
+    new: &str,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_deltatable SET schema_name = $2 WHERE id = $1",
+        None,
+        &[deltatable_id.into(), new.into()],
+    )?;
+    Ok(())
+}
+
 /// Escape a string for inclusion in a JSON string literal. Handles all
 /// JSON-mandatory escapes (`"`, `\\`, control chars 0x00–0x1F). Used by the
 /// hand-rolled JSON writers above; we don't pull in a full JSON crate just
@@ -644,7 +938,8 @@ pub fn get_partition_by_name(
     table_name: &str,
 ) -> spi::SpiResult<Option<PartitionInfo>> {
     let mut result = client.select(
-        "SELECT id, deltatable_id, schema_name, table_name, range_start, range_end, is_compressed
+        "SELECT id, deltatable_id, schema_name, table_name, range_start, range_end,
+                is_compressed, compressed_columns
          FROM deltax.deltax_partition
          WHERE schema_name = $1 AND table_name = $2",
         None,
@@ -669,6 +964,10 @@ pub fn get_partition_by_name(
                 .get_datum_by_ordinal(7)?
                 .value::<bool>()?
                 .unwrap_or(false),
+            compressed_columns: row
+                .get_datum_by_ordinal(8)?
+                .value::<pgrx::datum::JsonB>()?
+                .map(|j| j.0),
         }));
     }
 
