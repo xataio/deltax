@@ -1,6 +1,7 @@
 use pgrx::pg_sys;
+use pgrx::pg_guard;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use super::batch_qual::{BatchCompareOp, BatchQual, LikeStrategy, sql_like_match};
@@ -948,6 +949,7 @@ unsafe impl Send for SegmentData {}
 unsafe impl Sync for SegmentData {}
 
 /// Metadata returned by the SPI metadata query.
+#[derive(Clone)]
 pub(super) struct MetadataInfo {
     pub(super) col_names: Vec<String>,
     pub(super) col_types: Vec<pg_sys::Oid>,
@@ -956,6 +958,72 @@ pub(super) struct MetadataInfo {
     pub(super) segment_by: Vec<String>,
     pub(super) order_by: Vec<String>,
     pub(super) time_column: String,
+}
+
+thread_local! {
+    /// Backend-local cache: companion (`_meta`) table OID → MetadataInfo.
+    /// Populated lazily by `load_metadata_cached`. Cleared wholesale on any
+    /// relcache invalidation (see `metadata_relcache_callback`).
+    static METADATA_CACHE: RefCell<HashMap<pg_sys::Oid, MetadataInfo>> =
+        RefCell::new(HashMap::new());
+    /// Tracks whether we've registered the relcache callback yet in this
+    /// backend. PG's `CacheRegisterRelcacheCallback` is one-shot — register
+    /// once on the first cache miss.
+    static METADATA_CB_REGISTERED: Cell<bool> = const { Cell::new(false) };
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn metadata_relcache_callback(
+    _arg: pg_sys::Datum,
+    _relid: pg_sys::Oid,
+) {
+    // Conservative: wipe the whole cache on any relcache invalidation.
+    // The cache is tiny (≤ #partitions per backend) so re-populating is cheap,
+    // and this avoids tracking dependencies between MetadataInfo entries and
+    // every catalog row they read (parent table pg_attribute, deltax catalog).
+    METADATA_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+fn ensure_metadata_callback_registered() {
+    METADATA_CB_REGISTERED.with(|c| {
+        if !c.get() {
+            unsafe {
+                pg_sys::CacheRegisterRelcacheCallback(
+                    Some(metadata_relcache_callback),
+                    pg_sys::Datum::from(0u32),
+                );
+            }
+            c.set(true);
+        }
+    });
+}
+
+/// Cached variant of `load_metadata` keyed on the companion (`_meta`) table
+/// OID. On miss, derives the companion name and runs the SPI queries; on
+/// hit, returns a clone of the cached `MetadataInfo` (which all 5 executor
+/// call sites consume by value).
+pub(super) fn load_metadata_cached(companion_oid: pg_sys::Oid) -> MetadataInfo {
+    if let Some(cached) =
+        METADATA_CACHE.with(|c| c.borrow().get(&companion_oid).cloned())
+    {
+        return cached;
+    }
+    ensure_metadata_callback_registered();
+    let companion_name = unsafe {
+        let name_ptr = pg_sys::get_rel_name(companion_oid);
+        if name_ptr.is_null() {
+            pgrx::error!(
+                "pg_deltax: companion table not found for OID {}",
+                u32::from(companion_oid)
+            );
+        }
+        std::ffi::CStr::from_ptr(name_ptr)
+            .to_string_lossy()
+            .into_owned()
+    };
+    let meta = pgrx::Spi::connect(|client| load_metadata(client, &companion_name));
+    METADATA_CACHE.with(|c| c.borrow_mut().insert(companion_oid, meta.clone()));
+    meta
 }
 
 /// Load metadata (column names, types, segment_by) from catalog via SPI.

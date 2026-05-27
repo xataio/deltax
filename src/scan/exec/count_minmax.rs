@@ -1,11 +1,10 @@
 use pgrx::pg_guard;
 use pgrx::pg_sys;
-use pgrx::prelude::*;
 
 use std::time::Instant;
 
 use super::datum_utils::compare_datums;
-use super::segments::{ScanBufferStats, load_metadata, load_segments_heap};
+use super::segments::{ScanBufferStats, load_segments_heap};
 use super::{DELTAX_COUNT_EXEC_METHODS, DELTAX_MINMAX_EXEC_METHODS};
 use crate::compress::{decode_i64_to_f32, decode_i64_to_f64};
 
@@ -51,24 +50,6 @@ unsafe fn parse_trailing_qual_bytes(custom_private: *mut pg_sys::List, idx: i32)
             bytes.push(pg_sys::list_nth_int(custom_private, idx + 1 + off) as u8);
         }
         bytes
-    }
-}
-
-/// Look up a relation name by OID. Used by Begin* callbacks that derive
-/// the table-name for `load_metadata`. Errors out if PG returns NULL
-/// (relation dropped between planning and execution).
-unsafe fn relation_name_or_error(oid: pg_sys::Oid) -> String {
-    unsafe {
-        let name_ptr = pg_sys::get_rel_name(oid);
-        if name_ptr.is_null() {
-            pgrx::error!(
-                "pg_deltax: companion table not found for OID {}",
-                u32::from(oid)
-            );
-        }
-        std::ffi::CStr::from_ptr(name_ptr)
-            .to_string_lossy()
-            .into_owned()
     }
 }
 
@@ -204,10 +185,8 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
             }
         } else {
             // Fallback path: scan meta tables to sum per-segment row counts.
-            let first_name = relation_name_or_error(companion_oids[0]);
-
             let t_meta = Instant::now();
-            let meta = Spi::connect(|client| load_metadata(client, &first_name));
+            let meta = super::segments::load_metadata_cached(companion_oids[0]);
             let metadata_us = t_meta.elapsed().as_micros() as u64;
 
             let num_cols = meta.col_names.len();
@@ -404,12 +383,9 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
         }
         let qual_bytes = parse_trailing_qual_bytes(custom_private, idx);
 
-        // Get first companion table name for metadata
-        let first_name = relation_name_or_error(companion_oids[0]);
-
-        // Load metadata via SPI from first companion table
+        // Load metadata for first companion table (cached per-backend).
         let t0 = Instant::now();
-        let meta = Spi::connect(|client| load_metadata(client, &first_name));
+        let meta = super::segments::load_metadata_cached(companion_oids[0]);
         let metadata_us = t0.elapsed().as_micros() as u64;
 
         // Resolve varattno → column name for MIN/MAX/SUM/COUNT(col) specs.

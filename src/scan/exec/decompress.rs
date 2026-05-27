@@ -1,6 +1,5 @@
 use pgrx::pg_guard;
 use pgrx::pg_sys;
-use pgrx::prelude::*;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,7 +17,7 @@ use super::datum_utils::{
 };
 use super::segments::{
     SegmentData, detoast_lazy_blobs, detoast_lazy_blobs_selective, extract_segment_filters,
-    fetch_segment_blobs, load_metadata, load_segments_heap, segment_skippable_by_dict,
+    fetch_segment_blobs, load_segments_heap, segment_skippable_by_dict,
 };
 use super::text_col::{
     TextQualInfo, apply_text_eq_filter, apply_text_in_filter, apply_text_like_filter,
@@ -545,26 +544,11 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
             None => (0i64, true, false, false, 0i32),
         };
 
-        // Get companion table name
-        let companion_name = {
-            let name_ptr = pg_sys::get_rel_name(companion_oid);
-            if name_ptr.is_null() {
-                pgrx::error!(
-                    "pg_deltax: companion table not found for OID {}",
-                    u32::from(companion_oid)
-                );
-            }
-            std::ffi::CStr::from_ptr(name_ptr)
-                .to_string_lossy()
-                .into_owned()
-        };
-
-        // Load metadata via SPI, then load segment data via direct heap scan
+        // Load metadata (cached), then load segment data via direct heap scan
         // (plan_qual is passed so batch qual columns are included in needed_cols)
         let plan_qual = (*(*node).ss.ps.plan).qual;
         let mut state = load_decompress_state(
             companion_oid,
-            &companion_name,
             &needed_indices,
             plan_qual,
             topn_limit,
@@ -737,23 +721,9 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             pgrx::error!("pg_deltax: DeltaXAppend has no companion tables");
         }
 
-        // Get first companion table name for metadata
-        let first_name = {
-            let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
-            if name_ptr.is_null() {
-                pgrx::error!(
-                    "pg_deltax: companion table not found for OID {}",
-                    u32::from(companion_oids[0])
-                );
-            }
-            std::ffi::CStr::from_ptr(name_ptr)
-                .to_string_lossy()
-                .into_owned()
-        };
-
-        // Load metadata via SPI from first companion table
+        // Load metadata for first companion table (cached per-backend).
         let t0 = Instant::now();
-        let meta = Spi::connect(|client| load_metadata(client, &first_name));
+        let meta = super::segments::load_metadata_cached(companion_oids[0]);
         let metadata_us = t0.elapsed().as_micros() as u64;
 
         // Extract batch quals early — we need to know which extra columns to load
@@ -983,14 +953,13 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
 /// unneeded columns get empty placeholder blobs to keep index mapping correct.
 fn load_decompress_state(
     companion_oid: pg_sys::Oid,
-    companion_name: &str,
     needed_indices: &[usize],
     plan_qual: *mut pg_sys::List,
     topn_limit: i64,
 ) -> DecompressState {
-    // Phase 1: SPI for metadata only (small, fast)
+    // Phase 1: metadata (cached per-backend; SPI on first miss only)
     let t0 = Instant::now();
-    let meta = Spi::connect(|client| load_metadata(client, companion_name));
+    let meta = super::segments::load_metadata_cached(companion_oid);
     let metadata_us = t0.elapsed().as_micros() as u64;
 
     // Extract batch quals early — we need to know which extra columns to load

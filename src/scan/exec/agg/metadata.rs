@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use pgrx::pg_sys;
-use pgrx::prelude::*;
 
 use super::super::batch_qual::{
     BatchCompareOp, BatchQual, apply_batch_filter_f32, apply_batch_filter_f64,
@@ -28,7 +27,6 @@ use super::super::batch_qual::{
 use super::super::datum_utils::{decompress_blob_to_datums, pg_type_name};
 use super::super::segments::{
     MetadataInfo, SegmentData, SegmentQualResult, classify_segment_quals, is_zero_const,
-    load_metadata,
 };
 use super::extract::decode_encoded_to_pg_i64;
 use super::state::{
@@ -740,27 +738,13 @@ pub(super) unsafe fn accumulate_segment_decompressed(
 pub(super) unsafe fn load_agg_metadata_from_plan(
     companion_oids: &[pg_sys::Oid],
 ) -> (MetadataInfo, u64) {
-    unsafe {
-        if companion_oids.is_empty() {
-            pgrx::error!("pg_deltax: load_agg_metadata_from_plan called with empty oids");
-        }
-        let first_name = {
-            let name_ptr = pg_sys::get_rel_name(companion_oids[0]);
-            if name_ptr.is_null() {
-                pgrx::error!(
-                    "pg_deltax: companion table not found for OID {}",
-                    u32::from(companion_oids[0])
-                );
-            }
-            std::ffi::CStr::from_ptr(name_ptr)
-                .to_string_lossy()
-                .into_owned()
-        };
-        let t0 = Instant::now();
-        let meta = Spi::connect(|client| load_metadata(client, &first_name));
-        let metadata_us = t0.elapsed().as_micros() as u64;
-        (meta, metadata_us)
+    if companion_oids.is_empty() {
+        pgrx::error!("pg_deltax: load_agg_metadata_from_plan called with empty oids");
     }
+    let t0 = Instant::now();
+    let meta = super::super::segments::load_metadata_cached(companion_oids[0]);
+    let metadata_us = t0.elapsed().as_micros() as u64;
+    (meta, metadata_us)
 }
 
 #[cfg(any(test, feature = "pg_test"))]
