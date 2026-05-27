@@ -793,7 +793,12 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
         };
         let skip_blob_load = topn_limit == 0;
 
-        // Load segments from ALL companion tables via heap scan (with lazy pruning)
+        // Load segments from ALL companion tables via heap scan (with lazy pruning).
+        // Bulk-prewarm the partition-level minmax cache in one SPI so the
+        // per-partition prune check inside `load_segments_heap` is a pure
+        // HashMap lookup.
+        crate::scan::cost::prewarm_partition_column_minmax(&companion_oids);
+
         super::segments::reset_scan_buf_stats();
         let t1 = Instant::now();
         let mut all_segments: Vec<SegmentData> = Vec::new();

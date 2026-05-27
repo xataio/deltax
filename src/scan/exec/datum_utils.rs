@@ -106,26 +106,6 @@ pub(super) fn string_to_datum(s: &str, type_oid: pg_sys::Oid) -> pg_sys::Datum {
     }
 }
 
-/// Map a PG type name (udt_name) to a type OID.
-pub(super) fn pg_type_oid(type_name: &str) -> pg_sys::Oid {
-    match type_name {
-        "timestamptz" => pg_sys::TIMESTAMPTZOID,
-        "timestamp" => pg_sys::TIMESTAMPOID,
-        "float8" => pg_sys::FLOAT8OID,
-        "float4" => pg_sys::FLOAT4OID,
-        "int2" => pg_sys::INT2OID,
-        "int4" => pg_sys::INT4OID,
-        "int8" => pg_sys::INT8OID,
-        "date" => pg_sys::DATEOID,
-        "bpchar" => pg_sys::BPCHAROID,
-        "bool" => pg_sys::BOOLOID,
-        "text" => pg_sys::TEXTOID,
-        "varchar" => pg_sys::VARCHAROID,
-        "jsonb" => pg_sys::JSONBOID,
-        _ => pg_sys::TEXTOID,
-    }
-}
-
 /// Map a type OID back to a data_type string for codec dispatch.
 pub(super) fn pg_type_name(type_oid: pg_sys::Oid) -> String {
     if type_oid == pg_sys::TIMESTAMPTZOID || type_oid == pg_sys::TIMESTAMPOID {

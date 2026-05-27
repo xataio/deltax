@@ -430,6 +430,69 @@ pub fn update_partition_column_valmap(
     Ok(())
 }
 
+/// Aggregate per-segment colstats min/max into a partition-level
+/// `{col_name: [min, max]}` JSONB and persist it on
+/// `deltax.deltax_partition.column_minmax`. The aggregation runs as a single
+/// SQL pass over the partition's `_colstats` table after all segments have
+/// been written — `_col_idx` maps to the i-th non-segment-by column from
+/// `columns`, matching the encoding used at scan time.
+///
+/// Used at read time by partition-level pruning: a `WHERE col = const`
+/// equality whose const falls outside `[min, max]` for that partition can
+/// skip the partition entirely (no meta open, no colstats probe).
+pub fn update_partition_column_minmax(
+    client: &mut SpiClient,
+    partition_id: i32,
+    colstats_fqn: &str,
+    columns: &[crate::compress::ColumnMeta],
+) -> spi::SpiResult<()> {
+    // Build the parallel col_idx → col_name mapping in the same order
+    // colstats uses (non-segment-by, 0-based).
+    let mut idx_to_name: Vec<&str> = Vec::new();
+    for col in columns {
+        if !col.is_segment_by {
+            idx_to_name.push(col.name.as_str());
+        }
+    }
+    if idx_to_name.is_empty() {
+        return Ok(());
+    }
+
+    // One pass over _colstats to get per-col_idx min(_min) / max(_max).
+    let agg_sql = format!(
+        "SELECT _col_idx, MIN(_min), MAX(_max) FROM {} \
+         WHERE _min IS NOT NULL AND _max IS NOT NULL \
+         GROUP BY _col_idx",
+        colstats_fqn
+    );
+    let rows = client.select(&agg_sql, None, &[])?;
+
+    let mut parts: Vec<String> = Vec::new();
+    for row in rows {
+        let col_idx: Option<i16> = row.get(1).ok().flatten();
+        let min_v: Option<i64> = row.get(2).ok().flatten();
+        let max_v: Option<i64> = row.get(3).ok().flatten();
+        let (Some(ci), Some(min_v), Some(max_v)) = (col_idx, min_v, max_v) else {
+            continue;
+        };
+        let Some(name) = idx_to_name.get(ci as usize).copied() else {
+            continue;
+        };
+        parts.push(format!("\"{}\":[{},{}]", json_escape(name), min_v, max_v));
+    }
+    if parts.is_empty() {
+        return Ok(());
+    }
+    let json = format!("{{{}}}", parts.join(","));
+
+    client.update(
+        "UPDATE deltax.deltax_partition SET column_minmax = $1::jsonb WHERE id = $2",
+        None,
+        &[json.into(), partition_id.into()],
+    )?;
+    Ok(())
+}
+
 /// Escape a string for inclusion in a JSON string literal. Handles all
 /// JSON-mandatory escapes (`"`, `\\`, control chars 0x00–0x1F). Used by the
 /// hand-rolled JSON writers above; we don't pull in a full JSON crate just

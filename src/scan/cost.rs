@@ -3,6 +3,10 @@ use pgrx::prelude::*;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+/// Per-column i64-encoded (min, max) for one compressed partition, or
+/// `None` when the partition predates the `column_minmax` catalog column.
+type PartitionMinmax = Option<HashMap<String, (i64, i64)>>;
+
 /// Planning-only fallback when we have the companion meta-table row count
 /// (one row per segment) but not the exact partition row count. This matches
 /// the historic fallback in `estimate_cost`; it only affects path costing,
@@ -27,6 +31,15 @@ thread_local! {
     /// partition (no low-card text columns).
     static VALMAP_CACHE: RefCell<HashMap<pg_sys::Oid, HashMap<String, Vec<String>>>> =
         RefCell::new(HashMap::new());
+
+    /// Cache of companion_oid → per-column partition-level i64-encoded
+    /// (min, max). Populated bulk on miss from
+    /// `deltax.deltax_partition.column_minmax` for ALL partitions of the
+    /// containing deltatable. `None` value means the column_minmax JSONB is
+    /// NULL on disk (partition compressed before this catalog column shipped
+    /// — caller treats it as "can't prune").
+    static PARTITION_MINMAX_CACHE: RefCell<HashMap<pg_sys::Oid, PartitionMinmax>> =
+        RefCell::new(HashMap::new());
 }
 
 /// Clear all cost-related caches. Called from `hook::invalidate_compressed_cache`.
@@ -34,6 +47,7 @@ pub(super) fn invalidate_caches() {
     PARTITION_STATS_CACHE.with(|cache| cache.borrow_mut().clear());
     NDISTINCT_CACHE.with(|cache| cache.borrow_mut().clear());
     VALMAP_CACHE.with(|cache| cache.borrow_mut().clear());
+    PARTITION_MINMAX_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
 /// Estimate the cost and row count for scanning a compressed partition.
@@ -441,6 +455,197 @@ pub(crate) fn get_column_valmap(
 
     VALMAP_CACHE.with(|cache| cache.borrow_mut().insert(companion_oid, result_map.clone()));
     result_map
+}
+
+/// Get the partition-level `{col_name: (min, max)}` map populated at compress
+/// time on `deltax.deltax_partition.column_minmax`. `min` / `max` are the
+/// same i64 encoding colstats uses (so callers compare with
+/// `encode_datum_to_i64`).
+///
+/// On miss, bulk-loads the whole deltatable in one SPI round-trip (matches
+/// `get_partition_stats`'s pattern). Returns `None` for partitions whose
+/// `column_minmax` is NULL on disk (compressed before this column existed —
+/// caller treats it as "can't prune").
+pub(crate) fn get_partition_column_minmax(companion_oid: pg_sys::Oid) -> PartitionMinmax {
+    PARTITION_MINMAX_CACHE
+        .with(|cache| cache.borrow().get(&companion_oid).cloned())
+        .unwrap_or(None)
+}
+
+/// Bulk-load partition-level column minmax for the given companion OIDs into
+/// the backend-local cache. Called once per query from the executor's
+/// per-partition loop site (e.g. `begin_agg_scan`) so the per-partition
+/// pruning check inside `load_segments_heap` only does HashMap lookups.
+///
+/// A single SPI `WHERE table_name = ANY($1)` is issued for every OID not
+/// already cached — both 1-partition and 123-partition queries pay one SPI
+/// round-trip total, not one per partition.
+pub(crate) fn prewarm_partition_column_minmax(oids: &[pg_sys::Oid]) {
+    if oids.is_empty() {
+        return;
+    }
+    // Identify OIDs missing from the cache and recover their partition names.
+    let mut missing_oids: Vec<pg_sys::Oid> = Vec::new();
+    let mut missing_names: Vec<String> = Vec::new();
+    PARTITION_MINMAX_CACHE.with(|cache| {
+        let c = cache.borrow();
+        for &oid in oids {
+            if !c.contains_key(&oid) {
+                let companion_name = unsafe {
+                    let name_ptr = pg_sys::get_rel_name(oid);
+                    if name_ptr.is_null() {
+                        continue;
+                    }
+                    std::ffi::CStr::from_ptr(name_ptr)
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                let partition_name = companion_name
+                    .strip_suffix("_meta")
+                    .unwrap_or(&companion_name)
+                    .to_string();
+                missing_oids.push(oid);
+                missing_names.push(partition_name);
+            }
+        }
+    });
+    if missing_names.is_empty() {
+        return;
+    }
+
+    let _profile = super::plan_profile::scope("cost_partition_minmax_bulk_load");
+    let mut by_name: HashMap<String, PartitionMinmax> = HashMap::new();
+    let _ = Spi::connect(|client| -> Option<()> {
+        let rows = client
+            .select(
+                "SELECT table_name, column_minmax::text \
+                   FROM deltax.deltax_partition \
+                  WHERE table_name = ANY($1) AND is_compressed",
+                None,
+                &[missing_names.clone().into()],
+            )
+            .ok()?;
+        for row in rows {
+            let table_name: Option<String> = row.get(1).ok().flatten();
+            let json_text: Option<String> = row.get(2).ok().flatten();
+            let Some(table_name) = table_name else {
+                continue;
+            };
+            let parsed = json_text.as_deref().and_then(parse_minmax_json);
+            by_name.insert(table_name, parsed);
+        }
+        Some(())
+    });
+
+    PARTITION_MINMAX_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        for (oid, name) in missing_oids.into_iter().zip(missing_names) {
+            let parsed = by_name.remove(&name).unwrap_or(None);
+            c.insert(oid, parsed);
+        }
+    });
+}
+
+/// Parse a `{"col": [min,max], ...}` JSON map of i64 ranges (as emitted by
+/// `catalog::update_partition_column_minmax`). Returns `None` if the input
+/// isn't shaped like an object — callers treat that as "no info, can't prune".
+fn parse_minmax_json(text: &str) -> Option<HashMap<String, (i64, i64)>> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'{' {
+        return None;
+    }
+    i += 1;
+
+    let mut out: HashMap<String, (i64, i64)> = HashMap::new();
+    loop {
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'}' {
+            return Some(out);
+        }
+        // Key: "<col_name>"
+        if bytes[i] != b'"' {
+            return Some(out);
+        }
+        i += 1;
+        let key_start = i;
+        let mut key = String::new();
+        while i < bytes.len() && bytes[i] != b'"' {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                match bytes[i + 1] {
+                    b'"' => key.push('"'),
+                    b'\\' => key.push('\\'),
+                    b'n' => key.push('\n'),
+                    b'r' => key.push('\r'),
+                    b't' => key.push('\t'),
+                    c => key.push(c as char),
+                }
+                i += 2;
+            } else {
+                key.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        if i >= bytes.len() {
+            return Some(out);
+        }
+        let _ = key_start; // satisfy lint when key escape path empty
+        i += 1; // skip closing quote
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b':' {
+            return Some(out);
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        // Value: [<min>,<max>]
+        if i >= bytes.len() || bytes[i] != b'[' {
+            return Some(out);
+        }
+        i += 1;
+        let (min_v, ni) = parse_i64(bytes, i)?;
+        i = ni;
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        let (max_v, ni) = parse_i64(bytes, i)?;
+        i = ni;
+        while i < bytes.len() && bytes[i] != b']' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return Some(out);
+        }
+        i += 1; // skip ']'
+        out.insert(key, (min_v, max_v));
+    }
+}
+
+fn parse_i64(bytes: &[u8], start: usize) -> Option<(i64, usize)> {
+    let mut i = start;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let num_start = i;
+    if i < bytes.len() && (bytes[i] == b'-' || bytes[i] == b'+') {
+        i += 1;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == num_start {
+        return None;
+    }
+    let s = std::str::from_utf8(&bytes[num_start..i]).ok()?;
+    s.parse::<i64>().ok().map(|v| (v, i))
 }
 
 /// Parse a `{"col": ["v0","v1",...], ...}` JSON object (as emitted by

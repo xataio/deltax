@@ -375,16 +375,9 @@ mod tests {
     }
 
     #[test]
-    fn test_pg_type_oid_and_name() {
-        use super::datum_utils::{pg_type_name, pg_type_oid};
+    fn test_pg_type_name() {
+        use super::datum_utils::pg_type_name;
         use pgrx::pg_sys;
-
-        assert_eq!(pg_type_oid("int4"), pg_sys::INT4OID);
-        assert_eq!(pg_type_oid("int8"), pg_sys::INT8OID);
-        assert_eq!(pg_type_oid("float8"), pg_sys::FLOAT8OID);
-        assert_eq!(pg_type_oid("bool"), pg_sys::BOOLOID);
-        assert_eq!(pg_type_oid("text"), pg_sys::TEXTOID);
-        assert_eq!(pg_type_oid("unknown_type"), pg_sys::TEXTOID); // fallback
 
         assert_eq!(pg_type_name(pg_sys::INT4OID), "integer");
         assert_eq!(pg_type_name(pg_sys::INT8OID), "bigint");

@@ -1010,6 +1010,13 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     catalog::update_partition_column_valmap(client, part_info.id, &column_valmap)
         .expect("failed to update partition column_valmap");
 
+    // Aggregate per-segment colstats into a partition-level {col_name: [min,max]}
+    // map. Read path uses this to skip partitions whose [min, max] range
+    // doesn't cover the const in `WHERE col = const` queries — cuts the
+    // 60µs/partition setup cost for non-matching partitions on wide scans.
+    catalog::update_partition_column_minmax(client, part_info.id, &ddl.colstats_fqn, &columns)
+        .expect("failed to update partition column_minmax");
+
     // Populate pg_class.reltuples + pg_statistic for the compressed
     // child partition so PG's built-in selectivity functions stop
     // falling back to defaults (0.005 equality-sel, ~2.5e-5 text-eq).
