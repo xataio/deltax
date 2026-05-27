@@ -2911,13 +2911,8 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
         .expect("failed to update partition column_ndistinct");
         catalog::update_partition_column_valmap(client, partition_id, &column_valmap)
             .expect("failed to update partition column_valmap");
-        catalog::update_partition_column_minmax(
-            client,
-            partition_id,
-            &ddl.colstats_fqn,
-            columns,
-        )
-        .expect("failed to update partition column_minmax");
+        catalog::update_partition_column_minmax(client, partition_id, &ddl.colstats_fqn, columns)
+            .expect("failed to update partition column_minmax");
 
         // Snapshot the physical-column shape so a later ADD COLUMN on the
         // parent doesn't desync this partition's blobs. See

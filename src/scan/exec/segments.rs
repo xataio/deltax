@@ -1,5 +1,5 @@
-use pgrx::pg_sys;
 use pgrx::pg_guard;
+use pgrx::pg_sys;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -1008,10 +1008,7 @@ thread_local! {
 }
 
 #[pg_guard]
-unsafe extern "C-unwind" fn metadata_relcache_callback(
-    _arg: pg_sys::Datum,
-    _relid: pg_sys::Oid,
-) {
+unsafe extern "C-unwind" fn metadata_relcache_callback(_arg: pg_sys::Datum, _relid: pg_sys::Oid) {
     // Conservative: wipe the whole cache on any relcache invalidation.
     // The cache is tiny (≤ #partitions per backend) so re-populating is cheap,
     // and this avoids tracking dependencies between MetadataInfo entries and
@@ -1038,9 +1035,7 @@ fn ensure_metadata_callback_registered() {
 /// hit, returns a clone of the cached `MetadataInfo` (which all 5 executor
 /// call sites consume by value).
 pub(super) fn load_metadata_cached(companion_oid: pg_sys::Oid) -> MetadataInfo {
-    if let Some(cached) =
-        METADATA_CACHE.with(|c| c.borrow().get(&companion_oid).cloned())
-    {
+    if let Some(cached) = METADATA_CACHE.with(|c| c.borrow().get(&companion_oid).cloned()) {
         return cached;
     }
     ensure_metadata_callback_registered();
@@ -1150,8 +1145,7 @@ pub(super) fn load_metadata(
         attnums: mut col_attnums,
     } = load_parent_columns(&parent_schema, &parent_table);
     // Descriptor-compat: `compressed_columns.type_oid` was persisted as i64.
-    let col_atttypids: Vec<i64> =
-        col_types.iter().map(|oid| u32::from(*oid) as i64).collect();
+    let col_atttypids: Vec<i64> = col_types.iter().map(|oid| u32::from(*oid) as i64).collect();
 
     // Resolve each physical column's `_col_idx` against the persisted
     // descriptor. None descriptor → legacy positional mapping (today's
@@ -1324,10 +1318,10 @@ struct ParentColumnLayout {
 /// Errors out if the schema or relation can't be resolved (e.g. the parent
 /// has been dropped between planning and execution).
 fn load_parent_columns(parent_schema: &str, parent_table: &str) -> ParentColumnLayout {
-    let schema_cstr = std::ffi::CString::new(parent_schema)
-        .expect("pg_deltax: parent schema name contained NUL");
-    let table_cstr = std::ffi::CString::new(parent_table)
-        .expect("pg_deltax: parent table name contained NUL");
+    let schema_cstr =
+        std::ffi::CString::new(parent_schema).expect("pg_deltax: parent schema name contained NUL");
+    let table_cstr =
+        std::ffi::CString::new(parent_table).expect("pg_deltax: parent table name contained NUL");
     unsafe {
         let ns_oid = pg_sys::get_namespace_oid(schema_cstr.as_ptr(), false);
         let parent_oid = pg_sys::get_relname_relid(table_cstr.as_ptr(), ns_oid);
@@ -1584,8 +1578,7 @@ pub(super) unsafe fn load_segments_heap(
                 .collect();
 
             if !eligible_eq.is_empty()
-                && let Some(part_minmax) =
-                    crate::scan::cost::get_partition_column_minmax(meta_oid)
+                && let Some(part_minmax) = crate::scan::cost::get_partition_column_minmax(meta_oid)
             {
                 let can_match = eligible_eq.iter().all(|(col_idx, value)| {
                     let col_name = &col_names[*col_idx];

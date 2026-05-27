@@ -559,12 +559,8 @@ pub(super) unsafe extern "C-unwind" fn begin_custom_scan(
         // Load metadata (cached), then load segment data via direct heap scan
         // (plan_qual is passed so batch qual columns are included in needed_cols)
         let plan_qual = (*(*node).ss.ps.plan).qual;
-        let mut state = load_decompress_state(
-            companion_oid,
-            &needed_indices,
-            plan_qual,
-            topn_limit,
-        );
+        let mut state =
+            load_decompress_state(companion_oid, &needed_indices, plan_qual, topn_limit);
 
         // If all plan quals are handled by batch eval, skip PG's per-row ExecQual
         if state.all_quals_batch_handled {
