@@ -65,58 +65,91 @@ impl BitWriter {
     }
 }
 
+/// MSB-first bit reader backed by a 64-bit refill buffer.
+///
+/// `acc` holds the next bits left-aligned (the next bit to read is bit 63);
+/// `cnt` is how many of those high bits are valid. `refill` tops the buffer up
+/// from `bytes` 8 bits at a time until it holds >56 bits, so any read of up to
+/// 57 bits is served by a single shift/mask without per-bit branching. Reads
+/// wider than 57 bits (the 64-bit first value / `1111` delta-of-delta escape)
+/// are split into two sub-reads. Out-of-bounds reads return the bits available
+/// (zero-padded), matching the previous byte-at-a-time reader; for valid data
+/// (exact `count`) this path is never hit.
 struct BitReader<'a> {
     bytes: &'a [u8],
-    byte_pos: usize,
-    bit_pos: u8,
+    pos: usize, // next byte to load into `acc`
+    acc: u64,   // bit buffer; next bit at the MSB
+    cnt: u32,   // number of valid bits currently in `acc` (from the MSB side)
 }
 
 impl<'a> BitReader<'a> {
     fn new(bytes: &'a [u8]) -> Self {
-        Self {
+        let mut r = Self {
             bytes,
-            byte_pos: 0,
-            bit_pos: 0,
+            pos: 0,
+            acc: 0,
+            cnt: 0,
+        };
+        r.refill();
+        r
+    }
+
+    #[inline(always)]
+    fn refill(&mut self) {
+        while self.cnt <= 56 && self.pos < self.bytes.len() {
+            self.acc |= (self.bytes[self.pos] as u64) << (56 - self.cnt);
+            self.pos += 1;
+            self.cnt += 8;
         }
     }
 
+    #[inline(always)]
     fn read_bit(&mut self) -> bool {
-        if self.byte_pos >= self.bytes.len() {
-            return false;
+        if self.cnt == 0 {
+            self.refill();
+            if self.cnt == 0 {
+                return false;
+            }
         }
-        let bit = (self.bytes[self.byte_pos] >> (7 - self.bit_pos)) & 1 == 1;
-        self.bit_pos += 1;
-        if self.bit_pos == 8 {
-            self.byte_pos += 1;
-            self.bit_pos = 0;
-        }
+        let bit = (self.acc >> 63) & 1 == 1;
+        self.acc <<= 1;
+        self.cnt -= 1;
         bit
     }
 
+    #[inline(always)]
     fn read_bits(&mut self, num_bits: u8) -> u64 {
-        if num_bits == 0 {
+        let n = num_bits as u32;
+        if n == 0 {
             return 0;
         }
-        let mut remaining = num_bits;
-        let mut value = 0u64;
-        while remaining > 0 {
-            if self.byte_pos >= self.bytes.len() {
-                break;
-            }
-            let avail = 8 - self.bit_pos;
-            let take = remaining.min(avail);
-            let shift = avail - take;
-            let mask = ((1u16 << take) - 1) as u8;
-            let bits = (self.bytes[self.byte_pos] >> shift) & mask;
-            value = (value << take) | bits as u64;
-            self.bit_pos += take;
-            if self.bit_pos == 8 {
-                self.byte_pos += 1;
-                self.bit_pos = 0;
-            }
-            remaining -= take;
+        // Widths beyond 57 (the 64-bit first value / escape delta) don't fit a
+        // single refilled buffer — split into a high and low half.
+        if n > 57 {
+            let lo_bits = num_bits - 32;
+            let hi = self.read_bits(32);
+            let lo = self.read_bits(lo_bits);
+            return (hi << lo_bits) | lo;
         }
-        value
+        if self.cnt < n {
+            self.refill();
+            if self.cnt < n {
+                // Truncated input: return whatever high bits remain.
+                let avail = self.cnt;
+                let val = if avail == 0 {
+                    0
+                } else {
+                    self.acc >> (64 - avail)
+                };
+                self.acc = 0;
+                self.cnt = 0;
+                return val;
+            }
+        }
+        let val = self.acc >> (64 - n);
+        self.acc <<= n;
+        self.cnt -= n;
+        val
     }
 }
 
@@ -176,15 +209,23 @@ pub fn encode_floats(values: &[f64]) -> Vec<u8> {
 }
 
 pub fn decode_floats(data: &[u8], count: usize) -> Vec<f64> {
+    let mut values = Vec::with_capacity(count);
+    decode_floats_each(data, count, |v| values.push(v));
+    values
+}
+
+/// Callback form of [`decode_floats`]: invokes `f` for each decoded value in
+/// order, with no intermediate `Vec`. Lets callers decode straight into their
+/// final layout (e.g. `(Datum, bool)` pairs) — one allocation, one pass.
+#[inline]
+pub fn decode_floats_each(data: &[u8], count: usize, mut f: impl FnMut(f64)) {
     if count == 0 {
-        return Vec::new();
+        return;
     }
 
     let mut reader = BitReader::new(data);
-    let mut values = Vec::with_capacity(count);
-
     let first_bits = reader.read_bits(64);
-    values.push(f64::from_bits(first_bits));
+    f(f64::from_bits(first_bits));
     let mut prev_bits = first_bits;
     let mut prev_leading: u8 = 0;
     let mut prev_trailing: u8 = 0;
@@ -192,14 +233,13 @@ pub fn decode_floats(data: &[u8], count: usize) -> Vec<f64> {
     for _ in 1..count {
         if !reader.read_bit() {
             // Same value
-            values.push(f64::from_bits(prev_bits));
+            f(f64::from_bits(prev_bits));
         } else if !reader.read_bit() {
             // Same window
             let meaningful = 64 - prev_leading - prev_trailing;
             let xor_meaningful = reader.read_bits(meaningful);
-            let xor = xor_meaningful << prev_trailing;
-            prev_bits ^= xor;
-            values.push(f64::from_bits(prev_bits));
+            prev_bits ^= xor_meaningful << prev_trailing;
+            f(f64::from_bits(prev_bits));
         } else {
             // New window
             let leading = reader.read_bits(6) as u8;
@@ -207,15 +247,12 @@ pub fn decode_floats(data: &[u8], count: usize) -> Vec<f64> {
             let meaningful = if meaningful == 0 { 64 } else { meaningful };
             let trailing = 64 - leading - meaningful;
             let xor_meaningful = reader.read_bits(meaningful);
-            let xor = xor_meaningful << trailing;
-            prev_bits ^= xor;
-            values.push(f64::from_bits(prev_bits));
+            prev_bits ^= xor_meaningful << trailing;
+            f(f64::from_bits(prev_bits));
             prev_leading = leading;
             prev_trailing = trailing;
         }
     }
-
-    values
 }
 
 // ---------------------------------------------------------------------------
@@ -266,43 +303,45 @@ pub fn encode_floats_f32(values: &[f32]) -> Vec<u8> {
 }
 
 pub fn decode_floats_f32(data: &[u8], count: usize) -> Vec<f32> {
+    let mut values = Vec::with_capacity(count);
+    decode_floats_f32_each(data, count, |v| values.push(v));
+    values
+}
+
+/// Callback form of [`decode_floats_f32`] — see [`decode_floats_each`].
+#[inline]
+pub fn decode_floats_f32_each(data: &[u8], count: usize, mut f: impl FnMut(f32)) {
     if count == 0 {
-        return Vec::new();
+        return;
     }
 
     let mut reader = BitReader::new(data);
-    let mut values = Vec::with_capacity(count);
-
     let first_bits = reader.read_bits(32) as u32;
-    values.push(f32::from_bits(first_bits));
+    f(f32::from_bits(first_bits));
     let mut prev_bits = first_bits;
     let mut prev_leading: u8 = 0;
     let mut prev_trailing: u8 = 0;
 
     for _ in 1..count {
         if !reader.read_bit() {
-            values.push(f32::from_bits(prev_bits));
+            f(f32::from_bits(prev_bits));
         } else if !reader.read_bit() {
             let meaningful = 32 - prev_leading - prev_trailing;
             let xor_meaningful = reader.read_bits(meaningful) as u32;
-            let xor = xor_meaningful << prev_trailing;
-            prev_bits ^= xor;
-            values.push(f32::from_bits(prev_bits));
+            prev_bits ^= xor_meaningful << prev_trailing;
+            f(f32::from_bits(prev_bits));
         } else {
             let leading = reader.read_bits(5) as u8;
             let meaningful = reader.read_bits(5) as u8;
             let meaningful = if meaningful == 0 { 32 } else { meaningful };
             let trailing = 32 - leading - meaningful;
             let xor_meaningful = reader.read_bits(meaningful) as u32;
-            let xor = xor_meaningful << trailing;
-            prev_bits ^= xor;
-            values.push(f32::from_bits(prev_bits));
+            prev_bits ^= xor_meaningful << trailing;
+            f(f32::from_bits(prev_bits));
             prev_leading = leading;
             prev_trailing = trailing;
         }
     }
-
-    values
 }
 
 // ---------------------------------------------------------------------------
@@ -338,13 +377,16 @@ pub fn encode_timestamps(values: &[i64]) -> Vec<u8> {
 
         if dod == 0 {
             writer.write_bit(false);
-        } else if (-63..=64).contains(&dod) {
+        } else if (-64..=63).contains(&dod) {
+            // 7-bit two's complement: [-64, 63]. Must match the decoder's
+            // sign_extend(_, 7); the previous (-63..=64) bound mis-encoded
+            // dod == 64 as -64 (and likewise at the 9/12-bit boundaries).
             writer.write_bits(0b10, 2);
             writer.write_bits(dod as u64, 7);
-        } else if (-255..=256).contains(&dod) {
+        } else if (-256..=255).contains(&dod) {
             writer.write_bits(0b110, 3);
             writer.write_bits(dod as u64, 9);
-        } else if (-2047..=2048).contains(&dod) {
+        } else if (-2048..=2047).contains(&dod) {
             writer.write_bits(0b1110, 4);
             writer.write_bits(dod as u64, 12);
         } else {
@@ -359,24 +401,34 @@ pub fn encode_timestamps(values: &[i64]) -> Vec<u8> {
 }
 
 pub fn decode_timestamps(data: &[u8], count: usize) -> Vec<i64> {
+    let mut values = Vec::with_capacity(count);
+    decode_timestamps_each(data, count, |v| values.push(v));
+    values
+}
+
+/// Callback form of [`decode_timestamps`] — see [`decode_floats_each`]. Also
+/// tracks the running value in a local instead of re-reading `values.last()`
+/// every row.
+#[inline]
+pub fn decode_timestamps_each(data: &[u8], count: usize, mut f: impl FnMut(i64)) {
     if count == 0 {
-        return Vec::new();
+        return;
     }
 
     let mut reader = BitReader::new(data);
-    let mut values = Vec::with_capacity(count);
 
     // First value
     let first = reader.read_bits(64) as i64;
-    values.push(first);
+    f(first);
 
     if count == 1 {
-        return values;
+        return;
     }
 
     // First delta
     let mut prev_delta = reader.read_bits(64) as i64;
-    values.push(first + prev_delta);
+    let mut cur = first + prev_delta;
+    f(cur);
 
     for _ in 2..count {
         let dod = if !reader.read_bit() {
@@ -396,11 +448,9 @@ pub fn decode_timestamps(data: &[u8], count: usize) -> Vec<i64> {
         };
 
         prev_delta += dod;
-        let val = *values.last().unwrap() + prev_delta;
-        values.push(val);
+        cur += prev_delta;
+        f(cur);
     }
-
-    values
 }
 
 #[cfg(test)]
@@ -543,5 +593,125 @@ mod tests {
             "constant-delta timestamps should compress >10x, got {:.1}x",
             ratio
         );
+    }
+
+    // --- Randomized roundtrip coverage for the refill-buffer BitReader -------
+    //
+    // The encoder is unchanged, so bit-identical roundtrip over varied,
+    // randomized inputs exercises every reader branch (same-value, same-window,
+    // new-window, each delta-of-delta width, and the 64-bit escape paths).
+
+    fn xorshift64(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn test_floats_random_roundtrip() {
+        let mut s = 0x9E3779B97F4A7C15u64;
+        for trial in 0..200 {
+            let n = (xorshift64(&mut s) % 500) as usize + 1;
+            let mut values = Vec::with_capacity(n);
+            let mut base = f64::from_bits(xorshift64(&mut s));
+            if !base.is_finite() {
+                base = 1.0;
+            }
+            for _ in 0..n {
+                match xorshift64(&mut s) % 4 {
+                    0 => {}                                   // repeat previous (xor==0)
+                    1 => base += (xorshift64(&mut s) % 8) as f64 * 0.001, // tiny step
+                    2 => base = f64::from_bits(xorshift64(&mut s)), // arbitrary bits
+                    _ => base *= 1.0001,                       // small relative step
+                }
+                values.push(base);
+            }
+            let encoded = encode_floats(&values);
+            let decoded = decode_floats(&encoded, values.len());
+            assert_eq!(decoded.len(), values.len(), "trial {trial}");
+            for (i, (a, b)) in values.iter().zip(decoded.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "trial {trial} idx {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_f32_random_roundtrip() {
+        let mut s = 0xD1B54A32D192ED03u64;
+        for trial in 0..200 {
+            let n = (xorshift64(&mut s) % 500) as usize + 1;
+            let mut values = Vec::with_capacity(n);
+            let mut base = f32::from_bits(xorshift64(&mut s) as u32);
+            if !base.is_finite() {
+                base = 1.0;
+            }
+            for _ in 0..n {
+                match xorshift64(&mut s) % 4 {
+                    0 => {}
+                    1 => base += (xorshift64(&mut s) % 8) as f32 * 0.001,
+                    2 => base = f32::from_bits(xorshift64(&mut s) as u32),
+                    _ => base *= 1.0001,
+                }
+                values.push(base);
+            }
+            let encoded = encode_floats_f32(&values);
+            let decoded = decode_floats_f32(&encoded, values.len());
+            assert_eq!(decoded.len(), values.len(), "trial {trial}");
+            for (i, (a, b)) in values.iter().zip(decoded.iter()).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "trial {trial} idx {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_timestamps_random_roundtrip() {
+        let mut s = 0x2545F4914F6CDD1Du64;
+        for trial in 0..300 {
+            let n = (xorshift64(&mut s) % 500) as usize + 1;
+            let mut values = Vec::with_capacity(n);
+            // Realistic microsecond-scale base; deltas are bounded so the
+            // encoder's delta-of-delta subtraction stays within i64 (real
+            // timestamps never produce overflowing dods).
+            let mut cur = 1_700_000_000_000_000i64 + ((xorshift64(&mut s) % 1_000_000) as i64);
+            values.push(cur);
+            for _ in 1..n {
+                // Mix of delta-of-delta magnitudes to hit every prefix width,
+                // including the 64-bit escape (deltas ≫ 2048 take that branch).
+                let delta = match xorshift64(&mut s) % 5 {
+                    0 => 0i64,
+                    1 => (xorshift64(&mut s) % 64) as i64 - 32,
+                    2 => (xorshift64(&mut s) % 512) as i64 - 256,
+                    3 => (xorshift64(&mut s) % 4096) as i64 - 2048,
+                    _ => (xorshift64(&mut s) % (1 << 40)) as i64 - (1 << 39), // → 64-bit dod escape
+                };
+                cur = cur.wrapping_add(delta);
+                values.push(cur);
+            }
+            let encoded = encode_timestamps(&values);
+            let decoded = decode_timestamps(&encoded, values.len());
+            assert_eq!(decoded, values, "trial {trial}");
+        }
+    }
+
+    #[test]
+    fn test_timestamp_dod_boundaries() {
+        // Regression for the delta-of-delta prefix-width off-by-one: each
+        // boundary dod must round-trip exactly, including the values that sit
+        // right on the 7/9/12-bit two's-complement edges (±64, ±256, ±2048).
+        let base = 1_700_000_000_000_000i64;
+        for &dod in &[
+            -2049i64, -2048, -2047, -257, -256, -255, -65, -64, -63, -1, 0, 1, 63, 64, 65, 255,
+            256, 257, 2047, 2048, 2049,
+        ] {
+            // delta0 = 1000; delta1 = 1000 + dod, so values[2]'s dod == `dod`.
+            let v1 = base + 1000;
+            let values = vec![base, v1, v1 + (1000 + dod)];
+            let encoded = encode_timestamps(&values);
+            let decoded = decode_timestamps(&encoded, values.len());
+            assert_eq!(decoded, values, "dod={dod}");
+        }
     }
 }

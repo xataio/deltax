@@ -235,12 +235,23 @@ pub(super) fn apply_regex_to_seg_col(
                 } else {
                     let s = std::str::from_utf8(&buf[off as usize..off as usize + len as usize])
                         .unwrap_or("");
-                    let replaced = regex.replace(s, replacement).into_owned();
-                    let idx = *unique_map.entry(replaced.clone()).or_insert_with(|| {
-                        let idx = entries.len() as u32;
-                        entries.push(replaced);
-                        idx
-                    });
+                    // `regex.replace` returns a `Cow` (borrowed when nothing
+                    // matched). The replaced output is typically low-cardinality
+                    // (e.g. a host extracted from many distinct URLs), so look up
+                    // by borrowed `&str` and only allocate an owned `String` for
+                    // genuinely new outputs — instead of one allocation plus a
+                    // clone for the map key on every row.
+                    let replaced = regex.replace(s, replacement);
+                    let idx = match unique_map.get(replaced.as_ref()) {
+                        Some(&idx) => idx,
+                        None => {
+                            let owned = replaced.into_owned();
+                            let idx = entries.len() as u32;
+                            unique_map.insert(owned.clone(), idx);
+                            entries.push(owned);
+                            idx
+                        }
+                    };
                     new_row_to_entry.push(idx);
                 }
             }

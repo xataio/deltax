@@ -51,6 +51,11 @@ pub(crate) static DISABLE_META_AGG_FASTPATH: GucSetting<bool> = GucSetting::<boo
 /// runs — this only disables the PG-level partial-path activation.
 pub(crate) static DISABLE_PARALLEL_AGG: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// When true, disables the dict-aware GROUP BY fast path (per-segment
+/// dict-entry → group-index caching in `parallel_mixed`), forcing per-row
+/// hashing + map probing. For A/B measurement of the optimization.
+pub(crate) static DISABLE_DICT_GROUP_FAST: GucSetting<bool> = GucSetting::<bool>::new(false);
+
 /// Controls how COPY ... FORMAT deltax_compress extracts JSON paths into
 /// extra columnar columns alongside the original JSONB, and whether the
 /// planner_hook walker rewrites upper-plan chain Exprs to read from
@@ -266,6 +271,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"Disable the partial+Gather+FinalAgg path for DeltaXAgg",
         c"When ON, add_agg_partial_path is a no-op and the planner only sees the complete CustomScan DeltaXAgg. Escape hatch for bisecting suspected regressions on the partial path; the complete path's internal-rayon parallelism still runs.",
         &DISABLE_PARALLEL_AGG,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.disable_dict_group_fast",
+        c"Disable the dict-aware GROUP BY fast path",
+        c"When ON, parallel_mixed hashes + probes the group map per row for dict-encoded text group keys instead of caching dict-entry->group-index per segment. For A/B measurement.",
+        &DISABLE_DICT_GROUP_FAST,
         GucContext::Userset,
         GucFlags::default(),
     );

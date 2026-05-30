@@ -123,49 +123,45 @@ pub(super) fn decompress_numeric_no_nulls(
     let mut out = Vec::with_capacity(total_count);
     match cc.type_tag {
         compression::CompressionType::Gorilla => {
+            // Decode straight into `out` via the `_each` callback — no
+            // intermediate `Vec<primitive>`.
             if type_oid == pg_sys::TIMESTAMPOID || type_oid == pg_sys::TIMESTAMPTZOID {
-                let timestamps = compression::gorilla::decode_timestamps(cc.data, total_count);
-                for usec in timestamps {
-                    let pg_usec = usec - PG_EPOCH_OFFSET_USEC;
-                    out.push((pg_sys::Datum::from(pg_usec as usize), false));
-                }
+                compression::gorilla::decode_timestamps_each(cc.data, total_count, |usec| {
+                    out.push((pg_sys::Datum::from((usec - PG_EPOCH_OFFSET_USEC) as usize), false));
+                });
             } else if type_oid == pg_sys::DATEOID {
-                let timestamps = compression::gorilla::decode_timestamps(cc.data, total_count);
-                for usec in timestamps {
+                compression::gorilla::decode_timestamps_each(cc.data, total_count, |usec| {
                     let unix_days = (usec / 86_400_000_000) as i32;
-                    let pg_days = unix_days - PG_EPOCH_OFFSET_DAYS;
-                    out.push((pg_sys::Datum::from(pg_days as usize), false));
-                }
+                    out.push((
+                        pg_sys::Datum::from((unix_days - PG_EPOCH_OFFSET_DAYS) as usize),
+                        false,
+                    ));
+                });
             } else if type_oid == pg_sys::FLOAT4OID {
-                let floats = compression::gorilla::decode_floats_f32(cc.data, total_count);
-                for v in floats {
+                compression::gorilla::decode_floats_f32_each(cc.data, total_count, |v| {
                     out.push((pg_sys::Datum::from(v.to_bits() as usize), false));
-                }
+                });
             } else {
                 // FLOAT8OID
-                let floats = compression::gorilla::decode_floats(cc.data, total_count);
-                for v in floats {
+                compression::gorilla::decode_floats_each(cc.data, total_count, |v| {
                     out.push((pg_sys::Datum::from(v.to_bits() as usize), false));
-                }
+                });
             }
         }
         compression::CompressionType::DeltaVarint => {
             if type_oid == pg_sys::INT2OID {
-                let ints = compression::integer::decode_i32(cc.data, total_count);
-                for v in ints {
+                compression::integer::decode_i32_each(cc.data, total_count, |v| {
                     out.push((pg_sys::Datum::from(v as i16 as usize), false));
-                }
+                });
             } else if type_oid == pg_sys::INT4OID || type_oid == pg_sys::DATEOID {
-                let ints = compression::integer::decode_i32(cc.data, total_count);
-                for v in ints {
+                compression::integer::decode_i32_each(cc.data, total_count, |v| {
                     out.push((pg_sys::Datum::from(v as usize), false));
-                }
+                });
             } else {
                 // INT8OID, TIMESTAMPOID, TIMESTAMPTZOID
-                let ints = compression::integer::decode_i64(cc.data, total_count);
-                for v in ints {
+                compression::integer::decode_i64_each(cc.data, total_count, |v| {
                     out.push((pg_sys::Datum::from(v as usize), false));
-                }
+                });
             }
         }
         compression::CompressionType::Constant => {

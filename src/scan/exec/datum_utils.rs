@@ -254,44 +254,16 @@ unsafe fn decode_compressed_datums(
             }
         }
         CompressionType::Lz4 => {
+            // text/varchar/jsonb go straight from ranges to arena varlenas with
+            // no intermediate slice Vec and no UTF-8 validation; bpchar needs
+            // the input function (handled inside text_ranges_to_datums).
             let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
-            if type_oid == pg_sys::JSONBOID {
-                // Skip UTF-8 validation — stored bytes are jsonb varlena payload.
-                let byte_slices: Vec<&[u8]> = ranges
-                    .iter()
-                    .map(|&(off, len)| &buf[off..off + len])
-                    .collect();
-                unsafe { byte_slices_to_jsonb_datums_arena(&byte_slices) }
-            } else {
-                let slices: Vec<&str> = ranges
-                    .iter()
-                    .map(|&(off, len)| {
-                        std::str::from_utf8(&buf[off..off + len])
-                            .expect("invalid UTF-8 in LZ4 data")
-                    })
-                    .collect();
-                unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
-            }
+            unsafe { text_ranges_to_datums(&buf, &ranges, type_oid, typmod) }
         }
         CompressionType::Lz4Blocked => {
             let (buf, ranges) =
                 compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
-            if type_oid == pg_sys::JSONBOID {
-                let byte_slices: Vec<&[u8]> = ranges
-                    .iter()
-                    .map(|&(off, len)| &buf[off..off + len])
-                    .collect();
-                unsafe { byte_slices_to_jsonb_datums_arena(&byte_slices) }
-            } else {
-                let slices: Vec<&str> = ranges
-                    .iter()
-                    .map(|&(off, len)| {
-                        std::str::from_utf8(&buf[off..off + len])
-                            .expect("invalid UTF-8 in LZ4 data")
-                    })
-                    .collect();
-                unsafe { str_slices_to_text_datums_arena(&slices, type_oid, typmod) }
-            }
+            unsafe { text_ranges_to_datums(&buf, &ranges, type_oid, typmod) }
         }
         CompressionType::BooleanBitmap => {
             let bools = compression::boolean::decode(cc.data, non_null_count);
@@ -347,6 +319,171 @@ unsafe fn decode_compressed_datums(
 /// value is stored directly in the Datum with zero allocation.
 /// For pass-by-reference types (text, varchar, bpchar), a varlena is allocated
 /// in the current memory context (caller must set the right context).
+/// Weave decoded pass-by-value primitives into a full-length
+/// `Vec<(Datum, bool)>`, applying `f` per value and inserting null placeholders
+/// per the bitmap — in a single pass.
+///
+/// This fuses the value→Datum map with null reinsertion so pass-by-value
+/// columns avoid the intermediate `Vec<Datum>` allocation + extra copy pass
+/// that `decode_compressed_datums` + `reinsert_nulls_datum` would do. (Same
+/// optimization the parallel agg path already applies via
+/// `decompress_numeric_no_nulls`.)
+#[inline]
+fn weave_numeric_pairs<T: Copy>(
+    prims: Vec<T>,
+    null_bitmap: &[u8],
+    total_count: usize,
+    f: impl Fn(T) -> pg_sys::Datum,
+) -> Vec<(pg_sys::Datum, bool)> {
+    let mut out = Vec::with_capacity(total_count);
+    if null_bitmap.is_empty() {
+        for v in prims {
+            out.push((f(v), false));
+        }
+    } else {
+        let mut val_idx = 0usize;
+        for i in 0..total_count {
+            if is_null_at(null_bitmap, i) {
+                out.push((pg_sys::Datum::from(0usize), true));
+            } else {
+                out.push((f(prims[val_idx]), false));
+                val_idx += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Fused decode for pass-by-value codecs: decode directly into
+/// `Vec<(Datum, bool)>` with nulls woven in, skipping the intermediate
+/// `Vec<Datum>`. Returns `None` for pass-by-ref / dictionary codecs (text,
+/// jsonb), which keep the arena path in `decode_compressed_datums`. `dt` is
+/// the lowercased type name; transforms mirror `decode_compressed_datums`
+/// exactly.
+fn decode_numeric_blob_pairs(
+    cc: &CompressedColumnRef,
+    dt: &str,
+    non_null_count: usize,
+    total_count: usize,
+) -> Option<Vec<(pg_sys::Datum, bool)>> {
+    let nb = cc.null_bitmap;
+    let is_intlike = dt == "integer" || dt.contains("int4") || dt == "smallint";
+
+    // For Gorilla/DeltaVarint: on the no-null path decode straight into the
+    // output via the `_each` callback (one alloc, one pass — no intermediate
+    // `Vec<primitive>`); on the null path decode to a Vec and weave nulls.
+    // `$each`/`$vec` are the callback / Vec-returning decoders; `$tf` maps a
+    // decoded value to its Datum (transforms mirror `decode_compressed_datums`).
+    macro_rules! build {
+        ($each:path, $vec:path, $tf:expr) => {{
+            let tf = $tf;
+            if nb.is_empty() {
+                let mut out = Vec::with_capacity(total_count);
+                $each(cc.data, total_count, |v| out.push((tf(v), false)));
+                out
+            } else {
+                weave_numeric_pairs($vec(cc.data, non_null_count), nb, total_count, tf)
+            }
+        }};
+    }
+
+    let pairs = match cc.type_tag {
+        CompressionType::Gorilla => {
+            if dt.contains("timestamp") {
+                build!(
+                    compression::gorilla::decode_timestamps_each,
+                    compression::gorilla::decode_timestamps,
+                    |usec: i64| pg_sys::Datum::from((usec - PG_EPOCH_OFFSET_USEC) as usize)
+                )
+            } else if dt == "date" {
+                build!(
+                    compression::gorilla::decode_timestamps_each,
+                    compression::gorilla::decode_timestamps,
+                    |usec: i64| {
+                        let unix_days = (usec / 86_400_000_000) as i32;
+                        pg_sys::Datum::from((unix_days - PG_EPOCH_OFFSET_DAYS) as usize)
+                    }
+                )
+            } else if dt == "real" || dt.contains("float4") {
+                build!(
+                    compression::gorilla::decode_floats_f32_each,
+                    compression::gorilla::decode_floats_f32,
+                    |v: f32| pg_sys::Datum::from(v.to_bits() as usize)
+                )
+            } else {
+                build!(
+                    compression::gorilla::decode_floats_each,
+                    compression::gorilla::decode_floats,
+                    |v: f64| pg_sys::Datum::from(v.to_bits() as usize)
+                )
+            }
+        }
+        CompressionType::DeltaVarint => {
+            if is_intlike {
+                if dt == "smallint" {
+                    build!(
+                        compression::integer::decode_i32_each,
+                        compression::integer::decode_i32,
+                        |v: i32| pg_sys::Datum::from(v as i16 as usize)
+                    )
+                } else {
+                    build!(
+                        compression::integer::decode_i32_each,
+                        compression::integer::decode_i32,
+                        |v: i32| pg_sys::Datum::from(v as usize)
+                    )
+                }
+            } else {
+                build!(
+                    compression::integer::decode_i64_each,
+                    compression::integer::decode_i64,
+                    |v: i64| pg_sys::Datum::from(v as usize)
+                )
+            }
+        }
+        CompressionType::Constant => {
+            if is_intlike {
+                let ints = compression::bitpacked::decode_constant_i32(cc.data, non_null_count);
+                if dt == "smallint" {
+                    weave_numeric_pairs(ints, nb, total_count, |v| {
+                        pg_sys::Datum::from(v as i16 as usize)
+                    })
+                } else {
+                    weave_numeric_pairs(ints, nb, total_count, |v| pg_sys::Datum::from(v as usize))
+                }
+            } else {
+                let ints = compression::bitpacked::decode_constant_i64(cc.data, non_null_count);
+                weave_numeric_pairs(ints, nb, total_count, |v| pg_sys::Datum::from(v as usize))
+            }
+        }
+        CompressionType::ForBitpacked => {
+            if is_intlike {
+                let ints = compression::bitpacked::decode_for_i32(cc.data, non_null_count);
+                if dt == "smallint" {
+                    weave_numeric_pairs(ints, nb, total_count, |v| {
+                        pg_sys::Datum::from(v as i16 as usize)
+                    })
+                } else {
+                    weave_numeric_pairs(ints, nb, total_count, |v| pg_sys::Datum::from(v as usize))
+                }
+            } else {
+                let ints = compression::bitpacked::decode_for_i64(cc.data, non_null_count);
+                weave_numeric_pairs(ints, nb, total_count, |v| pg_sys::Datum::from(v as usize))
+            }
+        }
+        CompressionType::BooleanBitmap => {
+            let bools = compression::boolean::decode(cc.data, non_null_count);
+            weave_numeric_pairs(bools, nb, total_count, |b| pg_sys::Datum::from(b as usize))
+        }
+        // Pass-by-ref / dictionary codecs: keep the arena path.
+        CompressionType::Dictionary
+        | CompressionType::DictionaryLz4
+        | CompressionType::Lz4
+        | CompressionType::Lz4Blocked => return None,
+    };
+    Some(pairs)
+}
+
 pub(super) unsafe fn decompress_blob_to_datums(
     blob: &[u8],
     data_type: &str,
@@ -360,15 +497,15 @@ pub(super) unsafe fn decompress_blob_to_datums(
     let cc = CompressedColumnRef::from_bytes(blob);
     let total_count = cc.row_count as usize;
     let non_null_count = count_non_null(cc.null_bitmap, total_count);
-    let datums = unsafe {
-        decode_compressed_datums(
-            &cc,
-            &data_type.to_lowercase(),
-            type_oid,
-            typmod,
-            non_null_count,
-        )
-    };
+    let dt = data_type.to_lowercase();
+
+    // Fused pass-by-value path: decode straight into `(Datum, bool)` pairs.
+    if let Some(pairs) = decode_numeric_blob_pairs(&cc, &dt, non_null_count, total_count) {
+        return pairs;
+    }
+
+    // Pass-by-ref / dictionary codecs: decode to non-null datums, then reinsert.
+    let datums = unsafe { decode_compressed_datums(&cc, &dt, type_oid, typmod, non_null_count) };
     reinsert_nulls_datum(&datums, cc.null_bitmap, total_count)
 }
 
@@ -1228,24 +1365,9 @@ pub(super) unsafe fn decompress_text_blob_with_selection(
         }
         CompressionType::Lz4 => {
             let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
-
-            let slices: Vec<&str> = ranges
-                .iter()
-                .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len]).expect("invalid UTF-8 in LZ4 data")
-                })
-                .collect();
-
-            // Collect only selected slices for arena allocation
-            let matched_slices: Vec<&str> = slices
-                .iter()
-                .zip(nn_selection.iter())
-                .filter(|&(_, &sel)| sel)
-                .map(|(&s, _)| s)
-                .collect();
-            let matched_datums =
-                unsafe { str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod) };
-
+            let matched_datums = unsafe {
+                matched_text_ranges_to_datums(&buf, &ranges, &nn_selection, type_oid, typmod)
+            };
             merge_with_placeholder(&matched_datums, &nn_selection)
         }
         CompressionType::Lz4Blocked => {
@@ -1255,19 +1377,9 @@ pub(super) unsafe fn decompress_text_blob_with_selection(
                 non_null_count,
                 Some(&nn_selection),
             );
-
-            // Collect only selected slices for arena allocation
-            let matched_slices: Vec<&str> = ranges
-                .iter()
-                .zip(nn_selection.iter())
-                .filter(|&(_, &sel)| sel)
-                .map(|(&(off, len), _)| {
-                    std::str::from_utf8(&buf[off..off + len]).expect("invalid UTF-8 in LZ4 data")
-                })
-                .collect();
-            let matched_datums =
-                unsafe { str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod) };
-
+            let matched_datums = unsafe {
+                matched_text_ranges_to_datums(&buf, &ranges, &nn_selection, type_oid, typmod)
+            };
             merge_with_placeholder(&matched_datums, &nn_selection)
         }
         _ => {
@@ -1537,6 +1649,111 @@ unsafe fn varlena_arena_alloc(slices: &[&[u8]]) -> Vec<pg_sys::Datum> {
         }
 
         datums
+    }
+}
+
+/// Arena-allocate one varlena per `(offset, len)` range over `buf`, returning
+/// the Datums — like [`varlena_arena_alloc`] but reading directly from the
+/// decompressed buffer via ranges, with no intermediate `Vec<&str>`/`Vec<&[u8]>`
+/// and no UTF-8 validation (PG text/jsonb store raw bytes and don't re-validate;
+/// the bytes were validated at ingest).
+unsafe fn ranges_to_varlena_datums(buf: &[u8], ranges: &[(usize, usize)]) -> Vec<pg_sys::Datum> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    unsafe {
+        const VARHDRSZ: usize = pg_sys::VARHDRSZ;
+        const MAXALIGN: usize = 8;
+
+        let total_size: usize = ranges
+            .iter()
+            .map(|&(_, len)| (VARHDRSZ + len + MAXALIGN - 1) & !(MAXALIGN - 1))
+            .sum();
+
+        let arena = pg_sys::palloc(total_size) as *mut u8;
+        let mut datums = Vec::with_capacity(ranges.len());
+        let mut arena_off = 0;
+        let base = buf.as_ptr();
+
+        for &(off, len) in ranges {
+            let varlena_ptr = arena.add(arena_off) as *mut pg_sys::varlena;
+            let total_len = (VARHDRSZ + len) as i32;
+            pgrx::set_varsize_4b(varlena_ptr, total_len);
+            std::ptr::copy_nonoverlapping(
+                base.add(off),
+                (varlena_ptr as *mut u8).add(VARHDRSZ),
+                len,
+            );
+            datums.push(pg_sys::Datum::from(varlena_ptr as usize));
+            arena_off += ((total_len as usize) + MAXALIGN - 1) & !(MAXALIGN - 1);
+        }
+
+        datums
+    }
+}
+
+/// Build text/varchar/jsonb/bpchar Datums from decompressed `(buf, ranges)`.
+///
+/// text/varchar/jsonb take the zero-validation arena path
+/// ([`ranges_to_varlena_datums`]). bpchar still needs the type input function
+/// for blank-padding, so it falls back to the per-string path (and is the only
+/// case that pays UTF-8 validation).
+unsafe fn text_ranges_to_datums(
+    buf: &[u8],
+    ranges: &[(usize, usize)],
+    type_oid: pg_sys::Oid,
+    typmod: i32,
+) -> Vec<pg_sys::Datum> {
+    unsafe {
+        if type_oid == pg_sys::BPCHAROID {
+            ranges
+                .iter()
+                .map(|&(off, len)| {
+                    let s = std::str::from_utf8(&buf[off..off + len])
+                        .expect("invalid UTF-8 in LZ4 data");
+                    str_to_text_datum(s, type_oid, typmod)
+                })
+                .collect()
+        } else {
+            ranges_to_varlena_datums(buf, ranges)
+        }
+    }
+}
+
+/// Selection-aware variant of [`text_ranges_to_datums`]: build datums only for
+/// rows where `nn_selection[i]` is true (in order, for `merge_with_placeholder`).
+/// Skips UTF-8 validation for text/varchar (PG stores raw bytes); only bpchar
+/// pays the input function + validation. Avoids materializing a `Vec<&str>` over
+/// the whole column — important for the monolithic Lz4 path, which otherwise
+/// validates every row just to keep the (often few) matching ones.
+unsafe fn matched_text_ranges_to_datums(
+    buf: &[u8],
+    ranges: &[(usize, usize)],
+    nn_selection: &[bool],
+    type_oid: pg_sys::Oid,
+    typmod: i32,
+) -> Vec<pg_sys::Datum> {
+    unsafe {
+        if type_oid == pg_sys::BPCHAROID {
+            ranges
+                .iter()
+                .zip(nn_selection.iter())
+                .filter(|&(_, &sel)| sel)
+                .map(|(&(off, len), _)| {
+                    let s = std::str::from_utf8(&buf[off..off + len])
+                        .expect("invalid UTF-8 in LZ4 data");
+                    str_to_text_datum(s, type_oid, typmod)
+                })
+                .collect()
+        } else {
+            let matched: Vec<&[u8]> = ranges
+                .iter()
+                .zip(nn_selection.iter())
+                .filter(|&(_, &sel)| sel)
+                .map(|(&(off, len), _)| &buf[off..off + len])
+                .collect();
+            varlena_arena_alloc(&matched)
+        }
     }
 }
 

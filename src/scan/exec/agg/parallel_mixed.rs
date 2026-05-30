@@ -253,6 +253,10 @@ pub(super) struct ParallelMixedConfig<'a> {
     /// `per_segment` so each worker resolves `(seg_idx, local_dict_id)` →
     /// `global_id` without further coordination.
     pub(super) dict_distinct_remaps: &'a std::collections::HashMap<usize, DictDistinctRemap>,
+    /// When false, the dict-aware GROUP BY fast path is disabled (per-row
+    /// hashing + probing). Set from `pg_deltax.disable_dict_group_fast` on the
+    /// main thread; threaded through so worker threads don't read the GUC.
+    pub(super) dict_group_fast: bool,
 }
 
 // SAFETY: see equivalent impl on `ParallelCompactConfig` for the
@@ -927,6 +931,39 @@ pub(super) fn process_segments_mixed(
         let mut int_keys = vec![0i64; n_int_keys];
         let mut str_keys: Vec<Option<&str>> = vec![None; n_str_keys];
 
+        // Dict-aware fast path: a single dictionary-encoded text group key
+        // (plain Column or a RegexpReplace whose transformed column is a Dict),
+        // no int keys, no F8 preselect. Routes each row through a cached
+        // dict-entry -> group index so the per-row hash + map probe collapses to
+        // once per *distinct* dict entry per segment; repeated values (the common
+        // case for dict columns) become a Vec index lookup. Reset per segment.
+        let dict_fast: Option<&SegTextColumn> = if config.dict_group_fast
+            && n_int_keys == 0
+            && n_str_keys == 1
+            && config.group_specs.len() == 1
+            && config.preselected_keys.is_none()
+        {
+            let gs = &config.group_specs[0];
+            let sc = match &gs.expr {
+                GroupByExpr::Column => text_seg_cols[gs.col_idx as usize].as_ref(),
+                GroupByExpr::RegexpReplace { .. } if !regex_text_cols.is_empty() => {
+                    regex_text_cols[gs.col_idx as usize].as_ref()
+                }
+                _ => None,
+            };
+            match sc {
+                Some(c @ SegTextColumn::Dict { .. }) => Some(c),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut dict_gidx_cache: Vec<u32> = match dict_fast {
+            Some(SegTextColumn::Dict { entries, .. }) => vec![u32::MAX; entries.len()],
+            _ => Vec::new(),
+        };
+        let mut dict_null_gidx: u32 = u32::MAX;
+
         for row in 0..row_count {
             if !selection.is_empty() && !selection[row] {
                 continue;
@@ -1003,40 +1040,87 @@ pub(super) fn process_segments_mixed(
                 continue;
             }
 
-            let hash_key = hash_mixed_key(&int_keys[..n_int_keys], &str_keys[..n_str_keys]);
-
-            // F8: when a preselected key set is supplied, skip rows whose
-            // group-key hash is not in the set. The set is bounded to
-            // `bare_limit` entries (typically 10), so the probe is an
-            // L1-resident hashbrown lookup (~5 ns). Rows that hit proceed
-            // to the normal Entry path below; rows that miss contribute
-            // nothing to any output group.
-            if let Some(preselected) = config.preselected_keys
-                && !preselected.contains(&hash_key)
+            let group_idx = if let Some(SegTextColumn::Dict {
+                entries,
+                row_to_entry,
+            }) = dict_fast
             {
-                continue;
-            }
-
-            // Lookup or insert group
-            if compact_map.len() == compact_map.capacity() {
-                let cap = compact_map.capacity();
-                if cap >= 32_000_000 {
-                    compact_map.reserve(8_000_000);
+                // Dict-aware fast path: resolve the group index from the cached
+                // dict-entry -> group-index map; only hash + probe the global map
+                // the first time each dict entry is seen this segment.
+                let e = row_to_entry[row];
+                if e == u32::MAX {
+                    if dict_null_gidx == u32::MAX {
+                        let hash_key = hash_mixed_key(&[], &[None]);
+                        dict_null_gidx = match compact_map.entry(hash_key) {
+                            hashbrown::hash_map::Entry::Occupied(en) => *en.get(),
+                            hashbrown::hash_map::Entry::Vacant(en) => {
+                                let idx = compact_storage.alloc_group();
+                                cd_sidecar.alloc_group();
+                                en.insert(idx);
+                                mixed_keys.insert(&[], &[None], config.group_specs);
+                                idx
+                            }
+                        };
+                    }
+                    dict_null_gidx
+                } else {
+                    let cached = dict_gidx_cache[e as usize];
+                    if cached != u32::MAX {
+                        cached
+                    } else {
+                        let s = entries[e as usize].as_str();
+                        let hash_key = hash_mixed_key(&[], &[Some(s)]);
+                        let gidx = match compact_map.entry(hash_key) {
+                            hashbrown::hash_map::Entry::Occupied(en) => *en.get(),
+                            hashbrown::hash_map::Entry::Vacant(en) => {
+                                let idx = compact_storage.alloc_group();
+                                cd_sidecar.alloc_group();
+                                en.insert(idx);
+                                mixed_keys.insert(&[], &[Some(s)], config.group_specs);
+                                idx
+                            }
+                        };
+                        dict_gidx_cache[e as usize] = gidx;
+                        gidx
+                    }
                 }
-            }
-            let group_idx = match compact_map.entry(hash_key) {
-                hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
-                hashbrown::hash_map::Entry::Vacant(e) => {
-                    let idx = compact_storage.alloc_group();
-                    cd_sidecar.alloc_group();
-                    e.insert(idx);
-                    // Store actual key values for this new group
-                    mixed_keys.insert(
-                        &int_keys[..n_int_keys],
-                        &str_keys[..n_str_keys],
-                        config.group_specs,
-                    );
-                    idx
+            } else {
+                let hash_key = hash_mixed_key(&int_keys[..n_int_keys], &str_keys[..n_str_keys]);
+
+                // F8: when a preselected key set is supplied, skip rows whose
+                // group-key hash is not in the set. The set is bounded to
+                // `bare_limit` entries (typically 10), so the probe is an
+                // L1-resident hashbrown lookup (~5 ns). Rows that hit proceed
+                // to the normal Entry path below; rows that miss contribute
+                // nothing to any output group.
+                if let Some(preselected) = config.preselected_keys
+                    && !preselected.contains(&hash_key)
+                {
+                    continue;
+                }
+
+                // Lookup or insert group
+                if compact_map.len() == compact_map.capacity() {
+                    let cap = compact_map.capacity();
+                    if cap >= 32_000_000 {
+                        compact_map.reserve(8_000_000);
+                    }
+                }
+                match compact_map.entry(hash_key) {
+                    hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
+                    hashbrown::hash_map::Entry::Vacant(e) => {
+                        let idx = compact_storage.alloc_group();
+                        cd_sidecar.alloc_group();
+                        e.insert(idx);
+                        // Store actual key values for this new group
+                        mixed_keys.insert(
+                            &int_keys[..n_int_keys],
+                            &str_keys[..n_str_keys],
+                            config.group_specs,
+                        );
+                        idx
+                    }
                 }
             };
 
@@ -3427,6 +3511,7 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             sidecar_only_cols,
             preselected_keys: preselected_keys.as_ref(),
             dict_distinct_remaps: &dict_distinct_remaps,
+            dict_group_fast: !crate::DISABLE_DICT_GROUP_FAST.get(),
         };
 
         let mut pipeline_detoast_us: u64 = 0;
