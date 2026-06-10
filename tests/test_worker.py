@@ -214,8 +214,11 @@ def test_worker_retention_drops_old_partitions(postgres_db):
             "ALTER SYSTEM SET pg_deltax.mock_now = '2025-06-20 00:00:00+00'"
         )
 
-        # Poll until the worker drops the old partitions
-        deadline = time.time() + 90
+        # Poll until the worker drops the old partitions. The worker wakes
+        # every 60s and the mock_now change only takes effect via config
+        # reload, so worst case the drop lands on the *second* cycle after
+        # the ALTER SYSTEM — a 90s deadline missed that intermittently in CI.
+        deadline = time.time() + 150
         dropped = False
         while time.time() < deadline:
             time.sleep(5)

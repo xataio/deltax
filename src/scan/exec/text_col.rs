@@ -478,8 +478,7 @@ pub(super) fn apply_text_like_filter(
         // only surviving rows, which beats sweeping the whole buffer for a
         // sparse selection.
         SegTextColumn::Lz4 { buf, row_to_range }
-            if sel.is_empty()
-                && matches!(strategy, LikeStrategy::Contains(s) if !s.is_empty()) =>
+            if sel.is_empty() && matches!(strategy, LikeStrategy::Contains(s) if !s.is_empty()) =>
         {
             let LikeStrategy::Contains(needle) = strategy else {
                 unreachable!()
@@ -553,11 +552,7 @@ fn apply_lz4_contains_filter(
         if off == u32::MAX {
             return false; // NULL never passes, even for NOT LIKE
         }
-        if negate {
-            !matched[row]
-        } else {
-            matched[row]
-        }
+        if negate { !matched[row] } else { matched[row] }
     };
     if sel.is_empty() {
         sel.reserve(row_count);
@@ -840,17 +835,35 @@ mod tests {
             Some("agooglea"),
         ]);
         let mut sel: Vec<bool> = Vec::new();
-        apply_text_like_filter(&c, &LikeStrategy::Contains("google".into()), false, 5, &mut sel);
+        apply_text_like_filter(
+            &c,
+            &LikeStrategy::Contains("google".into()),
+            false,
+            5,
+            &mut sel,
+        );
         assert_eq!(sel, vec![true, false, false, false, true]);
 
         // NOT LIKE: non-matching rows pass, NULL stays false, empty passes.
         let mut sel: Vec<bool> = Vec::new();
-        apply_text_like_filter(&c, &LikeStrategy::Contains("google".into()), true, 5, &mut sel);
+        apply_text_like_filter(
+            &c,
+            &LikeStrategy::Contains("google".into()),
+            true,
+            5,
+            &mut sel,
+        );
         assert_eq!(sel, vec![false, true, false, true, false]);
 
         // AND into an existing selection: already-false rows stay false.
         let mut sel = vec![false, true, true, true, true];
-        apply_text_like_filter(&c, &LikeStrategy::Contains("google".into()), false, 5, &mut sel);
+        apply_text_like_filter(
+            &c,
+            &LikeStrategy::Contains("google".into()),
+            false,
+            5,
+            &mut sel,
+        );
         assert_eq!(sel, vec![false, false, false, false, true]);
     }
 
@@ -861,7 +874,13 @@ mod tests {
         // while a genuine match later in the buffer still must.
         let c = lz4_col(&[Some("goo"), Some("gle"), Some("xgooglex")]);
         let mut sel: Vec<bool> = Vec::new();
-        apply_text_like_filter(&c, &LikeStrategy::Contains("google".into()), false, 3, &mut sel);
+        apply_text_like_filter(
+            &c,
+            &LikeStrategy::Contains("google".into()),
+            false,
+            3,
+            &mut sel,
+        );
         assert_eq!(sel, vec![false, false, true]);
 
         // A boundary-spanning hit must not mask an overlapping in-row match
@@ -869,7 +888,13 @@ mod tests {
         // byte after the rejected hit and still finds row 1's match.
         let c = lz4_col(&[Some("xgoog"), Some("googley")]);
         let mut sel: Vec<bool> = Vec::new();
-        apply_text_like_filter(&c, &LikeStrategy::Contains("google".into()), false, 2, &mut sel);
+        apply_text_like_filter(
+            &c,
+            &LikeStrategy::Contains("google".into()),
+            false,
+            2,
+            &mut sel,
+        );
         assert_eq!(sel, vec![false, true]);
     }
 
@@ -879,7 +904,13 @@ mod tests {
         // the row end without losing later rows' matches.
         let c = lz4_col(&[Some("googlegoogle"), Some("nope"), Some("google")]);
         let mut sel: Vec<bool> = Vec::new();
-        apply_text_like_filter(&c, &LikeStrategy::Contains("google".into()), false, 3, &mut sel);
+        apply_text_like_filter(
+            &c,
+            &LikeStrategy::Contains("google".into()),
+            false,
+            3,
+            &mut sel,
+        );
         assert_eq!(sel, vec![true, false, true]);
     }
 
