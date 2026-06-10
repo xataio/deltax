@@ -852,8 +852,7 @@ pub(super) fn process_segments_mixed(
                 (0..config.col_names.len()).map(|_| None).collect();
             for ri in config.rust_regex_infos {
                 if let Some(ref seg_col) = text_seg_cols[ri.col_idx] {
-                    cols[ri.col_idx] =
-                        Some(apply_regex_to_seg_col(seg_col, &ri.regex, &ri.replacement));
+                    cols[ri.col_idx] = Some(apply_regex_to_seg_col(seg_col, ri));
                 }
             }
             cols
@@ -935,13 +934,18 @@ pub(super) fn process_segments_mixed(
         let mut int_keys = vec![0i64; n_int_keys];
         let mut str_keys: Vec<Option<&str>> = vec![None; n_str_keys];
 
-        // Dict-aware fast path: a single dictionary-encoded text group key
-        // (plain Column or a RegexpReplace whose transformed column is a Dict),
-        // no int keys, no F8 preselect. Routes each row through a cached
-        // dict-entry -> group index so the per-row hash + map probe collapses to
-        // once per *distinct* dict entry per segment; repeated values (the common
-        // case for dict columns) become a Vec index lookup. Reset per segment.
-        let dict_fast: Option<&SegTextColumn> = if n_int_keys == 0
+        // Text-key fast path: a single text group key (plain Column or a
+        // RegexpReplace whose transformed column is a Dict), no int keys, no
+        // F8 preselect. Routes each row through a cached dict-entry -> group
+        // index so the per-row hash + map probe collapses to once per
+        // *distinct* dict entry per segment; repeated values (the common
+        // case for dict columns) become a Vec index lookup. Reset per
+        // segment. Lz4 columns deliberately stay on the generic path: a
+        // segment-local string -> group-index memo was tried for them and
+        // lost at bench level — the global-map probes it avoids compare
+        // u128 hashes only, while every memo probe pays an extra full-string
+        // memcmp (ClickBench Q33/Q34 +8%).
+        let text_key_fast: Option<&SegTextColumn> = if n_int_keys == 0
             && n_str_keys == 1
             && config.group_specs.len() == 1
             && config.preselected_keys.is_none()
@@ -961,11 +965,11 @@ pub(super) fn process_segments_mixed(
         } else {
             None
         };
-        let mut dict_gidx_cache: Vec<u32> = match dict_fast {
+        let mut dict_gidx_cache: Vec<u32> = match text_key_fast {
             Some(SegTextColumn::Dict { entries, .. }) => vec![u32::MAX; entries.len()],
             _ => Vec::new(),
         };
-        let mut dict_null_gidx: u32 = u32::MAX;
+        let mut text_null_gidx: u32 = u32::MAX;
 
         for row in 0..row_count {
             if !selection.is_empty() && !selection[row] {
@@ -973,69 +977,73 @@ pub(super) fn process_segments_mixed(
             }
             rows_processed += 1;
 
-            // Build key components
+            // Build key components (skipped on the text-key fast path: the
+            // Dict arm below resolves the key directly from the segment
+            // column)
             let mut has_null = false;
             let mut int_idx = 0;
             let mut str_idx = 0;
-            for (gi, gs) in config.group_specs.iter().enumerate() {
-                if is_text_group_col(gs) {
-                    // CaseWhen: use pre-computed column indexed by group spec index
-                    if matches!(gs.expr, GroupByExpr::CaseWhen(_)) {
-                        if let Some(Some(seg_col)) = case_when_text_cols.get(gi) {
-                            str_keys[str_idx] = seg_col.get_str(row);
+            if text_key_fast.is_none() {
+                for (gi, gs) in config.group_specs.iter().enumerate() {
+                    if is_text_group_col(gs) {
+                        // CaseWhen: use pre-computed column indexed by group spec index
+                        if matches!(gs.expr, GroupByExpr::CaseWhen(_)) {
+                            if let Some(Some(seg_col)) = case_when_text_cols.get(gi) {
+                                str_keys[str_idx] = seg_col.get_str(row);
+                            } else {
+                                str_keys[str_idx] = None;
+                            }
+                            str_idx += 1;
+                            continue;
+                        }
+                        let col_idx = gs.col_idx as usize;
+                        // For RegexpReplace columns, use the pre-transformed column;
+                        // for plain text columns, use the original
+                        let seg_col_ref = if matches!(gs.expr, GroupByExpr::RegexpReplace { .. })
+                            && !regex_text_cols.is_empty()
+                        {
+                            regex_text_cols[col_idx].as_ref()
                         } else {
-                            str_keys[str_idx] = None;
+                            text_seg_cols[col_idx].as_ref()
+                        };
+                        match seg_col_ref {
+                            Some(seg_col) => {
+                                str_keys[str_idx] = seg_col.get_str(row);
+                                // NULL text key: leave str_keys[str_idx] as None.
+                                // hash_mixed_key and MixedKeyStorage handle None correctly,
+                                // producing a NULL group (matching PostgreSQL GROUP BY semantics).
+                            }
+                            None => {
+                                str_keys[str_idx] = None;
+                            }
                         }
                         str_idx += 1;
-                        continue;
-                    }
-                    let col_idx = gs.col_idx as usize;
-                    // For RegexpReplace columns, use the pre-transformed column;
-                    // for plain text columns, use the original
-                    let seg_col_ref = if matches!(gs.expr, GroupByExpr::RegexpReplace { .. })
-                        && !regex_text_cols.is_empty()
-                    {
-                        regex_text_cols[col_idx].as_ref()
                     } else {
-                        text_seg_cols[col_idx].as_ref()
-                    };
-                    match seg_col_ref {
-                        Some(seg_col) => {
-                            str_keys[str_idx] = seg_col.get_str(row);
-                            // NULL text key: leave str_keys[str_idx] as None.
-                            // hash_mixed_key and MixedKeyStorage handle None correctly,
-                            // producing a NULL group (matching PostgreSQL GROUP BY semantics).
+                        if let Some(v) = const_group_keys[gi] {
+                            int_keys[int_idx] = v;
+                        } else {
+                            let col = &numeric_cols[gs.col_idx as usize];
+                            if col.is_empty() || col[row].1 {
+                                has_null = true;
+                                break;
+                            }
+                            int_keys[int_idx] = match &gs.expr {
+                                GroupByExpr::DateTrunc { unit_usecs, .. } => {
+                                    let pg_usec = col[row].0.value() as i64;
+                                    pg_usec.div_euclid(*unit_usecs) * *unit_usecs
+                                }
+                                GroupByExpr::Extract { unit, divisor, .. } => {
+                                    eval_extract(col[row].0.value() as i64, *divisor, unit)
+                                }
+                                GroupByExpr::AddConst { offset, .. } => {
+                                    col[row].0.value() as i64 + offset
+                                }
+                                GroupByExpr::Column => col[row].0.value() as i64,
+                                _ => unreachable!(),
+                            };
                         }
-                        None => {
-                            str_keys[str_idx] = None;
-                        }
+                        int_idx += 1;
                     }
-                    str_idx += 1;
-                } else {
-                    if let Some(v) = const_group_keys[gi] {
-                        int_keys[int_idx] = v;
-                    } else {
-                        let col = &numeric_cols[gs.col_idx as usize];
-                        if col.is_empty() || col[row].1 {
-                            has_null = true;
-                            break;
-                        }
-                        int_keys[int_idx] = match &gs.expr {
-                            GroupByExpr::DateTrunc { unit_usecs, .. } => {
-                                let pg_usec = col[row].0.value() as i64;
-                                pg_usec.div_euclid(*unit_usecs) * *unit_usecs
-                            }
-                            GroupByExpr::Extract { unit, divisor, .. } => {
-                                eval_extract(col[row].0.value() as i64, *divisor, unit)
-                            }
-                            GroupByExpr::AddConst { offset, .. } => {
-                                col[row].0.value() as i64 + offset
-                            }
-                            GroupByExpr::Column => col[row].0.value() as i64,
-                            _ => unreachable!(),
-                        };
-                    }
-                    int_idx += 1;
                 }
             }
 
@@ -1046,16 +1054,16 @@ pub(super) fn process_segments_mixed(
             let group_idx = if let Some(SegTextColumn::Dict {
                 entries,
                 row_to_entry,
-            }) = dict_fast
+            }) = text_key_fast
             {
                 // Dict-aware fast path: resolve the group index from the cached
                 // dict-entry -> group-index map; only hash + probe the global map
                 // the first time each dict entry is seen this segment.
                 let e = row_to_entry[row];
                 if e == u32::MAX {
-                    if dict_null_gidx == u32::MAX {
+                    if text_null_gidx == u32::MAX {
                         let hash_key = hash_mixed_key(&[], &[None]);
-                        dict_null_gidx = match compact_map.entry(hash_key) {
+                        text_null_gidx = match compact_map.entry(hash_key) {
                             hashbrown::hash_map::Entry::Occupied(en) => *en.get(),
                             hashbrown::hash_map::Entry::Vacant(en) => {
                                 let idx = compact_storage.alloc_group();
@@ -1066,7 +1074,7 @@ pub(super) fn process_segments_mixed(
                             }
                         };
                     }
-                    dict_null_gidx
+                    text_null_gidx
                 } else {
                     let cached = dict_gidx_cache[e as usize];
                     if cached != u32::MAX {

@@ -2170,8 +2170,7 @@ unsafe fn compact_partitioned_topn(
                                                 let d = dup_storage.alloc_group();
                                                 dup_cd.alloc_group();
                                                 dup_count += 1;
-                                                let (w0, g0) =
-                                                    ((r >> 32) as usize, r as u32);
+                                                let (w0, g0) = ((r >> 32) as usize, r as u32);
                                                 merge_group_into(
                                                     &mut dup_storage,
                                                     &mut dup_cd,
@@ -2210,22 +2209,19 @@ unsafe fn compact_partitioned_topn(
                             let dup_cd = dup_cd;
 
                             // Resolve a packed ref to (storage, cd_sidecar, gidx).
-                            let resolve = |r: u64| -> (
-                                &CompactAccStorage,
-                                &CountDistinctSideCar,
-                                u32,
-                            ) {
-                                if r & DUP_FLAG != 0 {
-                                    (&dup_storage, &dup_cd, (r & !DUP_FLAG) as u32)
-                                } else {
-                                    let w = (r >> 32) as usize;
-                                    (
-                                        &workers[w].compact_storage,
-                                        &workers[w].cd_sidecar,
-                                        r as u32,
-                                    )
-                                }
-                            };
+                            let resolve =
+                                |r: u64| -> (&CompactAccStorage, &CountDistinctSideCar, u32) {
+                                    if r & DUP_FLAG != 0 {
+                                        (&dup_storage, &dup_cd, (r & !DUP_FLAG) as u32)
+                                    } else {
+                                        let w = (r >> 32) as usize;
+                                        (
+                                            &workers[w].compact_storage,
+                                            &workers[w].cd_sidecar,
+                                            r as u32,
+                                        )
+                                    }
+                                };
 
                             // Local top-N selection using a heap
                             let (_, sort_kind) = dup_storage.layout.slots[sort_slot];
@@ -2255,8 +2251,7 @@ unsafe fn compact_partitioned_topn(
                                     let (st, _, gidx) = resolve(r);
                                     let avg = match sort_kind {
                                         CompactAccKind::SumIntNarrow => {
-                                            let (s, c) =
-                                                st.read_sum_int_narrow(gidx, sort_slot);
+                                            let (s, c) = st.read_sum_int_narrow(gidx, sort_slot);
                                             if c > 0 { s as f64 / c as f64 } else { 0.0 }
                                         }
                                         CompactAccKind::SumFloat => {
@@ -2364,9 +2359,7 @@ unsafe fn compact_partitioned_topn(
                                             if off != u32::MAX {
                                                 let val_str = src_st.str_arena.get(off, len);
                                                 let (no, nl) = mini.str_arena.alloc(val_str);
-                                                mini.write_min_max_str(
-                                                    new_gidx, slot_idx, no, nl,
-                                                );
+                                                mini.write_min_max_str(new_gidx, slot_idx, no, nl);
                                             } else {
                                                 mini.write_min_max_str(
                                                     new_gidx,

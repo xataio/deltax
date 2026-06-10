@@ -36,7 +36,11 @@ impl StringArena {
     }
 
     pub(crate) fn get(&self, off: u32, len: u32) -> &str {
-        std::str::from_utf8(&self.buf[off as usize..off as usize + len as usize]).unwrap_or("")
+        let slice = &self.buf[off as usize..off as usize + len as usize];
+        // SAFETY: `alloc` only ever appends whole `&str` byte ranges, and
+        // callers pass back the exact (off, len) `alloc` returned.
+        debug_assert!(std::str::from_utf8(slice).is_ok());
+        unsafe { std::str::from_utf8_unchecked(slice) }
     }
 }
 

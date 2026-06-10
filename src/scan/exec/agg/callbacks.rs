@@ -943,6 +943,7 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                     rust_regex_infos.push(RustRegexInfo {
                         regex: compiled,
                         replacement: rust_replacement,
+                        simple: super::regex::SimplePattern::try_parse(pattern, replacement),
                         col_idx: gs.col_idx as usize,
                     });
                 }

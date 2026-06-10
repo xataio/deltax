@@ -1834,3 +1834,92 @@ memory is no worse than the old design.
 `20260610_112034`):** Q32 9.464 → 8.585 s, Q15 1.944 → 1.842 s, all
 other queries within noise. Combined with #50, bench hot total
 58.8 → **53.4 s** (−9.1%) for the day.
+
+### 52. Segment-local memo for Lz4 text group keys [TRIED — REGRESSED, REVERTED]
+
+**Tried 2026-06-10, reverted the same day (Q33/Q34 bench hot
+3.35 → 3.62 s, +8%).**
+
+The dict-aware fast path in `process_segments_mixed` (single text
+group key, no int keys) only covers `SegTextColumn::Dict`. URL-class
+columns are LZ4-encoded, so Q33/Q34 (`GROUP BY URL`) hash the full
+string twice per row (`hash_mixed_key` builds a u128 from two ahash
+streams) and probe the multi-million-entry global group map per row.
+URL repeats ~4.2x within a segment (30 K rows ≈ 7.1 K distinct), so a
+per-segment `AHashMap<&str, u32>` (key string → group index) looked
+like it should collapse most of those probes into small-map hits.
+
+It lost at bench level because the trade is worse than it looks: the
+global map is `HashMap<u128, u32>` — collisions are impossible by
+construction, so probes never compare keys, only u128s. The memo
+probe pays one ahash over the string (vs two) but adds a full-string
+`memcmp` on every hit plus an insert on every miss, and at 7 K
+entries × ~32 B the memo doesn't stay L2-resident anyway. Warm
+EXPLAIN ANALYZE in a mixed session suggested −8% (confounded by blob
+cache evictions inflating the baseline); the bench protocol (PG
+restart per query, best-of-3) showed +8%. Keep Lz4 group keys on the
+generic path.
+
+Two pieces from the same pass survived: skipping the generic per-row
+key-component build loop when the Dict fast path is active (it
+re-fetched the string per row just to discard it), and an input-side
+memo in the regex transform (`apply_regex_to_seg_col`, Lz4 arm) that
+skips regex + output-dedup work for repeated inputs (Referer repeats
+~2.7x per segment).
+
+**Files touched:** `src/scan/exec/agg/parallel_mixed.rs`
+(`process_segments_mixed`), `src/scan/exec/agg/regex.rs`
+(`apply_regex_to_seg_col`).
+
+### 53. Byte-op fast path for prefix-strip regexp_replace [DONE]
+
+**Landed 2026-06-10. Q28 bench hot 7.918 → 2.769 s (with #54) —
+2.4x faster than ClickHouse's 9.58 s on this query.**
+
+`perf` on Q28 showed 37% of all CPU inside the regex crate — 30.4% of
+it in `BoundedBacktracker::search_imp`. The ClickBench pattern
+`^https?://(?:www\.)?([^/]+)/.*$` is not one-pass (at byte `w` the
+NFA can't tell whether `www.` belongs to the optional literal or to
+the capture class), so the regex meta-engine resolves the capture
+with its bounded backtracker on every one of the 81 M matching rows.
+
+`SimplePattern` (in `regex.rs`) recognizes the restricted shape
+`^ lit [opt-lit | x?]... ([^c]+) c-lit .*$` at plan time and compiles
+it to byte comparisons: literals via `starts_with`, the optional
+literals via greedy try-then-skip (same preference order as the regex
+engine), and the capture via a scan for the stop byte — valid because
+parse-time validation requires the component after the capture to be
+a literal starting with the stop char, so the capture provably ends
+at its first occurrence and no backtracking can ever be needed.
+Anything outside the shape (two captures, alternations, class
+escapes, unanchored patterns, `\2+` backrefs) returns None and falls
+back to the regex crate. Differential tests in `regex.rs` assert
+byte-for-byte agreement with the Rust regex engine on the tricky
+inputs (backtracking case `https://www./path` → host `www.`, empty
+host, embedded newlines, multibyte hosts, case sensitivity).
+
+**Files touched:** `src/scan/exec/agg/regex.rs` (`SimplePattern`),
+`src/scan/exec/agg/callbacks.rs` (construction).
+
+### 54. Skip per-row UTF-8 revalidation in text hot paths [DONE]
+
+**Landed 2026-06-10 (same pass as #53).**
+
+The same Q28 profile showed 9.3% of CPU in `core::str::from_utf8` and
+3.0% in `do_count_chars`: `SegTextColumn::get_str`/`get_len` (Lz4
+arm), `StringArena::get` and the regex-transform row loop revalidated
+UTF-8 on every access, although the bytes are decompressed PG text
+our own compressor wrote — valid UTF-8 by construction. These four
+sites now use `from_utf8_unchecked` with a `debug_assert!` guard.
+This is why Q28's agg phase (per-row `MIN(Referer)` get_str +
+`AVG(length(Referer))` get_len) dropped 4.3 → 1.7 s on top of the
+#53 decompress-side win; every text-heavy aggregate benefits.
+
+**Files touched:** `src/scan/exec/text_col.rs`,
+`src/scan/exec/agg/compact.rs`, `src/scan/exec/agg/regex.rs`.
+
+**Bench-level for #52–#54 combined (best-of-3 hot, history
+`20260610_114934` → `20260610_131038`):** Q28 7.918 → 2.769 s,
+Q20 1.199 → 1.061 s, Q13 2.320 → 2.224 s, Q12 1.179 → 1.112 s,
+Q34 3.412 → 3.234 s, everything else within noise. Bench hot total
+53.77 → **48.23 s** (−10.3%).

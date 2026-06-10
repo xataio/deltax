@@ -58,10 +58,13 @@ impl SegTextColumn {
                 if off == u32::MAX {
                     None
                 } else {
-                    Some(
-                        std::str::from_utf8(&buf[off as usize..off as usize + len as usize])
-                            .unwrap_or(""),
-                    )
+                    let slice = &buf[off as usize..off as usize + len as usize];
+                    // SAFETY: the buffer holds decompressed PG text values our
+                    // own compressor wrote, so it is valid UTF-8 by
+                    // construction; revalidating per row showed up at ~9% of
+                    // query CPU on text-heavy aggregates.
+                    debug_assert!(std::str::from_utf8(slice).is_ok());
+                    Some(unsafe { std::str::from_utf8_unchecked(slice) })
                 }
             }
             SegTextColumn::SegBy(opt) => opt.as_deref(),
@@ -106,7 +109,14 @@ impl SegTextColumn {
                     None
                 } else {
                     let slice = &buf[off as usize..off as usize + len as usize];
-                    Some(std::str::from_utf8(slice).unwrap_or("").chars().count())
+                    // SAFETY: same as `get_str` — our compressor only writes
+                    // valid UTF-8 into Lz4 text buffers.
+                    debug_assert!(std::str::from_utf8(slice).is_ok());
+                    Some(
+                        unsafe { std::str::from_utf8_unchecked(slice) }
+                            .chars()
+                            .count(),
+                    )
                 }
             }
             SegTextColumn::SegBy(opt) => opt.as_deref().map(|s| s.chars().count()),
