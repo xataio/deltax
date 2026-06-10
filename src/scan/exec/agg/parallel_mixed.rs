@@ -287,9 +287,17 @@ pub(super) fn can_parallel_mixed(
     batch_quals: &[BatchQual],
     agg_specs: &[AggExecSpec],
 ) -> bool {
-    if group_specs.is_empty() || group_specs.len() > 6 {
+    if group_specs.len() > 6 {
         return false;
     }
+
+    // No-GROUP-BY aggregates are allowed: workers funnel every row into a
+    // single constant-key group (`hash_mixed_key(&[], &[])`). The text
+    // requirement below still applies, so this only claims queries the
+    // serial path would otherwise scan one-threaded (e.g.
+    // `SELECT COUNT(*) WHERE url LIKE '%x%'`). The dispatch gate in
+    // callbacks.rs additionally requires batch quals for the no-GROUP-BY
+    // shape so unfiltered aggregates keep their existing paths.
 
     // Must have at least one text column involved (GROUP BY, qual, or agg) to justify
     // the mixed path instead of the compact path.
@@ -3295,6 +3303,12 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
     mut total_cache_bytes_served: u64,
 ) -> AggScanState {
     let has_group_by = !group_specs.is_empty();
+    // No-GROUP-BY queries arrive with `compact_storage` unset — the caller
+    // only builds it when has_group_by — but the merge paths below need a
+    // leader-side storage regardless.
+    if compact_storage.is_none() {
+        compact_storage = Some(CompactAccStorage::new(CompactAccLayout::new(&agg_specs)));
+    }
     #[allow(unused_assignments)] // overwritten by `largest.compact_map` on the merge branch
     let mut compact_group_map: CompactGroupMap =
         CompactGroupMap::with_hasher(BuildHasherDefault::default());
@@ -3509,7 +3523,7 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
         };
 
         let mut pipeline_detoast_us: u64 = 0;
-        let partial_results: Vec<ParallelMixedResult> = if use_pipeline {
+        let mut partial_results: Vec<ParallelMixedResult> = if use_pipeline {
             let n_batches = PIPELINE_N_BATCHES.min(all_segments.len());
             let batch_size = all_segments.len().div_ceil(n_batches);
             let mut results: Vec<ParallelMixedResult> = Vec::new();
@@ -3572,6 +3586,22 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             })
         };
+
+        // A no-GROUP-BY aggregate must emit exactly one row even when every
+        // row was filtered out (COUNT(*) = 0, SUM/MIN/MAX = NULL). Workers
+        // only allocate a group on the first passing row, so when none saw a
+        // match, synthesize the single constant-key group with default
+        // accumulator state; every merge path downstream then treats it like
+        // an ordinary group.
+        if !has_group_by
+            && partial_results.iter().all(|r| r.compact_map.is_empty())
+            && let Some(r0) = partial_results.first_mut()
+        {
+            let idx = r0.compact_storage.alloc_group();
+            r0.cd_sidecar.alloc_group();
+            r0.mixed_keys.insert(&[], &[], &group_specs);
+            r0.compact_map.insert(hash_mixed_key(&[], &[]), idx);
+        }
 
         // Accumulate stats
         let scan_wall_us = t2.elapsed().as_micros() as u64;

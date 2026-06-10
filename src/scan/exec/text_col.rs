@@ -472,11 +472,103 @@ pub(super) fn apply_text_like_filter(
             let dict_matches: Vec<bool> = entries.iter().map(|s| matches_like(s)).collect();
             apply_via_dict(sel, row_count, row_to_entry, &dict_matches);
         }
+        // Buffer-sweep fast path only for the *initial* evaluation: when an
+        // earlier qual already narrowed `sel` (e.g. ClickBench Q22's dict
+        // Title LIKE before the URL NOT LIKE), the per-row path below visits
+        // only surviving rows, which beats sweeping the whole buffer for a
+        // sparse selection.
+        SegTextColumn::Lz4 { buf, row_to_range }
+            if sel.is_empty()
+                && matches!(strategy, LikeStrategy::Contains(s) if !s.is_empty()) =>
+        {
+            let LikeStrategy::Contains(needle) = strategy else {
+                unreachable!()
+            };
+            apply_lz4_contains_filter(buf, row_to_range, needle, negate, row_count, sel);
+        }
         _ => {
             apply_per_row(sel, row_count, |row| match seg_col.get_str(row) {
                 Some(s) => matches_like(s),
                 None => false,
             });
+        }
+    }
+}
+
+/// `LIKE '%needle%'` over an `Lz4` column via one SIMD `memmem` sweep of the
+/// whole decompressed buffer instead of a `contains` call per row.
+///
+/// Per-row substring search pays the searcher set-up cost on every ~100-byte
+/// haystack; a single pass over the segment's buffer amortizes it across all
+/// rows and skips per-row UTF-8 re-validation entirely (byte-level
+/// containment of a valid-UTF-8 needle == `str::contains`). Hits are mapped
+/// back to rows by binary search over the (offset-ordered) row ranges; a hit
+/// must lie fully inside one row's value — the buffer interleaves 4-byte
+/// length prefixes between values, so a match spanning a row boundary or a
+/// prefix is rejected and the sweep resumes one byte further.
+fn apply_lz4_contains_filter(
+    buf: &[u8],
+    row_to_range: &[(u32, u16)],
+    needle: &str,
+    negate: bool,
+    row_count: usize,
+    sel: &mut Vec<bool>,
+) {
+    // Offset-ordered (start, end, row) for rows that could contain the
+    // needle. Null rows (u32::MAX) and empty/skipped rows (len == 0) can
+    // never match; under `negate` their fate is decided below, not here.
+    let mut ranges: Vec<(u32, u32, u32)> = Vec::with_capacity(row_count);
+    for (row, &(off, len)) in row_to_range.iter().enumerate() {
+        if off != u32::MAX && len > 0 {
+            ranges.push((off, off + len as u32, row as u32));
+        }
+    }
+    debug_assert!(ranges.windows(2).all(|w| w[0].0 <= w[1].0));
+
+    let mut matched = vec![false; row_count];
+    let finder = memchr::memmem::Finder::new(needle.as_bytes());
+    let needle_len = needle.len();
+    let mut pos = 0usize;
+    while let Some(rel) = finder.find(&buf[pos..]) {
+        let hit = pos + rel;
+        // Last range starting at or before the hit.
+        let idx = ranges.partition_point(|&(start, _, _)| (start as usize) <= hit);
+        if idx > 0 {
+            let (start, end, row) = ranges[idx - 1];
+            if hit >= start as usize && hit + needle_len <= end as usize {
+                matched[row as usize] = true;
+                // Anything else inside this row is redundant — resume at
+                // its end (also guarantees forward progress).
+                pos = end as usize;
+                continue;
+            }
+        }
+        // Hit fell in a length prefix or spans a row boundary; a real
+        // in-row match may overlap it, so advance by one byte only.
+        pos = hit + 1;
+    }
+
+    let pass_at = |row: usize| -> bool {
+        let (off, _) = row_to_range[row];
+        if off == u32::MAX {
+            return false; // NULL never passes, even for NOT LIKE
+        }
+        if negate {
+            !matched[row]
+        } else {
+            matched[row]
+        }
+    };
+    if sel.is_empty() {
+        sel.reserve(row_count);
+        for row in 0..row_count {
+            sel.push(pass_at(row));
+        }
+    } else {
+        for (row, s) in sel.iter_mut().enumerate() {
+            if *s {
+                *s = pass_at(row);
+            }
         }
     }
 }
@@ -735,6 +827,60 @@ mod tests {
         let mut sel: Vec<bool> = Vec::new();
         apply_text_like_filter(&c, &LikeStrategy::Exact("beta".into()), false, 4, &mut sel);
         assert_eq!(sel, vec![false, true, false, false]);
+    }
+
+    #[test]
+    fn apply_text_like_filter_lz4_contains_single_sweep() {
+        // Lz4 columns route Contains through the buffer-sweep fast path.
+        let c = lz4_col(&[
+            Some("http://google.com/q"),
+            Some("http://example.com"),
+            None,
+            Some(""),
+            Some("agooglea"),
+        ]);
+        let mut sel: Vec<bool> = Vec::new();
+        apply_text_like_filter(&c, &LikeStrategy::Contains("google".into()), false, 5, &mut sel);
+        assert_eq!(sel, vec![true, false, false, false, true]);
+
+        // NOT LIKE: non-matching rows pass, NULL stays false, empty passes.
+        let mut sel: Vec<bool> = Vec::new();
+        apply_text_like_filter(&c, &LikeStrategy::Contains("google".into()), true, 5, &mut sel);
+        assert_eq!(sel, vec![false, true, false, true, false]);
+
+        // AND into an existing selection: already-false rows stay false.
+        let mut sel = vec![false, true, true, true, true];
+        apply_text_like_filter(&c, &LikeStrategy::Contains("google".into()), false, 5, &mut sel);
+        assert_eq!(sel, vec![false, false, false, false, true]);
+    }
+
+    #[test]
+    fn apply_text_like_filter_lz4_contains_rejects_boundary_spans() {
+        // The test helper packs values back-to-back, so "goo" + "gle" puts
+        // the needle bytes across a row boundary — that must NOT match,
+        // while a genuine match later in the buffer still must.
+        let c = lz4_col(&[Some("goo"), Some("gle"), Some("xgooglex")]);
+        let mut sel: Vec<bool> = Vec::new();
+        apply_text_like_filter(&c, &LikeStrategy::Contains("google".into()), false, 3, &mut sel);
+        assert_eq!(sel, vec![false, false, true]);
+
+        // A boundary-spanning hit must not mask an overlapping in-row match
+        // right after it: "...goog" | "google..." — the sweep resumes one
+        // byte after the rejected hit and still finds row 1's match.
+        let c = lz4_col(&[Some("xgoog"), Some("googley")]);
+        let mut sel: Vec<bool> = Vec::new();
+        apply_text_like_filter(&c, &LikeStrategy::Contains("google".into()), false, 2, &mut sel);
+        assert_eq!(sel, vec![false, true]);
+    }
+
+    #[test]
+    fn apply_text_like_filter_lz4_contains_repeated_hits_one_row() {
+        // Multiple hits inside one row mark it once and the sweep skips to
+        // the row end without losing later rows' matches.
+        let c = lz4_col(&[Some("googlegoogle"), Some("nope"), Some("google")]);
+        let mut sel: Vec<bool> = Vec::new();
+        apply_text_like_filter(&c, &LikeStrategy::Contains("google".into()), false, 3, &mut sel);
+        assert_eq!(sel, vec![true, false, true]);
     }
 
     #[test]

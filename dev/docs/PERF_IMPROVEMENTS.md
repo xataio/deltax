@@ -1651,3 +1651,79 @@ allocation per column per segment, so it's kept.
   `unpack_bits_u32` fast paths for byte-aligned widths.
 - `src/scan/exec/agg.rs` — `decompress_numeric_blob` split into
   no-null fast path + null-containing path helpers.
+
+### 49. Parallel no-GROUP-BY aggregation with text quals + single-sweep LZ4 LIKE [DONE]
+
+**Landed 2026-06-10. Q20 4.63 s → 1.02 s warm (4.5×) on the full
+ClickBench EC2 dataset.**
+
+Two stacked changes, both motivated by Q20
+(`SELECT COUNT(*) FROM hits WHERE URL LIKE '%google%'`):
+
+**(a) No-GROUP-BY aggregates now run on the parallel mixed path.**
+`COUNT(*)/SUM/AVG` with a text WHERE qual previously fell through
+every parallel dispatch — `can_parallel_mixed` rejected empty
+`group_specs`, `try_metadata_fast_path` bails on non-numeric quals,
+and the CD path requires all-CountDistinct — so Q20 scanned 1703
+segments on one thread (worker-scaling test: flat 4.6 s from 4 to
+32 workers). The fix funnels every row into a single constant-key
+group (`hash_mixed_key(&[], &[])`):
+
+- `can_parallel_mixed` accepts empty `group_specs`; the existing
+  "must involve a text column" requirement still applies, so pure
+  numeric-qual shapes keep their metadata fast path.
+- The dispatch gate in `begin_agg_scan` admits the no-GROUP-BY shape
+  only when batch quals exist (unfiltered aggregates stay on the
+  metadata/CD paths). The length-sidecar activation gate mirrors the
+  same clause to stay in lockstep.
+- The parallel-CD dispatch moved ahead of the mixed dispatch so an
+  unfiltered `COUNT(DISTINCT text_col)` keeps the CD-specific
+  partitioned merge instead of being claimed by mixed.
+- `dispatch_parallel_mixed_path` builds the leader `CompactAccStorage`
+  itself when the caller didn't (it only did so for GROUP BY), and
+  synthesizes the single empty-key group when no row passed the
+  filters — a no-GROUP-BY aggregate must emit exactly one row
+  (COUNT = 0, SUM/AVG = NULL).
+
+**(b) `LIKE '%needle%'` on LZ4 text columns is one memmem sweep per
+segment.** `apply_text_like_filter` ran `str::contains` per row —
+searcher set-up cost on every ~100-byte haystack plus per-row UTF-8
+validation in `get_str` (`from_utf8` was ~6 % of the Q20 profile).
+`apply_lz4_contains_filter` runs a single SIMD `memmem::Finder` sweep
+over the segment's decompressed buffer and maps hits back to rows by
+binary search over the offset-ordered row ranges. A hit must lie
+fully inside one row's value (the buffer interleaves 4-byte length
+prefixes); boundary-spanning hits resume one byte further so an
+overlapping in-row match is never lost. NULL rows never pass, even
+under NOT LIKE. Q20 agg phase: 752 → 419 ms.
+
+The sweep only fires on the *initial* evaluation (`sel` empty). When
+an earlier qual already narrowed the selection — Q22's dict-encoded
+`Title LIKE '%Google%'` runs before the `URL NOT LIKE` — the per-row
+path visits only surviving rows and beats sweeping the full buffer
+(first measured as a +7.6 % Q22 regression before the gate).
+
+**Measured (EC2 c6a.4xlarge, 100 M rows, warm EXPLAIN ANALYZE):**
+
+| Query | Before | After (a) | After (a)+(b) |
+|-------|-------:|----------:|--------------:|
+| Q20 COUNT(*) URL LIKE | 4,627 ms | 1,177 ms | **1,018 ms** |
+| Q22 Title LIKE + URL NOT LIKE | 3,457 ms¹ | — | **3,105 ms** |
+
+¹ Q22 measured after (a) — it has GROUP BY so (a) doesn't affect it;
+its gain is from (b).
+
+Result-set equality for all 43 queries verified against
+`clickbench/reference_results.json` (`make -C clickbench verify`).
+
+**Files touched:**
+- `src/scan/exec/agg/parallel_mixed.rs` — `can_parallel_mixed` empty
+  group_specs; leader storage bootstrap + empty-group synthesis in
+  `dispatch_parallel_mixed_path`.
+- `src/scan/exec/agg/callbacks.rs` — dispatch-gate relaxation,
+  CD-before-mixed ordering, sidecar gate lockstep clause.
+- `src/scan/exec/text_col.rs` — `apply_lz4_contains_filter` +
+  Contains routing in `apply_text_like_filter`.
+- `tests/test_nogroup_parallel_agg.py` — integration coverage for the
+  no-GROUP-BY shapes (zero-match one-row semantics, NOT LIKE NULLs,
+  mixed text+numeric quals, COUNT(DISTINCT) with text qual).

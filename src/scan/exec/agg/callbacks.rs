@@ -686,6 +686,10 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
         let sidecar_only_cols: Vec<bool> = if sidecar_candidate.iter().any(|&s| s)
             && crate::get_parallel_workers() > 1
             && estimated_rows >= SIDECAR_MIN_ROWS
+            // Mirror the no-GROUP-BY clause of can_parallel_mixed_flag below;
+            // a no-group query without batch quals won't reach the mixed
+            // dispatch, so sidecar-only loading must stay off for it.
+            && (!group_specs.is_empty() || !batch_quals.is_empty())
             && can_parallel_mixed(
                 &group_specs,
                 &needed_cols,
@@ -869,7 +873,56 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
         }
 
         // ============================================================
+        // PARALLEL COUNT(DISTINCT) PATH: no GROUP BY, all aggs are
+        // CountDistinct — parallelize by splitting segments across
+        // threads, each builds local HashSets, then merge.
+        //
+        // Must run before the mixed path: with the no-GROUP-BY mixed
+        // relaxation, an unfiltered COUNT(DISTINCT text_col) would
+        // otherwise be claimed by mixed, losing the CD-specific
+        // partitioned merge.
+        // ============================================================
+        if parallel_count_distinct_eligible(
+            &agg_specs,
+            &group_specs,
+            &batch_quals,
+            all_segments.len(),
+            n_workers,
+        ) {
+            let state = dispatch_parallel_count_distinct_path(
+                agg_specs,
+                group_specs,
+                &output_map,
+                where_quals,
+                topn_ascending,
+                &meta,
+                &mut all_segments,
+                &needed_cols,
+                &seg_filters,
+                time_min,
+                time_max,
+                &count_distinct_only_str,
+                &count_distinct_only_int,
+                n_workers,
+                use_lazy,
+                num_result_cols,
+                metadata_us,
+                heap_scan_us,
+                t_wall,
+                &mut total_detoast_us,
+                &mut total_cache_hits,
+                &mut total_cache_misses,
+                &mut total_cache_bytes_served,
+            );
+            let state_ptr = Box::into_raw(Box::new(state));
+            (*node).custom_ps = state_ptr as *mut pg_sys::List;
+            return;
+        }
+
+        // ============================================================
         // PARALLEL MIXED PATH: multi-threaded with string GROUP BY
+        // (or no GROUP BY at all — single constant-key group — when
+        // there are batch quals involving a text column)
         // ============================================================
         // Try to compile regexp patterns with Rust regex for thread-safe parallel execution
         let mut rust_regex_infos: Vec<RustRegexInfo> = Vec::new();
@@ -922,7 +975,11 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
 
         // The parallel-compact dispatch above runs and returns when its
         // gate passes, so reaching this point means compact was ineligible.
-        let can_parallel_mixed_flag = has_group_by
+        // No-GROUP-BY shapes are admitted only when there are batch quals:
+        // unfiltered aggregates are already covered by the metadata fast
+        // path / parallel-CD path, and `can_parallel_mixed` requires the
+        // quals to involve a text column.
+        let can_parallel_mixed_flag = (has_group_by || !batch_quals.is_empty())
             && (n_workers > 1 || derived_minmax_topn.is_some())
             && all_segments.len() > 1
             && all_regexp_compiled
@@ -967,48 +1024,6 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 total_cache_hits,
                 total_cache_misses,
                 total_cache_bytes_served,
-            );
-            let state_ptr = Box::into_raw(Box::new(state));
-            (*node).custom_ps = state_ptr as *mut pg_sys::List;
-            return;
-        }
-
-        // ============================================================
-        // PARALLEL COUNT(DISTINCT) PATH: no GROUP BY, all aggs are
-        // CountDistinct — parallelize by splitting segments across
-        // threads, each builds local HashSets, then merge.
-        // ============================================================
-        if parallel_count_distinct_eligible(
-            &agg_specs,
-            &group_specs,
-            &batch_quals,
-            all_segments.len(),
-            n_workers,
-        ) {
-            let state = dispatch_parallel_count_distinct_path(
-                agg_specs,
-                group_specs,
-                &output_map,
-                where_quals,
-                topn_ascending,
-                &meta,
-                &mut all_segments,
-                &needed_cols,
-                &seg_filters,
-                time_min,
-                time_max,
-                &count_distinct_only_str,
-                &count_distinct_only_int,
-                n_workers,
-                use_lazy,
-                num_result_cols,
-                metadata_us,
-                heap_scan_us,
-                t_wall,
-                &mut total_detoast_us,
-                &mut total_cache_hits,
-                &mut total_cache_misses,
-                &mut total_cache_bytes_served,
             );
             let state_ptr = Box::into_raw(Box::new(state));
             (*node).custom_ps = state_ptr as *mut pg_sys::List;

@@ -97,15 +97,17 @@ noise. The follow-up (partition `CompactAccStorage` and
 cost — touches every accumulator accessor in hot code. Currently not
 prioritized.
 
-### F5. Q20/Q21/Q22 URL LIKE on LZ4 columns (unchanged)
+### F5. Q20/Q21/Q22 URL LIKE on LZ4 columns — largely fixed by #49
 
-Still the worst outliers in the benchmark. Q20 6.73 s (~22× CH), Q22
-3.62 s (5.2× CH). URL is LZ4-encoded (high cardinality), so
-dictionary-accelerated LIKE (#40) doesn't apply. Trigram bloom (#33)
-tried — ineffective on common patterns. The only remaining levers are
-pipelined detoast (already active, ~10 % help) or heavier inverted-index
-style approaches (per-(column, segment) trigram→row-set postings —
-storage-prohibitive at 100 M scale).
+**Update 2026-06-10:** Q20 was running single-threaded — no GROUP BY
+meant every parallel dispatch rejected it (see
+`PERF_IMPROVEMENTS.md` #49). With the no-GROUP-BY parallel-mixed
+relaxation plus a single-sweep memmem LIKE for LZ4 columns, Q20 went
+**4.63 s → 1.02 s** warm (the earlier 6.73 s figure predates the blob
+cache). Q22 3.46 → 3.11 s from the sweep alone. Remaining Q20 cost is
+~⅓ detoast / ⅓ LZ4 decompress / ⅓ sweep+row-loop. The older notes
+below on inverted-index approaches still apply to whatever gap
+remains vs ClickHouse, but the "22× CH" outlier status is gone.
 
 ### F6. `COUNT(DISTINCT)` on blob-backed columns (narrowed, deprioritized)
 
