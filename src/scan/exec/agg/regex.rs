@@ -792,6 +792,90 @@ mod tests {
         );
     }
 
+    /// Property test: SimplePattern must agree with the regex engine on
+    /// thousands of randomized inputs, for every accepted pattern shape.
+    /// Uses a fixed-seed xorshift PRNG so failures are reproducible.
+    #[test]
+    fn test_simple_pattern_property_random_inputs() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        // Char pool biased toward the pattern alphabets (prefix chars, stop
+        // chars, optional-literal chars) so random strings frequently land
+        // on near-matches — the interesting boundary cases.
+        const POOL: &[char] = &[
+            'h', 't', 'p', 's', ':', '/', '/', 'w', 'w', '.', '.', 'a', 'b', 'c', 'd', 'e', 'x',
+            '-', '_', '0', '%', '\n', '\\', 'é', '日', 'H',
+        ];
+
+        let cases: &[(&str, &str)] = &[
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"\1"),
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"host=\1;"),
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"\&|\1"),
+            (r"^([^\.]+)\..*$", r"\1"),
+            // two optionals in a row + multi-char literal after the capture
+            (r"^a(?:bc)?(?:de)?([^/]+)/x.*$", r"<\1>"),
+            // optional single char adjacent to the capture
+            (r"^ab?([^.]+)\.c.*$", r"\1"),
+        ];
+
+        for (pattern, replacement) in cases {
+            let sp = SimplePattern::try_parse(pattern, replacement)
+                .unwrap_or_else(|| panic!("pattern should parse: {pattern}"));
+            let re = Regex::new(&pg_pattern_to_rust(pattern)).unwrap();
+            let rust_repl = convert_pg_replacement(replacement);
+
+            for iter in 0..6000u32 {
+                let mut s = String::new();
+                if iter % 3 == 0 {
+                    // Structured URL-ish input: prefix + optional www. + host
+                    // + optional path, each piece independently mutated.
+                    let prefixes = [
+                        "http://",
+                        "https://",
+                        "httpss://",
+                        "http:/",
+                        "HTTP://",
+                        "ftp://",
+                        "",
+                        "http://www.",
+                        "https://www",
+                        "a",
+                        "abc",
+                        "abcde",
+                    ];
+                    s.push_str(prefixes[(next() % prefixes.len() as u64) as usize]);
+                    for _ in 0..(next() % 8) {
+                        s.push(POOL[(next() % POOL.len() as u64) as usize]);
+                    }
+                    if next() % 2 == 0 {
+                        s.push('/');
+                        for _ in 0..(next() % 6) {
+                            s.push(POOL[(next() % POOL.len() as u64) as usize]);
+                        }
+                    }
+                } else {
+                    // Fully random string from the pool, length 0..32
+                    for _ in 0..(next() % 32) {
+                        s.push(POOL[(next() % POOL.len() as u64) as usize]);
+                    }
+                }
+
+                let expected = re.replace(&s, rust_repl.as_str());
+                let got = sp.replace(&s);
+                assert_eq!(
+                    got, expected,
+                    "mismatch for pattern {pattern:?} replacement {replacement:?} input {s:?} (iter {iter})"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_pg_pattern_to_rust_conversions() {
         // (?s) prefix for dot-all mode + $ → \z conversion
