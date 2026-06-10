@@ -1429,17 +1429,27 @@ fn append_row_to_columns(
                 }
             }
             ColumnKind::Jsonb => {
-                // Classic compression path (post-INSERT). jsonb comes through
-                // SPI as canonical JSON text (via jsonb_out); we re-parse via
-                // jsonb_in to store the binary varlena representation, so the
-                // scan path can skip jsonb_in per row. rtabench's hot path is
-                // direct-backfill, not this one — the extra roundtrip is fine.
-                let text_opt = row
-                    .get_datum_by_ordinal(ordinal)
-                    .unwrap()
-                    .value::<String>()
-                    .unwrap();
-                let bytes_opt = text_opt.map(|t| unsafe { jsonb_text_to_binary(&t) });
+                // Classic compression path (post-INSERT). SPI returns native
+                // jsonb Datums (not text). Read as JsonB and re-materialize to
+                // extract the binary varlena payload; fall back to jsonb_out
+                // text + jsonb_in for callers that still deliver JSON text.
+                let entry = row.get_datum_by_ordinal(ordinal).unwrap();
+                let bytes_opt = entry
+                    .value::<pgrx::datum::JsonB>()
+                    .ok()
+                    .flatten()
+                    .map(|jb| unsafe {
+                        jsonb_datum_to_binary(
+                            jb.into_datum().expect("jsonb value must convert to datum"),
+                        )
+                    })
+                    .or_else(|| {
+                        entry
+                            .value::<String>()
+                            .ok()
+                            .flatten()
+                            .map(|t| unsafe { jsonb_text_to_binary(&t) })
+                    });
                 if let TypedColumn::Bytes(vec) = &mut typed_cols[i] {
                     vec.push(bytes_opt);
                 }
@@ -1456,6 +1466,18 @@ thread_local! {
     /// and `MemoryContextReset` after, which reclaims everything cheaply.
     static JSONB_SCRATCH_CTX: std::cell::Cell<pgrx::pg_sys::MemoryContext> =
         const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// Extract the binary jsonb varlena payload (everything after the varlena
+/// header) from an existing jsonb Datum returned by SPI.
+pub(crate) unsafe fn jsonb_datum_to_binary(datum: pgrx::pg_sys::Datum) -> Vec<u8> {
+    unsafe {
+        let varlena = datum.cast_mut_ptr::<pgrx::pg_sys::varlena>();
+        let detoasted = pgrx::pg_sys::pg_detoast_datum(varlena);
+        let total_len = pgrx::varsize_any_exhdr(detoasted);
+        let data_ptr = pgrx::vardata_any(detoasted).cast::<u8>();
+        std::slice::from_raw_parts(data_ptr, total_len).to_vec()
+    }
 }
 
 /// Convert canonical JSON text to the binary jsonb varlena payload
