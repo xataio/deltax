@@ -752,10 +752,20 @@ pub(super) fn process_segments_compact(
             return (keys, 0i64);
         }
 
+        // Skipping entries that tie the current floor keeps the floor
+        // unchanged and an equally valid candidate set — on
+        // high-cardinality COUNT sorts almost every group ties at 1, so
+        // this avoids a heap push+pop per group.
         if !ascending {
             let mut heap: BinaryHeap<Reverse<(i64, u128)>> = BinaryHeap::with_capacity(k + 1);
             for (&key, &gidx) in &compact_map {
                 let val = read_val(gidx);
+                if heap.len() == k
+                    && let Some(&Reverse((floor, _))) = heap.peek()
+                    && val <= floor
+                {
+                    continue;
+                }
                 heap.push(Reverse((val, key)));
                 if heap.len() > k {
                     heap.pop();
@@ -768,6 +778,12 @@ pub(super) fn process_segments_compact(
             let mut heap: BinaryHeap<(i64, u128)> = BinaryHeap::with_capacity(k + 1);
             for (&key, &gidx) in &compact_map {
                 let val = read_val(gidx);
+                if heap.len() == k
+                    && let Some(&(floor, _)) = heap.peek()
+                    && val >= floor
+                {
+                    continue;
+                }
                 heap.push((val, key));
                 if heap.len() > k {
                     heap.pop();
@@ -1010,6 +1026,59 @@ fn merge_group_into(
             CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
                 dst_cd.union_from(slot_idx, dst_gidx, src_cd, src_gidx);
             }
+        }
+    }
+}
+
+/// Cheap 64-bit finalizer (splitmix64) used to spread group keys across
+/// merge partitions. Packed int keys are raw values, not hashes — e.g.
+/// date_trunc keys are all multiples of a large power-of-two µs count,
+/// so a bare `key % n_partitions` would land everything in partition 0.
+#[inline]
+pub(super) fn mix64(mut x: u64) -> u64 {
+    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
+    x ^ (x >> 31)
+}
+
+/// Read a group's i64-comparable sort value straight from a worker (or
+/// dup) storage + CD sidecar. AVG sorts are mapped through the
+/// order-preserving f64→i64 bits encoding; CountDistinct slots resolve
+/// through the sidecar (worker storages never had their CD counts
+/// written into Count slots).
+fn read_sort_val_from(
+    st: &CompactAccStorage,
+    cd: &CountDistinctSideCar,
+    gidx: u32,
+    sort_slot: usize,
+    sort_is_avg: bool,
+) -> i64 {
+    let (_, kind) = st.layout.slots[sort_slot];
+    if sort_is_avg {
+        let avg = match kind {
+            CompactAccKind::SumIntNarrow => {
+                let (s, c) = st.read_sum_int_narrow(gidx, sort_slot);
+                if c > 0 { s as f64 / c as f64 } else { 0.0 }
+            }
+            CompactAccKind::SumFloat => {
+                let (s, c) = st.read_sum_float(gidx, sort_slot);
+                if c > 0 { s / c as f64 } else { 0.0 }
+            }
+            _ => st.read_count(gidx, sort_slot) as f64,
+        };
+        let bits = avg.to_bits() as i64;
+        if bits >= 0 { bits } else { bits ^ i64::MAX }
+    } else {
+        match kind {
+            CompactAccKind::Count => st.read_count(gidx, sort_slot),
+            CompactAccKind::SumIntNarrow => st.read_sum_int_narrow(gidx, sort_slot).0,
+            CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+                st.read_min_max_int(gidx, sort_slot).0
+            }
+            CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                cd.len(sort_slot, gidx)
+            }
+            _ => st.read_count(gidx, sort_slot),
         }
     }
 }
@@ -2107,292 +2176,391 @@ unsafe fn compact_partitioned_topn(
             OutputEntry::Agg(ai) => ai,
             _ => unreachable!(),
         };
-        let n_partitions = ctx.n_workers;
-
         let pre_topn_groups: usize = partial_results.iter().map(|r| r.compact_map.len()).sum();
 
-        // Each partition thread: merge its slice, find local top-N,
-        // copy winners to mini storage, drop the rest.
+        // Partition count scales with group count so each partition's hash
+        // map stays small enough to be cache-resident; Phase B threads
+        // (one per worker slot) each process a contiguous range of
+        // partitions sequentially.
+        let n_partitions = (pre_topn_groups / 131_072 + 1).clamp(ctx.n_workers, 1024);
+        let sort_is_avg = agg_specs[sort_slot].agg_type == AggType::Avg;
+
+        // Phase A: parallel bucketing. Each thread scans its share of the
+        // worker partials once and routes (key, owner ref, sort value)
+        // into per-partition vectors, so each Phase B thread reads only
+        // its own partitions' entries instead of every thread iterating
+        // every worker map (n_partitions× the scan bandwidth). The sort
+        // value is read here because the owning worker's accumulator
+        // storage is a small, cache-friendly working set while iterating
+        // that worker's map — reading it later through scattered refs
+        // would miss cache on every group.
+        type PartEntry = (u64, u64, u64, i64); // (key_lo, key_hi, packed ref, sort val)
+        let n_chunks = partial_results.len().min(ctx.n_workers).max(1);
+        let chunk_size = partial_results.len().div_ceil(n_chunks).max(1);
+        #[allow(clippy::type_complexity)]
+        let chunked: Vec<Vec<Vec<PartEntry>>> = std::thread::scope(|s| {
+            let handles: Vec<_> = partial_results
+                .chunks(chunk_size)
+                .enumerate()
+                .map(|(ci, chunk_partials)| {
+                    let np = n_partitions;
+                    s.spawn(move || {
+                        let mut out: Vec<Vec<PartEntry>> = (0..np).map(|_| Vec::new()).collect();
+                        for (i, worker) in chunk_partials.iter().enumerate() {
+                            let wref_base = ((ci * chunk_size + i) as u64) << 32;
+                            let st = &worker.compact_storage;
+                            let cd = &worker.cd_sidecar;
+                            // Pre-read sort values in group-index order: a
+                            // sequential sweep over the worker's accumulator
+                            // storage, instead of a random-access read per
+                            // map entry (map iteration order is random, and
+                            // the storage is far larger than cache).
+                            let n_groups = worker.compact_map.len();
+                            let mut vals: Vec<i64> = Vec::with_capacity(n_groups);
+                            for g in 0..n_groups as u32 {
+                                vals.push(read_sort_val_from(st, cd, g, sort_slot, sort_is_avg));
+                            }
+                            for (&key, &wgidx) in &worker.compact_map {
+                                let lo = key as u64;
+                                let hi = (key >> 64) as u64;
+                                out[(mix64(lo ^ hi) as usize) % np].push((
+                                    lo,
+                                    hi,
+                                    wref_base | wgidx as u64,
+                                    vals[wgidx as usize],
+                                ));
+                            }
+                        }
+                        out
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        // Transpose chunk-major → partition-major, then group partitions
+        // into per-thread chunks each thread can move (and free).
+        let mut per_part: Vec<Vec<Vec<PartEntry>>> = (0..n_partitions)
+            .map(|_| Vec::with_capacity(chunked.len()))
+            .collect();
+        for chunk_out in chunked {
+            for (p, v) in chunk_out.into_iter().enumerate() {
+                per_part[p].push(v);
+            }
+        }
+        let part_chunk_size = n_partitions.div_ceil(ctx.n_workers).max(1);
+        let mut part_chunks: Vec<Vec<Vec<Vec<PartEntry>>>> = Vec::new();
+        {
+            let mut it = per_part.into_iter();
+            loop {
+                let c: Vec<_> = it.by_ref().take(part_chunk_size).collect();
+                if c.is_empty() {
+                    break;
+                }
+                part_chunks.push(c);
+            }
+        }
+
+        // Phase B: each thread merges its partitions one at a time, finds
+        // each partition's local top-N, copies winners to mini storage,
+        // drops the rest. Results are flattened back to partition order.
         #[allow(clippy::type_complexity)]
         let partition_results: Vec<(CompactAccStorage, Vec<(i64, u128, u32)>)> =
             std::thread::scope(|s| {
                 let workers = partial_results;
                 let specs = &agg_specs;
-                let np = n_partitions;
                 let ascending = ctx.topn_ascending;
                 let hfilters = ctx.having_filters;
 
-                let handles: Vec<_> = (0..np)
-                    .map(|p| {
+                let handles: Vec<_> = part_chunks
+                    .into_iter()
+                    .map(|parts| {
                         s.spawn(move || {
-                            let layout = CompactAccLayout::new(specs);
-                            let n_slots = layout.slots.len();
+                            let mut results = Vec::with_capacity(parts.len());
+                            for part_vecs in parts {
+                                let layout = CompactAccLayout::new(specs);
+                                let n_slots = layout.slots.len();
 
-                            // Dedup-aware partition view. On high-cardinality
-                            // GROUP BYs almost every key lives in exactly one
-                            // worker partial, so instead of copying every
-                            // accumulator into a partition-local storage
-                            // (a second full copy of all groups — ~7 GB peak
-                            // on ClickBench Q32), the map stores a packed
-                            // reference to the owning worker's entry. Only
-                            // keys seen in more than one worker get their
-                            // accumulators materialized, into `dup_storage`.
-                            //
-                            // Ref encoding (u64): bit 63 = dup flag. Singles
-                            // pack (worker_idx << 32) | worker_gidx; dups
-                            // store the dup_storage group index.
-                            const DUP_FLAG: u64 = 1 << 63;
-                            let mut map: hashbrown::HashMap<
-                                u128,
-                                u64,
-                                BuildHasherDefault<ahash::AHasher>,
-                            > = hashbrown::HashMap::with_hasher(Default::default());
-                            let mut dup_storage = CompactAccStorage::new(layout);
-                            let mut dup_cd = CountDistinctSideCar::new(specs);
-                            let mut dup_count: u32 = 0;
+                                // Dedup-aware partition view. On high-cardinality
+                                // GROUP BYs almost every key lives in exactly one
+                                // worker partial, so instead of copying every
+                                // accumulator into a partition-local storage
+                                // (a second full copy of all groups — ~7 GB peak
+                                // on ClickBench Q32), the map stores a packed
+                                // reference to the owning worker's entry plus its
+                                // pre-read sort value. Only keys seen in more
+                                // than one worker get their accumulators
+                                // materialized, into `dup_storage`.
+                                //
+                                // Ref encoding (u64): bit 63 = dup flag. Singles
+                                // pack (worker_idx << 32) | worker_gidx; dups
+                                // store the dup_storage group index (their sort
+                                // value is re-read from dup_storage at heap time
+                                // — the map's copy goes stale on later merges).
+                                const DUP_FLAG: u64 = 1 << 63;
+                                let total_entries: usize = part_vecs.iter().map(|v| v.len()).sum();
+                                let mut map: hashbrown::HashMap<
+                                    u128,
+                                    (u64, i64),
+                                    BuildHasherDefault<ahash::AHasher>,
+                                > = hashbrown::HashMap::with_capacity_and_hasher(
+                                    total_entries,
+                                    Default::default(),
+                                );
+                                let mut dup_storage = CompactAccStorage::new(layout);
+                                let mut dup_cd = CountDistinctSideCar::new(specs);
+                                let mut dup_count: u32 = 0;
 
-                            for (w, worker) in workers.iter().enumerate() {
-                                for (&key, &wgidx) in &worker.compact_map {
-                                    if ((key as u64) ^ ((key >> 64) as u64)) as usize % np != p {
-                                        continue;
-                                    }
-                                    match map.entry(key) {
-                                        hashbrown::hash_map::Entry::Vacant(e) => {
-                                            e.insert(((w as u64) << 32) | wgidx as u64);
-                                        }
-                                        hashbrown::hash_map::Entry::Occupied(mut e) => {
-                                            let r = *e.get();
-                                            let d = if r & DUP_FLAG != 0 {
-                                                (r & !DUP_FLAG) as u32
-                                            } else {
-                                                // Promote single → dup: pull the
-                                                // first worker's accumulators in.
-                                                let d = dup_storage.alloc_group();
-                                                dup_cd.alloc_group();
-                                                dup_count += 1;
-                                                let (w0, g0) = ((r >> 32) as usize, r as u32);
+                                for vec in &part_vecs {
+                                    for &(lo, hi, wref, val) in vec {
+                                        let key = ((hi as u128) << 64) | lo as u128;
+                                        match map.entry(key) {
+                                            hashbrown::hash_map::Entry::Vacant(e) => {
+                                                e.insert((wref, val));
+                                            }
+                                            hashbrown::hash_map::Entry::Occupied(mut e) => {
+                                                let (r, _) = *e.get();
+                                                let d = if r & DUP_FLAG != 0 {
+                                                    (r & !DUP_FLAG) as u32
+                                                } else {
+                                                    // Promote single → dup: pull the
+                                                    // first worker's accumulators in.
+                                                    let d = dup_storage.alloc_group();
+                                                    dup_cd.alloc_group();
+                                                    dup_count += 1;
+                                                    let (w0, g0) = ((r >> 32) as usize, r as u32);
+                                                    merge_group_into(
+                                                        &mut dup_storage,
+                                                        &mut dup_cd,
+                                                        d,
+                                                        &workers[w0].compact_storage,
+                                                        &workers[w0].cd_sidecar,
+                                                        g0,
+                                                    );
+                                                    e.insert((DUP_FLAG | d as u64, 0));
+                                                    d
+                                                };
+                                                let (w, g) = ((wref >> 32) as usize, wref as u32);
                                                 merge_group_into(
                                                     &mut dup_storage,
                                                     &mut dup_cd,
                                                     d,
-                                                    &workers[w0].compact_storage,
-                                                    &workers[w0].cd_sidecar,
-                                                    g0,
-                                                );
-                                                e.insert(DUP_FLAG | d as u64);
-                                                d
-                                            };
-                                            merge_group_into(
-                                                &mut dup_storage,
-                                                &mut dup_cd,
-                                                d,
-                                                &worker.compact_storage,
-                                                &worker.cd_sidecar,
-                                                wgidx,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Write CD counts into dup storage Count slots
-                            // before top-N selection (dup gidxs are contiguous
-                            // 0..dup_count). Singles read their counts straight
-                            // from the owning worker's sidecar in `resolve`d
-                            // accesses below.
-                            for e in &dup_cd.entries {
-                                for g in 0..dup_count {
-                                    dup_storage.set_count(g, e.spec_idx, e.count(g));
-                                }
-                            }
-                            let dup_storage = dup_storage; // read-only from here
-                            let dup_cd = dup_cd;
-
-                            // Resolve a packed ref to (storage, cd_sidecar, gidx).
-                            let resolve =
-                                |r: u64| -> (&CompactAccStorage, &CountDistinctSideCar, u32) {
-                                    if r & DUP_FLAG != 0 {
-                                        (&dup_storage, &dup_cd, (r & !DUP_FLAG) as u32)
-                                    } else {
-                                        let w = (r >> 32) as usize;
-                                        (
-                                            &workers[w].compact_storage,
-                                            &workers[w].cd_sidecar,
-                                            r as u32,
-                                        )
-                                    }
-                                };
-
-                            // Local top-N selection using a heap
-                            let (_, sort_kind) = dup_storage.layout.slots[sort_slot];
-                            let sort_is_avg = specs[sort_slot].agg_type == AggType::Avg;
-                            // Read an i64-comparable slot value through a
-                            // packed ref. CountDistinct slots resolve through
-                            // the sidecar — singles never had their counts
-                            // written into worker storage Count slots.
-                            let read_slot_i64 = |r: u64, slot: usize| -> i64 {
-                                let (st, cd, gidx) = resolve(r);
-                                let (_, kind) = st.layout.slots[slot];
-                                match kind {
-                                    CompactAccKind::Count => st.read_count(gidx, slot),
-                                    CompactAccKind::SumIntNarrow => {
-                                        st.read_sum_int_narrow(gidx, slot).0
-                                    }
-                                    CompactAccKind::MinInt | CompactAccKind::MaxInt => {
-                                        st.read_min_max_int(gidx, slot).0
-                                    }
-                                    CompactAccKind::CountDistinctInt
-                                    | CompactAccKind::CountDistinctStr => cd.len(slot, gidx),
-                                    _ => st.read_count(gidx, slot),
-                                }
-                            };
-                            let read_val = |r: u64| -> i64 {
-                                if sort_is_avg {
-                                    let (st, _, gidx) = resolve(r);
-                                    let avg = match sort_kind {
-                                        CompactAccKind::SumIntNarrow => {
-                                            let (s, c) = st.read_sum_int_narrow(gidx, sort_slot);
-                                            if c > 0 { s as f64 / c as f64 } else { 0.0 }
-                                        }
-                                        CompactAccKind::SumFloat => {
-                                            let (s, c) = st.read_sum_float(gidx, sort_slot);
-                                            if c > 0 { s / c as f64 } else { 0.0 }
-                                        }
-                                        _ => st.read_count(gidx, sort_slot) as f64,
-                                    };
-                                    let bits = avg.to_bits() as i64;
-                                    if bits >= 0 { bits } else { bits ^ i64::MAX }
-                                } else {
-                                    read_slot_i64(r, sort_slot)
-                                }
-                            };
-
-                            let having_read_val =
-                                |r: u64, slot: usize| -> i64 { read_slot_i64(r, slot) };
-
-                            let winners: Vec<(i64, u128, u64)> = if ascending {
-                                // Keep smallest N: max-heap evicts largest
-                                let mut heap: BinaryHeap<(i64, u128, u64)> =
-                                    BinaryHeap::with_capacity(limit + 1);
-                                for (&key, &r) in &map {
-                                    let mut passes = true;
-                                    for hf in hfilters {
-                                        let val = having_read_val(r, hf.agg_idx);
-                                        let ok = match hf.op {
-                                            HavingOp::Gt => val > hf.const_val,
-                                            HavingOp::Lt => val < hf.const_val,
-                                            HavingOp::Ge => val >= hf.const_val,
-                                            HavingOp::Le => val <= hf.const_val,
-                                            HavingOp::Eq => val == hf.const_val,
-                                            HavingOp::Ne => val != hf.const_val,
-                                        };
-                                        if !ok {
-                                            passes = false;
-                                            break;
-                                        }
-                                    }
-                                    if !passes {
-                                        continue;
-                                    }
-                                    let val = read_val(r);
-                                    heap.push((val, key, r));
-                                    if heap.len() > limit {
-                                        heap.pop();
-                                    }
-                                }
-                                heap.into_vec()
-                            } else {
-                                // Keep largest N: min-heap (Reverse) evicts smallest
-                                let mut heap: BinaryHeap<Reverse<(i64, u128, u64)>> =
-                                    BinaryHeap::with_capacity(limit + 1);
-                                for (&key, &r) in &map {
-                                    let mut passes = true;
-                                    for hf in hfilters {
-                                        let val = having_read_val(r, hf.agg_idx);
-                                        let ok = match hf.op {
-                                            HavingOp::Gt => val > hf.const_val,
-                                            HavingOp::Lt => val < hf.const_val,
-                                            HavingOp::Ge => val >= hf.const_val,
-                                            HavingOp::Le => val <= hf.const_val,
-                                            HavingOp::Eq => val == hf.const_val,
-                                            HavingOp::Ne => val != hf.const_val,
-                                        };
-                                        if !ok {
-                                            passes = false;
-                                            break;
-                                        }
-                                    }
-                                    if !passes {
-                                        continue;
-                                    }
-                                    let val = read_val(r);
-                                    heap.push(Reverse((val, key, r)));
-                                    if heap.len() > limit {
-                                        heap.pop();
-                                    }
-                                }
-                                heap.into_iter().map(|Reverse(x)| x).collect()
-                            };
-
-                            drop(map); // free partition map (~250MB)
-
-                            // Copy winning groups to tiny mini-storage
-                            let layout2 = CompactAccLayout::new(specs);
-                            let stride = layout2.group_stride;
-                            let mut mini = CompactAccStorage::new(layout2);
-                            let mut top_entries = Vec::with_capacity(winners.len());
-
-                            for (sort_val, key, r) in winners {
-                                let (src_st, src_cd, src_gidx) = resolve(r);
-                                let new_gidx = mini.alloc_group();
-                                let src = src_gidx as usize * stride;
-                                let dst = new_gidx as usize * stride;
-                                mini.buf[dst..dst + stride]
-                                    .copy_from_slice(&src_st.buf[src..src + stride]);
-                                for slot_idx in 0..n_slots {
-                                    let (_, kind) = mini.layout.slots[slot_idx];
-                                    match kind {
-                                        // Remap MinStr/MaxStr arena references
-                                        CompactAccKind::MinStr | CompactAccKind::MaxStr => {
-                                            let (off, len) =
-                                                src_st.read_min_max_str(src_gidx, slot_idx);
-                                            if off != u32::MAX {
-                                                let val_str = src_st.str_arena.get(off, len);
-                                                let (no, nl) = mini.str_arena.alloc(val_str);
-                                                mini.write_min_max_str(new_gidx, slot_idx, no, nl);
-                                            } else {
-                                                mini.write_min_max_str(
-                                                    new_gidx,
-                                                    slot_idx,
-                                                    u32::MAX,
-                                                    0,
+                                                    &workers[w].compact_storage,
+                                                    &workers[w].cd_sidecar,
+                                                    g,
                                                 );
                                             }
                                         }
-                                        // Single refs never had CD counts
-                                        // written into the worker storage's
-                                        // Count slot — fill from the sidecar
-                                        // (correct for dups too).
-                                        CompactAccKind::CountDistinctInt
-                                        | CompactAccKind::CountDistinctStr => {
-                                            mini.set_count(
-                                                new_gidx,
-                                                slot_idx,
-                                                src_cd.len(slot_idx, src_gidx),
-                                            );
-                                        }
-                                        _ => {}
                                     }
                                 }
-                                top_entries.push((sort_val, key, new_gidx));
-                            }
+                                drop(part_vecs); // free this partition's entry vecs
 
-                            (mini, top_entries)
+                                // Write CD counts into dup storage Count slots
+                                // before top-N selection (dup gidxs are contiguous
+                                // 0..dup_count). Singles read their counts straight
+                                // from the owning worker's sidecar in `resolve`d
+                                // accesses below.
+                                for e in &dup_cd.entries {
+                                    for g in 0..dup_count {
+                                        dup_storage.set_count(g, e.spec_idx, e.count(g));
+                                    }
+                                }
+                                let dup_storage = dup_storage; // read-only from here
+                                let dup_cd = dup_cd;
+
+                                // Resolve a packed ref to (storage, cd_sidecar, gidx).
+                                let resolve =
+                                    |r: u64| -> (&CompactAccStorage, &CountDistinctSideCar, u32) {
+                                        if r & DUP_FLAG != 0 {
+                                            (&dup_storage, &dup_cd, (r & !DUP_FLAG) as u32)
+                                        } else {
+                                            let w = (r >> 32) as usize;
+                                            (
+                                                &workers[w].compact_storage,
+                                                &workers[w].cd_sidecar,
+                                                r as u32,
+                                            )
+                                        }
+                                    };
+
+                                // Read an i64-comparable slot value through a
+                                // packed ref (HAVING filters only — the sort
+                                // value rides in the map entry for singles).
+                                let having_read_val = |r: u64, slot: usize| -> i64 {
+                                    let (st, cd, gidx) = resolve(r);
+                                    let (_, kind) = st.layout.slots[slot];
+                                    match kind {
+                                        CompactAccKind::Count => st.read_count(gidx, slot),
+                                        CompactAccKind::SumIntNarrow => {
+                                            st.read_sum_int_narrow(gidx, slot).0
+                                        }
+                                        CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+                                            st.read_min_max_int(gidx, slot).0
+                                        }
+                                        CompactAccKind::CountDistinctInt
+                                        | CompactAccKind::CountDistinctStr => cd.len(slot, gidx),
+                                        _ => st.read_count(gidx, slot),
+                                    }
+                                };
+                                // Sort value: singles use the pre-read map copy;
+                                // dups re-read their merged accumulators.
+                                let entry_val = |r: u64, stored: i64| -> i64 {
+                                    if r & DUP_FLAG != 0 {
+                                        read_sort_val_from(
+                                            &dup_storage,
+                                            &dup_cd,
+                                            (r & !DUP_FLAG) as u32,
+                                            sort_slot,
+                                            sort_is_avg,
+                                        )
+                                    } else {
+                                        stored
+                                    }
+                                };
+
+                                // Local top-N selection using a heap
+                                let winners: Vec<(i64, u128, u64)> = if ascending {
+                                    // Keep smallest N: max-heap evicts largest
+                                    let mut heap: BinaryHeap<(i64, u128, u64)> =
+                                        BinaryHeap::with_capacity(limit + 1);
+                                    for (&key, &(r, stored)) in &map {
+                                        let mut passes = true;
+                                        for hf in hfilters {
+                                            let val = having_read_val(r, hf.agg_idx);
+                                            let ok = match hf.op {
+                                                HavingOp::Gt => val > hf.const_val,
+                                                HavingOp::Lt => val < hf.const_val,
+                                                HavingOp::Ge => val >= hf.const_val,
+                                                HavingOp::Le => val <= hf.const_val,
+                                                HavingOp::Eq => val == hf.const_val,
+                                                HavingOp::Ne => val != hf.const_val,
+                                            };
+                                            if !ok {
+                                                passes = false;
+                                                break;
+                                            }
+                                        }
+                                        if !passes {
+                                            continue;
+                                        }
+                                        let val = entry_val(r, stored);
+                                        if heap.len() == limit
+                                            && let Some(&(top, _, _)) = heap.peek()
+                                            && val >= top
+                                        {
+                                            continue;
+                                        }
+                                        heap.push((val, key, r));
+                                        if heap.len() > limit {
+                                            heap.pop();
+                                        }
+                                    }
+                                    heap.into_vec()
+                                } else {
+                                    // Keep largest N: min-heap (Reverse) evicts smallest
+                                    let mut heap: BinaryHeap<Reverse<(i64, u128, u64)>> =
+                                        BinaryHeap::with_capacity(limit + 1);
+                                    for (&key, &(r, stored)) in &map {
+                                        let mut passes = true;
+                                        for hf in hfilters {
+                                            let val = having_read_val(r, hf.agg_idx);
+                                            let ok = match hf.op {
+                                                HavingOp::Gt => val > hf.const_val,
+                                                HavingOp::Lt => val < hf.const_val,
+                                                HavingOp::Ge => val >= hf.const_val,
+                                                HavingOp::Le => val <= hf.const_val,
+                                                HavingOp::Eq => val == hf.const_val,
+                                                HavingOp::Ne => val != hf.const_val,
+                                            };
+                                            if !ok {
+                                                passes = false;
+                                                break;
+                                            }
+                                        }
+                                        if !passes {
+                                            continue;
+                                        }
+                                        let val = entry_val(r, stored);
+                                        if heap.len() == limit
+                                            && let Some(&Reverse((top, _, _))) = heap.peek()
+                                            && val <= top
+                                        {
+                                            continue;
+                                        }
+                                        heap.push(Reverse((val, key, r)));
+                                        if heap.len() > limit {
+                                            heap.pop();
+                                        }
+                                    }
+                                    heap.into_iter().map(|Reverse(x)| x).collect()
+                                };
+
+                                drop(map); // free partition map
+
+                                // Copy winning groups to tiny mini-storage
+                                let layout2 = CompactAccLayout::new(specs);
+                                let stride = layout2.group_stride;
+                                let mut mini = CompactAccStorage::new(layout2);
+                                let mut top_entries = Vec::with_capacity(winners.len());
+
+                                for (sort_val, key, r) in winners {
+                                    let (src_st, src_cd, src_gidx) = resolve(r);
+                                    let new_gidx = mini.alloc_group();
+                                    let src = src_gidx as usize * stride;
+                                    let dst = new_gidx as usize * stride;
+                                    mini.buf[dst..dst + stride]
+                                        .copy_from_slice(&src_st.buf[src..src + stride]);
+                                    for slot_idx in 0..n_slots {
+                                        let (_, kind) = mini.layout.slots[slot_idx];
+                                        match kind {
+                                            // Remap MinStr/MaxStr arena references
+                                            CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                                                let (off, len) =
+                                                    src_st.read_min_max_str(src_gidx, slot_idx);
+                                                if off != u32::MAX {
+                                                    let val_str = src_st.str_arena.get(off, len);
+                                                    let (no, nl) = mini.str_arena.alloc(val_str);
+                                                    mini.write_min_max_str(
+                                                        new_gidx, slot_idx, no, nl,
+                                                    );
+                                                } else {
+                                                    mini.write_min_max_str(
+                                                        new_gidx,
+                                                        slot_idx,
+                                                        u32::MAX,
+                                                        0,
+                                                    );
+                                                }
+                                            }
+                                            // Single refs never had CD counts
+                                            // written into the worker storage's
+                                            // Count slot — fill from the sidecar
+                                            // (correct for dups too).
+                                            CompactAccKind::CountDistinctInt
+                                            | CompactAccKind::CountDistinctStr => {
+                                                mini.set_count(
+                                                    new_gidx,
+                                                    slot_idx,
+                                                    src_cd.len(slot_idx, src_gidx),
+                                                );
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    top_entries.push((sort_val, key, new_gidx));
+                                }
+
+                                results.push((mini, top_entries));
+                            }
+                            results
                         })
                     })
                     .collect();
 
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap())
+                    .collect()
             });
 
         let merge_us = t_merge.elapsed().as_micros() as u64;
