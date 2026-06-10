@@ -14,7 +14,7 @@ All settings are PostgreSQL GUCs and follow the usual scoping rules (`SET`, `ALT
 
 | GUC | Default | Context | Description |
 |---|---|---|---|
-| `pg_deltax.blob_cache_mb` | `-1` (auto) | postmaster | Size of the process-shared blob cache, in MiB. `-1` = auto (25% of physical RAM, clamped to `[256, 4096]`); `0` = cache disabled; `N > 0` = explicit MiB (up to 32768). Restart required — the shmem reservation is captured at postmaster start. See `dev/docs/BLOB_CACHE.md`. |
+| `pg_deltax.blob_cache_mb` | `-1` (auto) | postmaster | Size of the process-shared blob cache, in MiB. `-1` = auto (1/6 of physical RAM, clamped to `[256, 16384]`); `0` = cache disabled; `N > 0` = explicit MiB (up to 32768). Restart required — the shmem reservation is captured at postmaster start. See `dev/docs/BLOB_CACHE.md`. |
 | `pg_deltax.blob_cache_shards` | `64` | postmaster | Number of shards (power of two, `1..=1024`) in the blob cache. Each shard owns an LWLock + LRU list; more shards reduce contention under high concurrency, fewer save shmem overhead. Restart required. |
 
 ## Optimization toggles

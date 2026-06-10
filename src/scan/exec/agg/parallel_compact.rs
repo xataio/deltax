@@ -941,6 +941,79 @@ pub(super) fn merge_compact_results(
     }
 }
 
+/// Merge one group's accumulators from a worker partial into `dst`.
+///
+/// Thread-safe variant of the `merge_compact_results` inner loop for the
+/// partitioned merge: string comparison goes through `strcoll_cmp` (no PG
+/// FFI), so it may run inside partition threads.
+fn merge_group_into(
+    dst_storage: &mut CompactAccStorage,
+    dst_cd: &mut CountDistinctSideCar,
+    dst_gidx: u32,
+    src_storage: &CompactAccStorage,
+    src_cd: &CountDistinctSideCar,
+    src_gidx: u32,
+) {
+    for slot_idx in 0..dst_storage.layout.slots.len() {
+        let (_, kind) = dst_storage.layout.slots[slot_idx];
+        match kind {
+            CompactAccKind::Count => {
+                let wc = src_storage.read_count(src_gidx, slot_idx);
+                dst_storage.incr_count(dst_gidx, slot_idx, wc);
+            }
+            CompactAccKind::SumInt => {
+                let (ws, wc) = src_storage.read_sum_int(src_gidx, slot_idx);
+                dst_storage.add_sum_int(dst_gidx, slot_idx, ws, wc);
+            }
+            CompactAccKind::SumIntNarrow => {
+                let (ws, wc) = src_storage.read_sum_int_narrow(src_gidx, slot_idx);
+                dst_storage.add_sum_int_narrow(dst_gidx, slot_idx, ws, wc);
+            }
+            CompactAccKind::SumFloat => {
+                let (ws, wc) = src_storage.read_sum_float(src_gidx, slot_idx);
+                dst_storage.add_sum_float(dst_gidx, slot_idx, ws, wc);
+            }
+            CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                let (w_off, w_len) = src_storage.read_min_max_str(src_gidx, slot_idx);
+                if w_off != u32::MAX {
+                    let w_str = src_storage.str_arena.get(w_off, w_len);
+                    let (g_off, g_len) = dst_storage.read_min_max_str(dst_gidx, slot_idx);
+                    let should_update = if g_off == u32::MAX {
+                        true
+                    } else {
+                        let g_str = dst_storage.str_arena.get(g_off, g_len);
+                        let cmp = strcoll_cmp(w_str, g_str);
+                        match kind {
+                            CompactAccKind::MinStr => cmp == std::cmp::Ordering::Less,
+                            _ => cmp == std::cmp::Ordering::Greater,
+                        }
+                    };
+                    if should_update {
+                        let w_str = src_storage.str_arena.get(w_off, w_len);
+                        let (new_off, new_len) = dst_storage.str_arena.alloc(w_str);
+                        dst_storage.write_min_max_str(dst_gidx, slot_idx, new_off, new_len);
+                    }
+                }
+            }
+            CompactAccKind::MinInt => {
+                let (w_val, w_has) = src_storage.read_min_max_int(src_gidx, slot_idx);
+                if w_has {
+                    dst_storage.update_min_int(dst_gidx, slot_idx, w_val);
+                }
+            }
+            CompactAccKind::MaxInt => {
+                let (w_val, w_has) = src_storage.read_min_max_int(src_gidx, slot_idx);
+                if w_has {
+                    dst_storage.update_max_int(dst_gidx, slot_idx, w_val);
+                }
+            }
+            CompactAccKind::CountDistinctInt | CompactAccKind::CountDistinctStr => {
+                dst_cd.union_from(slot_idx, dst_gidx, src_cd, src_gidx);
+            }
+        }
+    }
+}
+
 /// Check if all needed columns (for aggs, groups, and batch quals) are numeric.
 pub(super) fn all_needed_cols_numeric(needed_cols: &[bool], col_types: &[pg_sys::Oid]) -> bool {
     needed_cols
@@ -2054,177 +2127,162 @@ unsafe fn compact_partitioned_topn(
                         s.spawn(move || {
                             let layout = CompactAccLayout::new(specs);
                             let n_slots = layout.slots.len();
-                            let mut map: CompactGroupMap =
-                                CompactGroupMap::with_hasher(Default::default());
-                            let mut storage = CompactAccStorage::new(layout);
-                            let mut cd_sidecar = CountDistinctSideCar::new(specs);
 
-                            // Merge entries from all workers belonging to this partition
-                            for worker in workers {
+                            // Dedup-aware partition view. On high-cardinality
+                            // GROUP BYs almost every key lives in exactly one
+                            // worker partial, so instead of copying every
+                            // accumulator into a partition-local storage
+                            // (a second full copy of all groups — ~7 GB peak
+                            // on ClickBench Q32), the map stores a packed
+                            // reference to the owning worker's entry. Only
+                            // keys seen in more than one worker get their
+                            // accumulators materialized, into `dup_storage`.
+                            //
+                            // Ref encoding (u64): bit 63 = dup flag. Singles
+                            // pack (worker_idx << 32) | worker_gidx; dups
+                            // store the dup_storage group index.
+                            const DUP_FLAG: u64 = 1 << 63;
+                            let mut map: hashbrown::HashMap<
+                                u128,
+                                u64,
+                                BuildHasherDefault<ahash::AHasher>,
+                            > = hashbrown::HashMap::with_hasher(Default::default());
+                            let mut dup_storage = CompactAccStorage::new(layout);
+                            let mut dup_cd = CountDistinctSideCar::new(specs);
+                            let mut dup_count: u32 = 0;
+
+                            for (w, worker) in workers.iter().enumerate() {
                                 for (&key, &wgidx) in &worker.compact_map {
                                     if ((key as u64) ^ ((key >> 64) as u64)) as usize % np != p {
                                         continue;
                                     }
-                                    let gidx = match map.entry(key) {
-                                        hashbrown::hash_map::Entry::Occupied(e) => *e.get(),
+                                    match map.entry(key) {
                                         hashbrown::hash_map::Entry::Vacant(e) => {
-                                            let idx = storage.alloc_group();
-                                            cd_sidecar.alloc_group();
-                                            e.insert(idx);
-                                            idx
+                                            e.insert(((w as u64) << 32) | wgidx as u64);
                                         }
-                                    };
-                                    for slot_idx in 0..n_slots {
-                                        let (_, kind) = storage.layout.slots[slot_idx];
-                                        match kind {
-                                            CompactAccKind::Count => {
-                                                let wc = worker
-                                                    .compact_storage
-                                                    .read_count(wgidx, slot_idx);
-                                                storage.incr_count(gidx, slot_idx, wc);
-                                            }
-                                            CompactAccKind::SumInt => {
-                                                let (ws, wc) = worker
-                                                    .compact_storage
-                                                    .read_sum_int(wgidx, slot_idx);
-                                                storage.add_sum_int(gidx, slot_idx, ws, wc);
-                                            }
-                                            CompactAccKind::SumIntNarrow => {
-                                                let (ws, wc) = worker
-                                                    .compact_storage
-                                                    .read_sum_int_narrow(wgidx, slot_idx);
-                                                storage.add_sum_int_narrow(gidx, slot_idx, ws, wc);
-                                            }
-                                            CompactAccKind::SumFloat => {
-                                                let (ws, wc) = worker
-                                                    .compact_storage
-                                                    .read_sum_float(wgidx, slot_idx);
-                                                storage.add_sum_float(gidx, slot_idx, ws, wc);
-                                            }
-                                            CompactAccKind::MinStr | CompactAccKind::MaxStr => {
-                                                let (w_off, w_len) = worker
-                                                    .compact_storage
-                                                    .read_min_max_str(wgidx, slot_idx);
-                                                if w_off != u32::MAX {
-                                                    let w_str = worker
-                                                        .compact_storage
-                                                        .str_arena
-                                                        .get(w_off, w_len);
-                                                    let (g_off, g_len) =
-                                                        storage.read_min_max_str(gidx, slot_idx);
-                                                    let should_update = if g_off == u32::MAX {
-                                                        true
-                                                    } else {
-                                                        let g_str =
-                                                            storage.str_arena.get(g_off, g_len);
-                                                        let cmp = strcoll_cmp(w_str, g_str);
-                                                        match kind {
-                                                            CompactAccKind::MinStr => {
-                                                                cmp == std::cmp::Ordering::Less
-                                                            }
-                                                            _ => cmp == std::cmp::Ordering::Greater,
-                                                        }
-                                                    };
-                                                    if should_update {
-                                                        let w_str = worker
-                                                            .compact_storage
-                                                            .str_arena
-                                                            .get(w_off, w_len);
-                                                        let (new_off, new_len) =
-                                                            storage.str_arena.alloc(w_str);
-                                                        storage.write_min_max_str(
-                                                            gidx, slot_idx, new_off, new_len,
-                                                        );
-                                                    }
-                                                }
-                                            }
-                                            CompactAccKind::MinInt => {
-                                                let (w_val, w_has) = worker
-                                                    .compact_storage
-                                                    .read_min_max_int(wgidx, slot_idx);
-                                                if w_has {
-                                                    storage.update_min_int(gidx, slot_idx, w_val);
-                                                }
-                                            }
-                                            CompactAccKind::MaxInt => {
-                                                let (w_val, w_has) = worker
-                                                    .compact_storage
-                                                    .read_min_max_int(wgidx, slot_idx);
-                                                if w_has {
-                                                    storage.update_max_int(gidx, slot_idx, w_val);
-                                                }
-                                            }
-                                            CompactAccKind::CountDistinctInt
-                                            | CompactAccKind::CountDistinctStr => {
-                                                cd_sidecar.union_from(
-                                                    slot_idx,
-                                                    gidx,
-                                                    &worker.cd_sidecar,
-                                                    wgidx,
+                                        hashbrown::hash_map::Entry::Occupied(mut e) => {
+                                            let r = *e.get();
+                                            let d = if r & DUP_FLAG != 0 {
+                                                (r & !DUP_FLAG) as u32
+                                            } else {
+                                                // Promote single → dup: pull the
+                                                // first worker's accumulators in.
+                                                let d = dup_storage.alloc_group();
+                                                dup_cd.alloc_group();
+                                                dup_count += 1;
+                                                let (w0, g0) =
+                                                    ((r >> 32) as usize, r as u32);
+                                                merge_group_into(
+                                                    &mut dup_storage,
+                                                    &mut dup_cd,
+                                                    d,
+                                                    &workers[w0].compact_storage,
+                                                    &workers[w0].cd_sidecar,
+                                                    g0,
                                                 );
-                                            }
+                                                e.insert(DUP_FLAG | d as u64);
+                                                d
+                                            };
+                                            merge_group_into(
+                                                &mut dup_storage,
+                                                &mut dup_cd,
+                                                d,
+                                                &worker.compact_storage,
+                                                &worker.cd_sidecar,
+                                                wgidx,
+                                            );
                                         }
                                     }
                                 }
                             }
 
-                            // Write CD counts into storage before top-N selection
-                            cd_sidecar.write_counts_to_storage(&mut storage, &map);
+                            // Write CD counts into dup storage Count slots
+                            // before top-N selection (dup gidxs are contiguous
+                            // 0..dup_count). Singles read their counts straight
+                            // from the owning worker's sidecar in `resolve`d
+                            // accesses below.
+                            for e in &dup_cd.entries {
+                                for g in 0..dup_count {
+                                    dup_storage.set_count(g, e.spec_idx, e.count(g));
+                                }
+                            }
+                            let dup_storage = dup_storage; // read-only from here
+                            let dup_cd = dup_cd;
+
+                            // Resolve a packed ref to (storage, cd_sidecar, gidx).
+                            let resolve = |r: u64| -> (
+                                &CompactAccStorage,
+                                &CountDistinctSideCar,
+                                u32,
+                            ) {
+                                if r & DUP_FLAG != 0 {
+                                    (&dup_storage, &dup_cd, (r & !DUP_FLAG) as u32)
+                                } else {
+                                    let w = (r >> 32) as usize;
+                                    (
+                                        &workers[w].compact_storage,
+                                        &workers[w].cd_sidecar,
+                                        r as u32,
+                                    )
+                                }
+                            };
 
                             // Local top-N selection using a heap
-                            let (_, sort_kind) = storage.layout.slots[sort_slot];
+                            let (_, sort_kind) = dup_storage.layout.slots[sort_slot];
                             let sort_is_avg = specs[sort_slot].agg_type == AggType::Avg;
-                            let read_val = |gidx: u32| -> i64 {
+                            // Read an i64-comparable slot value through a
+                            // packed ref. CountDistinct slots resolve through
+                            // the sidecar — singles never had their counts
+                            // written into worker storage Count slots.
+                            let read_slot_i64 = |r: u64, slot: usize| -> i64 {
+                                let (st, cd, gidx) = resolve(r);
+                                let (_, kind) = st.layout.slots[slot];
+                                match kind {
+                                    CompactAccKind::Count => st.read_count(gidx, slot),
+                                    CompactAccKind::SumIntNarrow => {
+                                        st.read_sum_int_narrow(gidx, slot).0
+                                    }
+                                    CompactAccKind::MinInt | CompactAccKind::MaxInt => {
+                                        st.read_min_max_int(gidx, slot).0
+                                    }
+                                    CompactAccKind::CountDistinctInt
+                                    | CompactAccKind::CountDistinctStr => cd.len(slot, gidx),
+                                    _ => st.read_count(gidx, slot),
+                                }
+                            };
+                            let read_val = |r: u64| -> i64 {
                                 if sort_is_avg {
+                                    let (st, _, gidx) = resolve(r);
                                     let avg = match sort_kind {
                                         CompactAccKind::SumIntNarrow => {
                                             let (s, c) =
-                                                storage.read_sum_int_narrow(gidx, sort_slot);
+                                                st.read_sum_int_narrow(gidx, sort_slot);
                                             if c > 0 { s as f64 / c as f64 } else { 0.0 }
                                         }
                                         CompactAccKind::SumFloat => {
-                                            let (s, c) = storage.read_sum_float(gidx, sort_slot);
+                                            let (s, c) = st.read_sum_float(gidx, sort_slot);
                                             if c > 0 { s / c as f64 } else { 0.0 }
                                         }
-                                        _ => storage.read_count(gidx, sort_slot) as f64,
+                                        _ => st.read_count(gidx, sort_slot) as f64,
                                     };
                                     let bits = avg.to_bits() as i64;
                                     if bits >= 0 { bits } else { bits ^ i64::MAX }
                                 } else {
-                                    match sort_kind {
-                                        CompactAccKind::Count => {
-                                            storage.read_count(gidx, sort_slot)
-                                        }
-                                        CompactAccKind::SumIntNarrow => {
-                                            storage.read_sum_int_narrow(gidx, sort_slot).0
-                                        }
-                                        CompactAccKind::MinInt | CompactAccKind::MaxInt => {
-                                            storage.read_min_max_int(gidx, sort_slot).0
-                                        }
-                                        _ => storage.read_count(gidx, sort_slot),
-                                    }
+                                    read_slot_i64(r, sort_slot)
                                 }
                             };
 
-                            let having_read_val = |gidx: u32, slot: usize| -> i64 {
-                                let (_, kind) = storage.layout.slots[slot];
-                                match kind {
-                                    CompactAccKind::Count => storage.read_count(gidx, slot),
-                                    CompactAccKind::SumIntNarrow => {
-                                        storage.read_sum_int_narrow(gidx, slot).0
-                                    }
-                                    _ => storage.read_count(gidx, slot),
-                                }
-                            };
+                            let having_read_val =
+                                |r: u64, slot: usize| -> i64 { read_slot_i64(r, slot) };
 
-                            let winners: Vec<(i64, u128, u32)> = if ascending {
+                            let winners: Vec<(i64, u128, u64)> = if ascending {
                                 // Keep smallest N: max-heap evicts largest
-                                let mut heap: BinaryHeap<(i64, u128, u32)> =
+                                let mut heap: BinaryHeap<(i64, u128, u64)> =
                                     BinaryHeap::with_capacity(limit + 1);
-                                for (&key, &gidx) in &map {
+                                for (&key, &r) in &map {
                                     let mut passes = true;
                                     for hf in hfilters {
-                                        let val = having_read_val(gidx, hf.agg_idx);
+                                        let val = having_read_val(r, hf.agg_idx);
                                         let ok = match hf.op {
                                             HavingOp::Gt => val > hf.const_val,
                                             HavingOp::Lt => val < hf.const_val,
@@ -2241,8 +2299,8 @@ unsafe fn compact_partitioned_topn(
                                     if !passes {
                                         continue;
                                     }
-                                    let val = read_val(gidx);
-                                    heap.push((val, key, gidx));
+                                    let val = read_val(r);
+                                    heap.push((val, key, r));
                                     if heap.len() > limit {
                                         heap.pop();
                                     }
@@ -2250,12 +2308,12 @@ unsafe fn compact_partitioned_topn(
                                 heap.into_vec()
                             } else {
                                 // Keep largest N: min-heap (Reverse) evicts smallest
-                                let mut heap: BinaryHeap<Reverse<(i64, u128, u32)>> =
+                                let mut heap: BinaryHeap<Reverse<(i64, u128, u64)>> =
                                     BinaryHeap::with_capacity(limit + 1);
-                                for (&key, &gidx) in &map {
+                                for (&key, &r) in &map {
                                     let mut passes = true;
                                     for hf in hfilters {
-                                        let val = having_read_val(gidx, hf.agg_idx);
+                                        let val = having_read_val(r, hf.agg_idx);
                                         let ok = match hf.op {
                                             HavingOp::Gt => val > hf.const_val,
                                             HavingOp::Lt => val < hf.const_val,
@@ -2272,8 +2330,8 @@ unsafe fn compact_partitioned_topn(
                                     if !passes {
                                         continue;
                                     }
-                                    let val = read_val(gidx);
-                                    heap.push(Reverse((val, key, gidx)));
+                                    let val = read_val(r);
+                                    heap.push(Reverse((val, key, r)));
                                     if heap.len() > limit {
                                         heap.pop();
                                     }
@@ -2285,35 +2343,56 @@ unsafe fn compact_partitioned_topn(
 
                             // Copy winning groups to tiny mini-storage
                             let layout2 = CompactAccLayout::new(specs);
-                            let stride = storage.layout.group_stride;
+                            let stride = layout2.group_stride;
                             let mut mini = CompactAccStorage::new(layout2);
                             let mut top_entries = Vec::with_capacity(winners.len());
 
-                            for (sort_val, key, old_gidx) in winners {
+                            for (sort_val, key, r) in winners {
+                                let (src_st, src_cd, src_gidx) = resolve(r);
                                 let new_gidx = mini.alloc_group();
-                                let src = old_gidx as usize * stride;
+                                let src = src_gidx as usize * stride;
                                 let dst = new_gidx as usize * stride;
                                 mini.buf[dst..dst + stride]
-                                    .copy_from_slice(&storage.buf[src..src + stride]);
-                                // Remap MinStr/MaxStr arena references
+                                    .copy_from_slice(&src_st.buf[src..src + stride]);
                                 for slot_idx in 0..n_slots {
-                                    let (_, kind) = storage.layout.slots[slot_idx];
-                                    if kind == CompactAccKind::MinStr
-                                        || kind == CompactAccKind::MaxStr
-                                    {
-                                        let (off, len) =
-                                            storage.read_min_max_str(old_gidx, slot_idx);
-                                        if off != u32::MAX {
-                                            let val_str = storage.str_arena.get(off, len);
-                                            let (no, nl) = mini.str_arena.alloc(val_str);
-                                            mini.write_min_max_str(new_gidx, slot_idx, no, nl);
+                                    let (_, kind) = mini.layout.slots[slot_idx];
+                                    match kind {
+                                        // Remap MinStr/MaxStr arena references
+                                        CompactAccKind::MinStr | CompactAccKind::MaxStr => {
+                                            let (off, len) =
+                                                src_st.read_min_max_str(src_gidx, slot_idx);
+                                            if off != u32::MAX {
+                                                let val_str = src_st.str_arena.get(off, len);
+                                                let (no, nl) = mini.str_arena.alloc(val_str);
+                                                mini.write_min_max_str(
+                                                    new_gidx, slot_idx, no, nl,
+                                                );
+                                            } else {
+                                                mini.write_min_max_str(
+                                                    new_gidx,
+                                                    slot_idx,
+                                                    u32::MAX,
+                                                    0,
+                                                );
+                                            }
                                         }
+                                        // Single refs never had CD counts
+                                        // written into the worker storage's
+                                        // Count slot — fill from the sidecar
+                                        // (correct for dups too).
+                                        CompactAccKind::CountDistinctInt
+                                        | CompactAccKind::CountDistinctStr => {
+                                            mini.set_count(
+                                                new_gidx,
+                                                slot_idx,
+                                                src_cd.len(slot_idx, src_gidx),
+                                            );
+                                        }
+                                        _ => {}
                                     }
                                 }
                                 top_entries.push((sort_val, key, new_gidx));
                             }
-
-                            drop(storage); // free full partition storage
 
                             (mini, top_entries)
                         })

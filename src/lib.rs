@@ -284,7 +284,7 @@ pub extern "C-unwind" fn _PG_init() {
     );
     GucRegistry::define_int_guc(
         c"pg_deltax.blob_cache_mb",
-        c"Size of the process-shared blob cache, in MiB. -1 = auto (25% of physical RAM, clamped to [256, 4096]); 0 = disabled; N > 0 = explicit MiB.",
+        c"Size of the process-shared blob cache, in MiB. -1 = auto (1/6 of physical RAM, clamped to [256, 16384]); 0 = disabled; N > 0 = explicit MiB.",
         c"The blob cache stores detoasted compressed segment blobs keyed by (companion_oid, segment_id, col_idx). Repeated queries against the same segments skip the pg_detoast_datum path. -1 (default) auto-sizes at postmaster start from /proc/meminfo, falling back to the 256 MB floor if it can't be read. Explicit values override the auto heuristic. See dev/docs/BLOB_CACHE.md. Restart required — the shmem reservation is captured at postmaster start.",
         &BLOB_CACHE_MB,
         -1,

@@ -1727,3 +1727,110 @@ Result-set equality for all 43 queries verified against
 - `tests/test_nogroup_parallel_agg.py` — integration coverage for the
   no-GROUP-BY shapes (zero-match one-row semantics, NOT LIKE NULLs,
   mixed text+numeric quals, COUNT(DISTINCT) with text qual).
+
+### 50. Blob-cache auto-size: cap 4 → 16 GiB, fraction RAM/4 → RAM/6 [DONE]
+
+**Landed 2026-06-10. Bench hot total 58.8 s → 54.5 s (−4.3 s, −7.4%)
+on the full ClickBench EC2 dataset, no regressions.**
+
+Two-constant change in `src/blob_cache/mod.rs`: `AUTO_CAP_MB`
+4096 → 16384 and the auto fraction `MemTotal/4` → `MemTotal/6`
+(floor unchanged at 256 MiB). On the c6a.4xlarge (32 GiB) auto now
+resolves to ~5.2 GiB instead of the capped 4 GiB.
+
+**Why it mattered.** The old cap pinned the cache at 4 GiB while the
+compressed dataset is 14.6 GB. The big-text working sets (URL ≈
+2.1 GB, URL+Title+SearchPhrase+UserID ≈ 4.3 GB for Q22) didn't fit
+alongside the int columns, so warm runs of the text-heavy queries
+thrashed the LRU: Q22 ran warm at a **42% miss rate** and re-paid
+2.8 s of detoast on every run, Q20 1.5 s. With the working set
+resident, warm detoast collapses to ~0 across the board.
+
+**Why RAM/6, not RAM/4.** The first iteration kept 25% (→ 7.8 GiB
+here) and OOM-killed Q32 when the full bench ran back-to-back on one
+postmaster (`make verify`): once queries 0–31 fill the cache, Q32's
+high-cardinality agg transient (~15–18 GB anon at the time, see #51)
++ 8 GB shared_buffers + 7.8 GB cache exceeded the box. Shmem pages,
+once touched, are non-reclaimable without swap, so a filled cache is
+permanent occupancy — the default has to leave room for worst-case
+query transients. RAM/6 + the #51 merge-memory reduction fits with
+headroom; the official bench protocol (PG restart before each query)
+was never at risk because the cache then only ever holds the current
+query's columns.
+
+**Measured (EC2 c6a.4xlarge, 100 M rows, warm EXPLAIN ANALYZE):**
+
+| Query | Before | After | detoast before → after |
+|-------|-------:|------:|-----------------------:|
+| Q20 COUNT(*) URL LIKE | 2,004 ms | **1,120 ms** | 1,528 → 3 ms |
+| Q22 Title LIKE + URL NOT LIKE | 4,158 ms | **2,753 ms** | 2,778 → 8 ms |
+| Q28 Referer REGEXP_REPLACE | 8,172 ms¹ | **7,827 ms¹** | — |
+
+¹ best-of-3 bench numbers; Q28's gain is partial-working-set
+residency, not a full fit.
+
+Full-bench comparison (best-of-3 hot, history
+`20260610_081000` vs `20260610_104132`): only Q20 (−3.5 s, combined
+with #49 which landed in the same window), Q22 (−0.41 s) and Q28
+(−0.35 s) moved beyond noise; cold totals unchanged (+0.7 s on a
+310 s sum).
+
+The cache reserves its full size as shmem up front (DSA in-place),
+but pages are only touched as entries land, so the larger cap costs
+nothing on workloads that never fill it.
+
+### 51. Dedup-aware partitioned merge (compact path) [DONE]
+
+**Landed 2026-06-10. Q32 warm 9.5 → 8.7 s, peak backend RSS during
+Q32 21.4 → 17.1 GB (−4.3 GB). Unblocked the #50 cache-size increase.**
+
+`compact_partitioned_topn` used to have each partition thread build a
+full partition-local copy of its slice of the group space: a
+`CompactGroupMap` *plus* a `CompactAccStorage` into which every
+worker's accumulators were copied slot-by-slot. On essentially-unique
+GROUP BY keys (Q32: 99,997,494 groups from 99,997,497 rows) that
+second copy is 99.99% pure waste — almost no key appears in more
+than one worker partial, so there is nothing to merge.
+
+Now the partition map stores a packed `u64` reference instead of a
+group index: bit 63 = dup flag; singles pack
+`(worker_idx << 32) | worker_gidx`, dups index into a `dup_storage`
+that only materializes groups actually seen in ≥2 worker partials
+(via `merge_group_into`, the thread-safe per-group extraction of the
+`merge_compact_results` inner loop). Top-N heap reads and HAVING
+filters resolve through the reference (`read_slot_i64`); winner
+materialization into the per-partition mini-storage stride-copies
+from the owning worker's storage and fixes up MinStr/MaxStr arena
+offsets and CountDistinct counts (singles read CD counts from the
+worker sidecar — they were never written into worker storage Count
+slots).
+
+Effects on Q32 (warm, EXPLAIN ANALYZE):
+
+| Metric | Before | After |
+|---|---:|---:|
+| merge | 5,298 ms | 4,435 ms |
+| total DeltaX | 8,854 ms | 7,999 ms |
+| peak backend RSS | 21.4 GB | 17.1 GB |
+
+The memory drop matters more than the time: Q32's transient anon was
+what made the #50 blob-cache increase OOM in no-restart sessions
+(8 GB shared_buffers + filled cache + ~18 GB agg transient > 30 GB
+box). With the dedup merge, `make -C clickbench verify` (all 43
+queries against one postmaster, cache fully populated) passes:
+43 OK, 0 mismatch, no OOM.
+
+Worst-case behaviour (every key present in all workers, e.g.
+low-cardinality groups that still route here) degenerates gracefully:
+every key promotes to `dup_storage` on its second sighting, which is
+the same alloc + merge work as before plus one extra map write; peak
+memory is no worse than the old design.
+
+**Files touched:** `src/scan/exec/agg/parallel_compact.rs`
+(`merge_group_into` helper + rewritten partition-thread closure in
+`compact_partitioned_topn`).
+
+**Bench-level (best-of-3 hot, history `20260610_104132` →
+`20260610_112034`):** Q32 9.464 → 8.585 s, Q15 1.944 → 1.842 s, all
+other queries within noise. Combined with #50, bench hot total
+58.8 → **53.4 s** (−9.1%) for the day.
