@@ -406,6 +406,9 @@ pub(super) struct ParallelCompactConfig<'a> {
     /// If set, each worker computes top-K candidates for speculative merge-skip.
     /// (sort_slot, k, ascending)
     pub(super) topn_spec: Option<(usize, usize, bool)>,
+    /// Pre-size for each worker partial's group map — see
+    /// `ParallelMixedConfig::reserve_groups`.
+    pub(super) reserve_groups: usize,
 }
 
 // SAFETY: ParallelCompactConfig holds a `&[Option<(Datum, bool)>]` for
@@ -453,9 +456,13 @@ impl ParallelCompactResult {
 /// Safe to call from any thread.
 pub(super) fn process_segments_compact(
     segments: &[SegmentData],
+    claim: &std::sync::atomic::AtomicUsize,
     config: &ParallelCompactConfig,
 ) -> ParallelCompactResult {
-    let mut compact_map = CompactGroupMap::with_hasher(BuildHasherDefault::default());
+    let mut compact_map = CompactGroupMap::with_capacity_and_hasher(
+        config.reserve_groups,
+        BuildHasherDefault::default(),
+    );
     let mut compact_storage = CompactAccStorage::new(CompactAccLayout::new(config.agg_specs));
     let mut cd_sidecar = CountDistinctSideCar::new(config.agg_specs);
     let mut segments_processed: u64 = 0;
@@ -463,7 +470,13 @@ pub(super) fn process_segments_compact(
     let mut decompress_us: u64 = 0;
     let num_group_keys = config.group_specs.len();
 
-    for seg in segments {
+    // Dynamic work claiming — see `process_segments_mixed` for rationale.
+    loop {
+        let seg_idx = claim.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if seg_idx >= segments.len() {
+            break;
+        }
+        let seg = &segments[seg_idx];
         if seg.row_count == 0 {
             continue;
         }
@@ -1368,6 +1381,7 @@ unsafe fn compact_full_merge(
             );
         }
         global_cd_sidecar.write_counts_to_storage(storage, compact_group_map);
+        crate::scan::exec::background_drop(partial_results);
         let merge_us = t_merge.elapsed().as_micros() as u64;
 
         let pre_topn_groups = compact_group_map.len();
@@ -2651,6 +2665,7 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
     time_min: Option<i64>,
     time_max: Option<i64>,
     n_workers: usize,
+    est_groups: usize,
     use_lazy: bool,
     num_result_cols: usize,
     metadata_us: u64,
@@ -2686,6 +2701,10 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
             None
         };
 
+        // Pipeline detoast with parallel processing when enough segments
+        // to amortize thread::scope overhead; otherwise single scope.
+        let use_pipeline = use_lazy && all_segments.len() >= n_workers * 16;
+
         let config = ParallelCompactConfig {
             agg_specs: &agg_specs,
             group_specs: &group_specs,
@@ -2700,11 +2719,23 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
             time_min,
             time_max,
             topn_spec,
+            reserve_groups: {
+                // One partial per worker thread per batch — mirrors the
+                // n_batches formula in the pipeline branch below. Filtered
+                // queries are excluded — see ParallelMixedConfig.
+                let n_partials = if use_pipeline {
+                    (n_workers * 2).max(2).min(all_segments.len()) * n_workers
+                } else {
+                    n_workers
+                };
+                let unfiltered = batch_quals.is_empty() && where_quals.is_null();
+                if unfiltered && est_groups > 262_144 {
+                    (est_groups / n_partials.max(1)).min(2_000_000)
+                } else {
+                    0
+                }
+            },
         };
-
-        // Pipeline detoast with parallel processing when enough segments
-        // to amortize thread::scope overhead; otherwise single scope.
-        let use_pipeline = use_lazy && all_segments.len() >= n_workers * 16;
 
         if use_lazy {
             let t_detoast = Instant::now();
@@ -2746,13 +2777,14 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                 let (done, pending) = all_segments.split_at_mut(batch_end);
                 let current_batch = &done[batch_start..];
 
+                let claim = std::sync::atomic::AtomicUsize::new(0);
                 std::thread::scope(|s| {
-                    let chunk_size = current_batch.len().div_ceil(n_workers);
-                    let handles: Vec<_> = current_batch
-                        .chunks(chunk_size)
-                        .map(|chunk| {
+                    let n_threads = n_workers.min(current_batch.len()).max(1);
+                    let handles: Vec<_> = (0..n_threads)
+                        .map(|_| {
                             let cfg = &config;
-                            s.spawn(move || process_segments_compact(chunk, cfg))
+                            let claim = &claim;
+                            s.spawn(move || process_segments_compact(current_batch, claim, cfg))
                         })
                         .collect();
 
@@ -2778,13 +2810,15 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
             results
         } else {
             // Single scope — original path (or lazy already detoasted above)
-            let chunk_size = all_segments.len().div_ceil(n_workers);
+            let claim = std::sync::atomic::AtomicUsize::new(0);
+            let segs: &[SegmentData] = all_segments;
             std::thread::scope(|s| {
-                let handles: Vec<_> = all_segments
-                    .chunks(chunk_size)
-                    .map(|chunk| {
+                let n_threads = n_workers.min(segs.len()).max(1);
+                let handles: Vec<_> = (0..n_threads)
+                    .map(|_| {
                         let cfg = &config;
-                        s.spawn(move || process_segments_compact(chunk, cfg))
+                        let claim = &claim;
+                        s.spawn(move || process_segments_compact(segs, claim, cfg))
                     })
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -2837,25 +2871,31 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
             &partial_results,
             compact_storage.as_mut().unwrap(),
         ) {
-            return build_topn_agg_scan_state(&merge_ctx, agg_specs, group_specs, outcome);
+            let state = build_topn_agg_scan_state(&merge_ctx, agg_specs, group_specs, outcome);
+            crate::scan::exec::background_drop(partial_results);
+            return state;
         }
 
         // Bare LIMIT short-circuit for compact path — see `compact_bare_limit`.
         if bare_limit > 0 && having_filters.is_empty() {
-            return compact_bare_limit(
+            let state = compact_bare_limit(
                 &merge_ctx,
                 agg_specs,
                 group_specs,
                 &partial_results,
                 compact_storage.as_mut().unwrap(),
             );
+            crate::scan::exec::background_drop(partial_results);
+            return state;
         }
 
         // Partitioned parallel merge + top-N — see `compact_partitioned_topn`.
         if topn_limit > 0 {
             let outcome =
                 compact_partitioned_topn(&merge_ctx, &agg_specs, &group_specs, &partial_results);
-            return build_topn_agg_scan_state(&merge_ctx, agg_specs, group_specs, outcome);
+            let state = build_topn_agg_scan_state(&merge_ctx, agg_specs, group_specs, outcome);
+            crate::scan::exec::background_drop(partial_results);
+            return state;
         }
 
         // Fallthrough: full merge path — see `compact_full_merge`.

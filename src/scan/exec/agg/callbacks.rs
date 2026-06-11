@@ -727,6 +727,9 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
         // Load segments from all companion tables (with lazy pruning)
         let n_workers = crate::get_parallel_workers();
         let use_lazy = n_workers > 1;
+        // Planner group-count estimate for this agg (HLL-backed ndistinct).
+        // Used by the parallel paths to pre-size worker hash maps.
+        let est_groups = (*(*node).ss.ps.plan).plan_rows.max(0.0) as usize;
         let lazy_cols: Vec<bool> = needed_cols_main.clone();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         let mut total_detoast_us: u64 = 0;
@@ -856,6 +859,7 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 time_min,
                 time_max,
                 n_workers,
+                est_groups,
                 use_lazy,
                 num_result_cols,
                 metadata_us,
@@ -1014,6 +1018,7 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 time_min,
                 time_max,
                 n_workers,
+                est_groups,
                 use_lazy,
                 num_result_cols,
                 metadata_us,
@@ -1217,6 +1222,7 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
                 time_min: ctx.time_min,
                 time_max: ctx.time_max,
                 topn_spec: ctx.topn_spec,
+                reserve_groups: 0,
             };
 
             const CHUNK: u64 = 4;
@@ -1229,7 +1235,8 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
                 }
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
-                let chunk_result = process_segments_compact(slice, &cfg);
+                let seq = std::sync::atomic::AtomicUsize::new(0);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg);
                 merge_compact_results(
                     &mut global.compact_map,
                     &mut global.compact_storage,
@@ -1436,6 +1443,7 @@ unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
                 time_min: ctx.time_min,
                 time_max: ctx.time_max,
                 topn_spec: None,
+                reserve_groups: 0,
             };
             const CHUNK: u64 = 4;
             loop {
@@ -1447,7 +1455,8 @@ unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
                 }
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
-                let chunk_result = process_segments_compact(slice, &cfg);
+                let seq = std::sync::atomic::AtomicUsize::new(0);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg);
                 merge_compact_results(
                     &mut local.compact_map,
                     &mut local.compact_storage,
@@ -1546,6 +1555,7 @@ unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
                 time_min: ctx.time_min,
                 time_max: ctx.time_max,
                 topn_spec: ctx.topn_spec,
+                reserve_groups: 0,
             };
 
             loop {
@@ -1555,7 +1565,8 @@ unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
                 }
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
-                let chunk_result = process_segments_compact(slice, &cfg);
+                let seq = std::sync::atomic::AtomicUsize::new(0);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg);
 
                 merge_compact_results(
                     &mut local.compact_map,

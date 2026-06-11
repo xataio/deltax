@@ -253,6 +253,11 @@ pub(super) struct ParallelMixedConfig<'a> {
     /// `per_segment` so each worker resolves `(seg_idx, local_dict_id)` →
     /// `global_id` without further coordination.
     pub(super) dict_distinct_remaps: &'a std::collections::HashMap<usize, DictDistinctRemap>,
+    /// Pre-size for each worker partial's group map, derived from the
+    /// planner's group-count estimate divided across partials. 0 = don't
+    /// reserve. Avoids repeated rehash growth on multi-million-group
+    /// aggregations; capped so a bad over-estimate stays bounded.
+    pub(super) reserve_groups: usize,
 }
 
 // SAFETY: see equivalent impl on `ParallelCompactConfig` for the
@@ -629,12 +634,19 @@ pub(super) fn try_build_preselected(
 pub(super) fn process_segments_mixed(
     segments: &[SegmentData],
     chunk_offset: usize,
+    claim: &std::sync::atomic::AtomicUsize,
     config: &ParallelMixedConfig,
 ) -> ParallelMixedResult {
-    let mut compact_map = CompactGroupMap::with_hasher(BuildHasherDefault::default());
+    let mut compact_map = CompactGroupMap::with_capacity_and_hasher(
+        config.reserve_groups,
+        BuildHasherDefault::default(),
+    );
     let mut compact_storage = CompactAccStorage::new(CompactAccLayout::new(config.agg_specs));
     let num_group_keys = config.group_specs.len();
     let mut mixed_keys = MixedKeyStorage::new(num_group_keys);
+    mixed_keys
+        .keys
+        .reserve(config.reserve_groups.saturating_mul(num_group_keys));
     // Phase D: classify each CountDistinct(text) spec as DictBitset when the
     // leader pre-pass produced a remap for it. Bitset size = global string
     // count for the column. Sized lookup map kept on the stack — at most a
@@ -662,11 +674,20 @@ pub(super) fn process_segments_mixed(
         .filter(|gs| is_text_group_col(gs))
         .count();
 
-    for (rel_idx, seg) in segments.iter().enumerate() {
+    // Dynamic work claiming: every worker thread shares `claim` and pulls
+    // the next unprocessed segment index. Static per-thread chunks left
+    // 5-15% of CPU idle at the per-batch barrier — segment processing cost
+    // varies with text density, so fixed chunks always have stragglers.
+    // One uncontended fetch_add per ~30K-row segment is noise.
+    loop {
+        let rel_idx = claim.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if rel_idx >= segments.len() {
+            break;
+        }
+        let seg = &segments[rel_idx];
         // Phase D: absolute seg_idx into all_segments (and into each
-        // dict_distinct_remaps.per_segment). The chunk-mode `for seg in segments`
-        // doesn't expose this; we shadow it via `(rel_idx, seg)` so the bitset
-        // lookup at the per-row insert site can resolve `(spec_idx, seg_idx,
+        // dict_distinct_remaps.per_segment), used by the bitset lookup at
+        // the per-row insert site to resolve `(spec_idx, seg_idx,
         // local_id) → global_id` without further coordination.
         let seg_idx_in_all = chunk_offset + rel_idx;
         if seg.row_count == 0 {
@@ -1306,10 +1327,20 @@ pub(super) fn process_segments_mixed(
             return (keys, 0i64);
         }
 
+        // Skipping entries that tie the current floor keeps the floor
+        // unchanged and an equally valid candidate set — on
+        // high-cardinality COUNT sorts almost every group ties at 1, so
+        // this avoids a heap push+pop per group.
         if !ascending {
             let mut heap: BinaryHeap<Reverse<(i64, u128)>> = BinaryHeap::with_capacity(k + 1);
             for (&key, &gidx) in &compact_map {
                 let val = read_val(gidx);
+                if heap.len() == k
+                    && let Some(&Reverse((floor, _))) = heap.peek()
+                    && val <= floor
+                {
+                    continue;
+                }
                 heap.push(Reverse((val, key)));
                 if heap.len() > k {
                     heap.pop();
@@ -1322,6 +1353,12 @@ pub(super) fn process_segments_mixed(
             let mut heap: BinaryHeap<(i64, u128)> = BinaryHeap::with_capacity(k + 1);
             for (&key, &gidx) in &compact_map {
                 let val = read_val(gidx);
+                if heap.len() == k
+                    && let Some(&(floor, _)) = heap.peek()
+                    && val >= floor
+                {
+                    continue;
+                }
                 heap.push((val, key));
                 if heap.len() > k {
                     heap.pop();
@@ -1782,6 +1819,7 @@ unsafe fn mixed_full_merge(
         if !merged_cd_sidecar.is_empty() {
             merged_cd_sidecar.write_counts_to_storage(storage, compact_group_map);
         }
+        crate::scan::exec::background_drop(partial_results);
         let merge_us = t_merge.elapsed().as_micros() as u64;
 
         // Finalize
@@ -3298,6 +3336,7 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
     time_min: Option<i64>,
     time_max: Option<i64>,
     n_workers: usize,
+    est_groups: usize,
     use_lazy: bool,
     num_result_cols: usize,
     metadata_us: u64,
@@ -3528,6 +3567,27 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             sidecar_only_cols,
             preselected_keys: preselected_keys.as_ref(),
             dict_distinct_remaps: &dict_distinct_remaps,
+            reserve_groups: {
+                // One partial per worker thread per batch. Gate small
+                // estimates (default growth handles them fine) and cap
+                // large ones so a planner over-estimate stays bounded
+                // (~50 MB map + keys per worker at the cap). Filtered
+                // queries are excluded: the group estimate doesn't know
+                // how many groups the quals remove (ClickBench Q30:
+                // est 29M groups, far fewer survive the filter, and the
+                // wasted up-front zeroing cost ~270 ms).
+                let n_partials = if use_pipeline {
+                    PIPELINE_N_BATCHES * n_workers
+                } else {
+                    n_workers
+                };
+                let unfiltered = batch_quals.is_empty() && where_quals.is_null();
+                if unfiltered && est_groups > 262_144 && preselected_keys.is_none() {
+                    (est_groups / n_partials.max(1)).min(2_000_000)
+                } else {
+                    0
+                }
+            },
         };
 
         let mut pipeline_detoast_us: u64 = 0;
@@ -3545,18 +3605,20 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
                 let (done, pending) = all_segments.split_at_mut(batch_end);
                 let current_batch = &done[batch_start..];
 
+                let claim = std::sync::atomic::AtomicUsize::new(0);
                 std::thread::scope(|s| {
-                    let chunk_size = current_batch.len().div_ceil(n_workers);
-                    let handles: Vec<_> = current_batch
-                        .chunks(chunk_size)
-                        .enumerate()
-                        .map(|(ci, chunk)| {
+                    let n_threads = n_workers.min(current_batch.len());
+                    let handles: Vec<_> = (0..n_threads)
+                        .map(|_| {
                             let cfg = &config;
-                            // Phase D: chunk_offset is the seg_idx of chunk[0]
-                            // in the leader's all_segments view, used to index
+                            let claim = &claim;
+                            // Phase D: batch_start is the seg_idx of
+                            // current_batch[0] in the leader's all_segments
+                            // view, used to index
                             // dict_distinct_remaps.per_segment.
-                            let chunk_offset = batch_start + ci * chunk_size;
-                            s.spawn(move || process_segments_mixed(chunk, chunk_offset, cfg))
+                            s.spawn(move || {
+                                process_segments_mixed(current_batch, batch_start, claim, cfg)
+                            })
                         })
                         .collect();
 
@@ -3580,15 +3642,15 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             }
             results
         } else {
-            let chunk_size = all_segments.len().div_ceil(n_workers);
+            let claim = std::sync::atomic::AtomicUsize::new(0);
+            let segs: &[SegmentData] = all_segments;
             std::thread::scope(|s| {
-                let handles: Vec<_> = all_segments
-                    .chunks(chunk_size)
-                    .enumerate()
-                    .map(|(ci, chunk)| {
+                let n_threads = n_workers.min(segs.len()).max(1);
+                let handles: Vec<_> = (0..n_threads)
+                    .map(|_| {
                         let cfg = &config;
-                        let chunk_offset = ci * chunk_size;
-                        s.spawn(move || process_segments_mixed(chunk, chunk_offset, cfg))
+                        let claim = &claim;
+                        s.spawn(move || process_segments_mixed(segs, 0, claim, cfg))
                     })
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -3655,7 +3717,7 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
 
         // Derived MIN/MAX-difference top-N — see `mixed_derived_minmax_topn`.
         if let Some((max_slot, min_slot)) = derived_minmax_topn {
-            return mixed_derived_minmax_topn(
+            let state = mixed_derived_minmax_topn(
                 &merge_ctx,
                 agg_specs,
                 group_specs,
@@ -3664,6 +3726,8 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
                 max_slot,
                 min_slot,
             );
+            crate::scan::exec::background_drop(partial_results);
+            return state;
         }
 
         // Speculative top-N — see `mixed_speculative_topn`.
@@ -3674,19 +3738,27 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             &partial_results,
             compact_storage.as_mut().unwrap(),
         ) {
-            return build_mixed_topn_agg_scan_state(&merge_ctx, agg_specs, group_specs, outcome);
+            let state =
+                build_mixed_topn_agg_scan_state(&merge_ctx, agg_specs, group_specs, outcome);
+            crate::scan::exec::background_drop(partial_results);
+            return state;
         }
 
         // Bare LIMIT short-circuit for mixed path — see `mixed_bare_limit`.
         if bare_limit > 0 && having_filters.is_empty() {
-            return mixed_bare_limit(&merge_ctx, agg_specs, group_specs, &partial_results);
+            let state = mixed_bare_limit(&merge_ctx, agg_specs, group_specs, &partial_results);
+            crate::scan::exec::background_drop(partial_results);
+            return state;
         }
 
         // Partitioned parallel merge + top-N — see `mixed_partitioned_topn`.
         if topn_limit > 0 {
             let outcome =
                 mixed_partitioned_topn(&merge_ctx, &agg_specs, &group_specs, &partial_results);
-            return build_mixed_topn_agg_scan_state(&merge_ctx, agg_specs, group_specs, outcome);
+            let state =
+                build_mixed_topn_agg_scan_state(&merge_ctx, agg_specs, group_specs, outcome);
+            crate::scan::exec::background_drop(partial_results);
+            return state;
         }
 
         // Fallthrough: full merge path — see `mixed_full_merge`.
