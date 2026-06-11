@@ -14,7 +14,6 @@ use pgrx::pg_sys;
 
 use super::super::datum_utils::string_to_datum;
 use super::super::segments::SegmentData;
-use super::keys::CompactGroupMap;
 use super::state::{AggAccumulator, AggExecSpec, AggType, OutputTransform};
 
 /// String arena: all group key strings packed into one `Vec<u8>`.
@@ -869,10 +868,10 @@ impl CountDistinctSideCar {
     }
 
     /// Write cached counts into compact storage Count slots for top-N sorting.
-    pub(crate) fn write_counts_to_storage(
+    pub(crate) fn write_counts_to_storage<S: std::hash::BuildHasher>(
         &self,
         storage: &mut CompactAccStorage,
-        map: &CompactGroupMap,
+        map: &hashbrown::HashMap<u128, u32, S>,
     ) {
         for e in &self.entries {
             for (_, &gidx) in map.iter() {
@@ -1182,8 +1181,8 @@ pub(crate) fn can_use_compact_accs(agg_specs: &[AggExecSpec]) -> bool {
 /// from compact storage, without full finalization.
 ///
 /// Uses a BinaryHeap of size `limit` to find the top-N in O(n log limit) time.
-pub(crate) fn compact_topn_select(
-    map: &CompactGroupMap,
+pub(crate) fn compact_topn_select<S: std::hash::BuildHasher>(
+    map: &hashbrown::HashMap<u128, u32, S>,
     storage: &CompactAccStorage,
     sort_slot: usize,
     limit: usize,

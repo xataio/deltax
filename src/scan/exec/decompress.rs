@@ -2193,7 +2193,7 @@ fn process_topn_text_chunk(
 
         // Decompress sort column
         let sort_blob = &seg.compressed_blobs[config.sort_blob_idx];
-        let sort_seg_col = match decompress_text_to_seg_col(sort_blob) {
+        let sort_seg_col = match decompress_text_to_seg_col(sort_blob, false) {
             Some(c) => c,
             None => continue,
         };
@@ -2243,7 +2243,7 @@ fn process_topn_text_chunk(
                     } else {
                         // Need to decompress this column — use a temporary
                         // Since we can't store the temp and reference it, decompress inline
-                        if let Some(ref sc) = decompress_text_to_seg_col(blob) {
+                        if let Some(ref sc) = decompress_text_to_seg_col(blob, false) {
                             apply_text_eq_filter(sc, const_str, *is_ne, row_count, &mut selection);
                         } else if selection.is_empty() {
                             selection = vec![false; row_count];
@@ -2269,7 +2269,7 @@ fn process_topn_text_chunk(
                         let blob_idx =
                             col_to_blob_idx(config.col_names, config.segment_by, *col_idx);
                         let blob = &seg.compressed_blobs[blob_idx];
-                        if let Some(ref sc) = decompress_text_to_seg_col(blob) {
+                        if let Some(ref sc) = decompress_text_to_seg_col(blob, false) {
                             apply_text_like_filter(
                                 sc,
                                 strategy,
@@ -2310,7 +2310,7 @@ fn process_topn_text_chunk(
                         let blob_idx =
                             col_to_blob_idx(config.col_names, config.segment_by, *col_idx);
                         let blob = &seg.compressed_blobs[blob_idx];
-                        if let Some(ref sc) = decompress_text_to_seg_col(blob) {
+                        if let Some(ref sc) = decompress_text_to_seg_col(blob, false) {
                             apply_text_in_filter(sc, values, row_count, &mut selection);
                         } else if selection.is_empty() {
                             selection = vec![false; row_count];

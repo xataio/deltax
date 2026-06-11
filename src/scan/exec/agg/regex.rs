@@ -12,7 +12,7 @@ use pgrx::pg_sys;
 use pgrx::warning;
 use regex::Regex;
 
-use super::super::text_col::SegTextColumn;
+use super::super::text_col::{SegTextColumn, dict_entry_str};
 use super::{CaseWhenOp, CaseWhenSpec, CaseWhenValue};
 
 /// Info for a regexp GROUP BY column that compiled successfully with Rust regex.
@@ -493,10 +493,7 @@ pub(super) fn apply_case_when_to_seg_col(
         }
     }
 
-    SegTextColumn::Dict {
-        entries,
-        row_to_entry,
-    }
+    SegTextColumn::dict_from_owned_entries(entries, row_to_entry)
 }
 
 /// Apply a Rust regex replacement to a SegTextColumn, producing a new transformed column.
@@ -520,16 +517,25 @@ pub(super) fn apply_regex_to_seg_col(seg_col: &SegTextColumn, ri: &RustRegexInfo
     }
     match seg_col {
         SegTextColumn::Dict {
-            entries,
+            buf,
+            entry_ranges,
             row_to_entry,
+            ..
         } => {
-            let new_entries: Vec<String> = entries
-                .iter()
-                .map(|e| do_replace!(e).into_owned())
-                .collect();
+            // Replace each unique dict entry once, writing results into a
+            // fresh flat buffer (no per-entry String allocation).
+            let mut new_buf = Vec::with_capacity(buf.len());
+            let mut new_ranges = Vec::with_capacity(entry_ranges.len());
+            for &r in entry_ranges {
+                let replaced = do_replace!(dict_entry_str(buf, r));
+                new_ranges.push((new_buf.len() as u32, replaced.len() as u32));
+                new_buf.extend_from_slice(replaced.as_bytes());
+            }
             SegTextColumn::Dict {
-                entries: new_entries,
+                buf: new_buf,
+                entry_ranges: new_ranges,
                 row_to_entry: row_to_entry.clone(),
+                entry_char_lens: Vec::new(),
             }
         }
         SegTextColumn::Lz4 { buf, row_to_range } => {
@@ -576,10 +582,7 @@ pub(super) fn apply_regex_to_seg_col(seg_col: &SegTextColumn, ri: &RustRegexInfo
                     new_row_to_entry.push(idx);
                 }
             }
-            SegTextColumn::Dict {
-                entries,
-                row_to_entry: new_row_to_entry,
-            }
+            SegTextColumn::dict_from_owned_entries(entries, new_row_to_entry)
         }
         SegTextColumn::SegBy(opt) => {
             let new_opt = opt.as_deref().map(|s| do_replace!(s).into_owned());
