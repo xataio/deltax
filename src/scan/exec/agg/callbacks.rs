@@ -841,6 +841,41 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
             &meta.col_types,
             &batch_quals,
         ) {
+            // Lower bound on the GROUP BY cardinality for the singleton-skip
+            // gate: catalog HLL ndistinct of the most distinct single group
+            // column, summed across the scanned partitions. The group count
+            // is >= any one (bijective) key component's ndistinct. Planner
+            // estimates won't do here — `plan_rows` is clamped to the
+            // input-row estimate, which runs ~3x low. Cheap: the planner
+            // already populated the per-backend ndistinct cache for this
+            // query's partitions.
+            let nd_hint: usize = if topn_limit > 0 && where_quals.is_null() {
+                group_specs
+                    .iter()
+                    .filter(|gs| {
+                        matches!(
+                            gs.expr,
+                            GroupByExpr::Column | GroupByExpr::AddConst { .. }
+                        ) && (gs.col_idx as usize) < meta.col_names.len()
+                    })
+                    .map(|gs| {
+                        let col_name = &meta.col_names[gs.col_idx as usize];
+                        companion_oids
+                            .iter()
+                            .map(|&oid| {
+                                crate::scan::cost::get_column_ndistinct(oid)
+                                    .get(col_name)
+                                    .copied()
+                                    .unwrap_or(0)
+                                    .max(0) as usize
+                            })
+                            .sum()
+                    })
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             let state = dispatch_parallel_compact_path(
                 agg_specs,
                 group_specs,
@@ -860,6 +895,7 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 time_max,
                 n_workers,
                 est_groups,
+                nd_hint,
                 use_lazy,
                 num_result_cols,
                 metadata_us,

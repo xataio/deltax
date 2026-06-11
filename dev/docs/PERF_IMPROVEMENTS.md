@@ -1923,3 +1923,59 @@ This is why Q28's agg phase (per-row `MIN(Referer)` get_str +
 Q20 1.199 → 1.061 s, Q13 2.320 → 2.224 s, Q12 1.179 → 1.112 s,
 Q34 3.412 → 3.234 s, everything else within noise. Bench hot total
 53.77 → **48.23 s** (−10.3%).
+
+### 55. Singleton-skip two-pass top-N for near-unique COUNT(*) sorts [DONE]
+
+**Landed 2026-06-11. Q32 warm 4.63 → 2.73 s (EXPLAIN ANALYZE;
+agg 2.63 → ~2.2 s across two passes, merge 1.57 s → 0.07 s).**
+
+ClickBench Q32 (`GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT
+10`, no WHERE) has 99,997,494 groups in 99,997,497 rows — exactly
+four pairs occur twice, everything else is a singleton. The compact
+path built a 100M-entry map (plus accumulators) across 16 workers and
+partition-merged all of it to pick 10 winners, almost all of which
+are interchangeable count=1 ties.
+
+The two-pass scheme in `parallel_compact.rs` exploits that a count=1
+group can never beat a count>=2 group:
+
+- **Pass 1** decompresses only the GROUP BY key columns and bumps a
+  shared `CountingFilter` — a blocked counting Bloom filter (two
+  byte-wide saturating counters per key inside one 64-byte block, so
+  each row costs a single cache-line fetch; `AtomicU8` with a
+  load-before-add guard that makes wraparound impossible). Two
+  occurrences of a key always leave both its counters at >= 2, so the
+  filter has no false negatives; false positives just take the exact
+  path. Sized at 8 slots/row (cap 1 GiB → load ~0.19 at 100M rows),
+  measured FP ~3.3% on Q32.
+- **Pass 2** is the normal worker aggregation loop, except rows whose
+  key the filter proves globally unique skip the group map entirely —
+  apart from `limit` filler singletons per worker, aggregated
+  normally so the merge always has enough exact count=1 groups to pad
+  ties. Worker maps end up at ~3.3M total entries instead of 100M, so
+  the partitioned merge collapses (1.57 s → 0.07 s) and map-insert
+  traffic disappears.
+
+Gating: `ORDER BY COUNT(*) DESC LIMIT <=10K`, no HAVING / batch quals
+/ WHERE / segment filters / time bounds, >= 16M rows, and a
+cardinality hint of >= 0.9 × exact row count. The hint is the catalog
+HLL ndistinct (`deltax_partition.column_ndistinct`) of the most
+distinct single bijective group column, summed across scanned
+partitions — a lower bound on the true group count. Planner
+`plan_rows` can't serve here: it's clamped to the estimated input
+rows (3338 segs × 10K = 33.4M for Q32 vs 100M actual), which would
+make Q32 indistinguishable from genuinely duplicate-heavy keys where
+pass 2 would degenerate into the full map plus a wasted pass 1
+(that's also why UserID- or ClientIP-keyed top-Ns — sum-nd 20M/14M vs
+100M rows — correctly stay on the old path). Pass 1 reuses the
+pipeline-detoast overlap, so on cold runs it hides behind I/O.
+
+Correctness note: any count=1 group is as valid a LIMIT tie pick as
+any other (the old path's pick among ties was equally arbitrary);
+Q32 is a `LIMIT_TIE_QUERIES` entry in the verify harness, and the
+count>=2 groups + all aggregate values are exact.
+
+**Files touched:** `src/scan/exec/agg/parallel_compact.rs`
+(`CountingFilter`, `process_segments_count_filter`,
+`process_segments_compact_filtered`, dispatch gating),
+`src/scan/exec/agg/callbacks.rs` (`nd_hint` from catalog ndistinct).

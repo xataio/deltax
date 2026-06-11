@@ -450,6 +450,208 @@ impl ParallelCompactResult {
     }
 }
 
+/// Shared counting filter for the singleton-skip two-pass top-N scheme.
+///
+/// Counting Bloom filter with two byte-wide saturating counters per key,
+/// bumped once per input row in pass 1. A key with either slot reading
+/// < 2 in pass 2 is a *guaranteed* global singleton (every occurrence of
+/// a key hits the same two slots, so two occurrences always leave both
+/// counts >= 2 — no false negatives). Slots can alias across distinct
+/// keys, which only produces false "maybe duplicate" answers; those rows
+/// go through the exact map in pass 2. With two probes a singleton is a
+/// false positive only when *both* its slots see other keys:
+/// (1-e^-l)^2 ~= 3% at the l ~= 0.19 per-probe load this sizing yields.
+pub(super) struct CountingFilter {
+    slots: Box<[std::sync::atomic::AtomicU8]>,
+    mask: usize,
+}
+
+impl CountingFilter {
+    pub(super) fn new(rows: usize) -> Self {
+        // 2 probes/row at ~8 slots/row → per-probe load ~0.25, FP ~4.7%;
+        // the 1 GiB cap puts ClickBench-scale inputs (100M rows) at load
+        // 0.19 / FP 2.9%.
+        let size = rows
+            .saturating_mul(8)
+            .next_power_of_two()
+            .clamp(1 << 22, 1 << 30);
+        // calloc-backed zeroed alloc; AtomicU8 is repr(transparent) over u8.
+        let zeroed = vec![0u8; size].into_boxed_slice();
+        let slots = unsafe {
+            Box::from_raw(Box::into_raw(zeroed) as *mut [std::sync::atomic::AtomicU8])
+        };
+        Self {
+            slots,
+            mask: size - 1,
+        }
+    }
+
+    /// Two slot indices within one 64-byte block (blocked Bloom layout):
+    /// both probes share a cache line, so each row costs one memory fetch
+    /// instead of two. Per-slot load — and thus the FP rate — matches the
+    /// unblocked layout up to block-occupancy variance. The xor delta is
+    /// forced odd so the two offsets never coincide (a coinciding pair
+    /// would double-bump one slot and flag every such key as a duplicate).
+    #[inline(always)]
+    fn slot_pair(
+        &self,
+        key: u128,
+    ) -> (&std::sync::atomic::AtomicU8, &std::sync::atomic::AtomicU8) {
+        let folded = (key as u64) ^ ((key >> 64) as u64).wrapping_mul(0x9e3779b97f4a7c15);
+        let h = mix64(folded);
+        let block = ((h as usize) & self.mask) & !63;
+        let o1 = ((h >> 32) & 63) as usize;
+        let o2 = o1 ^ (((h >> 38) as usize & 62) | 1);
+        (&self.slots[block | o1], &self.slots[block | o2])
+    }
+
+    /// Pass 1: bump the key's counters, saturating at 2 (the only state we
+    /// care about). The load-then-add guard also makes u8 wraparound
+    /// impossible: once a slot reads >= 2 no thread adds to it again, so
+    /// transient over-add is bounded by the thread count.
+    #[inline(always)]
+    pub(super) fn bump(&self, key: u128) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (s1, s2) = self.slot_pair(key);
+        if s1.load(Relaxed) < 2 {
+            s1.fetch_add(1, Relaxed);
+        }
+        if s2.load(Relaxed) < 2 {
+            s2.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Pass 2: may this key occur more than once in the input?
+    #[inline(always)]
+    pub(super) fn maybe_dup(&self, key: u128) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (s1, s2) = self.slot_pair(key);
+        s1.load(Relaxed) >= 2 && s2.load(Relaxed) >= 2
+    }
+}
+
+/// Build the packed u128 group key for one row, or None if any key part is
+/// NULL (compact path drops NULL-keyed groups before this is reached only
+/// via not-null gating; NULL handling mirrors the historical inline loop).
+#[inline(always)]
+fn build_packed_key(
+    group_specs: &[GroupByColSpec],
+    decompressed: &[Vec<(pg_sys::Datum, bool)>],
+    row: usize,
+) -> Option<u128> {
+    let mut int_keys: [i64; 2] = [0; 2];
+    for (ki, gs) in group_specs.iter().enumerate() {
+        let col = &decompressed[gs.col_idx as usize];
+        if col.is_empty() || col[row].1 {
+            return None;
+        }
+        int_keys[ki] = match &gs.expr {
+            GroupByExpr::DateTrunc { unit_usecs, .. } => {
+                let pg_usec = col[row].0.value() as i64;
+                pg_usec.div_euclid(*unit_usecs) * *unit_usecs
+            }
+            GroupByExpr::Extract { unit, divisor, .. } => {
+                eval_extract(col[row].0.value() as i64, *divisor, unit)
+            }
+            GroupByExpr::AddConst { offset, .. } => col[row].0.value() as i64 + offset,
+            GroupByExpr::Column => col[row].0.value() as i64,
+            _ => unreachable!(),
+        };
+    }
+    Some(if group_specs.len() == 1 {
+        pack_int_key_1(int_keys[0])
+    } else {
+        pack_int_keys_2(int_keys[0], int_keys[1])
+    })
+}
+
+/// Decompress the columns selected by `col_mask` for one segment (pure
+/// Rust, no PG calls). Unselected columns get empty placeholder vecs so
+/// the result stays indexable by col_idx.
+fn decompress_segment_cols(
+    seg: &SegmentData,
+    config: &ParallelCompactConfig,
+    col_mask: &[bool],
+) -> Vec<Vec<(pg_sys::Datum, bool)>> {
+    let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
+    let mut seg_val_idx = 0;
+
+    for (col_idx, col_name) in config.col_names.iter().enumerate() {
+        let type_oid = config.col_types[col_idx];
+        let is_segment_by = config.segment_by.contains(col_name);
+
+        if !col_mask[col_idx] {
+            if is_segment_by {
+                seg_val_idx += 1;
+            }
+            decompressed.push(Vec::new());
+            continue;
+        }
+
+        if is_segment_by {
+            // Parse segment_by string to integer datum directly (no PG calls)
+            let val = &seg.segment_values[seg_val_idx];
+            let (datum, is_null) = match val {
+                Some(s) => {
+                    let d = parse_string_to_datum(s, type_oid);
+                    (d, false)
+                }
+                None => (pg_sys::Datum::from(0usize), true),
+            };
+            let repeated: Vec<(pg_sys::Datum, bool)> =
+                (0..seg.row_count).map(|_| (datum, is_null)).collect();
+            decompressed.push(repeated);
+            seg_val_idx += 1;
+        } else if let Some(slot) = config.blob_idx[col_idx] {
+            let blob = &seg.compressed_blobs[slot as usize];
+            decompressed.push(decompress_numeric_blob(blob, type_oid));
+        } else {
+            // Column added to the parent after this partition was
+            // compressed — no blob exists. Synthesize the missing
+            // value (one constant Datum per row).
+            let (datum, is_null) = config
+                .missing_values
+                .get(col_idx)
+                .copied()
+                .flatten()
+                .unwrap_or((pg_sys::Datum::from(0usize), true));
+            let repeated: Vec<(pg_sys::Datum, bool)> =
+                (0..seg.row_count).map(|_| (datum, is_null)).collect();
+            decompressed.push(repeated);
+        }
+    }
+    decompressed
+}
+
+/// Pass 1 of the singleton-skip scheme: decompress only the GROUP BY key
+/// columns and bump the counting filter once per row. No quals or pruning
+/// are evaluated — the dispatch gate restricts this path to unfiltered
+/// scans, and pass 2 must see exactly the same row set.
+pub(super) fn process_segments_count_filter(
+    segments: &[SegmentData],
+    claim: &std::sync::atomic::AtomicUsize,
+    config: &ParallelCompactConfig,
+    key_cols: &[bool],
+    filter: &CountingFilter,
+) {
+    loop {
+        let seg_idx = claim.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if seg_idx >= segments.len() {
+            break;
+        }
+        let seg = &segments[seg_idx];
+        if seg.row_count == 0 {
+            continue;
+        }
+        let decompressed = decompress_segment_cols(seg, config, key_cols);
+        for row in 0..seg.row_count as usize {
+            if let Some(packed) = build_packed_key(config.group_specs, &decompressed, row) {
+                filter.bump(packed);
+            }
+        }
+    }
+}
+
 /// Process a chunk of segments on a worker thread using the compact path.
 ///
 /// Does decompression + aggregation entirely in pure Rust (no PG function calls).
@@ -458,6 +660,21 @@ pub(super) fn process_segments_compact(
     segments: &[SegmentData],
     claim: &std::sync::atomic::AtomicUsize,
     config: &ParallelCompactConfig,
+) -> ParallelCompactResult {
+    process_segments_compact_filtered(segments, claim, config, None)
+}
+
+/// `process_segments_compact` with an optional singleton filter from the
+/// two-pass top-N scheme. When `singleton` is set to `(filter, filler_limit)`,
+/// rows whose key the filter proves globally unique skip the group map
+/// entirely — except the first `filler_limit` such rows per worker, which
+/// are aggregated normally so the merged result always has at least
+/// `limit` groups to choose from (their single-row aggregates are exact).
+pub(super) fn process_segments_compact_filtered(
+    segments: &[SegmentData],
+    claim: &std::sync::atomic::AtomicUsize,
+    config: &ParallelCompactConfig,
+    singleton: Option<(&CountingFilter, usize)>,
 ) -> ParallelCompactResult {
     let mut compact_map = CompactGroupMap::with_capacity_and_hasher(
         config.reserve_groups,
@@ -468,7 +685,9 @@ pub(super) fn process_segments_compact(
     let mut segments_processed: u64 = 0;
     let mut rows_processed: u64 = 0;
     let mut decompress_us: u64 = 0;
-    let num_group_keys = config.group_specs.len();
+    // Singleton-skip: budget of guaranteed-unique rows this worker still
+    // aggregates as filler groups (see `process_segments_compact_filtered`).
+    let mut filler_budget = singleton.map(|(_, limit)| limit).unwrap_or(0);
 
     // Dynamic work claiming — see `process_segments_mixed` for rationale.
     loop {
@@ -541,53 +760,7 @@ pub(super) fn process_segments_compact(
         // column was added after this partition was compressed, so
         // synthesize from `config.missing_values[col_idx]`.
         let t_dec = Instant::now();
-        let mut decompressed: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
-        let mut seg_val_idx = 0;
-
-        for (col_idx, col_name) in config.col_names.iter().enumerate() {
-            let type_oid = config.col_types[col_idx];
-            let is_segment_by = config.segment_by.contains(col_name);
-
-            if !config.needed_cols[col_idx] {
-                if is_segment_by {
-                    seg_val_idx += 1;
-                }
-                decompressed.push(Vec::new());
-                continue;
-            }
-
-            if is_segment_by {
-                // Parse segment_by string to integer datum directly (no PG calls)
-                let val = &seg.segment_values[seg_val_idx];
-                let (datum, is_null) = match val {
-                    Some(s) => {
-                        let d = parse_string_to_datum(s, type_oid);
-                        (d, false)
-                    }
-                    None => (pg_sys::Datum::from(0usize), true),
-                };
-                let repeated: Vec<(pg_sys::Datum, bool)> =
-                    (0..seg.row_count).map(|_| (datum, is_null)).collect();
-                decompressed.push(repeated);
-                seg_val_idx += 1;
-            } else if let Some(slot) = config.blob_idx[col_idx] {
-                let blob = &seg.compressed_blobs[slot as usize];
-                decompressed.push(decompress_numeric_blob(blob, type_oid));
-            } else {
-                // Column added to the parent after this partition was
-                // compressed — no blob exists. Synthesize the missing
-                // value (one constant Datum per row).
-                let (datum, is_null) = config
-                    .missing_values
-                    .get(col_idx)
-                    .copied()
-                    .flatten()
-                    .unwrap_or((pg_sys::Datum::from(0usize), true));
-                let repeated: Vec<(pg_sys::Datum, bool)> =
-                    (0..seg.row_count).map(|_| (datum, is_null)).collect();
-                decompressed.push(repeated);
-            }
-        }
+        let decompressed = decompress_segment_cols(seg, config, config.needed_cols);
         decompress_us += t_dec.elapsed().as_micros() as u64;
 
         let row_count = seg.row_count as usize;
@@ -609,37 +782,21 @@ pub(super) fn process_segments_compact(
             rows_processed += 1;
 
             // Build packed u128 key
-            let mut int_keys: [i64; 2] = [0; 2];
-            let mut has_null = false;
-            for (ki, gs) in config.group_specs.iter().enumerate() {
-                let col = &decompressed[gs.col_idx as usize];
-                if col.is_empty() || col[row].1 {
-                    has_null = true;
-                    break;
-                }
-                int_keys[ki] = match &gs.expr {
-                    GroupByExpr::DateTrunc { unit_usecs, .. } => {
-                        let pg_usec = col[row].0.value() as i64;
-                        pg_usec.div_euclid(*unit_usecs) * *unit_usecs
-                    }
-                    GroupByExpr::Extract { unit, divisor, .. } => {
-                        eval_extract(col[row].0.value() as i64, *divisor, unit)
-                    }
-                    GroupByExpr::AddConst { offset, .. } => col[row].0.value() as i64 + offset,
-                    GroupByExpr::Column => col[row].0.value() as i64,
-                    _ => unreachable!(),
-                };
-            }
-
-            if has_null {
+            let Some(packed) = build_packed_key(config.group_specs, &decompressed, row) else {
                 continue;
-            }
-
-            let packed = if num_group_keys == 1 {
-                pack_int_key_1(int_keys[0])
-            } else {
-                pack_int_keys_2(int_keys[0], int_keys[1])
             };
+
+            // Singleton-skip: a key the filter proves globally unique can
+            // only ever be a count=1 group. The top-N merge needs at most
+            // `limit` of those as tie fillers; skip the rest entirely.
+            if let Some((filter, _)) = singleton
+                && !filter.maybe_dup(packed)
+            {
+                if filler_budget == 0 {
+                    continue;
+                }
+                filler_budget -= 1;
+            }
 
             // Lookup or insert group
             if compact_map.len() == compact_map.capacity() {
@@ -2666,6 +2823,7 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
     time_max: Option<i64>,
     n_workers: usize,
     est_groups: usize,
+    nd_hint: usize,
     use_lazy: bool,
     num_result_cols: usize,
     metadata_us: u64,
@@ -2705,6 +2863,38 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
         // to amortize thread::scope overhead; otherwise single scope.
         let use_pipeline = use_lazy && all_segments.len() >= n_workers * 16;
 
+        // ---- Singleton-skip two-pass top-N eligibility ----
+        // Targets `GROUP BY <int keys> ORDER BY COUNT(*) DESC LIMIT n` over
+        // unfiltered scans whose keys are nearly all unique (ClickBench
+        // Q32: 99.997M groups in 99.997M rows). Building the full
+        // 100M-entry map only to pick 10 winners is almost entirely wasted
+        // work — a count=1 group can never beat a count>=2 group, so a
+        // cheap counting filter (pass 1) lets pass 2 aggregate only rows
+        // whose key might repeat, plus `limit` filler singletons per
+        // worker to pad out ties (their single-row aggregates are exact,
+        // and any count=1 group is as valid a tie pick as any other).
+        // `nd_hint` is the catalog HLL ndistinct of the most distinct
+        // single group column summed across partitions — a lower bound on
+        // the true group count that's immune to the planner's clamping of
+        // `plan_rows` to its (underestimated) input-row count. Requiring
+        // it to be ~= the exact row count keeps this path off queries
+        // where duplicates are common; there pass 2 would degenerate into
+        // the normal full map with pass 1 as pure overhead.
+        let total_rows: u64 = all_segments.iter().map(|s| s.row_count as u64).sum();
+        let singleton_mode = topn_limit > 0
+            && topn_limit <= 10_000
+            && !topn_ascending
+            && having_filters.is_empty()
+            && batch_quals.is_empty()
+            && where_quals.is_null()
+            && seg_filters.is_empty()
+            && time_min.is_none()
+            && time_max.is_none()
+            && total_rows >= 16_000_000
+            && (nd_hint as f64) >= (total_rows as f64) * 0.9
+            && matches!(output_map.get(topn_sort_col),
+                Some(&OutputEntry::Agg(ai)) if agg_specs[ai].agg_type == AggType::CountStar);
+
         let config = ParallelCompactConfig {
             agg_specs: &agg_specs,
             group_specs: &group_specs,
@@ -2729,7 +2919,9 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                     n_workers
                 };
                 let unfiltered = batch_quals.is_empty() && where_quals.is_null();
-                if unfiltered && est_groups > 262_144 {
+                // Singleton mode keeps worker maps tiny by construction —
+                // pre-sizing them from est_groups would defeat the point.
+                if unfiltered && est_groups > 262_144 && !singleton_mode {
                     (est_groups / n_partials.max(1)).min(2_000_000)
                 } else {
                     0
@@ -2763,7 +2955,110 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
         }
 
         let mut pipeline_detoast_us: u64 = 0;
-        let partial_results: Vec<ParallelCompactResult> = if use_pipeline {
+
+        // Singleton-skip pass 1: bump the counting filter once per row.
+        // Mirrors the pipeline-detoast structure of the main scan (workers
+        // count the current batch while the main thread detoasts the
+        // next); once it finishes every segment is detoasted, so pass 2
+        // below runs as a plain single scope.
+        let singleton_filter: Option<CountingFilter> = if singleton_mode {
+            let filter = CountingFilter::new(total_rows as usize);
+            let mut key_cols = vec![false; meta.col_names.len()];
+            for gs in &group_specs {
+                key_cols[gs.col_idx as usize] = true;
+            }
+            let key_cols = &key_cols;
+            let filter_ref = &filter;
+            let t_p1 = Instant::now();
+            if use_pipeline {
+                let n_batches = (n_workers * 2).max(2).min(all_segments.len());
+                let batch_size = all_segments.len().div_ceil(n_batches);
+                let mut batch_start = 0;
+                let total_segs = all_segments.len();
+                while batch_start < total_segs {
+                    let batch_end = (batch_start + batch_size).min(total_segs);
+                    let next_end = (batch_end + batch_size).min(total_segs);
+                    let (done, pending) = all_segments.split_at_mut(batch_end);
+                    let current_batch = &done[batch_start..];
+                    let claim = std::sync::atomic::AtomicUsize::new(0);
+                    std::thread::scope(|s| {
+                        let n_threads = n_workers.min(current_batch.len()).max(1);
+                        for _ in 0..n_threads {
+                            let cfg = &config;
+                            let claim = &claim;
+                            s.spawn(move || {
+                                process_segments_count_filter(
+                                    current_batch,
+                                    claim,
+                                    cfg,
+                                    key_cols,
+                                    filter_ref,
+                                )
+                            });
+                        }
+                        if batch_end < total_segs {
+                            let t_pd = Instant::now();
+                            for seg in &mut pending[..next_end - batch_end] {
+                                let dl = detoast_lazy_blobs(seg);
+                                total_cache_hits += dl.cache_hits;
+                                total_cache_misses += dl.cache_misses;
+                                total_cache_bytes_served += dl.cache_bytes_served;
+                            }
+                            pipeline_detoast_us += t_pd.elapsed().as_micros() as u64;
+                        }
+                    });
+                    batch_start = batch_end;
+                }
+            } else {
+                let claim = std::sync::atomic::AtomicUsize::new(0);
+                let segs: &[SegmentData] = all_segments;
+                std::thread::scope(|s| {
+                    let n_threads = n_workers.min(segs.len()).max(1);
+                    for _ in 0..n_threads {
+                        let cfg = &config;
+                        let claim = &claim;
+                        s.spawn(move || {
+                            process_segments_count_filter(segs, claim, cfg, key_cols, filter_ref)
+                        });
+                    }
+                });
+            }
+            pgrx::log!(
+                "pg_deltax compact: singleton-skip pass1 rows={} nd_hint={} pass1_ms={}",
+                total_rows,
+                nd_hint,
+                t_p1.elapsed().as_millis(),
+            );
+            Some(filter)
+        } else {
+            None
+        };
+
+        let partial_results: Vec<ParallelCompactResult> = if let Some(filter) = &singleton_filter {
+            // Singleton-skip pass 2: aggregate maybe-duplicate keys plus
+            // up to `limit` filler singletons per worker.
+            let claim = std::sync::atomic::AtomicUsize::new(0);
+            let segs: &[SegmentData] = all_segments;
+            let filler_limit = topn_limit as usize;
+            std::thread::scope(|s| {
+                let n_threads = n_workers.min(segs.len()).max(1);
+                let handles: Vec<_> = (0..n_threads)
+                    .map(|_| {
+                        let cfg = &config;
+                        let claim = &claim;
+                        s.spawn(move || {
+                            process_segments_compact_filtered(
+                                segs,
+                                claim,
+                                cfg,
+                                Some((filter, filler_limit)),
+                            )
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            })
+        } else if use_pipeline {
             let n_batches = (n_workers * 2).max(2).min(all_segments.len());
             let batch_size = all_segments.len().div_ceil(n_batches);
             let mut results: Vec<ParallelCompactResult> = Vec::new();
@@ -2824,6 +3119,12 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             })
         };
+
+        // The counting filter (up to 1 GiB) is dead after pass 2 — free it
+        // off the query critical path.
+        if let Some(filter) = singleton_filter {
+            crate::scan::exec::background_drop(filter);
+        }
 
         // Accumulate stats from all workers
         let scan_wall_us = t2.elapsed().as_micros() as u64;
@@ -2907,5 +3208,59 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
             compact_storage.as_mut().unwrap(),
             &mut compact_group_map,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CountingFilter;
+
+    /// The singleton-skip scheme is only exact if the filter never
+    /// produces a false negative: every key bumped at least twice must
+    /// report `maybe_dup`. False positives (unique keys reported as
+    /// maybe-dup) are allowed — they just take the exact-map path.
+    #[test]
+    fn counting_filter_has_no_false_negatives() {
+        let filter = CountingFilter::new(100_000);
+        // Duplicate keys: bumped twice, must always be flagged.
+        for i in 0..50_000u128 {
+            let key = i.wrapping_mul(0x9e37_79b9_7f4a_7c15_2545_f491_4f6c_dd1d);
+            filter.bump(key);
+            filter.bump(key);
+        }
+        for i in 0..50_000u128 {
+            let key = i.wrapping_mul(0x9e37_79b9_7f4a_7c15_2545_f491_4f6c_dd1d);
+            assert!(filter.maybe_dup(key), "false negative for dup key {}", i);
+        }
+    }
+
+    #[test]
+    fn counting_filter_mostly_clears_singletons() {
+        let filter = CountingFilter::new(1_000_000);
+        for i in 0..1_000_000u128 {
+            filter.bump(i << 32 | 0xabcd);
+        }
+        let false_positives = (0..1_000_000u128)
+            .filter(|&i| filter.maybe_dup(i << 32 | 0xabcd))
+            .count();
+        // Expected FP rate at this load is ~5%; 15% leaves slack for
+        // block-occupancy variance while still catching a broken hash
+        // (which would push this toward 100%).
+        assert!(
+            false_positives < 150_000,
+            "FP rate too high: {}",
+            false_positives
+        );
+    }
+
+    /// Saturating bump must not wrap: 300+ bumps of one key still reads
+    /// as maybe-dup (a u8 wraparound would read < 2 again).
+    #[test]
+    fn counting_filter_saturates_without_wraparound() {
+        let filter = CountingFilter::new(100_000);
+        for _ in 0..300 {
+            filter.bump(42);
+        }
+        assert!(filter.maybe_dup(42));
     }
 }
