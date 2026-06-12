@@ -405,9 +405,53 @@ pub(super) fn try_metadata_fast_path(
     })
 }
 
+/// Plan-shape gate shared by `begin_agg_scan`'s pre-check and
+/// [`try_groupby_count_fast_path`]: returns the group column index when the
+/// plan is `GROUP BY <bare INT2/4/8 column>` with only `COUNT(*)` /
+/// `COUNT(<group col>)` aggregates and no HAVING / Top-N / LIMIT / partial
+/// mode / derived group outputs; `None` otherwise.
+pub(super) fn groupby_count_shape(plan: &ParsedAggPlan, meta: &MetadataInfo) -> Option<usize> {
+    if plan.group_specs.len() != 1
+        || !plan.having_filters.is_empty()
+        || plan.is_partial
+        || plan.topn_limit > 0
+        || plan.bare_limit > 0
+        || plan.derived_minmax_topn.is_some()
+    {
+        return None;
+    }
+    let gs = &plan.group_specs[0];
+    if !matches!(gs.expr, GroupByExpr::Column)
+        || !matches!(
+            gs.type_oid,
+            pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+        )
+        || gs.col_idx < 0
+        || (gs.col_idx as usize) >= meta.col_names.len()
+    {
+        return None;
+    }
+    // Every aggregate must be COUNT(*) or COUNT(<group col>).
+    for spec in &plan.agg_specs {
+        match spec.agg_type {
+            AggType::CountStar => {}
+            AggType::Count if spec.col_idx == gs.col_idx && spec.expr_kind == AggExpr::Column => {}
+            _ => return None,
+        }
+    }
+    if plan
+        .output_map
+        .iter()
+        .any(|e| matches!(e, OutputEntry::DerivedGroup { .. }))
+    {
+        return None;
+    }
+    Some(gs.col_idx as usize)
+}
+
 /// Fast path for `SELECT col, COUNT(*) FROM t [WHERE ...] GROUP BY col` on a
 /// low-cardinality integer column, answered entirely from the per-(segment,
-/// value) COUNT sidecar (R5) — no blob is touched.
+/// value) COUNT sidecar — no blob is touched.
 ///
 /// The caller loads segments metadata-only and attaches each segment's
 /// decoded `(value, count)` list for the GROUP BY column to
@@ -438,45 +482,7 @@ pub(super) fn try_groupby_count_fast_path(
     heap_scan_us: u64,
 ) -> Option<AggScanState> {
     // ---- Plan-shape gates -------------------------------------------------
-    if plan.group_specs.len() != 1
-        || !plan.having_filters.is_empty()
-        || plan.is_partial
-        || plan.topn_limit > 0
-        || plan.bare_limit > 0
-        || plan.derived_minmax_topn.is_some()
-    {
-        return None;
-    }
-    let gs = &plan.group_specs[0];
-    if !matches!(gs.expr, GroupByExpr::Column) {
-        return None;
-    }
-    if !matches!(
-        gs.type_oid,
-        pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
-    ) {
-        return None;
-    }
-    if gs.col_idx < 0 || (gs.col_idx as usize) >= meta.col_names.len() {
-        return None;
-    }
-    let group_col_idx = gs.col_idx as usize;
-
-    // Every aggregate must be COUNT(*) or COUNT(<group col>).
-    for spec in &plan.agg_specs {
-        match spec.agg_type {
-            AggType::CountStar => {}
-            AggType::Count if spec.col_idx == gs.col_idx && spec.expr_kind == AggExpr::Column => {}
-            _ => return None,
-        }
-    }
-    if plan
-        .output_map
-        .iter()
-        .any(|e| matches!(e, OutputEntry::DerivedGroup { .. }))
-    {
-        return None;
-    }
+    let group_col_idx = groupby_count_shape(plan, meta)?;
 
     // ---- Qual gates -------------------------------------------------------
     let has_where = !plan.where_quals.is_null();
@@ -490,35 +496,22 @@ pub(super) fn try_groupby_count_fast_path(
     let mut rest_quals: Vec<BatchQual> = Vec::new();
     for bq in batch_quals {
         if bq.col_idx == group_col_idx {
-            let c = match (bq.op, bq.type_oid) {
-                (
-                    BatchCompareOp::Eq
+            if !matches!(
+                bq.op,
+                BatchCompareOp::Eq
                     | BatchCompareOp::Ne
                     | BatchCompareOp::Lt
                     | BatchCompareOp::Le
                     | BatchCompareOp::Gt
-                    | BatchCompareOp::Ge,
-                    pg_sys::INT2OID,
-                ) => bq.const_datum.value() as i16 as i64,
-                (
-                    BatchCompareOp::Eq
-                    | BatchCompareOp::Ne
-                    | BatchCompareOp::Lt
-                    | BatchCompareOp::Le
-                    | BatchCompareOp::Gt
-                    | BatchCompareOp::Ge,
-                    pg_sys::INT4OID,
-                ) => bq.const_datum.value() as i32 as i64,
-                (
-                    BatchCompareOp::Eq
-                    | BatchCompareOp::Ne
-                    | BatchCompareOp::Lt
-                    | BatchCompareOp::Le
-                    | BatchCompareOp::Gt
-                    | BatchCompareOp::Ge,
-                    pg_sys::INT8OID,
-                ) => bq.const_datum.value() as i64,
-                _ => return None, // InList / LIKE / non-int typed qual on group col
+                    | BatchCompareOp::Ge
+            ) {
+                return None; // InList / LIKE on group col
+            }
+            let c = match bq.type_oid {
+                pg_sys::INT2OID => bq.const_datum.value() as i16 as i64,
+                pg_sys::INT4OID => bq.const_datum.value() as i32 as i64,
+                pg_sys::INT8OID => bq.const_datum.value() as i64,
+                _ => return None, // non-int typed qual on group col
             };
             group_quals.push((bq.op, c));
         } else {
@@ -1587,7 +1580,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // try_groupby_count_fast_path tests (R5 per-value count sidecar)
+    // try_groupby_count_fast_path tests (per-value count sidecar)
     // -------------------------------------------------------------------
 
     /// Plan: `SELECT adv, COUNT(*) GROUP BY adv` over make_meta(["ts","adv"]).

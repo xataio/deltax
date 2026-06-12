@@ -4291,8 +4291,8 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         // so correctness is never at risk if the partial variant is
         // rejected for any reason.
         //
-        // R5 exception: when the query shape is fully answerable from the
-        // per-(segment, value) COUNT sidecar (single low-cardinality int
+        // Count-sidecar exception: when the query shape is fully answerable
+        // from the per-(segment, value) COUNT sidecar (single low-cardinality int
         // GROUP BY + COUNT(*), quals only on the group column, sidecar
         // present on every partition), skip the Gather variant — its cost
         // formula would otherwise undercut the complete path and shadow the
@@ -4320,7 +4320,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
     }
 }
 
-/// Plan-time predictor for the R5 GROUP-BY-valcounts metadata fast path
+/// Plan-time predictor for the GROUP-BY-valcounts metadata fast path
 /// (`try_groupby_count_fast_path`): single bare integer GROUP BY column,
 /// all aggregates COUNT(*) (or COUNT(<group col>)), WHERE quals referencing
 /// no column other than the group column, and every companion partition's
@@ -4381,12 +4381,19 @@ unsafe fn groupby_valcounts_shape_likely(
         if !parse.is_null() {
             let jointree = (*parse).jointree;
             if !jointree.is_null() && !(*jointree).quals.is_null() {
-                let vars = pg_sys::pull_var_clause((*jointree).quals, 0);
+                // Recurse-everything flags: `pull_var_clause` with flags 0
+                // ERRORs on PlaceHolderVars (possible after subquery pullup);
+                // recursing returns the contained plain Vars instead (see
+                // `json_extract::PVC_FLAGS_FULL`).
+                let vars =
+                    pg_sys::pull_var_clause((*jointree).quals, super::json_extract::PVC_FLAGS_FULL);
                 if !vars.is_null() {
                     let nvars = (*vars).length;
                     for j in 0..nvars {
                         let v = (*(*vars).elements.add(j as usize)).ptr_value as *mut pg_sys::Var;
-                        if v.is_null() {
+                        if v.is_null()
+                            || (*(v as *mut pg_sys::Node)).type_ != pg_sys::NodeTag::T_Var
+                        {
                             continue;
                         }
                         if (*v).varattno != attno {

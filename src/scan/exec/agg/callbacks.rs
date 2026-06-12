@@ -25,7 +25,8 @@ use super::compact::{
 };
 use super::keys::{CompactGroupMap, can_use_compact_keys, unpack_int_keys};
 use super::metadata::{
-    load_agg_metadata_from_plan, try_catalog_shortcut, try_groupby_count_fast_path,
+    groupby_count_shape, load_agg_metadata_from_plan, try_catalog_shortcut,
+    try_groupby_count_fast_path,
     try_metadata_fast_path,
 };
 use super::parallel_cd::{dispatch_parallel_count_distinct_path, parallel_count_distinct_eligible};
@@ -489,33 +490,13 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
             }
         }
 
-        // Fast path 3 (R5): GROUP BY <low-cardinality int col> [+ COUNT(*)]
+        // Fast path 3: GROUP BY <low-cardinality int col> [+ COUNT(*)]
         // answered entirely from the per-(segment, value) COUNT sidecar on
         // the `_valbitmap` companion table — no blobs touched. Bails to the
         // normal path on any shape/coverage mismatch (see
         // `try_groupby_count_fast_path` for the exactness rules).
         let t_fp3 = Instant::now();
-        if plan.group_specs.len() == 1
-            && plan.having_filters.is_empty()
-            && !plan.is_partial
-            && plan.topn_limit <= 0
-            && plan.bare_limit <= 0
-            && plan.derived_minmax_topn.is_none()
-            && matches!(plan.group_specs[0].expr, GroupByExpr::Column)
-            && matches!(
-                plan.group_specs[0].type_oid,
-                pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
-            )
-            && plan.group_specs[0].col_idx >= 0
-            && (plan.group_specs[0].col_idx as usize) < meta.col_names.len()
-            && plan.agg_specs.iter().all(|s| {
-                s.agg_type == AggType::CountStar
-                    || (s.agg_type == AggType::Count
-                        && s.col_idx == plan.group_specs[0].col_idx
-                        && s.expr_kind == AggExpr::Column)
-            })
-        {
-            let group_col_idx = plan.group_specs[0].col_idx as usize;
+        if let Some(group_col_idx) = groupby_count_shape(&plan, &meta) {
             let group_col_name = meta.col_names[group_col_idx].clone();
 
             // The sidecar only exists for non-segment-by columns persisted in

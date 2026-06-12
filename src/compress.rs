@@ -1614,15 +1614,16 @@ pub(crate) type FlushResult = (
 pub(crate) const VALBITMAP_MAX_DISTINCT: usize = 32;
 
 /// Cap on distinct values for the per-(segment, value) COUNT sidecar on
-/// low-cardinality *integer* columns (R5). Integer columns with at most this
+/// low-cardinality *integer* columns. Integer columns with at most this
 /// many distinct values partition-wide get an exact per-segment value→count
 /// list stored next to the presence bitmap (`_counts` on the `_valbitmap`
 /// companion table), letting `GROUP BY <col> + COUNT(*)` queries resolve
 /// entirely from metadata. Columns exceeding the cap are dropped (no entry).
-/// (col_idx, segment_id, bitmap_bits, optional counts blob).
-pub(crate) type ValbitmapEntry = (u16, i32, Vec<u8>, Option<Vec<u8>>);
-
 pub(crate) const VALCOUNTS_MAX_DISTINCT_INT: usize = 64;
+
+/// One encoded `<partition>_valbitmap` row:
+/// `(col_idx, segment_id, bitmap_bits, optional counts blob)`.
+pub(crate) type ValbitmapEntry = (u16, i32, Vec<u8>, Option<Vec<u8>>);
 
 /// Cap on distinct values tracked per text column for the partial-MCV
 /// (heavy-hitter) summary. Generous enough to hold every distinct value of a
@@ -1848,7 +1849,7 @@ pub(crate) fn flush_segment_metadata(
 ///   segment (feeds the value-presence bitmap + catalog valmap/valcounts);
 /// - integer column (`smallint`/`integer`/`bigint`, not timestamps/dates)
 ///   with ≤ `VALCOUNTS_MAX_DISTINCT_INT` distinct values in this segment
-///   (feeds the per-(segment, value) COUNT sidecar — R5). Integer values
+///   (feeds the per-(segment, value) COUNT sidecar). Integer values
 ///   are stringified in canonical decimal so they share the text plumbing.
 ///
 /// Columns that overflow their cap are simply omitted — the partition-level
@@ -1931,7 +1932,7 @@ fn collect_int_value_counts<T: Into<i64>>(
 }
 
 /// True for PostgreSQL integer-family types eligible for the per-(segment,
-/// value) COUNT sidecar (R5). Expects a lowercased type name. Deliberately
+/// value) COUNT sidecar. Expects a lowercased type name. Deliberately
 /// excludes bool / float / date / timestamp.
 pub(crate) fn is_intcount_data_type(dt: &str) -> bool {
     matches!(
@@ -2454,7 +2455,7 @@ pub(crate) fn build_companion_ddl(part_table: &str, columns: &[ColumnMeta]) -> C
     // `_counts` (nullable; populated for low-cardinality (≤64) integer columns
     // only) holds the exact per-(segment, value) occurrence counts — see
     // `encode_segment_value_counts` — serving `GROUP BY <int col> + COUNT(*)`
-    // entirely from metadata (R5).
+    // entirely from metadata.
     let valbitmap_ddl = format!(
         "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _bits BYTEA{} NOT NULL, _counts BYTEA{}, PRIMARY KEY (_col_idx, _segment_id))",
         valbitmap_fqn, lz4, lz4
@@ -2943,6 +2944,7 @@ fn compress_partition_streaming(
 
 /// Output of [`finalize_valbitmap_buffer`]: the catalog payloads plus the
 /// encoded per-(col, segment) sidecar rows ready for insertion.
+#[derive(Default)]
 pub(crate) struct ValbitmapFinal {
     /// Column name → sorted distinct value list (`column_valmap`). The array
     /// index is the bit position in each segment's `_bits` bitmap and the
@@ -2952,7 +2954,7 @@ pub(crate) struct ValbitmapFinal {
     pub(crate) valcounts: ColumnValcounts,
     /// `(col_idx, segment_id, bits, counts_blob)` sorted by (col_idx,
     /// segment_id). `counts_blob` is `Some` only for integer columns — the
-    /// per-(segment, value) COUNT sidecar (R5), encoded via
+    /// per-(segment, value) COUNT sidecar, encoded via
     /// [`encode_segment_value_counts`].
     pub(crate) entries: Vec<ValbitmapEntry>,
 }
@@ -2964,24 +2966,20 @@ pub(crate) struct ValbitmapFinal {
 ///
 /// Per-column distinct cap: `VALBITMAP_MAX_DISTINCT` (32) for text columns,
 /// `VALCOUNTS_MAX_DISTINCT_INT` (64) for integer columns. Columns that
-/// overflow their cap partition-wide are dropped entirely. Note the cap
-/// equality with `compute_segment_valbitmap_values`'s per-segment cap
-/// guarantees that a kept column has an entry for *every* segment (a segment
-/// exceeding the cap alone would push the partition union over the cap too) —
-/// the read-side fast path still re-verifies per-segment presence.
+/// overflow their cap partition-wide are dropped entirely. Note that a kept
+/// column may still lack rows for *some* segments: a segment that overflowed
+/// the per-segment cap in `compute_segment_valbitmap_values` contributed no
+/// entry here (and its values never reach the partition union) — the
+/// read-side count fast path re-verifies per-segment presence and bails on
+/// any gap.
 pub(crate) fn finalize_valbitmap_buffer(
     columns: &[ColumnMeta],
     value_buffer: Vec<(u16, i32, SegValueCounts)>,
 ) -> ValbitmapFinal {
     use std::collections::{BTreeMap, HashMap};
 
-    let empty = || ValbitmapFinal {
-        valmap: HashMap::new(),
-        valcounts: HashMap::new(),
-        entries: Vec::new(),
-    };
     if value_buffer.is_empty() {
-        return empty();
+        return ValbitmapFinal::default();
     }
 
     // Map non-segment-by col_idx → (user column name, is_integer).
@@ -3027,7 +3025,7 @@ pub(crate) fn finalize_valbitmap_buffer(
     }
 
     if count_by_col.is_empty() {
-        return empty();
+        return ValbitmapFinal::default();
     }
 
     // Finalize per-column sorted value list + value→bit_idx index. The
@@ -3120,39 +3118,22 @@ fn finalize_and_insert_valbitmaps(
         .update(&ddl.valbitmap_ddl, None, &[])
         .expect("failed to create valbitmap table");
 
+    let insert_sql = format!(
+        "INSERT INTO {} (_col_idx, _segment_id, _bits, _counts) VALUES ($1, $2, $3, $4)",
+        &ddl.valbitmap_fqn
+    );
     for (col_idx, seg_id, bits, counts) in fin.entries {
         use pgrx::datum::DatumWithOid;
-        match counts {
-            Some(counts_blob) => {
-                let insert_sql = format!(
-                    "INSERT INTO {} (_col_idx, _segment_id, _bits, _counts) VALUES ($1, $2, $3, $4)",
-                    &ddl.valbitmap_fqn
-                );
-                let args: Vec<DatumWithOid> = vec![
-                    (col_idx as i16).into(),
-                    seg_id.into(),
-                    DatumWithOid::from(bits),
-                    DatumWithOid::from(counts_blob),
-                ];
-                client
-                    .update(&insert_sql, None, &args)
-                    .expect("failed to insert valbitmap row");
-            }
-            None => {
-                let insert_sql = format!(
-                    "INSERT INTO {} (_col_idx, _segment_id, _bits) VALUES ($1, $2, $3)",
-                    &ddl.valbitmap_fqn
-                );
-                let args: Vec<DatumWithOid> = vec![
-                    (col_idx as i16).into(),
-                    seg_id.into(),
-                    DatumWithOid::from(bits),
-                ];
-                client
-                    .update(&insert_sql, None, &args)
-                    .expect("failed to insert valbitmap row");
-            }
-        }
+        // `counts` is `None` (SQL NULL) for non-integer columns.
+        let args: Vec<DatumWithOid> = vec![
+            (col_idx as i16).into(),
+            seg_id.into(),
+            DatumWithOid::from(bits),
+            DatumWithOid::from(counts),
+        ];
+        client
+            .update(&insert_sql, None, &args)
+            .expect("failed to insert valbitmap row");
     }
     client
         .update(&format!("ANALYZE {}", ddl.valbitmap_fqn), None, &[])

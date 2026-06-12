@@ -939,7 +939,7 @@ pub(super) struct SegmentData {
     pub(super) cached_blob_pins: Vec<crate::blob_cache::BlobCachePin>,
     /// Exact per-value occurrence counts `(value, count)` for the GROUP BY
     /// fast-path column, decoded from the `_counts` sidecar on the
-    /// `_valbitmap` companion table (R5). Populated only by
+    /// `_valbitmap` companion table. Populated only by
     /// `load_groupcol_valcounts`; `None` means "sidecar not loaded / not
     /// available for this segment" and the metadata GROUP BY fast path bails.
     pub(super) valcounts: Option<Vec<(i64, i64)>>,
@@ -3649,7 +3649,7 @@ pub(super) unsafe fn load_text_length_sidecars(
     }
 }
 
-/// Load the per-(segment, value) COUNT sidecar (R5) for one column from the
+/// Load the per-(segment, value) COUNT sidecar for one column from the
 /// `<partition>_valbitmap` companion table's `_counts` column, attaching the
 /// decoded `(value, count)` list to each matching segment's `valcounts`.
 ///
@@ -3658,10 +3658,10 @@ pub(super) unsafe fn load_text_length_sidecars(
 /// value list from `column_valmap`, parsed to i64 — each blob's `bit_idx`
 /// indexes into it.
 ///
-/// Missing table / missing `_counts` column (data compressed before R5) /
-/// missing rows / undecodable blobs simply leave the affected segments'
-/// `valcounts` as `None`; the caller bails to the normal path when any
-/// surviving segment lacks counts. Never errors.
+/// Missing table / missing `_counts` column (data compressed before the
+/// sidecar existed) / missing rows / undecodable blobs simply leave the
+/// affected segments' `valcounts` as `None`; the caller bails to the normal
+/// path when any surviving segment lacks counts. Never errors.
 ///
 /// # Safety
 ///

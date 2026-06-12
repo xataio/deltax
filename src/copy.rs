@@ -3100,7 +3100,7 @@ fn finalize_and_insert_valbitmap(
 
     // Bulk-insert as multi-row VALUES (~100 rows/batch). `_counts` is NULL
     // for text columns; integer columns carry the per-(segment, value) COUNT
-    // sidecar blob (R5).
+    // sidecar blob.
     let batch_size = 100;
     for chunk in fin.entries.chunks(batch_size) {
         let mut values: Vec<String> = Vec::with_capacity(chunk.len());

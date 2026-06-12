@@ -1,4 +1,4 @@
-"""End-to-end tests for the per-(segment, value) COUNT sidecar (R5).
+"""End-to-end tests for the per-(segment, value) COUNT sidecar.
 
 Integer columns with at most 64 distinct values partition-wide get an exact
 per-segment value→count list stored in the `_counts` column of the
