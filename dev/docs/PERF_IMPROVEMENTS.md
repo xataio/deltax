@@ -1727,3 +1727,322 @@ Result-set equality for all 43 queries verified against
 - `tests/test_nogroup_parallel_agg.py` — integration coverage for the
   no-GROUP-BY shapes (zero-match one-row semantics, NOT LIKE NULLs,
   mixed text+numeric quals, COUNT(DISTINCT) with text qual).
+
+### 50. Blob-cache auto-size: cap 4 → 16 GiB, fraction RAM/4 → RAM/6 [DONE]
+
+**Landed 2026-06-10. Bench hot total 58.8 s → 54.5 s (−4.3 s, −7.4%)
+on the full ClickBench EC2 dataset, no regressions.**
+
+Two-constant change in `src/blob_cache/mod.rs`: `AUTO_CAP_MB`
+4096 → 16384 and the auto fraction `MemTotal/4` → `MemTotal/6`
+(floor unchanged at 256 MiB). On the c6a.4xlarge (32 GiB) auto now
+resolves to ~5.2 GiB instead of the capped 4 GiB.
+
+**Why it mattered.** The old cap pinned the cache at 4 GiB while the
+compressed dataset is 14.6 GB. The big-text working sets (URL ≈
+2.1 GB, URL+Title+SearchPhrase+UserID ≈ 4.3 GB for Q22) didn't fit
+alongside the int columns, so warm runs of the text-heavy queries
+thrashed the LRU: Q22 ran warm at a **42% miss rate** and re-paid
+2.8 s of detoast on every run, Q20 1.5 s. With the working set
+resident, warm detoast collapses to ~0 across the board.
+
+**Why RAM/6, not RAM/4.** The first iteration kept 25% (→ 7.8 GiB
+here) and OOM-killed Q32 when the full bench ran back-to-back on one
+postmaster (`make verify`): once queries 0–31 fill the cache, Q32's
+high-cardinality agg transient (~15–18 GB anon at the time, see #51)
++ 8 GB shared_buffers + 7.8 GB cache exceeded the box. Shmem pages,
+once touched, are non-reclaimable without swap, so a filled cache is
+permanent occupancy — the default has to leave room for worst-case
+query transients. RAM/6 + the #51 merge-memory reduction fits with
+headroom; the official bench protocol (PG restart before each query)
+was never at risk because the cache then only ever holds the current
+query's columns.
+
+**Measured (EC2 c6a.4xlarge, 100 M rows, warm EXPLAIN ANALYZE):**
+
+| Query | Before | After | detoast before → after |
+|-------|-------:|------:|-----------------------:|
+| Q20 COUNT(*) URL LIKE | 2,004 ms | **1,120 ms** | 1,528 → 3 ms |
+| Q22 Title LIKE + URL NOT LIKE | 4,158 ms | **2,753 ms** | 2,778 → 8 ms |
+| Q28 Referer REGEXP_REPLACE | 8,172 ms¹ | **7,827 ms¹** | — |
+
+¹ best-of-3 bench numbers; Q28's gain is partial-working-set
+residency, not a full fit.
+
+Full-bench comparison (best-of-3 hot, history
+`20260610_081000` vs `20260610_104132`): only Q20 (−3.5 s, combined
+with #49 which landed in the same window), Q22 (−0.41 s) and Q28
+(−0.35 s) moved beyond noise; cold totals unchanged (+0.7 s on a
+310 s sum).
+
+The cache reserves its full size as shmem up front (DSA in-place),
+but pages are only touched as entries land, so the larger cap costs
+nothing on workloads that never fill it.
+
+### 51. Dedup-aware partitioned merge (compact path) [DONE]
+
+**Landed 2026-06-10. Q32 warm 9.5 → 8.7 s, peak backend RSS during
+Q32 21.4 → 17.1 GB (−4.3 GB). Unblocked the #50 cache-size increase.**
+
+`compact_partitioned_topn` used to have each partition thread build a
+full partition-local copy of its slice of the group space: a
+`CompactGroupMap` *plus* a `CompactAccStorage` into which every
+worker's accumulators were copied slot-by-slot. On essentially-unique
+GROUP BY keys (Q32: 99,997,494 groups from 99,997,497 rows) that
+second copy is 99.99% pure waste — almost no key appears in more
+than one worker partial, so there is nothing to merge.
+
+Now the partition map stores a packed `u64` reference instead of a
+group index: bit 63 = dup flag; singles pack
+`(worker_idx << 32) | worker_gidx`, dups index into a `dup_storage`
+that only materializes groups actually seen in ≥2 worker partials
+(via `merge_group_into`, the thread-safe per-group extraction of the
+`merge_compact_results` inner loop). Top-N heap reads and HAVING
+filters resolve through the reference (`read_slot_i64`); winner
+materialization into the per-partition mini-storage stride-copies
+from the owning worker's storage and fixes up MinStr/MaxStr arena
+offsets and CountDistinct counts (singles read CD counts from the
+worker sidecar — they were never written into worker storage Count
+slots).
+
+Effects on Q32 (warm, EXPLAIN ANALYZE):
+
+| Metric | Before | After |
+|---|---:|---:|
+| merge | 5,298 ms | 4,435 ms |
+| total DeltaX | 8,854 ms | 7,999 ms |
+| peak backend RSS | 21.4 GB | 17.1 GB |
+
+The memory drop matters more than the time: Q32's transient anon was
+what made the #50 blob-cache increase OOM in no-restart sessions
+(8 GB shared_buffers + filled cache + ~18 GB agg transient > 30 GB
+box). With the dedup merge, `make -C clickbench verify` (all 43
+queries against one postmaster, cache fully populated) passes:
+43 OK, 0 mismatch, no OOM.
+
+Worst-case behaviour (every key present in all workers, e.g.
+low-cardinality groups that still route here) degenerates gracefully:
+every key promotes to `dup_storage` on its second sighting, which is
+the same alloc + merge work as before plus one extra map write; peak
+memory is no worse than the old design.
+
+**Files touched:** `src/scan/exec/agg/parallel_compact.rs`
+(`merge_group_into` helper + rewritten partition-thread closure in
+`compact_partitioned_topn`).
+
+**Bench-level (best-of-3 hot, history `20260610_104132` →
+`20260610_112034`):** Q32 9.464 → 8.585 s, Q15 1.944 → 1.842 s, all
+other queries within noise. Combined with #50, bench hot total
+58.8 → **53.4 s** (−9.1%) for the day.
+
+### 52. Segment-local memo for Lz4 text group keys [TRIED — REGRESSED, REVERTED]
+
+**Tried 2026-06-10, reverted the same day (Q33/Q34 bench hot
+3.35 → 3.62 s, +8%).**
+
+The dict-aware fast path in `process_segments_mixed` (single text
+group key, no int keys) only covers `SegTextColumn::Dict`. URL-class
+columns are LZ4-encoded, so Q33/Q34 (`GROUP BY URL`) hash the full
+string twice per row (`hash_mixed_key` builds a u128 from two ahash
+streams) and probe the multi-million-entry global group map per row.
+URL repeats ~4.2x within a segment (30 K rows ≈ 7.1 K distinct), so a
+per-segment `AHashMap<&str, u32>` (key string → group index) looked
+like it should collapse most of those probes into small-map hits.
+
+It lost at bench level because the trade is worse than it looks: the
+global map is `HashMap<u128, u32>` — collisions are impossible by
+construction, so probes never compare keys, only u128s. The memo
+probe pays one ahash over the string (vs two) but adds a full-string
+`memcmp` on every hit plus an insert on every miss, and at 7 K
+entries × ~32 B the memo doesn't stay L2-resident anyway. Warm
+EXPLAIN ANALYZE in a mixed session suggested −8% (confounded by blob
+cache evictions inflating the baseline); the bench protocol (PG
+restart per query, best-of-3) showed +8%. Keep Lz4 group keys on the
+generic path.
+
+Two pieces from the same pass survived: skipping the generic per-row
+key-component build loop when the Dict fast path is active (it
+re-fetched the string per row just to discard it), and an input-side
+memo in the regex transform (`apply_regex_to_seg_col`, Lz4 arm) that
+skips regex + output-dedup work for repeated inputs (Referer repeats
+~2.7x per segment).
+
+**Files touched:** `src/scan/exec/agg/parallel_mixed.rs`
+(`process_segments_mixed`), `src/scan/exec/agg/regex.rs`
+(`apply_regex_to_seg_col`).
+
+### 53. Byte-op fast path for prefix-strip regexp_replace [DONE]
+
+**Landed 2026-06-10. Q28 bench hot 7.918 → 2.769 s (with #54) —
+2.4x faster than ClickHouse's 9.58 s on this query.**
+
+`perf` on Q28 showed 37% of all CPU inside the regex crate — 30.4% of
+it in `BoundedBacktracker::search_imp`. The ClickBench pattern
+`^https?://(?:www\.)?([^/]+)/.*$` is not one-pass (at byte `w` the
+NFA can't tell whether `www.` belongs to the optional literal or to
+the capture class), so the regex meta-engine resolves the capture
+with its bounded backtracker on every one of the 81 M matching rows.
+
+`SimplePattern` (in `regex.rs`) recognizes the restricted shape
+`^ lit [opt-lit | x?]... ([^c]+) c-lit .*$` at plan time and compiles
+it to byte comparisons: literals via `starts_with`, the optional
+literals via greedy try-then-skip (same preference order as the regex
+engine), and the capture via a scan for the stop byte — valid because
+parse-time validation requires the component after the capture to be
+a literal starting with the stop char, so the capture provably ends
+at its first occurrence and no backtracking can ever be needed.
+Anything outside the shape (two captures, alternations, class
+escapes, unanchored patterns, `\2+` backrefs) returns None and falls
+back to the regex crate. Differential tests in `regex.rs` assert
+byte-for-byte agreement with the Rust regex engine on the tricky
+inputs (backtracking case `https://www./path` → host `www.`, empty
+host, embedded newlines, multibyte hosts, case sensitivity).
+
+**Files touched:** `src/scan/exec/agg/regex.rs` (`SimplePattern`),
+`src/scan/exec/agg/callbacks.rs` (construction).
+
+### 54. Skip per-row UTF-8 revalidation in text hot paths [DONE]
+
+**Landed 2026-06-10 (same pass as #53).**
+
+The same Q28 profile showed 9.3% of CPU in `core::str::from_utf8` and
+3.0% in `do_count_chars`: `SegTextColumn::get_str`/`get_len` (Lz4
+arm), `StringArena::get` and the regex-transform row loop revalidated
+UTF-8 on every access, although the bytes are decompressed PG text
+our own compressor wrote — valid UTF-8 by construction. These four
+sites now use `from_utf8_unchecked` with a `debug_assert!` guard.
+This is why Q28's agg phase (per-row `MIN(Referer)` get_str +
+`AVG(length(Referer))` get_len) dropped 4.3 → 1.7 s on top of the
+#53 decompress-side win; every text-heavy aggregate benefits.
+
+**Files touched:** `src/scan/exec/text_col.rs`,
+`src/scan/exec/agg/compact.rs`, `src/scan/exec/agg/regex.rs`.
+
+**Bench-level for #52–#54 combined (best-of-3 hot, history
+`20260610_114934` → `20260610_131038`):** Q28 7.918 → 2.769 s,
+Q20 1.199 → 1.061 s, Q13 2.320 → 2.224 s, Q12 1.179 → 1.112 s,
+Q34 3.412 → 3.234 s, everything else within noise. Bench hot total
+53.77 → **48.23 s** (−10.3%).
+
+### 55. Singleton-skip two-pass top-N for near-unique COUNT(*) sorts [DONE]
+
+**Landed 2026-06-11. Q32 warm 4.63 → 2.73 s (EXPLAIN ANALYZE;
+agg 2.63 → ~2.2 s across two passes, merge 1.57 s → 0.07 s).**
+
+ClickBench Q32 (`GROUP BY WatchID, ClientIP ORDER BY c DESC LIMIT
+10`, no WHERE) has 99,997,494 groups in 99,997,497 rows — exactly
+four pairs occur twice, everything else is a singleton. The compact
+path built a 100M-entry map (plus accumulators) across 16 workers and
+partition-merged all of it to pick 10 winners, almost all of which
+are interchangeable count=1 ties.
+
+The two-pass scheme in `parallel_compact.rs` exploits that a count=1
+group can never beat a count>=2 group:
+
+- **Pass 1** decompresses only the GROUP BY key columns and bumps a
+  shared `CountingFilter` — a blocked counting Bloom filter (two
+  byte-wide saturating counters per key inside one 64-byte block, so
+  each row costs a single cache-line fetch; `AtomicU8` with a
+  load-before-add guard that makes wraparound impossible). Two
+  occurrences of a key always leave both its counters at >= 2, so the
+  filter has no false negatives; false positives just take the exact
+  path. Sized at 8 slots/row (cap 1 GiB → load ~0.19 at 100M rows),
+  measured FP ~3.3% on Q32.
+- **Pass 2** is the normal worker aggregation loop, except rows whose
+  key the filter proves globally unique skip the group map entirely —
+  apart from `limit` filler singletons per worker, aggregated
+  normally so the merge always has enough exact count=1 groups to pad
+  ties. Worker maps end up at ~3.3M total entries instead of 100M, so
+  the partitioned merge collapses (1.57 s → 0.07 s) and map-insert
+  traffic disappears.
+
+Gating: `ORDER BY COUNT(*) DESC LIMIT <=10K`, no HAVING / batch quals
+/ WHERE / segment filters / time bounds, >= 16M rows, and a
+cardinality hint of >= 0.9 × exact row count. The hint is the catalog
+HLL ndistinct (`deltax_partition.column_ndistinct`) of the most
+distinct single bijective group column, summed across scanned
+partitions — a lower bound on the true group count. Planner
+`plan_rows` can't serve here: it's clamped to the estimated input
+rows (3338 segs × 10K = 33.4M for Q32 vs 100M actual), which would
+make Q32 indistinguishable from genuinely duplicate-heavy keys where
+pass 2 would degenerate into the full map plus a wasted pass 1
+(that's also why UserID- or ClientIP-keyed top-Ns — sum-nd 20M/14M vs
+100M rows — correctly stay on the old path). Pass 1 reuses the
+pipeline-detoast overlap, so on cold runs it hides behind I/O.
+
+Correctness note: any count=1 group is as valid a LIMIT tie pick as
+any other (the old path's pick among ties was equally arbitrary);
+Q32 is a `LIMIT_TIE_QUERIES` entry in the verify harness, and the
+count>=2 groups + all aggregate values are exact.
+
+**Files touched:** `src/scan/exec/agg/parallel_compact.rs`
+(`CountingFilter`, `process_segments_count_filter`,
+`process_segments_compact_filtered`, dispatch gating),
+`src/scan/exec/agg/callbacks.rs` (`nd_hint` from catalog ndistinct).
+
+### 56. Sampled count-floor two-pass top-N on the mixed (text) path [DONE]
+
+**Landed 2026-06-12. Full bench protocol: hot geomean(+10ms) 0.288 →
+0.282 (−2.1%), hot total 28.25 → 26.73 s. Q18 2.72 → 1.90 s,
+Q16 1.33 → 0.98 s, Q33 1.97 → 1.82 s, Q34 1.98 → 1.82 s.**
+
+Generalizes #55 from "skip count=1 groups" to "skip every group whose
+total count is provably below the limit-th largest" and extends it to
+the mixed/text aggregation path, where unfiltered
+`GROUP BY … ORDER BY COUNT(*) DESC LIMIT n` queries spend nearly all
+their time building tens-of-millions-entry digest maps (Q18: 57.8M
+groups in 100M rows; Q16: 26.9M; Q33/Q34: 27.7M).
+
+Three pieces on top of #55:
+
+- **Sample-proven floor.** Pass 1 exact-counts a key-coherent 1/128
+  sample alongside the filter bumps (membership depends only on the
+  key hash, so a sampled key's count is its exact global count). The
+  floor is the count of the `limit`-th largest sampled key
+  (`pick_count_floor`): that many global groups provably reach it, so
+  the true top-N all do, and pass 2 skipping every key the filter
+  reads below the floor is exact — no fallback or verification pass.
+  Sampled floors on ClickBench: Q18 59, Q16/Q33/Q34 235 (saturation
+  cap). When the sample can't prove more than the singleton floor
+  (2), the #55 filler semantics kick in unchanged (Q32's top 10 is
+  count-1 ties; its sampled floor stays 2).
+- **Cache-resident filter.** The mixed path sizes the
+  `CountingFilter` at 2^25 slots (32 MB) instead of #55's 1 GiB: at
+  100M rows the full-size filter pays a DRAM miss per bump and per
+  probe (~0.5 s per pass, measured — it ate the entire two-pass gain;
+  Q18 was 2.72 s with the 1 GiB filter, 1.90 s with 32 MB). Collision
+  noise at this density (~6 rows/slot) only matters to floors below
+  ~16; pass 2 drops the filter entirely when the sampled floor lands
+  below that (pass 1 sunk, correctness unaffected — collisions only
+  inflate counts, so skips stay sound at any size).
+- **Mixed-path pass 1** (`process_segments_mixed_count_filter`)
+  decompresses only the GROUP BY key columns and folds each row into
+  the same 128-bit digest the aggregation loop keys its map on
+  (int components then text components; per-dict-entry digests for
+  dict-encoded text, matching the multi-key dict fast path). Pass-2
+  probes sit at the digest sites: the generic/multi-key insert path
+  probes per row, the single-dict-key fast path caches a `GIDX_SKIP`
+  sentinel per dict entry so skipped entries cost one branch per
+  subsequent row.
+
+Gating mirrors #55 (`ORDER BY COUNT(*) DESC LIMIT <=10K`, unfiltered,
+>= 16M rows, plain Column/AddConst/DateTrunc/Extract keys, no
+sidecar-only key columns) but from `nd_hint >= 0.125 ×` rows instead
+of 0.9: text-keyed map entries cost several times an int-keyed one
+(arena + key storage + digest map), so the two-pass overhead breaks
+even at much lower cardinality. The compact path keeps the 0.9 gate —
+measured at Q35/Q15-class mid-cardinality (21M/100M int groups), the
+map+merge savings only offset the extra key scan (±50 ms), so the
+near-unique regime stays its only target.
+
+Results verified against ground truth on EC2 (subquery form that
+disables the top-N pushdown): Q18/Q16 count sequences and Q33 exact
+URL sets match; Q32 unchanged (boundary=1, filler path).
+
+**Files touched:** `src/scan/exec/agg/parallel_compact.rs`
+(`CountingFilter::{with_max_size, bump_hashed, above_floor,
+is_sampled_hashed}`, `pick_count_floor`, sampled pass 1),
+`src/scan/exec/agg/parallel_mixed.rs`
+(`process_segments_mixed_count_filter`, floor gate + pass-1 dispatch,
+probe sites, `GIDX_SKIP`), `src/scan/exec/agg/callbacks.rs`
+(`compute_group_nd_hint` shared by both paths).

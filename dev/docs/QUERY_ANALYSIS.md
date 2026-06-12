@@ -15,6 +15,18 @@ ideas.
 
 ## What changed since the last analysis
 
+**2026-06-10:** blob-cache auto-size retuned (cap 4 → 16 GiB,
+fraction RAM/4 → RAM/6; `PERF_IMPROVEMENTS.md` #50) + dedup-aware
+partitioned merge (#51). The c6a.4xlarge now resolves to ~5.2 GiB
+of blob cache and each query's working set stays resident under the
+bench protocol — warm detoast ≈ 0 everywhere. Q20 2.00 → 1.12 s,
+Q22 4.16 → 2.80 s, Q28 8.17 → 7.80 s; the merge change adds Q32
+9.50 → 8.59 s (and −4.3 GB peak RSS, fixing an OOM at-the-edge
+condition in no-restart sessions) and Q15 −0.16 s. Bench hot total
+**58.8 → 53.4 s (−9.1%)**. The F3 "detoast dominates" finding below
+is largely obsolete for warm runs, and F4's merge numbers predate
+#51; per-query breakdowns in this doc predate both changes.
+
 Landed in the interval: CountDistinct acceleration via hashbrown +
 parallel partitioned CD merge (`PERF_IMPROVEMENTS.md` #43 fixes (a)(b)(c)).
 

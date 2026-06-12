@@ -10,11 +10,18 @@ use crate::compression;
 /// Keeps decompressed string data alive during the row loop,
 /// providing O(1) &str access per row without interning.
 pub(super) enum SegTextColumn {
-    /// Dictionary-compressed: dict entries + per-row index (null-expanded).
+    /// Dictionary-compressed: flat entry buffer + per-row index (null-expanded).
     Dict {
-        entries: Vec<String>,
-        /// Per-row index into `entries`. u32::MAX = null.
+        /// Entry bytes (may interleave 4-byte length prefixes — ranges skip them).
+        buf: Vec<u8>,
+        /// Per-entry (offset, len) into `buf`.
+        entry_ranges: Vec<(u32, u32)>,
+        /// Per-row index into `entry_ranges`. u32::MAX = null.
         row_to_entry: Vec<u32>,
+        /// Per-entry character counts; empty unless requested at decode time
+        /// (`want_char_lens`). Lets `get_len` do an array lookup instead of
+        /// counting UTF-8 chars on every row.
+        entry_char_lens: Vec<u32>,
     },
     /// LZ4/LZ4Blocked: decompressed buffer + per-row range (null-expanded).
     Lz4 {
@@ -37,20 +44,53 @@ pub(super) enum SegTextColumn {
     },
 }
 
+/// Resolve one dictionary entry range to a `&str` without re-validating UTF-8.
+#[inline]
+pub(super) fn dict_entry_str(buf: &[u8], range: (u32, u32)) -> &str {
+    let s = &buf[range.0 as usize..range.0 as usize + range.1 as usize];
+    // SAFETY: dictionary entries are PG text values our own compressor wrote,
+    // so they are valid UTF-8 by construction (same argument as the Lz4
+    // variant in `get_str`).
+    debug_assert!(std::str::from_utf8(s).is_ok());
+    unsafe { std::str::from_utf8_unchecked(s) }
+}
+
 impl SegTextColumn {
+    /// Build a Dict column from already-materialized entry strings (used by
+    /// regex / CASE WHEN transforms whose outputs aren't backed by a blob).
+    pub(super) fn dict_from_owned_entries(
+        entries: Vec<String>,
+        row_to_entry: Vec<u32>,
+    ) -> SegTextColumn {
+        let mut buf = Vec::with_capacity(entries.iter().map(|s| s.len()).sum());
+        let mut entry_ranges = Vec::with_capacity(entries.len());
+        for e in &entries {
+            entry_ranges.push((buf.len() as u32, e.len() as u32));
+            buf.extend_from_slice(e.as_bytes());
+        }
+        SegTextColumn::Dict {
+            buf,
+            entry_ranges,
+            row_to_entry,
+            entry_char_lens: Vec::new(),
+        }
+    }
+
     /// Get the string for a given row, or None if null. Returns None for the
     /// Lengths variant since string bytes are not available there.
     pub(super) fn get_str(&self, row: usize) -> Option<&str> {
         match self {
             SegTextColumn::Dict {
-                entries,
+                buf,
+                entry_ranges,
                 row_to_entry,
+                ..
             } => {
                 let idx = row_to_entry[row];
                 if idx == u32::MAX {
                     None
                 } else {
-                    Some(&entries[idx as usize])
+                    Some(dict_entry_str(buf, entry_ranges[idx as usize]))
                 }
             }
             SegTextColumn::Lz4 { buf, row_to_range } => {
@@ -58,10 +98,13 @@ impl SegTextColumn {
                 if off == u32::MAX {
                     None
                 } else {
-                    Some(
-                        std::str::from_utf8(&buf[off as usize..off as usize + len as usize])
-                            .unwrap_or(""),
-                    )
+                    let slice = &buf[off as usize..off as usize + len as usize];
+                    // SAFETY: the buffer holds decompressed PG text values our
+                    // own compressor wrote, so it is valid UTF-8 by
+                    // construction; revalidating per row showed up at ~9% of
+                    // query CPU on text-heavy aggregates.
+                    debug_assert!(std::str::from_utf8(slice).is_ok());
+                    Some(unsafe { std::str::from_utf8_unchecked(slice) })
                 }
             }
             SegTextColumn::SegBy(opt) => opt.as_deref(),
@@ -90,14 +133,22 @@ impl SegTextColumn {
     pub(super) fn get_len(&self, row: usize) -> Option<usize> {
         match self {
             SegTextColumn::Dict {
-                entries,
+                buf,
+                entry_ranges,
                 row_to_entry,
+                entry_char_lens,
             } => {
                 let idx = row_to_entry[row];
                 if idx == u32::MAX {
                     None
+                } else if !entry_char_lens.is_empty() {
+                    Some(entry_char_lens[idx as usize] as usize)
                 } else {
-                    Some(entries[idx as usize].chars().count())
+                    Some(
+                        dict_entry_str(buf, entry_ranges[idx as usize])
+                            .chars()
+                            .count(),
+                    )
                 }
             }
             SegTextColumn::Lz4 { buf, row_to_range } => {
@@ -106,7 +157,14 @@ impl SegTextColumn {
                     None
                 } else {
                     let slice = &buf[off as usize..off as usize + len as usize];
-                    Some(std::str::from_utf8(slice).unwrap_or("").chars().count())
+                    // SAFETY: same as `get_str` — our compressor only writes
+                    // valid UTF-8 into Lz4 text buffers.
+                    debug_assert!(std::str::from_utf8(slice).is_ok());
+                    Some(
+                        unsafe { std::str::from_utf8_unchecked(slice) }
+                            .chars()
+                            .count(),
+                    )
                 }
             }
             SegTextColumn::SegBy(opt) => opt.as_deref().map(|s| s.chars().count()),
@@ -186,7 +244,14 @@ pub(super) fn decompress_length_sidecar(blob: &[u8]) -> Option<SegTextColumn> {
 }
 
 /// Decompress a text column blob into a SegTextColumn (pure Rust, thread-safe).
-pub(super) fn decompress_text_to_seg_col(blob: &[u8]) -> Option<SegTextColumn> {
+///
+/// `want_char_lens`: for Dict blobs, also compute per-entry character counts
+/// once (amortized across all rows referencing the entry) so `get_len` becomes
+/// an array lookup. Pass `false` unless some aggregate needs `length(col)`.
+pub(super) fn decompress_text_to_seg_col(
+    blob: &[u8],
+    want_char_lens: bool,
+) -> Option<SegTextColumn> {
     if blob.is_empty() {
         return None;
     }
@@ -196,16 +261,11 @@ pub(super) fn decompress_text_to_seg_col(blob: &[u8]) -> Option<SegTextColumn> {
 
     match cc.type_tag {
         compression::CompressionType::Dictionary | compression::CompressionType::DictionaryLz4 => {
-            let norm_buf;
-            let dict_data = if cc.type_tag == compression::CompressionType::DictionaryLz4 {
-                norm_buf = compression::dictionary::normalize_lz4(cc.data);
-                &norm_buf[..]
+            let (flat, nn_indices) = if cc.type_tag == compression::CompressionType::DictionaryLz4 {
+                compression::dictionary::decode_flat_lz4(cc.data, nn_count)
             } else {
-                cc.data
+                compression::dictionary::decode_flat(cc.data, nn_count)
             };
-            let (dict_entries, nn_indices) =
-                compression::dictionary::decode_dict_and_indices(dict_data, nn_count);
-            let entries: Vec<String> = dict_entries.iter().map(|&s| s.to_string()).collect();
 
             let row_to_entry = if cc.null_bitmap.is_empty() {
                 nn_indices.iter().map(|&idx| idx as u32).collect()
@@ -223,9 +283,19 @@ pub(super) fn decompress_text_to_seg_col(blob: &[u8]) -> Option<SegTextColumn> {
                 }
                 re
             };
+            let entry_char_lens = if want_char_lens {
+                flat.entry_ranges
+                    .iter()
+                    .map(|&r| dict_entry_str(&flat.buf, r).chars().count() as u32)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             Some(SegTextColumn::Dict {
-                entries,
+                buf: flat.buf,
+                entry_ranges: flat.entry_ranges,
                 row_to_entry,
+                entry_char_lens,
             })
         }
         compression::CompressionType::Lz4 | compression::CompressionType::Lz4Blocked => {
@@ -368,11 +438,16 @@ pub(super) fn apply_text_eq_filter(
 
     match seg_col {
         SegTextColumn::Dict {
-            entries,
+            buf,
+            entry_ranges,
             row_to_entry,
+            ..
         } => {
             // Dict fast path: precompute pass-bool per dict entry, then O(1) per row.
-            let dict_matches: Vec<bool> = entries.iter().map(|s| eq_pred(s.as_str())).collect();
+            let dict_matches: Vec<bool> = entry_ranges
+                .iter()
+                .map(|&r| eq_pred(dict_entry_str(buf, r)))
+                .collect();
             apply_via_dict(sel, row_count, row_to_entry, &dict_matches);
         }
         _ => {
@@ -423,11 +498,16 @@ pub(super) fn apply_text_in_filter(
 
     match seg_col {
         SegTextColumn::Dict {
-            entries,
+            buf,
+            entry_ranges,
             row_to_entry,
+            ..
         } => {
             // Build dict-entry → bool table once per segment. O(|entries| × |values|).
-            let dict_matches: Vec<bool> = entries.iter().map(|s| in_pred(s.as_str())).collect();
+            let dict_matches: Vec<bool> = entry_ranges
+                .iter()
+                .map(|&r| in_pred(dict_entry_str(buf, r)))
+                .collect();
             apply_via_dict(sel, row_count, row_to_entry, &dict_matches);
         }
         _ => {
@@ -437,6 +517,23 @@ pub(super) fn apply_text_in_filter(
             });
         }
     }
+}
+
+/// Decide whether an `Lz4` positive/negative `LIKE '%needle%'` should use the
+/// full-buffer SIMD sweep (`apply_lz4_contains_filter`) rather than the
+/// per-row fallback, given the selection already accumulated by prior quals.
+///
+/// The sweep cost is fixed (one `memmem` pass over the segment buffer); the
+/// per-row cost scales with the number of *surviving* rows. The sweep wins
+/// once more than ~1/16 of the rows still survive — comfortably separating
+/// ClickBench Q21 (`SearchPhrase <> ''` leaves ~13%, sweep) from Q22 (a dict
+/// LIKE narrows to ≪1% before the URL NOT LIKE, per-row).
+fn should_sweep_lz4_contains(sel: &[bool], row_count: usize) -> bool {
+    if sel.is_empty() {
+        return true; // no prior selection — every row is evaluated anyway
+    }
+    let surviving = sel.iter().filter(|&&s| s).count();
+    surviving.saturating_mul(16) >= row_count
 }
 
 /// Apply a text LIKE filter to a SegTextColumn, AND-ing into an existing selection.
@@ -465,20 +562,31 @@ pub(super) fn apply_text_like_filter(
 
     match seg_col {
         SegTextColumn::Dict {
-            entries,
+            buf,
+            entry_ranges,
             row_to_entry,
+            ..
         } => {
             // Dict fast path: match against unique dict entries only.
-            let dict_matches: Vec<bool> = entries.iter().map(|s| matches_like(s)).collect();
+            let dict_matches: Vec<bool> = entry_ranges
+                .iter()
+                .map(|&r| matches_like(dict_entry_str(buf, r)))
+                .collect();
             apply_via_dict(sel, row_count, row_to_entry, &dict_matches);
         }
-        // Buffer-sweep fast path only for the *initial* evaluation: when an
-        // earlier qual already narrowed `sel` (e.g. ClickBench Q22's dict
-        // Title LIKE before the URL NOT LIKE), the per-row path below visits
-        // only surviving rows, which beats sweeping the whole buffer for a
-        // sparse selection.
+        // Buffer-sweep fast path. The full-buffer SIMD `memmem` sweep is
+        // selection-independent: it always costs one pass over the segment's
+        // decompressed bytes (with the searcher built once) and skips per-row
+        // UTF-8 re-validation entirely. The per-row path below costs one
+        // `from_utf8` + one searcher set-up *per surviving row*, so it only
+        // wins once an earlier qual has narrowed `sel` to a sparse remainder
+        // (e.g. ClickBench Q22's dict Title LIKE before the URL NOT LIKE).
+        // When a non-trivial fraction of rows still survive (e.g. ClickBench
+        // Q21's `SearchPhrase <> ''` leaves ~13%), the sweep is far cheaper —
+        // 13M per-row `str::contains` calls otherwise dominate the scan.
         SegTextColumn::Lz4 { buf, row_to_range }
-            if sel.is_empty() && matches!(strategy, LikeStrategy::Contains(s) if !s.is_empty()) =>
+            if matches!(strategy, LikeStrategy::Contains(s) if !s.is_empty())
+                && should_sweep_lz4_contains(sel, row_count) =>
         {
             let LikeStrategy::Contains(needle) = strategy else {
                 unreachable!()
@@ -630,10 +738,10 @@ mod tests {
     use super::*;
 
     fn dict_col(entries: &[&str], row_to_entry: &[u32]) -> SegTextColumn {
-        SegTextColumn::Dict {
-            entries: entries.iter().map(|s| s.to_string()).collect(),
-            row_to_entry: row_to_entry.to_vec(),
-        }
+        SegTextColumn::dict_from_owned_entries(
+            entries.iter().map(|s| s.to_string()).collect(),
+            row_to_entry.to_vec(),
+        )
     }
 
     /// Build an Lz4-variant SegTextColumn from a vec of `Option<&str>`.
@@ -857,6 +965,50 @@ mod tests {
 
         // AND into an existing selection: already-false rows stay false.
         let mut sel = vec![false, true, true, true, true];
+        apply_text_like_filter(
+            &c,
+            &LikeStrategy::Contains("google".into()),
+            false,
+            5,
+            &mut sel,
+        );
+        assert_eq!(sel, vec![false, false, false, false, true]);
+    }
+
+    #[test]
+    fn should_sweep_lz4_contains_density_threshold() {
+        // Empty selection (initial evaluation) always sweeps.
+        assert!(should_sweep_lz4_contains(&[], 1000));
+        // A dense surviving selection (>= 1/16) favors the full-buffer sweep
+        // (ClickBench Q21: `SearchPhrase <> ''` leaves ~13%).
+        let dense = vec![true; 130]
+            .into_iter()
+            .chain(vec![false; 870])
+            .collect::<Vec<_>>();
+        assert!(should_sweep_lz4_contains(&dense, 1000));
+        // A sparse surviving selection (< 1/16) keeps the per-row path
+        // (ClickBench Q22: a dict LIKE narrows to ≪1% before the URL NOT LIKE).
+        let sparse = vec![true; 50]
+            .into_iter()
+            .chain(vec![false; 950])
+            .collect::<Vec<_>>();
+        assert!(!should_sweep_lz4_contains(&sparse, 1000));
+    }
+
+    #[test]
+    fn apply_text_like_filter_lz4_contains_sparse_selection_matches_sweep() {
+        // Whichever path the density gate picks, results are identical.
+        // Drive the per-row path with a sparse prior selection and confirm
+        // it agrees with the buffer sweep's semantics (NULL/empty handling).
+        let c = lz4_col(&[
+            Some("http://google.com/q"),
+            Some("http://example.com"),
+            None,
+            Some(""),
+            Some("agooglea"),
+        ]);
+        // Only one row survives the prior filter (< 1/16) → per-row path.
+        let mut sel = vec![false, false, false, false, true];
         apply_text_like_filter(
             &c,
             &LikeStrategy::Contains("google".into()),

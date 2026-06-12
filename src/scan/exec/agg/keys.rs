@@ -81,3 +81,40 @@ pub(super) fn unpack_int_keys(packed: u128, num_keys: usize) -> [i64; 2] {
 
 /// Type alias for compact group map with u128 keys.
 pub(crate) type CompactGroupMap = hashbrown::HashMap<u128, u32, BuildHasherDefault<ahash::AHasher>>;
+
+/// Hasher for maps keyed by an already-uniform 128-bit digest (the mixed
+/// path's group-key hashes from `hash_mixed_key`): fold the two halves
+/// instead of re-hashing 16 bytes through AHash. Saves the hash on every
+/// probe/insert and makes growth rehashes near-free (ClickBench Q18 spent
+/// ~10% of CPU re-hashing keys during table doublings).
+///
+/// NOT suitable for `CompactGroupMap`'s packed *raw* int keys
+/// (parallel_compact) — those aren't uniformly distributed and need a real
+/// hash to avoid clustering.
+#[derive(Default)]
+pub(crate) struct DigestFoldHasher(u64);
+
+impl std::hash::Hasher for DigestFoldHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // FNV-style fallback; the digest-map key path only calls write_u128.
+        for &b in bytes {
+            self.0 = (self.0 ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    #[inline]
+    fn write_u128(&mut self, v: u128) {
+        self.0 = (v as u64) ^ ((v >> 64) as u64);
+    }
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Group map keyed by 128-bit digests (parallel mixed path).
+pub(crate) type DigestGroupMap =
+    hashbrown::HashMap<u128, u32, BuildHasherDefault<DigestFoldHasher>>;
+
+/// Set of 128-bit digests (F8 preselect, speculative top-N candidates).
+pub(crate) type DigestSet = hashbrown::HashSet<u128, BuildHasherDefault<DigestFoldHasher>>;

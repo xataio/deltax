@@ -235,6 +235,46 @@ unsafe fn current_agg_worker_slot() -> usize {
     }
 }
 
+/// Lower bound on the GROUP BY cardinality for the count-floor two-pass
+/// top-N gate: catalog HLL ndistinct of the most distinct single group
+/// column, summed across the scanned partitions. The group count is >=
+/// any one (bijective) key component's ndistinct. Planner estimates
+/// won't do here — `plan_rows` is clamped to the input-row estimate,
+/// which runs ~3x low. Cheap: the planner already populated the
+/// per-backend ndistinct cache for this query's partitions.
+fn compute_group_nd_hint(
+    group_specs: &[GroupByColSpec],
+    meta: &crate::scan::exec::segments::MetadataInfo,
+    companion_oids: &[pg_sys::Oid],
+    topn_limit: i64,
+    where_quals: *mut pg_sys::List,
+) -> usize {
+    if topn_limit <= 0 || !where_quals.is_null() {
+        return 0;
+    }
+    group_specs
+        .iter()
+        .filter(|gs| {
+            matches!(gs.expr, GroupByExpr::Column | GroupByExpr::AddConst { .. })
+                && (gs.col_idx as usize) < meta.col_names.len()
+        })
+        .map(|gs| {
+            let col_name = &meta.col_names[gs.col_idx as usize];
+            companion_oids
+                .iter()
+                .map(|&oid| {
+                    crate::scan::cost::get_column_ndistinct(oid)
+                        .get(col_name)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(0) as usize
+                })
+                .sum()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Static CustomExecMethods struct for DeltaXAgg.
 pub(crate) static DELTAX_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
@@ -727,6 +767,9 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
         // Load segments from all companion tables (with lazy pruning)
         let n_workers = crate::get_parallel_workers();
         let use_lazy = n_workers > 1;
+        // Planner group-count estimate for this agg (HLL-backed ndistinct).
+        // Used by the parallel paths to pre-size worker hash maps.
+        let est_groups = (*(*node).ss.ps.plan).plan_rows.max(0.0) as usize;
         let lazy_cols: Vec<bool> = needed_cols_main.clone();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         let mut total_detoast_us: u64 = 0;
@@ -838,6 +881,13 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
             &meta.col_types,
             &batch_quals,
         ) {
+            let nd_hint = compute_group_nd_hint(
+                &group_specs,
+                &meta,
+                &companion_oids,
+                topn_limit,
+                where_quals,
+            );
             let state = dispatch_parallel_compact_path(
                 agg_specs,
                 group_specs,
@@ -856,6 +906,8 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 time_min,
                 time_max,
                 n_workers,
+                est_groups,
+                nd_hint,
                 use_lazy,
                 num_result_cols,
                 metadata_us,
@@ -943,6 +995,7 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                     rust_regex_infos.push(RustRegexInfo {
                         regex: compiled,
                         replacement: rust_replacement,
+                        simple: super::regex::SimplePattern::try_parse(pattern, replacement),
                         col_idx: gs.col_idx as usize,
                     });
                 }
@@ -993,6 +1046,13 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
             );
 
         if can_parallel_mixed_flag {
+            let nd_hint = compute_group_nd_hint(
+                &group_specs,
+                &meta,
+                &companion_oids,
+                topn_limit,
+                where_quals,
+            );
             let state = dispatch_parallel_mixed_path(
                 agg_specs,
                 group_specs,
@@ -1013,6 +1073,8 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 time_min,
                 time_max,
                 n_workers,
+                est_groups,
+                nd_hint,
                 use_lazy,
                 num_result_cols,
                 metadata_us,
@@ -1216,6 +1278,7 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
                 time_min: ctx.time_min,
                 time_max: ctx.time_max,
                 topn_spec: ctx.topn_spec,
+                reserve_groups: 0,
             };
 
             const CHUNK: u64 = 4;
@@ -1228,7 +1291,8 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
                 }
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
-                let chunk_result = process_segments_compact(slice, &cfg);
+                let seq = std::sync::atomic::AtomicUsize::new(0);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg);
                 merge_compact_results(
                     &mut global.compact_map,
                     &mut global.compact_storage,
@@ -1435,6 +1499,7 @@ unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
                 time_min: ctx.time_min,
                 time_max: ctx.time_max,
                 topn_spec: None,
+                reserve_groups: 0,
             };
             const CHUNK: u64 = 4;
             loop {
@@ -1446,7 +1511,8 @@ unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
                 }
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
-                let chunk_result = process_segments_compact(slice, &cfg);
+                let seq = std::sync::atomic::AtomicUsize::new(0);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg);
                 merge_compact_results(
                     &mut local.compact_map,
                     &mut local.compact_storage,
@@ -1545,6 +1611,7 @@ unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
                 time_min: ctx.time_min,
                 time_max: ctx.time_max,
                 topn_spec: ctx.topn_spec,
+                reserve_groups: 0,
             };
 
             loop {
@@ -1554,7 +1621,8 @@ unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
                 }
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
-                let chunk_result = process_segments_compact(slice, &cfg);
+                let seq = std::sync::atomic::AtomicUsize::new(0);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg);
 
                 merge_compact_results(
                     &mut local.compact_map,

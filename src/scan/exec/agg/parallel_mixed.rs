@@ -23,7 +23,7 @@
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::hash::BuildHasherDefault;
 use std::time::Instant;
 
 use pgrx::pg_sys;
@@ -36,12 +36,16 @@ use super::super::segments::{
 };
 use super::super::text_col::{
     SegTextColumn, TextQualInfo, apply_text_eq_filter, apply_text_in_filter,
-    apply_text_like_filter, decompress_length_sidecar, decompress_text_to_seg_col, strcoll_cmp,
+    apply_text_like_filter, decompress_length_sidecar, decompress_text_to_seg_col, dict_entry_str,
+    strcoll_cmp,
 };
 use super::cd_set::hash128_str;
 use super::extract::{constant_extract_key_for_segment, eval_extract};
-use super::keys::CompactGroupMap;
-use super::parallel_compact::{decompress_numeric_blob, is_numeric_type, parse_string_to_datum};
+use super::keys::{DigestGroupMap, DigestSet};
+use super::parallel_compact::{
+    CountingFilter, decompress_numeric_blob, is_numeric_type, parse_string_to_datum,
+    pick_count_floor,
+};
 use super::regex::{RustRegexInfo, apply_case_when_to_seg_col, apply_regex_to_seg_col};
 use super::state::{
     AggExecSpec, AggExpr, AggScanState, AggType, CaseWhenSpec, CaseWhenValue, GroupByColSpec,
@@ -53,11 +57,55 @@ use super::{
     compact_topn_select, datum_to_f64, datum_to_i128, i128_to_numeric_datum,
 };
 
-/// Compute a 128-bit hash of mixed integer and string group keys.
-/// Uses two independent AHasher instances (different seeds) to produce two 64-bit
-/// halves, giving collision probability ~2^-128.
-pub(super) fn hash_mixed_key(ints: &[i64], strs: &[Option<&str>]) -> u128 {
-    use std::hash::BuildHasher;
+/// Group-key hashing scheme: each key component gets an independent 128-bit
+/// digest, and components are folded together with `mix_digest` in a fixed
+/// order (all int components in group-spec order, then all string components).
+/// Building the combined hash from per-component digests lets dict-encoded
+/// text components be digested once per dict *entry* per segment instead of
+/// once per row (see the multi-key dict fast path in
+/// `process_segments_mixed`). Collision probability stays ~2^-128: string
+/// digests come from two independent AHasher instances, and the combiner is
+/// invertible in each argument.
+const MIX_SEED: u128 = 0x243f_6a88_85a3_08d3_1319_8a2e_0370_7344; // pi digits
+
+/// Digest reserved for NULL key components. A real string digesting to this
+/// exact value has probability 2^-128 — ignorable.
+const NULL_DIGEST: u128 = 0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c834;
+
+/// Sentinel in the dict-entry → group-index caches marking an entry the
+/// count-floor filter proved below the floor (skip its rows). u32::MAX
+/// stays the "not yet resolved" marker; group indices are sequential
+/// allocations and never reach either value.
+const GIDX_SKIP: u32 = u32::MAX - 1;
+
+/// Fold one component digest into the accumulator. Odd multiplier makes the
+/// map invertible in `acc` (fixed `d`) and in `d` (fixed `acc`), so distinct
+/// component sequences of equal length stay distinct-ish.
+#[inline]
+fn mix_digest(acc: u128, d: u128) -> u128 {
+    (acc ^ d).wrapping_mul(0x2d35_8dcc_aa6c_78a5_8bb8_4b93_962e_acc9)
+}
+
+/// 128-bit digest of an integer key component: two independent 64-bit
+/// finalizers (splitmix64 / murmur3 constants).
+#[inline]
+fn digest_int(v: i64) -> u128 {
+    let x = v as u64;
+    let mut a = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    a = (a ^ (a >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    a = (a ^ (a >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    a ^= a >> 31;
+    let mut b = x.wrapping_add(0xd1b5_4a32_d192_ed03);
+    b = (b ^ (b >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+    b = (b ^ (b >> 33)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    b ^= b >> 33;
+    ((a as u128) << 64) | b as u128
+}
+
+/// 128-bit digest of a string key component: two independent AHasher passes
+/// (different seeds), 64 bits each.
+#[inline]
+pub(super) fn digest_str(s: &str) -> u128 {
     let s1 = ahash::RandomState::with_seeds(
         0xc4a1_b2e3_d4f5_6789,
         0xa1b2_c3d4_e5f6_7890,
@@ -70,27 +118,37 @@ pub(super) fn hash_mixed_key(ints: &[i64], strs: &[Option<&str>]) -> u128 {
         0xfed0_cba9_8765_4321,
         0x0011_2233_4455_6677,
     );
-    let mut h1 = s1.build_hasher();
-    let mut h2 = s2.build_hasher();
+    ((s1.hash_one(s) as u128) << 64) | (s2.hash_one(s) as u128)
+}
+
+/// Fold the integer key components into a partial hash (the string components
+/// are mixed in afterwards — see `hash_mixed_key`).
+#[inline]
+pub(super) fn hash_int_part(ints: &[i64]) -> u128 {
+    let mut acc = MIX_SEED;
     for &v in ints {
-        v.hash(&mut h1);
-        v.hash(&mut h2);
+        acc = mix_digest(acc, digest_int(v));
     }
+    acc
+}
+
+/// Fold one string-component digest into a partial hash.
+#[inline]
+pub(super) fn mix_str_digest(acc: u128, d: u128) -> u128 {
+    mix_digest(acc, d)
+}
+
+/// Compute a 128-bit hash of mixed integer and string group keys.
+pub(super) fn hash_mixed_key(ints: &[i64], strs: &[Option<&str>]) -> u128 {
+    let mut acc = hash_int_part(ints);
     for s in strs {
-        match s {
-            Some(s) => {
-                0u8.hash(&mut h1);
-                s.hash(&mut h1);
-                0u8.hash(&mut h2);
-                s.hash(&mut h2);
-            }
-            None => {
-                1u8.hash(&mut h1);
-                1u8.hash(&mut h2);
-            }
-        }
+        let d = match s {
+            Some(s) => digest_str(s),
+            None => NULL_DIGEST,
+        };
+        acc = mix_digest(acc, d);
     }
-    ((h1.finish() as u128) << 64) | (h2.finish() as u128)
+    acc
 }
 
 /// Value stored per group key component in MixedKeyStorage.
@@ -103,20 +161,41 @@ pub(super) enum MixedKeyVal {
 
 /// Per-worker side table mapping group_idx → actual key values.
 /// Needed because the u128 hash is one-way — we need original values at finalization.
+///
+/// Components are stored packed as 8 bytes each (half the size of a
+/// `MixedKeyVal` enum — at tens of millions of groups the difference is
+/// gigabytes of writes): int components hold the raw `i64`; text components
+/// hold `(arena_offset << 32) | len`, with `u64::MAX` for NULL. Int
+/// components are never NULL on this path (the dispatch gate requires
+/// NOT NULL int group columns), and a text component can never legitimately
+/// encode as `u64::MAX` (offset and len can't both be `u32::MAX` —
+/// `offset + len` is bounded by the arena size). The `is_text` table,
+/// derived from the group specs, disambiguates on read.
 pub(super) struct MixedKeyStorage {
     pub(super) arena: StringArena,
-    /// Flat storage: group i's key components are at keys[i * n_keys .. (i+1) * n_keys]
-    pub(super) keys: Vec<MixedKeyVal>,
+    /// Flat packed storage: group i's key components are at
+    /// keys[i * n_keys .. (i+1) * n_keys].
+    keys: Vec<u64>,
+    /// Per-component "is text" flag, in group-spec order.
+    is_text: Vec<bool>,
     pub(super) n_keys: usize,
 }
 
+const MIXED_KEY_NULL: u64 = u64::MAX;
+
 impl MixedKeyStorage {
-    pub(super) fn new(n_keys: usize) -> Self {
+    pub(super) fn new(group_specs: &[GroupByColSpec]) -> Self {
         MixedKeyStorage {
             arena: StringArena::new(),
             keys: Vec::new(),
-            n_keys,
+            is_text: group_specs.iter().map(is_text_group_col).collect(),
+            n_keys: group_specs.len(),
         }
+    }
+
+    /// Reserve space for `groups` groups.
+    pub(super) fn reserve_groups(&mut self, groups: usize) {
+        self.keys.reserve(groups.saturating_mul(self.n_keys));
     }
 
     /// Store key values for a new group. Must be called in order (group 0, 1, 2, ...).
@@ -130,21 +209,42 @@ impl MixedKeyStorage {
                 match s {
                     Some(s) => {
                         let (off, len) = self.arena.alloc(s);
-                        self.keys.push(MixedKeyVal::Str(off, len));
+                        self.keys.push(((off as u64) << 32) | len as u64);
                     }
-                    None => self.keys.push(MixedKeyVal::Null),
+                    None => self.keys.push(MIXED_KEY_NULL),
                 }
             } else {
-                self.keys.push(MixedKeyVal::Int(ints[int_idx]));
+                self.keys.push(ints[int_idx] as u64);
                 int_idx += 1;
             }
         }
     }
 
+    /// Append one component (group-spec order within each group). Used by
+    /// merge paths that copy keys across worker storages.
+    #[inline]
+    pub(super) fn push_kv(&mut self, kv: MixedKeyVal) {
+        let packed = match kv {
+            MixedKeyVal::Null => MIXED_KEY_NULL,
+            MixedKeyVal::Int(v) => v as u64,
+            MixedKeyVal::Str(off, len) => ((off as u64) << 32) | len as u64,
+        };
+        self.keys.push(packed);
+    }
+
     /// Get a key component for a group.
     #[inline]
     pub(super) fn get(&self, group_idx: u32, col: usize) -> MixedKeyVal {
-        self.keys[group_idx as usize * self.n_keys + col]
+        let v = self.keys[group_idx as usize * self.n_keys + col];
+        if self.is_text[col] {
+            if v == MIXED_KEY_NULL {
+                MixedKeyVal::Null
+            } else {
+                MixedKeyVal::Str((v >> 32) as u32, v as u32)
+            }
+        } else {
+            MixedKeyVal::Int(v as i64)
+        }
     }
 }
 
@@ -242,7 +342,7 @@ pub(super) struct ParallelMixedConfig<'a> {
     /// the full group cardinality. Set iff the bare-LIMIT shape matches
     /// (no ORDER BY, no HAVING, no WHERE) and the Phase-0 probe
     /// succeeded in finding `bare_limit` distinct keys.
-    pub(super) preselected_keys: Option<&'a hashbrown::HashSet<u128>>,
+    pub(super) preselected_keys: Option<&'a DigestSet>,
     /// Phase D: leader-precomputed dict-distinct remaps. Keyed by spec_idx
     /// for every CountDistinct(text) spec where every segment is dict-encoded
     /// for the col AND the global-string count is below the bitset threshold.
@@ -253,6 +353,17 @@ pub(super) struct ParallelMixedConfig<'a> {
     /// `per_segment` so each worker resolves `(seg_idx, local_dict_id)` →
     /// `global_id` without further coordination.
     pub(super) dict_distinct_remaps: &'a std::collections::HashMap<usize, DictDistinctRemap>,
+    /// Count-floor two-pass top-N: pass-1 counting filter plus the
+    /// per-worker filler budget for the singleton floor (see the compact
+    /// path's `process_segments_compact_filtered` for the scheme). When
+    /// set, rows whose group-key digest the filter proves below the floor
+    /// skip the group map entirely.
+    pub(super) count_floor: Option<(&'a CountingFilter, usize)>,
+    /// Pre-size for each worker partial's group map, derived from the
+    /// planner's group-count estimate divided across partials. 0 = don't
+    /// reserve. Avoids repeated rehash growth on multi-million-group
+    /// aggregations; capped so a bad over-estimate stays bounded.
+    pub(super) reserve_groups: usize,
 }
 
 // SAFETY: see equivalent impl on `ParallelCompactConfig` for the
@@ -264,7 +375,7 @@ unsafe impl Sync for ParallelMixedConfig<'_> {}
 
 /// Result of parallel mixed aggregation from one worker thread.
 pub(super) struct ParallelMixedResult {
-    pub(super) compact_map: CompactGroupMap,
+    pub(super) compact_map: DigestGroupMap,
     pub(super) compact_storage: CompactAccStorage,
     pub(super) mixed_keys: MixedKeyStorage,
     pub(super) cd_sidecar: CountDistinctSideCar,
@@ -481,7 +592,7 @@ pub(super) fn try_build_preselected(
     needed_cols: &[bool],
     text_group_col_flags: &[bool],
     max_probe_segments: usize,
-) -> Option<hashbrown::HashSet<u128>> {
+) -> Option<DigestSet> {
     if bare_limit == 0 {
         return None;
     }
@@ -506,7 +617,8 @@ pub(super) fn try_build_preselected(
         .filter(|gs| is_text_group_col(gs))
         .count();
 
-    let mut keys: hashbrown::HashSet<u128> = hashbrown::HashSet::with_capacity(bare_limit.max(16));
+    let mut keys: DigestSet =
+        DigestSet::with_capacity_and_hasher(bare_limit.max(16), BuildHasherDefault::default());
 
     let probe_budget = max_probe_segments.min(segments.len());
 
@@ -561,7 +673,7 @@ pub(super) fn try_build_preselected(
                 }
                 let blob = &seg.compressed_blobs[blob_idx];
                 if text_group_col_flags[col_idx] {
-                    text_seg_cols.push(decompress_text_to_seg_col(blob));
+                    text_seg_cols.push(decompress_text_to_seg_col(blob, false));
                     numeric_cols.push(Vec::new());
                 } else if is_numeric_type(type_oid) {
                     numeric_cols.push(decompress_numeric_blob(blob, type_oid));
@@ -626,15 +738,214 @@ pub(super) fn try_build_preselected(
     None
 }
 
+/// Pass 1 of the count-floor two-pass top-N scheme on the mixed path:
+/// decompress only the GROUP BY key columns, fold each row's key into the
+/// same 128-bit digest the aggregation loop uses, bump the counting
+/// filter, and exact-count the key-coherent sample used to pick the floor
+/// (see `pick_count_floor`). The dispatch gate restricts this to
+/// unfiltered scans with plain Column / AddConst / DateTrunc / Extract
+/// keys, so no qual, regex, or case-when handling — pass 2 sees exactly
+/// the same row set. Dict-encoded text key columns are digested once per
+/// dict entry, mirroring the multi-key dict fast path.
+#[allow(clippy::too_many_arguments)]
+fn process_segments_mixed_count_filter(
+    segments: &[SegmentData],
+    claim: &std::sync::atomic::AtomicUsize,
+    group_specs: &[GroupByColSpec],
+    col_names: &[String],
+    col_types: &[pg_sys::Oid],
+    segment_by: &[String],
+    blob_idx: &[Option<u16>],
+    missing_values: &[Option<(pg_sys::Datum, bool)>],
+    text_group_col_flags: &[bool],
+    filter: &CountingFilter,
+) -> hashbrown::HashMap<u128, u32> {
+    let mut sample: hashbrown::HashMap<u128, u32> = hashbrown::HashMap::new();
+
+    let key_col_mask: Vec<bool> = (0..col_names.len())
+        .map(|ci| group_specs.iter().any(|gs| gs.col_idx as usize == ci))
+        .collect();
+
+    loop {
+        let seg_idx = claim.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if seg_idx >= segments.len() {
+            break;
+        }
+        let seg = &segments[seg_idx];
+        if seg.row_count == 0 {
+            continue;
+        }
+
+        // Decompress the GROUP BY key columns only (mirrors the main
+        // loop's column handling, minus quals/aggregates/regex).
+        let mut numeric_cols: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
+        let mut text_seg_cols: Vec<Option<SegTextColumn>> = Vec::new();
+        let mut seg_val_idx = 0;
+        for (col_idx, col_name) in col_names.iter().enumerate() {
+            let type_oid = col_types[col_idx];
+            let is_segment_by = segment_by.contains(col_name);
+            if !key_col_mask[col_idx] {
+                if is_segment_by {
+                    seg_val_idx += 1;
+                }
+                numeric_cols.push(Vec::new());
+                text_seg_cols.push(None);
+                continue;
+            }
+            if is_segment_by {
+                let val = &seg.segment_values[seg_val_idx];
+                if text_group_col_flags[col_idx] {
+                    text_seg_cols.push(Some(SegTextColumn::SegBy(val.clone())));
+                    numeric_cols.push(Vec::new());
+                } else {
+                    let (datum, is_null) = match val {
+                        Some(s) => (parse_string_to_datum(s, type_oid), false),
+                        None => (pg_sys::Datum::from(0usize), true),
+                    };
+                    numeric_cols.push((0..seg.row_count).map(|_| (datum, is_null)).collect());
+                    text_seg_cols.push(None);
+                }
+                seg_val_idx += 1;
+            } else if let Some(slot) = blob_idx[col_idx] {
+                let blob = &seg.compressed_blobs[slot as usize];
+                if text_group_col_flags[col_idx] {
+                    text_seg_cols.push(decompress_text_to_seg_col(blob, false));
+                    numeric_cols.push(Vec::new());
+                } else {
+                    numeric_cols.push(decompress_numeric_blob(blob, type_oid));
+                    text_seg_cols.push(None);
+                }
+            } else {
+                // Column added after this partition was compressed. Text
+                // keys resolve to a NULL digest (matching the main loop,
+                // which sees no SegTextColumn); numeric keys take the
+                // synthesized missing value.
+                let (datum, is_null) = missing_values
+                    .get(col_idx)
+                    .copied()
+                    .flatten()
+                    .unwrap_or((pg_sys::Datum::from(0usize), true));
+                numeric_cols.push((0..seg.row_count).map(|_| (datum, is_null)).collect());
+                text_seg_cols.push(None);
+            }
+        }
+
+        // Per-segment constant Extract keys (must mirror the main loop —
+        // same value either way, this is just the cheaper evaluation).
+        let mut const_group_keys: Vec<Option<i64>> = vec![None; group_specs.len()];
+        for (gi, gs) in group_specs.iter().enumerate() {
+            if is_text_group_col(gs) {
+                continue;
+            }
+            let GroupByExpr::Extract { unit, divisor, .. } = &gs.expr else {
+                continue;
+            };
+            let Some(col_name) = col_names.get(gs.col_idx as usize) else {
+                continue;
+            };
+            let Some(cm) = seg.col_minmax.get(col_name) else {
+                continue;
+            };
+            const_group_keys[gi] = constant_extract_key_for_segment(cm, *divisor, unit);
+        }
+
+        // Per-dict-entry digests for dict-encoded text key columns
+        // (indexed by group-spec position among text keys).
+        let text_key_cols: Vec<(&Option<SegTextColumn>, Option<Vec<u128>>)> = group_specs
+            .iter()
+            .filter(|gs| is_text_group_col(gs))
+            .map(|gs| {
+                let sc = &text_seg_cols[gs.col_idx as usize];
+                let digests = match sc {
+                    Some(SegTextColumn::Dict {
+                        buf, entry_ranges, ..
+                    }) => Some(
+                        entry_ranges
+                            .iter()
+                            .map(|&r| digest_str(dict_entry_str(buf, r)))
+                            .collect(),
+                    ),
+                    _ => None,
+                };
+                (sc, digests)
+            })
+            .collect();
+
+        let row_count = seg.row_count as usize;
+        for row in 0..row_count {
+            // Int key components in group-spec order.
+            let mut has_null = false;
+            let mut acc = MIX_SEED;
+            for (gi, gs) in group_specs.iter().enumerate() {
+                if is_text_group_col(gs) {
+                    continue;
+                }
+                let v = if let Some(v) = const_group_keys[gi] {
+                    v
+                } else {
+                    let col = &numeric_cols[gs.col_idx as usize];
+                    if col.is_empty() || col[row].1 {
+                        has_null = true;
+                        break;
+                    }
+                    match &gs.expr {
+                        GroupByExpr::DateTrunc { unit_usecs, .. } => {
+                            let pg_usec = col[row].0.value() as i64;
+                            pg_usec.div_euclid(*unit_usecs) * *unit_usecs
+                        }
+                        GroupByExpr::Extract { unit, divisor, .. } => {
+                            eval_extract(col[row].0.value() as i64, *divisor, unit)
+                        }
+                        GroupByExpr::AddConst { offset, .. } => col[row].0.value() as i64 + offset,
+                        GroupByExpr::Column => col[row].0.value() as i64,
+                        _ => unreachable!(),
+                    }
+                };
+                acc = mix_digest(acc, digest_int(v));
+            }
+            if has_null {
+                continue;
+            }
+            // Text key components, in group-spec order after all ints —
+            // matching hash_mixed_key's fold order.
+            for (sc, digests) in &text_key_cols {
+                let d = match (sc, digests) {
+                    (Some(c), Some(digests)) => match c.dict_local_id(row) {
+                        Some(e) => digests[e as usize],
+                        None => NULL_DIGEST,
+                    },
+                    (Some(c), None) => match c.get_str(row) {
+                        Some(s) => digest_str(s),
+                        None => NULL_DIGEST,
+                    },
+                    (None, _) => NULL_DIGEST,
+                };
+                acc = mix_str_digest(acc, d);
+            }
+
+            let h = CountingFilter::key_hash(acc);
+            filter.bump_hashed(h);
+            if CountingFilter::is_sampled_hashed(h) {
+                *sample.entry(acc).or_insert(0) += 1;
+            }
+        }
+    }
+    sample
+}
+
 pub(super) fn process_segments_mixed(
     segments: &[SegmentData],
     chunk_offset: usize,
+    claim: &std::sync::atomic::AtomicUsize,
     config: &ParallelMixedConfig,
 ) -> ParallelMixedResult {
-    let mut compact_map = CompactGroupMap::with_hasher(BuildHasherDefault::default());
+    let mut compact_map = DigestGroupMap::with_capacity_and_hasher(
+        config.reserve_groups,
+        BuildHasherDefault::default(),
+    );
     let mut compact_storage = CompactAccStorage::new(CompactAccLayout::new(config.agg_specs));
-    let num_group_keys = config.group_specs.len();
-    let mut mixed_keys = MixedKeyStorage::new(num_group_keys);
+    let mut mixed_keys = MixedKeyStorage::new(config.group_specs);
+    mixed_keys.reserve_groups(config.reserve_groups);
     // Phase D: classify each CountDistinct(text) spec as DictBitset when the
     // leader pre-pass produced a remap for it. Bitset size = global string
     // count for the column. Sized lookup map kept on the stack — at most a
@@ -649,6 +960,9 @@ pub(super) fn process_segments_mixed(
     let mut segments_processed: u64 = 0;
     let mut rows_processed: u64 = 0;
     let mut decompress_us: u64 = 0;
+    // Count-floor: budget of below-floor rows this worker still aggregates
+    // as filler groups (singleton floor only — see the compact path).
+    let mut filler_budget = config.count_floor.map(|(_, limit)| limit).unwrap_or(0);
 
     // Count int and str group keys
     let n_int_keys = config
@@ -662,11 +976,32 @@ pub(super) fn process_segments_mixed(
         .filter(|gs| is_text_group_col(gs))
         .count();
 
-    for (rel_idx, seg) in segments.iter().enumerate() {
+    // Columns where some aggregate needs length(col): ask the decoder for
+    // per-dict-entry char counts so the per-row length is an array lookup
+    // instead of a UTF-8 char count (ClickBench Q28's AVG(length(Referer))).
+    let want_char_lens: Vec<bool> = (0..config.col_names.len())
+        .map(|col_idx| {
+            config
+                .agg_specs
+                .iter()
+                .any(|s| s.expr_kind == AggExpr::LengthOf && s.col_idx == col_idx as i32)
+        })
+        .collect();
+
+    // Dynamic work claiming: every worker thread shares `claim` and pulls
+    // the next unprocessed segment index. Static per-thread chunks left
+    // 5-15% of CPU idle at the per-batch barrier — segment processing cost
+    // varies with text density, so fixed chunks always have stragglers.
+    // One uncontended fetch_add per ~30K-row segment is noise.
+    loop {
+        let rel_idx = claim.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if rel_idx >= segments.len() {
+            break;
+        }
+        let seg = &segments[rel_idx];
         // Phase D: absolute seg_idx into all_segments (and into each
-        // dict_distinct_remaps.per_segment). The chunk-mode `for seg in segments`
-        // doesn't expose this; we shadow it via `(rel_idx, seg)` so the bitset
-        // lookup at the per-row insert site can resolve `(spec_idx, seg_idx,
+        // dict_distinct_remaps.per_segment), used by the bitset lookup at
+        // the per-row insert site to resolve `(spec_idx, seg_idx,
         // local_id) → global_id` without further coordination.
         let seg_idx_in_all = chunk_offset + rel_idx;
         if seg.row_count == 0 {
@@ -813,7 +1148,8 @@ pub(super) fn process_segments_mixed(
                     let blob = &seg.compressed_blobs[slot];
                     if config.text_group_col_flags[col_idx] {
                         // Text GROUP BY column — decompress to SegTextColumn
-                        text_seg_cols.push(decompress_text_to_seg_col(blob));
+                        text_seg_cols
+                            .push(decompress_text_to_seg_col(blob, want_char_lens[col_idx]));
                         numeric_cols.push(Vec::new());
                     } else if skip_numeric_decompress[col_idx] {
                         numeric_cols.push(Vec::new());
@@ -823,8 +1159,10 @@ pub(super) fn process_segments_mixed(
                         numeric_cols.push(decompress_numeric_blob(blob, type_oid));
                         text_seg_cols.push(None);
                     } else {
-                        // Text column needed only for WHERE qual (not GROUP BY)
-                        text_seg_cols.push(decompress_text_to_seg_col(blob));
+                        // Text column needed for WHERE quals and/or aggregates
+                        // (e.g. MIN(col), AVG(length(col))) but not GROUP BY
+                        text_seg_cols
+                            .push(decompress_text_to_seg_col(blob, want_char_lens[col_idx]));
                         numeric_cols.push(Vec::new());
                     }
                 }
@@ -852,8 +1190,7 @@ pub(super) fn process_segments_mixed(
                 (0..config.col_names.len()).map(|_| None).collect();
             for ri in config.rust_regex_infos {
                 if let Some(ref seg_col) = text_seg_cols[ri.col_idx] {
-                    cols[ri.col_idx] =
-                        Some(apply_regex_to_seg_col(seg_col, &ri.regex, &ri.replacement));
+                    cols[ri.col_idx] = Some(apply_regex_to_seg_col(seg_col, ri));
                 }
             }
             cols
@@ -935,13 +1272,18 @@ pub(super) fn process_segments_mixed(
         let mut int_keys = vec![0i64; n_int_keys];
         let mut str_keys: Vec<Option<&str>> = vec![None; n_str_keys];
 
-        // Dict-aware fast path: a single dictionary-encoded text group key
-        // (plain Column or a RegexpReplace whose transformed column is a Dict),
-        // no int keys, no F8 preselect. Routes each row through a cached
-        // dict-entry -> group index so the per-row hash + map probe collapses to
-        // once per *distinct* dict entry per segment; repeated values (the common
-        // case for dict columns) become a Vec index lookup. Reset per segment.
-        let dict_fast: Option<&SegTextColumn> = if n_int_keys == 0
+        // Text-key fast path: a single text group key (plain Column or a
+        // RegexpReplace whose transformed column is a Dict), no int keys, no
+        // F8 preselect. Routes each row through a cached dict-entry -> group
+        // index so the per-row hash + map probe collapses to once per
+        // *distinct* dict entry per segment; repeated values (the common
+        // case for dict columns) become a Vec index lookup. Reset per
+        // segment. Lz4 columns deliberately stay on the generic path: a
+        // segment-local string -> group-index memo was tried for them and
+        // lost at bench level — the global-map probes it avoids compare
+        // u128 hashes only, while every memo probe pays an extra full-string
+        // memcmp (ClickBench Q33/Q34 +8%).
+        let text_key_fast: Option<&SegTextColumn> = if n_int_keys == 0
             && n_str_keys == 1
             && config.group_specs.len() == 1
             && config.preselected_keys.is_none()
@@ -961,11 +1303,51 @@ pub(super) fn process_segments_mixed(
         } else {
             None
         };
-        let mut dict_gidx_cache: Vec<u32> = match dict_fast {
-            Some(SegTextColumn::Dict { entries, .. }) => vec![u32::MAX; entries.len()],
+        let mut dict_gidx_cache: Vec<u32> = match text_key_fast {
+            Some(SegTextColumn::Dict { entry_ranges, .. }) => vec![u32::MAX; entry_ranges.len()],
             _ => Vec::new(),
         };
-        let mut dict_null_gidx: u32 = u32::MAX;
+        let mut text_null_gidx: u32 = u32::MAX;
+
+        // Multi-key dict digest fast path: exactly one text group key backed
+        // by a Dict column plus at least one int key (e.g. ClickBench Q16/Q18:
+        // GROUP BY UserID[, minute(EventTime)], SearchPhrase). The text
+        // component's 128-bit digest is precomputed once per dict entry, so
+        // the per-row hash is pure integer mixing — string bytes are only
+        // touched when a brand-new group stores its key in MixedKeyStorage.
+        let multikey_dict: Option<&SegTextColumn> =
+            if text_key_fast.is_none() && n_str_keys == 1 && n_int_keys >= 1 {
+                let sc = config
+                    .group_specs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, gs)| is_text_group_col(gs))
+                    .and_then(|(gi, gs)| match &gs.expr {
+                        GroupByExpr::Column => text_seg_cols[gs.col_idx as usize].as_ref(),
+                        GroupByExpr::RegexpReplace { .. } if !regex_text_cols.is_empty() => {
+                            regex_text_cols[gs.col_idx as usize].as_ref()
+                        }
+                        GroupByExpr::CaseWhen(_) => {
+                            case_when_text_cols.get(gi).and_then(|c| c.as_ref())
+                        }
+                        _ => None,
+                    });
+                match sc {
+                    Some(c @ SegTextColumn::Dict { .. }) => Some(c),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+        let multikey_entry_digests: Vec<u128> = match multikey_dict {
+            Some(SegTextColumn::Dict {
+                buf, entry_ranges, ..
+            }) => entry_ranges
+                .iter()
+                .map(|&r| digest_str(dict_entry_str(buf, r)))
+                .collect(),
+            _ => Vec::new(),
+        };
 
         for row in 0..row_count {
             if !selection.is_empty() && !selection[row] {
@@ -973,69 +1355,80 @@ pub(super) fn process_segments_mixed(
             }
             rows_processed += 1;
 
-            // Build key components
+            // Build key components (skipped on the text-key fast path: the
+            // Dict arm below resolves the key directly from the segment
+            // column)
             let mut has_null = false;
             let mut int_idx = 0;
             let mut str_idx = 0;
-            for (gi, gs) in config.group_specs.iter().enumerate() {
-                if is_text_group_col(gs) {
-                    // CaseWhen: use pre-computed column indexed by group spec index
-                    if matches!(gs.expr, GroupByExpr::CaseWhen(_)) {
-                        if let Some(Some(seg_col)) = case_when_text_cols.get(gi) {
-                            str_keys[str_idx] = seg_col.get_str(row);
+            if text_key_fast.is_none() {
+                for (gi, gs) in config.group_specs.iter().enumerate() {
+                    if is_text_group_col(gs) {
+                        if multikey_dict.is_some() {
+                            // Resolved via the per-entry digest below; the
+                            // actual string is only materialized for
+                            // first-seen groups at the insert site.
+                            str_idx += 1;
+                            continue;
+                        }
+                        // CaseWhen: use pre-computed column indexed by group spec index
+                        if matches!(gs.expr, GroupByExpr::CaseWhen(_)) {
+                            if let Some(Some(seg_col)) = case_when_text_cols.get(gi) {
+                                str_keys[str_idx] = seg_col.get_str(row);
+                            } else {
+                                str_keys[str_idx] = None;
+                            }
+                            str_idx += 1;
+                            continue;
+                        }
+                        let col_idx = gs.col_idx as usize;
+                        // For RegexpReplace columns, use the pre-transformed column;
+                        // for plain text columns, use the original
+                        let seg_col_ref = if matches!(gs.expr, GroupByExpr::RegexpReplace { .. })
+                            && !regex_text_cols.is_empty()
+                        {
+                            regex_text_cols[col_idx].as_ref()
                         } else {
-                            str_keys[str_idx] = None;
+                            text_seg_cols[col_idx].as_ref()
+                        };
+                        match seg_col_ref {
+                            Some(seg_col) => {
+                                str_keys[str_idx] = seg_col.get_str(row);
+                                // NULL text key: leave str_keys[str_idx] as None.
+                                // hash_mixed_key and MixedKeyStorage handle None correctly,
+                                // producing a NULL group (matching PostgreSQL GROUP BY semantics).
+                            }
+                            None => {
+                                str_keys[str_idx] = None;
+                            }
                         }
                         str_idx += 1;
-                        continue;
-                    }
-                    let col_idx = gs.col_idx as usize;
-                    // For RegexpReplace columns, use the pre-transformed column;
-                    // for plain text columns, use the original
-                    let seg_col_ref = if matches!(gs.expr, GroupByExpr::RegexpReplace { .. })
-                        && !regex_text_cols.is_empty()
-                    {
-                        regex_text_cols[col_idx].as_ref()
                     } else {
-                        text_seg_cols[col_idx].as_ref()
-                    };
-                    match seg_col_ref {
-                        Some(seg_col) => {
-                            str_keys[str_idx] = seg_col.get_str(row);
-                            // NULL text key: leave str_keys[str_idx] as None.
-                            // hash_mixed_key and MixedKeyStorage handle None correctly,
-                            // producing a NULL group (matching PostgreSQL GROUP BY semantics).
+                        if let Some(v) = const_group_keys[gi] {
+                            int_keys[int_idx] = v;
+                        } else {
+                            let col = &numeric_cols[gs.col_idx as usize];
+                            if col.is_empty() || col[row].1 {
+                                has_null = true;
+                                break;
+                            }
+                            int_keys[int_idx] = match &gs.expr {
+                                GroupByExpr::DateTrunc { unit_usecs, .. } => {
+                                    let pg_usec = col[row].0.value() as i64;
+                                    pg_usec.div_euclid(*unit_usecs) * *unit_usecs
+                                }
+                                GroupByExpr::Extract { unit, divisor, .. } => {
+                                    eval_extract(col[row].0.value() as i64, *divisor, unit)
+                                }
+                                GroupByExpr::AddConst { offset, .. } => {
+                                    col[row].0.value() as i64 + offset
+                                }
+                                GroupByExpr::Column => col[row].0.value() as i64,
+                                _ => unreachable!(),
+                            };
                         }
-                        None => {
-                            str_keys[str_idx] = None;
-                        }
+                        int_idx += 1;
                     }
-                    str_idx += 1;
-                } else {
-                    if let Some(v) = const_group_keys[gi] {
-                        int_keys[int_idx] = v;
-                    } else {
-                        let col = &numeric_cols[gs.col_idx as usize];
-                        if col.is_empty() || col[row].1 {
-                            has_null = true;
-                            break;
-                        }
-                        int_keys[int_idx] = match &gs.expr {
-                            GroupByExpr::DateTrunc { unit_usecs, .. } => {
-                                let pg_usec = col[row].0.value() as i64;
-                                pg_usec.div_euclid(*unit_usecs) * *unit_usecs
-                            }
-                            GroupByExpr::Extract { unit, divisor, .. } => {
-                                eval_extract(col[row].0.value() as i64, *divisor, unit)
-                            }
-                            GroupByExpr::AddConst { offset, .. } => {
-                                col[row].0.value() as i64 + offset
-                            }
-                            GroupByExpr::Column => col[row].0.value() as i64,
-                            _ => unreachable!(),
-                        };
-                    }
-                    int_idx += 1;
                 }
             }
 
@@ -1044,18 +1437,35 @@ pub(super) fn process_segments_mixed(
             }
 
             let group_idx = if let Some(SegTextColumn::Dict {
-                entries,
+                buf,
+                entry_ranges,
                 row_to_entry,
-            }) = dict_fast
+                ..
+            }) = text_key_fast
             {
                 // Dict-aware fast path: resolve the group index from the cached
                 // dict-entry -> group-index map; only hash + probe the global map
-                // the first time each dict entry is seen this segment.
+                // the first time each dict entry is seen this segment. The
+                // count-floor probe piggybacks on the same first-seen miss,
+                // caching a skip sentinel so below-floor entries cost one
+                // branch per subsequent row.
                 let e = row_to_entry[row];
                 if e == u32::MAX {
-                    if dict_null_gidx == u32::MAX {
+                    if text_null_gidx == GIDX_SKIP {
+                        continue;
+                    }
+                    if text_null_gidx == u32::MAX {
                         let hash_key = hash_mixed_key(&[], &[None]);
-                        dict_null_gidx = match compact_map.entry(hash_key) {
+                        if let Some((filter, _)) = config.count_floor
+                            && !filter.above_floor(hash_key)
+                        {
+                            if filler_budget == 0 {
+                                text_null_gidx = GIDX_SKIP;
+                                continue;
+                            }
+                            filler_budget -= 1;
+                        }
+                        text_null_gidx = match compact_map.entry(hash_key) {
                             hashbrown::hash_map::Entry::Occupied(en) => *en.get(),
                             hashbrown::hash_map::Entry::Vacant(en) => {
                                 let idx = compact_storage.alloc_group();
@@ -1066,14 +1476,26 @@ pub(super) fn process_segments_mixed(
                             }
                         };
                     }
-                    dict_null_gidx
+                    text_null_gidx
                 } else {
                     let cached = dict_gidx_cache[e as usize];
+                    if cached == GIDX_SKIP {
+                        continue;
+                    }
                     if cached != u32::MAX {
                         cached
                     } else {
-                        let s = entries[e as usize].as_str();
+                        let s = dict_entry_str(buf, entry_ranges[e as usize]);
                         let hash_key = hash_mixed_key(&[], &[Some(s)]);
+                        if let Some((filter, _)) = config.count_floor
+                            && !filter.above_floor(hash_key)
+                        {
+                            if filler_budget == 0 {
+                                dict_gidx_cache[e as usize] = GIDX_SKIP;
+                                continue;
+                            }
+                            filler_budget -= 1;
+                        }
                         let gidx = match compact_map.entry(hash_key) {
                             hashbrown::hash_map::Entry::Occupied(en) => *en.get(),
                             hashbrown::hash_map::Entry::Vacant(en) => {
@@ -1089,7 +1511,28 @@ pub(super) fn process_segments_mixed(
                     }
                 }
             } else {
-                let hash_key = hash_mixed_key(&int_keys[..n_int_keys], &str_keys[..n_str_keys]);
+                let hash_key = if let Some(dict_col) = multikey_dict {
+                    let acc = hash_int_part(&int_keys[..n_int_keys]);
+                    let d = match dict_col.dict_local_id(row) {
+                        Some(e) => multikey_entry_digests[e as usize],
+                        None => NULL_DIGEST,
+                    };
+                    mix_str_digest(acc, d)
+                } else {
+                    hash_mixed_key(&int_keys[..n_int_keys], &str_keys[..n_str_keys])
+                };
+
+                // Count-floor skip: a key the pass-1 filter proves below
+                // the floor can never reach the top N. Only the singleton
+                // floor carries a filler budget — see the compact path.
+                if let Some((filter, _)) = config.count_floor
+                    && !filter.above_floor(hash_key)
+                {
+                    if filler_budget == 0 {
+                        continue;
+                    }
+                    filler_budget -= 1;
+                }
 
                 // F8: when a preselected key set is supplied, skip rows whose
                 // group-key hash is not in the set. The set is bounded to
@@ -1116,7 +1559,12 @@ pub(super) fn process_segments_mixed(
                         let idx = compact_storage.alloc_group();
                         cd_sidecar.alloc_group();
                         e.insert(idx);
-                        // Store actual key values for this new group
+                        // Store actual key values for this new group. On the
+                        // multi-key dict path str_keys was skipped during key
+                        // building — resolve the string now (new groups only).
+                        if let Some(dict_col) = multikey_dict {
+                            str_keys[0] = dict_col.get_str(row);
+                        }
                         mixed_keys.insert(
                             &int_keys[..n_int_keys],
                             &str_keys[..n_str_keys],
@@ -1298,10 +1746,20 @@ pub(super) fn process_segments_mixed(
             return (keys, 0i64);
         }
 
+        // Skipping entries that tie the current floor keeps the floor
+        // unchanged and an equally valid candidate set — on
+        // high-cardinality COUNT sorts almost every group ties at 1, so
+        // this avoids a heap push+pop per group.
         if !ascending {
             let mut heap: BinaryHeap<Reverse<(i64, u128)>> = BinaryHeap::with_capacity(k + 1);
             for (&key, &gidx) in &compact_map {
                 let val = read_val(gidx);
+                if heap.len() == k
+                    && let Some(&Reverse((floor, _))) = heap.peek()
+                    && val <= floor
+                {
+                    continue;
+                }
                 heap.push(Reverse((val, key)));
                 if heap.len() > k {
                     heap.pop();
@@ -1314,6 +1772,12 @@ pub(super) fn process_segments_mixed(
             let mut heap: BinaryHeap<(i64, u128)> = BinaryHeap::with_capacity(k + 1);
             for (&key, &gidx) in &compact_map {
                 let val = read_val(gidx);
+                if heap.len() == k
+                    && let Some(&(floor, _)) = heap.peek()
+                    && val >= floor
+                {
+                    continue;
+                }
                 heap.push((val, key));
                 if heap.len() > k {
                     heap.pop();
@@ -1410,7 +1874,7 @@ unsafe fn mixed_bare_limit(
             group_stride: partial_results[0].compact_storage.layout.group_stride,
         };
         let mut final_storage = CompactAccStorage::new(layout);
-        let mut final_mixed_keys = MixedKeyStorage::new(group_specs.len());
+        let mut final_mixed_keys = MixedKeyStorage::new(&group_specs);
         let mut final_cd_sidecar = CountDistinctSideCar::new(&agg_specs);
 
         for &key in &target_keys {
@@ -1427,11 +1891,9 @@ unsafe fn mixed_bare_limit(
                     MixedKeyVal::Str(off, len) => {
                         let s = src.mixed_keys.arena.get(off, len);
                         let (new_off, new_len) = final_mixed_keys.arena.alloc(s);
-                        final_mixed_keys
-                            .keys
-                            .push(MixedKeyVal::Str(new_off, new_len));
+                        final_mixed_keys.push_kv(MixedKeyVal::Str(new_off, new_len));
                     }
-                    other => final_mixed_keys.keys.push(other),
+                    other => final_mixed_keys.push_kv(other),
                 }
             }
 
@@ -1632,7 +2094,7 @@ unsafe fn mixed_full_merge(
     group_specs: Vec<GroupByColSpec>,
     mut partial_results: Vec<ParallelMixedResult>,
     compact_storage: &mut CompactAccStorage,
-    compact_group_map: &mut CompactGroupMap,
+    compact_group_map: &mut DigestGroupMap,
 ) -> AggScanState {
     unsafe {
         let t_merge = Instant::now();
@@ -1670,12 +2132,10 @@ unsafe fn mixed_full_merge(
                                 MixedKeyVal::Str(off, len) => {
                                     let s = src_keys.arena.get(off, len);
                                     let (new_off, new_len) = merged_mixed_keys.arena.alloc(s);
-                                    merged_mixed_keys
-                                        .keys
-                                        .push(MixedKeyVal::Str(new_off, new_len));
+                                    merged_mixed_keys.push_kv(MixedKeyVal::Str(new_off, new_len));
                                 }
                                 other => {
-                                    merged_mixed_keys.keys.push(other);
+                                    merged_mixed_keys.push_kv(other);
                                 }
                             }
                         }
@@ -1774,6 +2234,7 @@ unsafe fn mixed_full_merge(
         if !merged_cd_sidecar.is_empty() {
             merged_cd_sidecar.write_counts_to_storage(storage, compact_group_map);
         }
+        crate::scan::exec::background_drop(partial_results);
         let merge_us = t_merge.elapsed().as_micros() as u64;
 
         // Finalize
@@ -2424,11 +2885,10 @@ unsafe fn mixed_speculative_topn(
             let t_spec = Instant::now();
 
             // Phase 1: Collect pre-computed top-K candidates from workers
-            let mut candidate_set: hashbrown::HashSet<u128, BuildHasherDefault<ahash::AHasher>> =
-                hashbrown::HashSet::with_capacity_and_hasher(
-                    k * partial_results.len(),
-                    BuildHasherDefault::default(),
-                );
+            let mut candidate_set: DigestSet = DigestSet::with_capacity_and_hasher(
+                k * partial_results.len(),
+                BuildHasherDefault::default(),
+            );
             let mut floor_sum: i64 = 0;
             for result in partial_results {
                 if let Some((keys, floor)) = &result.topk {
@@ -2895,6 +3355,7 @@ unsafe fn mixed_partitioned_topn(
             let np = n_partitions;
             let ascending = ctx.topn_ascending;
             let ngk = n_group_cols;
+            let gspecs = group_specs;
             let hfilters = ctx.having_filters;
 
             let handles: Vec<_> = (0..np)
@@ -2902,11 +3363,11 @@ unsafe fn mixed_partitioned_topn(
                     s.spawn(move || {
                         let layout = CompactAccLayout::new(specs);
                         let n_slots = layout.slots.len();
-                        let mut map: CompactGroupMap =
-                            CompactGroupMap::with_hasher(Default::default());
+                        let mut map: DigestGroupMap =
+                            DigestGroupMap::with_hasher(Default::default());
                         let mut storage = CompactAccStorage::new(layout);
                         let mut cd_sidecar = CountDistinctSideCar::new(specs);
-                        let mut mixed_ks = MixedKeyStorage::new(ngk);
+                        let mut mixed_ks = MixedKeyStorage::new(gspecs);
 
                         // Merge entries from all workers belonging to this partition
                         for worker in workers {
@@ -2926,9 +3387,9 @@ unsafe fn mixed_partitioned_topn(
                                                 MixedKeyVal::Str(off, len) => {
                                                     let sv = worker.mixed_keys.arena.get(off, len);
                                                     let (no, nl) = mixed_ks.arena.alloc(sv);
-                                                    mixed_ks.keys.push(MixedKeyVal::Str(no, nl));
+                                                    mixed_ks.push_kv(MixedKeyVal::Str(no, nl));
                                                 }
-                                                other => mixed_ks.keys.push(other),
+                                                other => mixed_ks.push_kv(other),
                                             }
                                         }
                                         e.insert(idx);
@@ -3138,7 +3599,7 @@ unsafe fn mixed_partitioned_topn(
                         let layout2 = CompactAccLayout::new(specs);
                         let stride = storage.layout.group_stride;
                         let mut mini = CompactAccStorage::new(layout2);
-                        let mut mini_keys = MixedKeyStorage::new(ngk);
+                        let mut mini_keys = MixedKeyStorage::new(gspecs);
                         let mut top_entries = Vec::with_capacity(winners.len());
 
                         for (sort_val, key, old_gidx) in winners {
@@ -3167,9 +3628,9 @@ unsafe fn mixed_partitioned_topn(
                                     MixedKeyVal::Str(off, len) => {
                                         let sv = mixed_ks.arena.get(off, len);
                                         let (no, nl) = mini_keys.arena.alloc(sv);
-                                        mini_keys.keys.push(MixedKeyVal::Str(no, nl));
+                                        mini_keys.push_kv(MixedKeyVal::Str(no, nl));
                                     }
-                                    other => mini_keys.keys.push(other),
+                                    other => mini_keys.push_kv(other),
                                 }
                             }
                             top_entries.push((sort_val, key, new_gidx));
@@ -3290,6 +3751,8 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
     time_min: Option<i64>,
     time_max: Option<i64>,
     n_workers: usize,
+    est_groups: usize,
+    nd_hint: usize,
     use_lazy: bool,
     num_result_cols: usize,
     metadata_us: u64,
@@ -3310,8 +3773,8 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
         compact_storage = Some(CompactAccStorage::new(CompactAccLayout::new(&agg_specs)));
     }
     #[allow(unused_assignments)] // overwritten by `largest.compact_map` on the merge branch
-    let mut compact_group_map: CompactGroupMap =
-        CompactGroupMap::with_hasher(BuildHasherDefault::default());
+    let mut compact_group_map: DigestGroupMap =
+        DigestGroupMap::with_hasher(BuildHasherDefault::default());
     unsafe {
         let t2 = Instant::now();
         // For derived MIN/MAX-difference top-N, workers don't maintain a
@@ -3469,7 +3932,7 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
         let has_regex_group = group_specs
             .iter()
             .any(|gs| matches!(gs.expr, GroupByExpr::RegexpReplace { .. }));
-        let preselected_keys: Option<hashbrown::HashSet<u128>> = if bare_limit > 0
+        let preselected_keys: Option<DigestSet> = if bare_limit > 0
             && having_filters.is_empty()
             && batch_quals.is_empty()
             && where_quals.is_null()
@@ -3500,6 +3963,127 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
         // `build_dict_distinct_remaps` for the cost/threshold logic.
         let dict_distinct_remaps = build_dict_distinct_remaps(all_segments, &agg_specs);
 
+        // ---- Count-floor two-pass top-N eligibility (mixed path) ----
+        // Same scheme as the compact path (see the singleton_mode comment
+        // in `dispatch_parallel_compact_path`), gated from a much lower
+        // cardinality bound: text-keyed group maps pay arena + key-storage
+        // + digest-map costs per entry, so shrinking the map pays for the
+        // extra key scan well below the near-unique regime (ClickBench
+        // Q18: 58M groups/100M rows, 97% of rows below the sampled floor;
+        // Q16: 27M/100M, 49%; Q33: 28M/100M, 34%). Pass 1 only handles
+        // plain key expressions and must see the exact pass-2 row set, so
+        // any filter, regex/case-when key, or sidecar-only key column
+        // disqualifies.
+        let total_rows: u64 = all_segments.iter().map(|s| s.row_count as u64).sum();
+        let floor_mode = topn_limit > 0
+            && topn_limit <= 10_000
+            && !topn_ascending
+            && has_group_by
+            && having_filters.is_empty()
+            && batch_quals.is_empty()
+            && where_quals.is_null()
+            && seg_filters.is_empty()
+            && time_min.is_none()
+            && time_max.is_none()
+            && derived_minmax_topn.is_none()
+            && preselected_keys.is_none()
+            && total_rows >= 16_000_000
+            && (nd_hint as f64) >= (total_rows as f64) * 0.125
+            && matches!(output_map.get(topn_sort_col),
+                Some(&OutputEntry::Agg(ai)) if agg_specs[ai].agg_type == AggType::CountStar)
+            && group_specs.iter().all(|gs| {
+                matches!(
+                    gs.expr,
+                    GroupByExpr::Column
+                        | GroupByExpr::AddConst { .. }
+                        | GroupByExpr::DateTrunc { .. }
+                        | GroupByExpr::Extract { .. }
+                ) && !sidecar_only_cols
+                    .get(gs.col_idx as usize)
+                    .copied()
+                    .unwrap_or(false)
+            });
+
+        // Count-floor pass 1: every segment is already detoasted here —
+        // floor_mode requires empty batch_quals, which forces the
+        // non-pipeline detoast-all branch above.
+        let count_floor_filter: Option<CountingFilter> = if floor_mode {
+            // 2^25 slots (32 MB) keeps the filter (mostly) cache-resident —
+            // the full-size filter's DRAM misses cost ~0.5s per pass at
+            // 100M rows, eating the entire two-pass gain. Collision noise
+            // at this density (~6 rows/slot at 100M rows) only matters to
+            // floors below ~16, which the post-pass-1 bail below drops
+            // anyway.
+            let mut filter = CountingFilter::with_max_size(total_rows as usize, 25);
+            let filter_ref = &filter;
+            let t_p1 = Instant::now();
+            let claim = std::sync::atomic::AtomicUsize::new(0);
+            let segs: &[SegmentData] = all_segments;
+            let maps = std::thread::scope(|s| {
+                let n_threads = n_workers.min(segs.len()).max(1);
+                let handles: Vec<_> = (0..n_threads)
+                    .map(|_| {
+                        let claim = &claim;
+                        let group_specs = &group_specs;
+                        let text_group_col_flags = &text_group_col_flags;
+                        s.spawn(move || {
+                            process_segments_mixed_count_filter(
+                                segs,
+                                claim,
+                                group_specs,
+                                &meta.col_names,
+                                &meta.col_types,
+                                &meta.segment_by,
+                                &meta.blob_idx,
+                                &meta.missing_values,
+                                text_group_col_flags,
+                                filter_ref,
+                            )
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let mut sample_counts: hashbrown::HashMap<u128, u32> = hashbrown::HashMap::new();
+            for map in maps {
+                for (k, c) in map {
+                    *sample_counts.entry(k).or_insert(0) += c;
+                }
+            }
+            let sampled_keys = sample_counts.len();
+            let mut counts: Vec<u32> = sample_counts.into_values().collect();
+            let floor = pick_count_floor(&mut counts, topn_limit as usize);
+            filter.set_threshold(floor);
+            pgrx::log!(
+                "pg_deltax mixed: count-floor pass1 rows={} nd_hint={} sampled_keys={} floor={} pass1_ms={}",
+                total_rows,
+                nd_hint,
+                sampled_keys,
+                floor,
+                t_p1.elapsed().as_millis(),
+            );
+            // Low floors are indistinguishable from the dense filter's
+            // collision noise — every probe would come back "maybe",
+            // making pass 2 a full aggregation with pure probe overhead.
+            // Drop the filter (pass 1 is sunk cost, correctness
+            // unaffected) rather than pay for nothing.
+            if floor >= 16 {
+                Some(filter)
+            } else {
+                crate::scan::exec::background_drop(filter);
+                None
+            }
+        } else {
+            None
+        };
+        let count_floor_fillers = match &count_floor_filter {
+            Some(f) if f.threshold() == 2 => topn_limit as usize,
+            _ => 0,
+        };
+
         let config = ParallelMixedConfig {
             agg_specs: &agg_specs,
             group_specs: &group_specs,
@@ -3520,6 +4104,36 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             sidecar_only_cols,
             preselected_keys: preselected_keys.as_ref(),
             dict_distinct_remaps: &dict_distinct_remaps,
+            count_floor: count_floor_filter
+                .as_ref()
+                .map(|f| (f, count_floor_fillers)),
+            reserve_groups: {
+                // One partial per worker thread per batch. Gate small
+                // estimates (default growth handles them fine) and cap
+                // large ones so a planner over-estimate stays bounded
+                // (~50 MB map + keys per worker at the cap). Filtered
+                // queries are excluded: the group estimate doesn't know
+                // how many groups the quals remove (ClickBench Q30:
+                // est 29M groups, far fewer survive the filter, and the
+                // wasted up-front zeroing cost ~270 ms). Count-floor mode
+                // keeps worker maps small by construction — pre-sizing
+                // from est_groups would defeat the point.
+                let n_partials = if use_pipeline {
+                    PIPELINE_N_BATCHES * n_workers
+                } else {
+                    n_workers
+                };
+                let unfiltered = batch_quals.is_empty() && where_quals.is_null();
+                if unfiltered
+                    && est_groups > 262_144
+                    && preselected_keys.is_none()
+                    && count_floor_filter.is_none()
+                {
+                    (est_groups / n_partials.max(1)).min(2_000_000)
+                } else {
+                    0
+                }
+            },
         };
 
         let mut pipeline_detoast_us: u64 = 0;
@@ -3537,18 +4151,20 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
                 let (done, pending) = all_segments.split_at_mut(batch_end);
                 let current_batch = &done[batch_start..];
 
+                let claim = std::sync::atomic::AtomicUsize::new(0);
                 std::thread::scope(|s| {
-                    let chunk_size = current_batch.len().div_ceil(n_workers);
-                    let handles: Vec<_> = current_batch
-                        .chunks(chunk_size)
-                        .enumerate()
-                        .map(|(ci, chunk)| {
+                    let n_threads = n_workers.min(current_batch.len());
+                    let handles: Vec<_> = (0..n_threads)
+                        .map(|_| {
                             let cfg = &config;
-                            // Phase D: chunk_offset is the seg_idx of chunk[0]
-                            // in the leader's all_segments view, used to index
+                            let claim = &claim;
+                            // Phase D: batch_start is the seg_idx of
+                            // current_batch[0] in the leader's all_segments
+                            // view, used to index
                             // dict_distinct_remaps.per_segment.
-                            let chunk_offset = batch_start + ci * chunk_size;
-                            s.spawn(move || process_segments_mixed(chunk, chunk_offset, cfg))
+                            s.spawn(move || {
+                                process_segments_mixed(current_batch, batch_start, claim, cfg)
+                            })
                         })
                         .collect();
 
@@ -3572,20 +4188,26 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             }
             results
         } else {
-            let chunk_size = all_segments.len().div_ceil(n_workers);
+            let claim = std::sync::atomic::AtomicUsize::new(0);
+            let segs: &[SegmentData] = all_segments;
             std::thread::scope(|s| {
-                let handles: Vec<_> = all_segments
-                    .chunks(chunk_size)
-                    .enumerate()
-                    .map(|(ci, chunk)| {
+                let n_threads = n_workers.min(segs.len()).max(1);
+                let handles: Vec<_> = (0..n_threads)
+                    .map(|_| {
                         let cfg = &config;
-                        let chunk_offset = ci * chunk_size;
-                        s.spawn(move || process_segments_mixed(chunk, chunk_offset, cfg))
+                        let claim = &claim;
+                        s.spawn(move || process_segments_mixed(segs, 0, claim, cfg))
                     })
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             })
         };
+
+        // The counting filter (up to 1 GiB) is dead after pass 2 — free it
+        // off the query critical path.
+        if let Some(filter) = count_floor_filter {
+            crate::scan::exec::background_drop(filter);
+        }
 
         // A no-GROUP-BY aggregate must emit exactly one row even when every
         // row was filtered out (COUNT(*) = 0, SUM/MIN/MAX = NULL). Workers
@@ -3647,7 +4269,7 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
 
         // Derived MIN/MAX-difference top-N — see `mixed_derived_minmax_topn`.
         if let Some((max_slot, min_slot)) = derived_minmax_topn {
-            return mixed_derived_minmax_topn(
+            let state = mixed_derived_minmax_topn(
                 &merge_ctx,
                 agg_specs,
                 group_specs,
@@ -3656,6 +4278,8 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
                 max_slot,
                 min_slot,
             );
+            crate::scan::exec::background_drop(partial_results);
+            return state;
         }
 
         // Speculative top-N — see `mixed_speculative_topn`.
@@ -3666,19 +4290,27 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             &partial_results,
             compact_storage.as_mut().unwrap(),
         ) {
-            return build_mixed_topn_agg_scan_state(&merge_ctx, agg_specs, group_specs, outcome);
+            let state =
+                build_mixed_topn_agg_scan_state(&merge_ctx, agg_specs, group_specs, outcome);
+            crate::scan::exec::background_drop(partial_results);
+            return state;
         }
 
         // Bare LIMIT short-circuit for mixed path — see `mixed_bare_limit`.
         if bare_limit > 0 && having_filters.is_empty() {
-            return mixed_bare_limit(&merge_ctx, agg_specs, group_specs, &partial_results);
+            let state = mixed_bare_limit(&merge_ctx, agg_specs, group_specs, &partial_results);
+            crate::scan::exec::background_drop(partial_results);
+            return state;
         }
 
         // Partitioned parallel merge + top-N — see `mixed_partitioned_topn`.
         if topn_limit > 0 {
             let outcome =
                 mixed_partitioned_topn(&merge_ctx, &agg_specs, &group_specs, &partial_results);
-            return build_mixed_topn_agg_scan_state(&merge_ctx, agg_specs, group_specs, outcome);
+            let state =
+                build_mixed_topn_agg_scan_state(&merge_ctx, agg_specs, group_specs, outcome);
+            crate::scan::exec::background_drop(partial_results);
+            return state;
         }
 
         // Fallthrough: full merge path — see `mixed_full_merge`.

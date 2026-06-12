@@ -166,6 +166,15 @@ Together those changes fit in `src/blob_cache/storage.rs`:
   postmaster start and resolves to `clamp(MemTotal / 4, 256 MiB,
   4096 MiB)`. Falls back to the floor on non-Linux hosts. Resolved
   value is observable via `pg_deltax_blob_cache_stats().bytes_max`.
+- **Auto heuristic retuned: cap 4 → 16 GiB, fraction RAM/4 → RAM/6
+  (2026-06-10).** On the ClickBench c6a.4xlarge (32 GiB), the 4 GiB
+  cap left the URL/Title working sets thrashing: warm Q22 ran at a
+  42% miss rate with detoast=2.8 s. With auto now resolving to
+  ~5.2 GiB on that box, warm detoast drops to ~0 across the
+  text-heavy queries — Q20 2.00 → 1.12 s, Q22 4.16 → 2.75 s, both at
+  100% hit rate. The fraction dropped from 1/4 to 1/6 after a first
+  iteration at 1/4 (7.8 GiB) OOM-killed ClickBench Q32 in no-restart
+  sessions — see `PERF_IMPROVEMENTS.md` #50/#51 for the full story.
 - **Integration tests (2026-05-14).** `tests/test_blob_cache.py` —
   6 tests covering: (1) the auto-sized default resolves to a
   non-zero cap, (2) cold scans populate misses + entries, (3) warm
@@ -186,7 +195,7 @@ Together those changes fit in `src/blob_cache/storage.rs`:
    `insert_failures_total` (~38 out of 50 attempts in a stress test
    on 4 MB / 64 shards). In practice this only matters when the
    cache is significantly smaller than the working set; the
-   auto-sized default + the 4 GiB cap make it a corner case. If a
+   auto-sized default + the 16 GiB cap make it a corner case. If a
    workload ever hits it, try shards `±1, ±2, ...` with
    `LWLockConditionalAcquire` (avoids deadlock without strict lock
    ordering).
@@ -521,7 +530,7 @@ workload.
 
 | GUC | Type | Default | Range | Meaning |
 |---|---|---|---|---|
-| `pg_deltax.blob_cache_mb` | int | `-1` (auto) | `-1..32768` | `-1` = auto (25% of physical RAM, clamped to [256, 4096] MiB). `0` = disabled. `N > 0` = explicit MiB. Postmaster context. |
+| `pg_deltax.blob_cache_mb` | int | `-1` (auto) | `-1..32768` | `-1` = auto (1/6 of physical RAM, clamped to [256, 16384] MiB). `0` = disabled. `N > 0` = explicit MiB. Postmaster context. |
 | `pg_deltax.blob_cache_shards` | int | `64` | `1..1024` | Shard count. Powers of two recommended. Postmaster context. |
 
 The auto-size default reads `MemTotal` from `/proc/meminfo` at
@@ -532,13 +541,19 @@ pg_deltax_blob_cache_stats()`). Heuristic:
 - **256 MiB floor.** On a 1 GiB Docker container, you get 256 MiB.
   On non-Linux hosts (where `/proc/meminfo` doesn't exist) the
   resolution silently falls back to the floor.
-- **4096 MiB cap.** On a 32+ GiB production box, you get exactly
-  4 GiB regardless of how much RAM is available — that's enough
-  for JSONBench's working set with headroom and ~75-80% of
-  ClickBench's working set. Heavy multi-column OLAP at scale
-  should explicitly bump to `8192` or more.
-- **25% in between.** A 16 GiB box gets 4 GiB. A 4 GiB box gets
-  1 GiB. A 2 GiB box gets 512 MiB.
+- **16384 MiB cap.** On a 96+ GiB production box, you get exactly
+  16 GiB regardless of how much RAM is available (a 256 GiB
+  instance gets 16 GiB, not ~42). The cap was 4 GiB until
+  2026-06-10; that left a 32 GiB box thrashing on ClickBench's
+  URL/Title working set (warm Q22 ran at a 42% miss rate). Truly
+  huge workloads can still set an explicit value up to 32768.
+- **1/6 of RAM in between.** A 32 GiB box gets ~5.3 GiB. A 24 GiB
+  box gets 4 GiB. A 6 GiB box gets 1 GiB. The fraction was RAM/4
+  until 2026-06-10; it dropped to RAM/6 because a filled cache is
+  non-reclaimable shmem that must coexist with shared_buffers
+  (conventionally RAM/4) and multi-GB transient allocations of
+  high-cardinality aggregations — at RAM/4 the combination
+  OOM-killed ClickBench Q32 (see `PERF_IMPROVEMENTS.md` #50/#51).
 
 Set `pg_deltax.blob_cache_mb = 0` to disable the cache entirely
 (e.g. for a baseline measurement). Set to an explicit positive value
@@ -585,18 +600,25 @@ behaviour, not solve it.
 
 **Auto-sizing.** The `-1` default reads `MemTotal` from
 `/proc/meminfo` at postmaster start and resolves to `clamp(MemTotal /
-4, 256 MiB, 4096 MiB)`. Falls back to the 256 MiB floor on non-Linux
+6, 256 MiB, 16384 MiB)`. Falls back to the 256 MiB floor on non-Linux
 hosts or anywhere `/proc/meminfo` isn't readable. The resolved value
 is observable via `pg_deltax_blob_cache_stats().bytes_max` — there's
 no separate startup log line; users querying the SRF immediately see
 what they got. Postmaster context (locked at start, can't change at
 runtime).
 
-The 4 GiB cap is deliberate: it covers JSONBench fully and most of
-ClickBench without surprising operators on memory-rich boxes (a
-128 GiB instance still gets only 4 GiB, not 32). Big-workload users
-who want more should set an explicit value; the floor and cap stay
-where they are.
+The heuristic was retuned on 2026-06-10. The cap was originally
+4 GiB on the theory that it covered most working sets; ClickBench on
+a 32 GiB c6a.4xlarge disproved that — the URL/Title blobs alone
+exceed 4 GiB, so warm runs of Q20/Q22 still paid full detoast (42%
+miss rate on Q22). The fraction was originally RAM/4 — that OOM'd:
+a filled cache is non-reclaimable shmem, and together with
+shared_buffers (conventionally RAM/4) and the transient agg maps of
+a high-cardinality GROUP BY (ClickBench Q32: ~14 GB anon after
+`PERF_IMPROVEMENTS.md` #51, ~18 GB before) it pushed the box over
+the edge. RAM/6 with a 16 GiB cap keeps the default useful on big
+boxes while leaving room for worst-case query transients; operators
+who want more (or less) should set an explicit value.
 
 ## Testing matrix
 

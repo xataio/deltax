@@ -564,6 +564,7 @@ pub(super) unsafe fn dispatch_parallel_count_distinct_path(
     }
 
     let actual_workers = partial_results.len();
+    crate::scan::exec::background_drop(partial_results);
 
     AggScanState {
         _agg_specs: agg_specs,

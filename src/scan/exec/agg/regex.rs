@@ -12,14 +12,311 @@ use pgrx::pg_sys;
 use pgrx::warning;
 use regex::Regex;
 
-use super::super::text_col::SegTextColumn;
+use super::super::text_col::{SegTextColumn, dict_entry_str};
 use super::{CaseWhenOp, CaseWhenSpec, CaseWhenValue};
 
 /// Info for a regexp GROUP BY column that compiled successfully with Rust regex.
 pub(super) struct RustRegexInfo {
     pub(super) regex: Regex,
     pub(super) replacement: String,
+    /// Byte-op evaluator for restricted prefix-strip patterns; used instead
+    /// of `regex` when present. The optional-literal alternation in patterns
+    /// like `^https?://(?:www\.)?([^/]+)/.*$` makes them not one-pass, so the
+    /// regex crate resolves the capture with its bounded backtracker — ~10x
+    /// slower than these byte comparisons.
+    pub(super) simple: Option<SimplePattern>,
     pub(super) col_idx: usize,
+}
+
+/// One component of a [`SimplePattern`].
+enum SimpleComp {
+    /// Literal byte run.
+    Lit(Vec<u8>),
+    /// Optional (greedy) literal byte run: `(?:lit)?` or `x?`.
+    OptLit(Vec<u8>),
+    /// The single capture group `([^stop]+)`. Parse-time validation
+    /// guarantees the next component is a `Lit` starting with `stop`, so the
+    /// capture always ends at the first occurrence of `stop` — no
+    /// backtracking is ever needed.
+    Cap { stop: u8 },
+}
+
+/// One part of the replacement template.
+enum TemplPart {
+    Lit(String),
+    /// `\1` — the capture.
+    Group1,
+    /// `\&` — the whole match (= the whole input: the pattern is fully
+    /// anchored with a `.*$` tail, so a match always covers the input).
+    Group0,
+}
+
+/// A `regexp_replace` pattern of the restricted shape
+/// `^ lit [opt-lit|x?]... ([^c]+) c-lit .*$` compiled down to byte
+/// comparisons plus a `position()` scan for the capture.
+pub(super) struct SimplePattern {
+    comps: Vec<SimpleComp>,
+    templ: Vec<TemplPart>,
+}
+
+impl SimplePattern {
+    /// Parse a PG regex `pattern` + `replacement` (PG syntax, i.e. `\1`)
+    /// into a SimplePattern. Returns None for anything outside the
+    /// restricted shape — callers then use the general regex engine.
+    pub(super) fn try_parse(pattern: &str, replacement: &str) -> Option<SimplePattern> {
+        let b = pattern.as_bytes();
+        if b.first() != Some(&b'^') {
+            return None;
+        }
+        let is_plain = |c: u8| {
+            !matches!(
+                c,
+                b'.' | b'?'
+                    | b'*'
+                    | b'+'
+                    | b'('
+                    | b')'
+                    | b'['
+                    | b']'
+                    | b'{'
+                    | b'}'
+                    | b'|'
+                    | b'^'
+                    | b'$'
+                    | b'\\'
+            )
+        };
+        let mut comps: Vec<SimpleComp> = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        let mut cap_seen = false;
+        let mut tail_seen = false;
+        let mut i = 1usize;
+        while i < b.len() {
+            match b[i] {
+                // `.` is only allowed as the closing `.*$` tail
+                b'.' => {
+                    if &b[i..] != b".*$" {
+                        return None;
+                    }
+                    if !cur.is_empty() {
+                        comps.push(SimpleComp::Lit(std::mem::take(&mut cur)));
+                    }
+                    tail_seen = true;
+                    i = b.len();
+                }
+                b'(' => {
+                    if b[i..].starts_with(b"(?:") {
+                        // optional literal group `(?:lit)?`
+                        let mut j = i + 3;
+                        let mut lit: Vec<u8> = Vec::new();
+                        loop {
+                            match *b.get(j)? {
+                                b')' => break,
+                                b'\\' => {
+                                    let e = *b.get(j + 1)?;
+                                    if e.is_ascii_alphanumeric() {
+                                        return None; // class escape (\d, \w, ...)
+                                    }
+                                    lit.push(e);
+                                    j += 2;
+                                }
+                                c if is_plain(c) => {
+                                    lit.push(c);
+                                    j += 1;
+                                }
+                                _ => return None,
+                            }
+                        }
+                        if b.get(j + 1) != Some(&b'?') || lit.is_empty() {
+                            return None;
+                        }
+                        if !cur.is_empty() {
+                            comps.push(SimpleComp::Lit(std::mem::take(&mut cur)));
+                        }
+                        comps.push(SimpleComp::OptLit(lit));
+                        i = j + 2;
+                    } else {
+                        // the capture group: exactly `([^X]+)` with ASCII X
+                        if cap_seen {
+                            return None;
+                        }
+                        let rest = &b[i..];
+                        if !rest.starts_with(b"([^") {
+                            return None;
+                        }
+                        let (stop, after) = if rest.get(3) == Some(&b'\\') {
+                            (*rest.get(4)?, 5)
+                        } else {
+                            (*rest.get(3)?, 4)
+                        };
+                        if !stop.is_ascii() || stop == b']' {
+                            return None;
+                        }
+                        if rest.get(after..after + 3) != Some(b"]+)".as_slice()) {
+                            return None;
+                        }
+                        if !cur.is_empty() {
+                            comps.push(SimpleComp::Lit(std::mem::take(&mut cur)));
+                        }
+                        comps.push(SimpleComp::Cap { stop });
+                        cap_seen = true;
+                        i += after + 3;
+                    }
+                }
+                // optional single char: `x?` — pop the last char of the
+                // pending literal into an OptLit
+                b'?' => {
+                    let s = std::str::from_utf8(&cur).ok()?;
+                    let last = s.chars().last()?;
+                    let cut = cur.len() - last.len_utf8();
+                    let tail: Vec<u8> = cur[cut..].to_vec();
+                    cur.truncate(cut);
+                    if !cur.is_empty() {
+                        comps.push(SimpleComp::Lit(std::mem::take(&mut cur)));
+                    }
+                    comps.push(SimpleComp::OptLit(tail));
+                    i += 1;
+                }
+                b'\\' => {
+                    let e = *b.get(i + 1)?;
+                    if e.is_ascii_alphanumeric() {
+                        return None; // class escape (\d, \w, ...)
+                    }
+                    cur.push(e);
+                    i += 2;
+                }
+                c if is_plain(c) => {
+                    cur.push(c);
+                    i += 1;
+                }
+                _ => return None,
+            }
+        }
+        if !tail_seen || !cap_seen {
+            return None;
+        }
+        // The capture-end heuristic (first occurrence of `stop`) matches the
+        // regex semantics only when the component right after the capture is
+        // a literal starting with `stop` (as in `([^/]+)/`); otherwise the
+        // true capture end would need backtracking — bail.
+        let cap_pos = comps
+            .iter()
+            .position(|c| matches!(c, SimpleComp::Cap { .. }))?;
+        let SimpleComp::Cap { stop } = comps[cap_pos] else {
+            return None;
+        };
+        match comps.get(cap_pos + 1) {
+            Some(SimpleComp::Lit(l)) if l.first() == Some(&stop) => {}
+            _ => return None,
+        }
+        let templ = Self::parse_replacement(replacement)?;
+        Some(SimplePattern { comps, templ })
+    }
+
+    /// Parse a PG-syntax replacement (`\1`, `\&`, `\\`, literals).
+    fn parse_replacement(replacement: &str) -> Option<Vec<TemplPart>> {
+        let mut parts: Vec<TemplPart> = Vec::new();
+        let mut lit = String::new();
+        let mut chars = replacement.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next()? {
+                    '1' => {
+                        if !lit.is_empty() {
+                            parts.push(TemplPart::Lit(std::mem::take(&mut lit)));
+                        }
+                        parts.push(TemplPart::Group1);
+                    }
+                    '&' => {
+                        if !lit.is_empty() {
+                            parts.push(TemplPart::Lit(std::mem::take(&mut lit)));
+                        }
+                        parts.push(TemplPart::Group0);
+                    }
+                    '\\' => lit.push('\\'),
+                    // \2..\9 reference groups the pattern doesn't have
+                    d if d.is_ascii_digit() => return None,
+                    other => lit.push(other),
+                }
+            } else {
+                lit.push(c);
+            }
+        }
+        if !lit.is_empty() {
+            parts.push(TemplPart::Lit(lit));
+        }
+        Some(parts)
+    }
+
+    /// regexp_replace semantics: on match, the (fully anchored) match covers
+    /// the whole input and is replaced by the template; on no match the
+    /// input is returned unchanged.
+    pub(super) fn replace<'a>(&self, s: &'a str) -> std::borrow::Cow<'a, str> {
+        use std::borrow::Cow;
+        match self.exec(s.as_bytes()) {
+            None => Cow::Borrowed(s),
+            Some((cs, ce)) => {
+                // capture bounds always fall on char boundaries: cs follows
+                // literal bytes (whole UTF-8 sequences) and ce is at an ASCII
+                // stop byte
+                if let [TemplPart::Group1] = self.templ.as_slice() {
+                    return Cow::Borrowed(&s[cs..ce]);
+                }
+                let mut out = String::with_capacity(s.len());
+                for p in &self.templ {
+                    match p {
+                        TemplPart::Lit(l) => out.push_str(l),
+                        TemplPart::Group1 => out.push_str(&s[cs..ce]),
+                        TemplPart::Group0 => out.push_str(s),
+                    }
+                }
+                Cow::Owned(out)
+            }
+        }
+    }
+
+    /// Match the whole input, returning the capture range on success.
+    fn exec(&self, s: &[u8]) -> Option<(usize, usize)> {
+        fn rec(
+            comps: &[SimpleComp],
+            s: &[u8],
+            pos: usize,
+            cap: Option<(usize, usize)>,
+        ) -> Option<(usize, usize)> {
+            let Some((first, rest)) = comps.split_first() else {
+                // remaining input is consumed by the `.*$` tail
+                return cap;
+            };
+            match first {
+                SimpleComp::Lit(l) => {
+                    if s[pos..].starts_with(l) {
+                        rec(rest, s, pos + l.len(), cap)
+                    } else {
+                        None
+                    }
+                }
+                SimpleComp::OptLit(l) => {
+                    // greedy: prefer consuming the literal, backtrack to
+                    // skipping it (mirrors the regex engine's preference
+                    // order for `(?:lit)?`)
+                    if s[pos..].starts_with(l)
+                        && let Some(r) = rec(rest, s, pos + l.len(), cap)
+                    {
+                        return Some(r);
+                    }
+                    rec(rest, s, pos, cap)
+                }
+                SimpleComp::Cap { stop } => {
+                    let k = s[pos..].iter().position(|&c| c == *stop)?;
+                    if k == 0 {
+                        return None; // `+` needs at least one char
+                    }
+                    rec(rest, s, pos + k, Some((pos, pos + k)))
+                }
+            }
+        }
+        rec(&self.comps, s, 0, None)
+    }
 }
 
 /// Detect POSIX character classes (e.g. `[:alpha:]`) inside `[]` —
@@ -196,74 +493,99 @@ pub(super) fn apply_case_when_to_seg_col(
         }
     }
 
-    SegTextColumn::Dict {
-        entries,
-        row_to_entry,
-    }
+    SegTextColumn::dict_from_owned_entries(entries, row_to_entry)
 }
 
 /// Apply a Rust regex replacement to a SegTextColumn, producing a new transformed column.
 /// The original column is not modified (needed for aggregations on the same column).
 /// For Dict columns, only applies regex to unique dict entries (O(dict_size)).
 /// For LZ4 columns, converts to Dict after applying regex.
-pub(super) fn apply_regex_to_seg_col(
-    seg_col: &SegTextColumn,
-    regex: &Regex,
-    replacement: &str,
-) -> SegTextColumn {
+pub(super) fn apply_regex_to_seg_col(seg_col: &SegTextColumn, ri: &RustRegexInfo) -> SegTextColumn {
+    let RustRegexInfo {
+        regex,
+        replacement,
+        simple,
+        ..
+    } = ri;
+    macro_rules! do_replace {
+        ($s:expr) => {
+            match simple {
+                Some(sp) => sp.replace($s),
+                None => regex.replace($s, replacement.as_str()),
+            }
+        };
+    }
     match seg_col {
         SegTextColumn::Dict {
-            entries,
+            buf,
+            entry_ranges,
             row_to_entry,
+            ..
         } => {
-            let new_entries: Vec<String> = entries
-                .iter()
-                .map(|e| regex.replace(e, replacement).into_owned())
-                .collect();
+            // Replace each unique dict entry once, writing results into a
+            // fresh flat buffer (no per-entry String allocation).
+            let mut new_buf = Vec::with_capacity(buf.len());
+            let mut new_ranges = Vec::with_capacity(entry_ranges.len());
+            for &r in entry_ranges {
+                let replaced = do_replace!(dict_entry_str(buf, r));
+                new_ranges.push((new_buf.len() as u32, replaced.len() as u32));
+                new_buf.extend_from_slice(replaced.as_bytes());
+            }
             SegTextColumn::Dict {
-                entries: new_entries,
+                buf: new_buf,
+                entry_ranges: new_ranges,
                 row_to_entry: row_to_entry.clone(),
+                entry_char_lens: Vec::new(),
             }
         }
         SegTextColumn::Lz4 { buf, row_to_range } => {
             let mut unique_map: HashMap<String, u32> = HashMap::new();
             let mut entries: Vec<String> = Vec::new();
+            // Input-side memo: within a segment the same input string repeats
+            // ~2-3x (e.g. ClickBench Referer), and a hash probe on the input
+            // bytes is an order of magnitude cheaper than re-running the regex.
+            let mut input_memo: ahash::AHashMap<&str, u32> = ahash::AHashMap::new();
             let mut new_row_to_entry: Vec<u32> = Vec::with_capacity(row_to_range.len());
             for &(off, len) in row_to_range {
                 if off == u32::MAX {
                     new_row_to_entry.push(u32::MAX);
                 } else {
-                    let s = std::str::from_utf8(&buf[off as usize..off as usize + len as usize])
-                        .unwrap_or("");
-                    // `regex.replace` returns a `Cow` (borrowed when nothing
-                    // matched). The replaced output is typically low-cardinality
-                    // (e.g. a host extracted from many distinct URLs), so look up
-                    // by borrowed `&str` and only allocate an owned `String` for
-                    // genuinely new outputs — instead of one allocation plus a
-                    // clone for the map key on every row.
-                    let replaced = regex.replace(s, replacement);
-                    let idx = match unique_map.get(replaced.as_ref()) {
+                    let slice = &buf[off as usize..off as usize + len as usize];
+                    // SAFETY: decompressed PG text — valid UTF-8 by construction
+                    // (see SegTextColumn::get_str).
+                    debug_assert!(std::str::from_utf8(slice).is_ok());
+                    let s = unsafe { std::str::from_utf8_unchecked(slice) };
+                    let idx = match input_memo.get(s) {
                         Some(&idx) => idx,
                         None => {
-                            let owned = replaced.into_owned();
-                            let idx = entries.len() as u32;
-                            unique_map.insert(owned.clone(), idx);
-                            entries.push(owned);
+                            // The replace returns a `Cow` (borrowed when nothing
+                            // matched). The replaced output is typically low-cardinality
+                            // (e.g. a host extracted from many distinct URLs), so look up
+                            // by borrowed `&str` and only allocate an owned `String` for
+                            // genuinely new outputs — instead of one allocation plus a
+                            // clone for the map key on every row.
+                            let replaced = do_replace!(s);
+                            let idx = match unique_map.get(replaced.as_ref()) {
+                                Some(&idx) => idx,
+                                None => {
+                                    let owned = replaced.into_owned();
+                                    let idx = entries.len() as u32;
+                                    unique_map.insert(owned.clone(), idx);
+                                    entries.push(owned);
+                                    idx
+                                }
+                            };
+                            input_memo.insert(s, idx);
                             idx
                         }
                     };
                     new_row_to_entry.push(idx);
                 }
             }
-            SegTextColumn::Dict {
-                entries,
-                row_to_entry: new_row_to_entry,
-            }
+            SegTextColumn::dict_from_owned_entries(entries, new_row_to_entry)
         }
         SegTextColumn::SegBy(opt) => {
-            let new_opt = opt
-                .as_deref()
-                .map(|s| regex.replace(s, replacement).into_owned());
+            let new_opt = opt.as_deref().map(|s| do_replace!(s).into_owned());
             SegTextColumn::SegBy(new_opt)
         }
         SegTextColumn::Lengths {
@@ -382,6 +704,179 @@ mod tests {
         let url4 = "http://example.com/path\n";
         let result4 = re.replace(url4, replacement.as_str());
         assert_eq!(result4, "example.com"); // .* consumes \n, \z matches at end
+    }
+
+    /// Differential check: SimplePattern must agree with the Rust regex
+    /// engine (which itself is verified against PG semantics above) on
+    /// every input.
+    fn assert_simple_matches_regex(pattern: &str, replacement: &str, inputs: &[&str]) {
+        let sp = SimplePattern::try_parse(pattern, replacement)
+            .unwrap_or_else(|| panic!("pattern should parse: {pattern}"));
+        let re = Regex::new(&pg_pattern_to_rust(pattern)).unwrap();
+        let rust_repl = convert_pg_replacement(replacement);
+        for input in inputs {
+            let expected = re.replace(input, rust_repl.as_str());
+            let got = sp.replace(input);
+            assert_eq!(
+                got, expected,
+                "mismatch for pattern {pattern:?} replacement {replacement:?} input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_simple_pattern_clickbench_q28() {
+        assert_simple_matches_regex(
+            r"^https?://(?:www\.)?([^/]+)/.*$",
+            r"\1",
+            &[
+                "https://www.example.com/path/to/page",
+                "http://example.com/",
+                "http://example.com", // no trailing slash — no match
+                "https://www./path",  // backtracking: host = "www."
+                "https://www.www.x/", // www. stripped once
+                "http://www.x/",
+                "",
+                "ftp://x/y",
+                "http:///path",            // empty host — no match
+                "https:///",               // empty host — no match
+                "http://exämple.com/päth", // multibyte
+                "http://x.com/a\nb",       // dot-all tail
+                "http://x.com/\n",
+                "http://example.com/path\n", // trailing newline
+                "HTTPS://X.COM/",            // case-sensitive — no match
+                "https//x.com/",             // missing colon — no match
+                "http://www.a/b",
+                "not a url at all",
+                "http://",
+            ],
+        );
+    }
+
+    #[test]
+    fn test_simple_pattern_other_shapes() {
+        // capture not followed by its stop char in a literal: must not parse
+        assert!(SimplePattern::try_parse(r"^([^/]+)x.*$", r"\1").is_none());
+        // two captures: must not parse
+        assert!(SimplePattern::try_parse(r"^([^/]+)/([^/]+)/.*$", r"\1").is_none());
+        // alternation: must not parse
+        assert!(SimplePattern::try_parse(r"^(a|b)/.*$", r"\1").is_none());
+        // no ^ anchor / no .*$ tail: must not parse
+        assert!(SimplePattern::try_parse(r"https?://([^/]+)/.*$", r"\1").is_none());
+        assert!(SimplePattern::try_parse(r"^https?://([^/]+)/", r"\1").is_none());
+        assert!(SimplePattern::try_parse(r"^https?://([^/]+)/.*", r"\1").is_none());
+        // class escapes: must not parse
+        assert!(SimplePattern::try_parse(r"^\d+([^/]+)/.*$", r"\1").is_none());
+        // backreference to a group we don't have: must not parse
+        assert!(SimplePattern::try_parse(r"^a([^/]+)/.*$", r"\2").is_none());
+        // unsupported quantifiers: must not parse
+        assert!(SimplePattern::try_parse(r"^a+([^/]+)/.*$", r"\1").is_none());
+        assert!(SimplePattern::try_parse(r"^a*([^/]+)/.*$", r"\1").is_none());
+        assert!(SimplePattern::try_parse(r"^a{2}([^/]+)/.*$", r"\1").is_none());
+        // no capture at all: must not parse
+        assert!(SimplePattern::try_parse(r"^https?://.*$", r"\1").is_none());
+
+        // escaped stop char in the class + escaped literals
+        assert_simple_matches_regex(
+            r"^([^\.]+)\..*$",
+            r"\1",
+            &["foo.bar", "foo", ".bar", "a.b.c", "", "x."],
+        );
+        // literal replacement parts around the capture + \& whole match
+        assert_simple_matches_regex(
+            r"^https?://(?:www\.)?([^/]+)/.*$",
+            r"host=\1",
+            &["https://www.example.com/p", "nope"],
+        );
+        assert_simple_matches_regex(
+            r"^https?://(?:www\.)?([^/]+)/.*$",
+            r"\&|\1",
+            &["https://www.example.com/p", "nope"],
+        );
+    }
+
+    /// Property test: SimplePattern must agree with the regex engine on
+    /// thousands of randomized inputs, for every accepted pattern shape.
+    /// Uses a fixed-seed xorshift PRNG so failures are reproducible.
+    #[test]
+    fn test_simple_pattern_property_random_inputs() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        // Char pool biased toward the pattern alphabets (prefix chars, stop
+        // chars, optional-literal chars) so random strings frequently land
+        // on near-matches — the interesting boundary cases.
+        const POOL: &[char] = &[
+            'h', 't', 'p', 's', ':', '/', '/', 'w', 'w', '.', '.', 'a', 'b', 'c', 'd', 'e', 'x',
+            '-', '_', '0', '%', '\n', '\\', 'é', '日', 'H',
+        ];
+
+        let cases: &[(&str, &str)] = &[
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"\1"),
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"host=\1;"),
+            (r"^https?://(?:www\.)?([^/]+)/.*$", r"\&|\1"),
+            (r"^([^\.]+)\..*$", r"\1"),
+            // two optionals in a row + multi-char literal after the capture
+            (r"^a(?:bc)?(?:de)?([^/]+)/x.*$", r"<\1>"),
+            // optional single char adjacent to the capture
+            (r"^ab?([^.]+)\.c.*$", r"\1"),
+        ];
+
+        for (pattern, replacement) in cases {
+            let sp = SimplePattern::try_parse(pattern, replacement)
+                .unwrap_or_else(|| panic!("pattern should parse: {pattern}"));
+            let re = Regex::new(&pg_pattern_to_rust(pattern)).unwrap();
+            let rust_repl = convert_pg_replacement(replacement);
+
+            for iter in 0..6000u32 {
+                let mut s = String::new();
+                if iter % 3 == 0 {
+                    // Structured URL-ish input: prefix + optional www. + host
+                    // + optional path, each piece independently mutated.
+                    let prefixes = [
+                        "http://",
+                        "https://",
+                        "httpss://",
+                        "http:/",
+                        "HTTP://",
+                        "ftp://",
+                        "",
+                        "http://www.",
+                        "https://www",
+                        "a",
+                        "abc",
+                        "abcde",
+                    ];
+                    s.push_str(prefixes[(next() % prefixes.len() as u64) as usize]);
+                    for _ in 0..(next() % 8) {
+                        s.push(POOL[(next() % POOL.len() as u64) as usize]);
+                    }
+                    if next() % 2 == 0 {
+                        s.push('/');
+                        for _ in 0..(next() % 6) {
+                            s.push(POOL[(next() % POOL.len() as u64) as usize]);
+                        }
+                    }
+                } else {
+                    // Fully random string from the pool, length 0..32
+                    for _ in 0..(next() % 32) {
+                        s.push(POOL[(next() % POOL.len() as u64) as usize]);
+                    }
+                }
+
+                let expected = re.replace(&s, rust_repl.as_str());
+                let got = sp.replace(&s);
+                assert_eq!(
+                    got, expected,
+                    "mismatch for pattern {pattern:?} replacement {replacement:?} input {s:?} (iter {iter})"
+                );
+            }
+        }
     }
 
     #[test]

@@ -137,7 +137,7 @@ pub(crate) fn register_hooks() {
 ///
 /// GUC semantics:
 /// - `0`  → disabled (returns 0).
-/// - `-1` → auto: 25% of physical RAM (read from `/proc/meminfo`),
+/// - `-1` → auto: 1/6 of physical RAM (read from `/proc/meminfo`),
 ///   clamped to `[AUTO_FLOOR_MB, AUTO_CAP_MB]`. If `/proc/meminfo`
 ///   can't be parsed (non-Linux, restricted container), falls back
 ///   to `AUTO_FLOOR_MB`.
@@ -153,7 +153,7 @@ pub(crate) fn configured_bytes() -> usize {
 
 /// Floor and cap for the auto-size heuristic, in MiB.
 const AUTO_FLOOR_MB: i32 = 256;
-const AUTO_CAP_MB: i32 = 4096;
+const AUTO_CAP_MB: i32 = 16384;
 
 fn resolve_configured_bytes() -> usize {
     let mb = crate::BLOB_CACHE_MB.get();
@@ -164,20 +164,29 @@ fn resolve_configured_bytes() -> usize {
     (effective_mb as usize).saturating_mul(1024 * 1024)
 }
 
-/// 25% of physical RAM, clamped to `[AUTO_FLOOR_MB, AUTO_CAP_MB]`.
+/// 1/6 of physical RAM, clamped to `[AUTO_FLOOR_MB, AUTO_CAP_MB]`.
 /// Returns `AUTO_FLOOR_MB` when /proc/meminfo isn't readable.
+///
+/// Why 1/6 and not 1/4: the cache is non-reclaimable shmem that
+/// coexists with shared_buffers (conventionally RAM/4) and the
+/// transient allocations of high-cardinality aggregations, which can
+/// reach half of RAM on their own (ClickBench Q32 peaks at ~15 GB of
+/// agg hash maps on a 32 GiB box). At RAM/4 that combination
+/// OOM-killed the backend once the cache filled; RAM/6 leaves the
+/// same queries ~2 GB of headroom while still fitting every
+/// single-query working set we've measured (largest: 4.3 GB).
 fn auto_size_mb() -> i32 {
     clamp_auto_mb(read_phys_mem_mb().unwrap_or(0))
 }
 
 /// Pure clamp logic factored out for unit testing. `phys_mb <= 0`
 /// (couldn't read system RAM) falls back to the floor; otherwise
-/// `25% × phys_mb` clamped to `[AUTO_FLOOR_MB, AUTO_CAP_MB]`.
+/// `phys_mb / 6` clamped to `[AUTO_FLOOR_MB, AUTO_CAP_MB]`.
 fn clamp_auto_mb(phys_mb: i32) -> i32 {
     if phys_mb <= 0 {
         return AUTO_FLOOR_MB;
     }
-    (phys_mb / 4).clamp(AUTO_FLOOR_MB, AUTO_CAP_MB)
+    (phys_mb / 6).clamp(AUTO_FLOOR_MB, AUTO_CAP_MB)
 }
 
 /// Reads `MemTotal:` from `/proc/meminfo` and returns it in MiB.
@@ -267,42 +276,42 @@ mod tests {
 
     #[test]
     fn clamp_auto_tiny_phys_hits_floor() {
-        // Boxes with < 1 GiB compute 25% below the floor and clamp up.
-        assert_eq!(clamp_auto_mb(512), AUTO_FLOOR_MB); // 128 < 256
-        assert_eq!(clamp_auto_mb(1023), AUTO_FLOOR_MB); // 255 < 256
+        // Boxes with < 1.5 GiB compute 1/6 below the floor and clamp up.
+        assert_eq!(clamp_auto_mb(512), AUTO_FLOOR_MB); // 85 < 256
+        assert_eq!(clamp_auto_mb(1535), AUTO_FLOOR_MB); // 255 < 256
     }
 
     #[test]
     fn clamp_auto_floor_exact() {
-        // 1 GiB / 4 = 256 MiB = floor exactly.
-        assert_eq!(clamp_auto_mb(1024), 256);
+        // 1.5 GiB / 6 = 256 MiB = floor exactly.
+        assert_eq!(clamp_auto_mb(1536), 256);
     }
 
     #[test]
-    fn clamp_auto_quarter_in_range() {
-        // 4 GiB → 1 GiB, 8 GiB → 2 GiB, 12 GiB → 3 GiB.
-        assert_eq!(clamp_auto_mb(4 * 1024), 1024);
-        assert_eq!(clamp_auto_mb(8 * 1024), 2048);
-        assert_eq!(clamp_auto_mb(12 * 1024), 3072);
+    fn clamp_auto_sixth_in_range() {
+        // 6 GiB → 1 GiB, 12 GiB → 2 GiB, 24 GiB → 4 GiB.
+        assert_eq!(clamp_auto_mb(6 * 1024), 1024);
+        assert_eq!(clamp_auto_mb(12 * 1024), 2048);
+        assert_eq!(clamp_auto_mb(24 * 1024), 4096);
     }
 
     #[test]
     fn clamp_auto_cap_exact() {
-        // 16 GiB / 4 = 4 GiB = cap exactly.
-        assert_eq!(clamp_auto_mb(16 * 1024), AUTO_CAP_MB);
+        // 96 GiB / 6 = 16 GiB = cap exactly.
+        assert_eq!(clamp_auto_mb(96 * 1024), AUTO_CAP_MB);
     }
 
     #[test]
     fn clamp_auto_large_phys_hits_cap() {
-        // Big production boxes get capped at AUTO_CAP_MB, not 25% of RAM.
-        assert_eq!(clamp_auto_mb(32 * 1024), AUTO_CAP_MB); // 8 GiB → cap 4 GiB
-        assert_eq!(clamp_auto_mb(128 * 1024), AUTO_CAP_MB); // 32 GiB → cap 4 GiB
-        assert_eq!(clamp_auto_mb(1024 * 1024), AUTO_CAP_MB); // 256 GiB → cap 4 GiB
+        // Big production boxes get capped at AUTO_CAP_MB, not 1/6 of RAM.
+        assert_eq!(clamp_auto_mb(32 * 1024), 5461); // 32 GiB → ~5.3 GiB, under cap
+        assert_eq!(clamp_auto_mb(128 * 1024), AUTO_CAP_MB); // 128 GiB → cap 16 GiB
+        assert_eq!(clamp_auto_mb(1024 * 1024), AUTO_CAP_MB); // 1 TiB → cap 16 GiB
     }
 
     #[test]
     fn clamp_auto_overflow_guard() {
-        // i32::MAX as MB ≈ 2 PiB. The /4 keeps us comfortably in i32,
+        // i32::MAX as MB ≈ 2 PiB. The /6 keeps us comfortably in i32,
         // and the cap clamps anyway.
         assert_eq!(clamp_auto_mb(i32::MAX), AUTO_CAP_MB);
     }
