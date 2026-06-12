@@ -1797,10 +1797,18 @@ pub(super) unsafe fn load_segments_heap(
             let mut blooms_oid: Option<pg_sys::Oid> = None; // resolved lazily
             let mut sentinel_rejected = false;
             for bq in batch_quals {
-                if segment_by.contains(&col_names[bq.col_idx]) {
+                // Index defensively: a qual can reference a column the
+                // partition descriptor doesn't know about (e.g. metadata
+                // still mid-sync on a logical-replication subscriber, where
+                // col_names/col_idx_map can be empty). Skipping the probe
+                // only forfeits pruning — never correctness.
+                let Some(col_name) = col_names.get(bq.col_idx) else {
+                    continue;
+                };
+                if segment_by.contains(col_name) {
                     continue;
                 }
-                let Some(ci) = col_idx_map[bq.col_idx] else {
+                let Some(ci) = col_idx_map.get(bq.col_idx).copied().flatten() else {
                     continue;
                 };
                 let Some(hashes) = bloom_probe_hashes(bq) else {
