@@ -43,6 +43,11 @@ pub(crate) static PARALLEL_REGEX: GucSetting<bool> = GucSetting::<bool>::new(tru
 
 pub(crate) static BLOOM_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(true);
 
+/// Query-side gate for partition-level bloom sentinels (`_segment_id = -1`
+/// rows in the blooms companion table). Build-side accumulation follows
+/// `pg_deltax.bloom_filters`.
+pub(crate) static PARTITION_BLOOM_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(true);
+
 pub(crate) static MAX_PARALLEL_WORKERS_PER_SCAN: GucSetting<i32> = GucSetting::<i32>::new(-1);
 
 /// When true, the hook skips `DeltaXCount`/`DeltaXMinMax` fast paths for
@@ -261,6 +266,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"Build per-segment bloom filters during compression for equality predicate pushdown",
         c"When ON, bloom filters are built during compression and used to skip segments during scans. Size is proportional to column cardinality (~2-5% storage overhead).",
         &BLOOM_FILTERS,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.partition_bloom_filters",
+        c"Use partition-level bloom sentinels to reject whole partitions on equality lookups",
+        c"When ON, a coarse per-partition bloom filter (built during compression for high-cardinality numeric columns) is tested before the per-segment blooms; a miss prunes every segment in the partition without reading the per-segment bloom rows.",
+        &PARTITION_BLOOM_FILTERS,
         GucContext::Userset,
         GucFlags::default(),
     );

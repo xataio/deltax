@@ -669,6 +669,10 @@ struct PartitionBuffer {
     blob_buffer: Vec<(u16, i32, Vec<u8>)>,
     blob_buffer_size: usize,
     bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)>,
+    /// Partition-level bloom accumulators for high-cardinality columns,
+    /// stored as `_segment_id = -1` sentinel rows at finalize. Transient
+    /// memory: PARTITION_BLOOM_BUILD_BYTES per eligible column.
+    partition_blooms: crate::compress::PartitionBlooms,
     /// Accumulated text-length sidecar blobs (col_idx, segment_id, length_blob).
     text_length_buffer: Vec<(u16, i32, Vec<u8>)>,
     /// Per-segment (value, count) lists for low-cardinality text columns.
@@ -969,6 +973,7 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_
             blob_buffer: Vec::new(),
             blob_buffer_size: 0,
             bloom_buffer: Vec::new(),
+            partition_blooms: crate::compress::PartitionBlooms::new(),
             text_length_buffer: Vec::new(),
             valbitmap_value_buffer: Vec::new(),
             total_compressed_size: 0,
@@ -2210,6 +2215,10 @@ struct CompressedSegment {
     row_count: usize,
     blobs: Vec<(u16, Vec<u8>)>,             // (col_idx, compressed_data)
     bloom_entries: Vec<(u16, u8, Vec<u8>)>, // (col_idx, num_hashes, bytes); empty if blooms disabled
+    /// Partition-bloom contribution: value hashes for every bloom-supported
+    /// column, merged into the partition-level accumulators on the main
+    /// thread. Empty if blooms disabled.
+    partition_bloom_hashes: Vec<(u16, Vec<u64>)>,
     /// Per-text-column length sidecars (col_idx, length_blob).
     text_length_blobs: Vec<(u16, Vec<u8>)>,
     /// Per-text-column (value, count) lists for low-cardinality (≤32) columns.
@@ -2375,7 +2384,17 @@ fn compress_segment(
 
     // Bloom filters
     let bloom_entries = if bloom_enabled {
-        compute_segment_blooms(&typed_cols, columns, &ndistinct)
+        // Partition-bloom accumulation happens on the main thread (see
+        // `partition_bloom_hashes` below), not here.
+        compute_segment_blooms(&typed_cols, columns, &ndistinct, None)
+    } else {
+        Vec::new()
+    };
+
+    // Partition-bloom contribution (merged on the main thread, which owns
+    // the per-partition accumulators).
+    let partition_bloom_hashes = if bloom_enabled {
+        crate::compress::compute_partition_bloom_hashes(&typed_cols, columns, &ndistinct)
     } else {
         Vec::new()
     };
@@ -2390,6 +2409,7 @@ fn compress_segment(
         row_count,
         blobs,
         bloom_entries,
+        partition_bloom_hashes,
         text_length_blobs,
         valbitmap_value_sets,
         meta_values_csv: meta_vals.join(", "),
@@ -2573,7 +2593,12 @@ fn flush_segment(buf: &mut PartitionBuffer, state: &BackfillState) {
 
     // Bloom filters
     let bloom_entries = if crate::BLOOM_FILTERS.get() {
-        compute_segment_blooms(&buf.typed_cols, &state.columns, &ndistinct)
+        compute_segment_blooms(
+            &buf.typed_cols,
+            &state.columns,
+            &ndistinct,
+            Some(&mut buf.partition_blooms),
+        )
     } else {
         Vec::new()
     };
@@ -2878,6 +2903,19 @@ fn write_compressed_segment(
         buf.bloom_buffer
             .push((col_idx, cs.seg_id, num_hashes, bytes));
     }
+    // Merge this segment's partition-bloom contribution into the
+    // per-partition accumulators (sentinels must cover every segment).
+    for (col_idx, hashes) in cs.partition_bloom_hashes {
+        let bf = buf.partition_blooms.entry(col_idx).or_insert_with(|| {
+            crate::bloom::BloomFilter::with_bytes(
+                crate::bloom::PARTITION_BLOOM_BUILD_BYTES,
+                crate::bloom::PARTITION_BLOOM_HASHES,
+            )
+        });
+        for h in hashes {
+            bf.insert(h);
+        }
+    }
     for (col_idx, length_blob) in cs.text_length_blobs {
         buf.text_length_buffer
             .push((col_idx, cs.seg_id, length_blob));
@@ -2911,6 +2949,36 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
             "ALTER TABLE {} ADD PRIMARY KEY (_col_idx, _segment_id)",
             ddl.blooms_fqn
         ));
+
+        // Partition-level bloom sentinels (_segment_id = -1): fold each
+        // accumulator to its storage size and insert one row per surviving
+        // column. The scan side probes the sentinel by PK in Phase 0pre of
+        // load_segments_heap and can reject the whole partition before the
+        // colstats probes and meta scan.
+        let sentinels = crate::compress::finalize_partition_blooms(
+            std::mem::take(&mut buf.partition_blooms),
+            &buf.partition_hll,
+        );
+        if !sentinels.is_empty() {
+            Spi::connect_mut(|client| {
+                use pgrx::datum::DatumWithOid;
+                let insert_sql = format!(
+                    "INSERT INTO {} (_col_idx, _segment_id, _num_hashes, _data) VALUES ($1, $2, $3, $4)",
+                    ddl.blooms_fqn
+                );
+                for (col_idx, num_hashes, bytes) in sentinels {
+                    let args: Vec<DatumWithOid> = vec![
+                        (col_idx as i16).into(),
+                        crate::bloom::PARTITION_BLOOM_SEGMENT_ID.into(),
+                        (num_hashes as i16).into(),
+                        DatumWithOid::from(bytes),
+                    ];
+                    client
+                        .update(&insert_sql, None, &args)
+                        .expect("failed to insert partition bloom sentinel");
+                }
+            });
+        }
     }
     if buf.text_lengths_table_created {
         spi_exec(&format!(

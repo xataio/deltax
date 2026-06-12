@@ -264,6 +264,50 @@ fn bloom_probe_encode(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> i64 {
     }
 }
 
+/// Probe hashes for an Eq/InList batch qual, in the bloom build-side hash
+/// domain (constants go through `bloom_probe_encode` first — same value→i64
+/// mapping `compress.rs` hashed at build time). Returns `None` when the qual
+/// isn't bloom-probeable: wrong op, a non-numeric/temporal column type, or
+/// an in-list whose constants weren't captured as i64. Shared by the
+/// partition-sentinel probe (Phase 0pre) and the per-segment bloom checks so
+/// the two can't diverge.
+fn bloom_probe_hashes(bq: &BatchQual) -> Option<Vec<u64>> {
+    if !matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::InList) {
+        return None;
+    }
+    let is_numeric_type = matches!(
+        bq.type_oid,
+        pg_sys::INT2OID
+            | pg_sys::INT4OID
+            | pg_sys::INT8OID
+            | pg_sys::FLOAT4OID
+            | pg_sys::FLOAT8OID
+            | pg_sys::DATEOID
+            | pg_sys::TIMESTAMPOID
+            | pg_sys::TIMESTAMPTZOID
+    );
+    if !is_numeric_type {
+        return None;
+    }
+    Some(if bq.op == BatchCompareOp::InList {
+        bq.in_list_i64
+            .as_ref()?
+            .iter()
+            .map(|&v| {
+                crate::bloom::hash_datum_i64(bloom_probe_encode(
+                    pg_sys::Datum::from(v as usize),
+                    bq.type_oid,
+                ))
+            })
+            .collect()
+    } else {
+        vec![crate::bloom::hash_datum_i64(bloom_probe_encode(
+            bq.const_datum,
+            bq.type_oid,
+        ))]
+    })
+}
+
 /// Resolve `{partition}_<suffix>` (where the partition name is derived
 /// from `meta_oid` by stripping the `_meta` suffix) to a relation OID in
 /// the same namespace as `meta_oid`. Returns `InvalidOid` when the table
@@ -1510,6 +1554,105 @@ unsafe fn shared_buf_snapshot() -> (i64, i64) {
     }
 }
 
+/// Probe a partition's bloom sentinel row (`_segment_id = -1`, built at
+/// compress time for high-cardinality numeric columns) for one column.
+///
+/// Returns `Some(true)` when the sentinel exists and rejects every probe
+/// hash — no probed value occurs anywhere in the partition, so every
+/// segment can be skipped. `Some(false)` when the sentinel exists and at
+/// least one hash might be present. `None` when there is no sentinel
+/// (legacy data, low-cardinality column, saturated filter, or no PK yet).
+unsafe fn partition_bloom_sentinel_rejects(
+    blooms_oid: pg_sys::Oid,
+    col_idx: i16,
+    hashes: &[u64],
+) -> Option<bool> {
+    unsafe {
+        let rel = pg_sys::table_open(blooms_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let pk_index_oid = primary_key_index_oid(rel);
+        if pk_index_oid == pg_sys::InvalidOid {
+            pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            return None;
+        }
+
+        // Locate _num_hashes / _data attnos from the tupdesc.
+        let tupdesc = (*rel).rd_att;
+        let natts = (*tupdesc).natts as usize;
+        let mut num_hashes_att: Option<usize> = None;
+        let mut data_att: Option<usize> = None;
+        for i in 0..natts {
+            let attr = &*tupdesc_get_attr(tupdesc, i);
+            let name = std::ffi::CStr::from_ptr(attr.attname.data.as_ptr()).to_string_lossy();
+            if name == "_num_hashes" {
+                num_hashes_att = Some(i);
+            } else if name == "_data" {
+                data_att = Some(i);
+            }
+        }
+        let (Some(nh_att), Some(dat_att)) = (num_hashes_att, data_att) else {
+            pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            return None;
+        };
+
+        let snapshot = pg_sys::GetActiveSnapshot();
+        let idx_rel = pg_sys::index_open(pk_index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+        let mut skeys = [
+            pg_sys::ScanKeyData::default(),
+            pg_sys::ScanKeyData::default(),
+        ];
+        pg_sys::ScanKeyInit(
+            &mut skeys[0],
+            1, // attnum 1 = _col_idx
+            pg_sys::BTEqualStrategyNumber as u16,
+            pg_sys::F_INT2EQ.into(),
+            pg_sys::Datum::from(col_idx),
+        );
+        pg_sys::ScanKeyInit(
+            &mut skeys[1],
+            2, // attnum 2 = _segment_id
+            pg_sys::BTEqualStrategyNumber as u16,
+            pg_sys::F_INT4EQ.into(),
+            pg_sys::Datum::from(crate::bloom::PARTITION_BLOOM_SEGMENT_ID),
+        );
+
+        #[cfg(feature = "pg17")]
+        let scan = pg_sys::index_beginscan(rel, idx_rel, snapshot, 2, 0);
+        #[cfg(feature = "pg18")]
+        let scan = pg_sys::index_beginscan(rel, idx_rel, snapshot, std::ptr::null_mut(), 2, 0);
+        pg_sys::index_rescan(scan, skeys.as_mut_ptr(), 2, std::ptr::null_mut(), 0);
+
+        let slot = pg_sys::table_slot_create(rel, std::ptr::null_mut());
+        let mut result: Option<bool> = None;
+        if pg_sys::index_getnext_slot(scan, pg_sys::ScanDirection::ForwardScanDirection, slot) {
+            pg_sys::slot_getallattrs(slot);
+            let tts_values = (*slot).tts_values;
+            let tts_isnull = (*slot).tts_isnull;
+            if !*tts_isnull.add(nh_att) && !*tts_isnull.add(dat_att) {
+                let num_hashes = (*tts_values.add(nh_att)).value() as u8;
+                let varlena_ptr = (*tts_values.add(dat_att)).cast_mut_ptr::<pg_sys::varlena>();
+                let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                let data_ptr = pgrx::vardata_any(detoasted);
+                let data_len = pgrx::varsize_any_exhdr(detoasted);
+                #[allow(clippy::unnecessary_cast)]
+                let bloom_bytes = std::slice::from_raw_parts(data_ptr as *const u8, data_len);
+                let bf = crate::bloom::BloomFilter::from_bytes(bloom_bytes, num_hashes);
+                let any_match = hashes.iter().any(|&h| bf.might_contain(h));
+                if detoasted != varlena_ptr {
+                    pg_sys::pfree(detoasted as *mut _);
+                }
+                result = Some(!any_match);
+            }
+        }
+
+        pg_sys::ExecDropSingleTupleTableSlot(slot);
+        pg_sys::index_endscan(scan);
+        pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        result
+    }
+}
+
 /// Load segment data via two-phase scan: meta table (no TOAST) then blob table
 /// (column-major, sequential TOAST I/O per column).
 ///
@@ -1642,6 +1785,57 @@ pub(super) unsafe fn load_segments_heap(
         debug_assert_eq!(col_names.len(), blob_idx.len());
         let col_idx_map: &[Option<u16>] = blob_idx;
         let num_blob_cols: usize = col_idx_map.iter().filter(|b| b.is_some()).count();
+
+        // ================================================================
+        // Phase 0pre: partition-level bloom rejection. High-cardinality
+        // numeric columns carry a partition-wide bloom sentinel
+        // (`_segment_id = -1`, built at compress time). If an equality
+        // probe is rejected by its sentinel, no segment in this partition
+        // can match — skip the colstats probes and the meta scan entirely.
+        // ================================================================
+        if crate::PARTITION_BLOOM_FILTERS.get() {
+            let mut blooms_oid: Option<pg_sys::Oid> = None; // resolved lazily
+            let mut sentinel_rejected = false;
+            for bq in batch_quals {
+                // Index defensively: a qual can reference a column the
+                // partition descriptor doesn't know about (e.g. metadata
+                // still mid-sync on a logical-replication subscriber, where
+                // col_names/col_idx_map can be empty). Skipping the probe
+                // only forfeits pruning — never correctness.
+                let Some(col_name) = col_names.get(bq.col_idx) else {
+                    continue;
+                };
+                if segment_by.contains(col_name) {
+                    continue;
+                }
+                let Some(ci) = col_idx_map.get(bq.col_idx).copied().flatten() else {
+                    continue;
+                };
+                let Some(hashes) = bloom_probe_hashes(bq) else {
+                    continue;
+                };
+
+                let oid = *blooms_oid.get_or_insert_with(|| sibling_table_oid(meta_oid, "_blooms"));
+                if oid == pg_sys::InvalidOid {
+                    break;
+                }
+                if partition_bloom_sentinel_rejects(oid, ci as i16, &hashes) == Some(true) {
+                    sentinel_rejected = true;
+                    break;
+                }
+            }
+
+            if sentinel_rejected {
+                let total_segments = reltuples_as_u64(meta_oid).unwrap_or_else(|| {
+                    crate::scan::cost::get_segment_count(meta_oid).max(0) as u64
+                });
+                let (t1_hit, t1_read) = shared_buf_snapshot();
+                buf_stats.bloom_hit = t1_hit - t0_hit;
+                buf_stats.bloom_read = t1_read - t0_read;
+                accumulate_scan_buf_stats(&buf_stats);
+                return (Vec::new(), total_segments, 0, total_segments, 0, 0);
+            }
+        }
 
         // Phase 0a: skip-meta fast path — `count(*)`-style scans (or any
         // caller that passes `skip_blob_load=true` with a single point qual)
@@ -1929,37 +2123,7 @@ pub(super) unsafe fn load_segments_heap(
             };
 
             // Numeric / temporal types → bloom (existing path).
-            let is_numeric_type = matches!(
-                bq.type_oid,
-                pg_sys::INT2OID
-                    | pg_sys::INT4OID
-                    | pg_sys::INT8OID
-                    | pg_sys::FLOAT4OID
-                    | pg_sys::FLOAT8OID
-                    | pg_sys::DATEOID
-                    | pg_sys::TIMESTAMPOID
-                    | pg_sys::TIMESTAMPTZOID
-            );
-            if is_numeric_type {
-                let hashes = if bq.op == BatchCompareOp::InList {
-                    if let Some(ref vals) = bq.in_list_i64 {
-                        vals.iter()
-                            .map(|&v| {
-                                crate::bloom::hash_datum_i64(bloom_probe_encode(
-                                    pg_sys::Datum::from(v as usize),
-                                    bq.type_oid,
-                                ))
-                            })
-                            .collect()
-                    } else {
-                        continue;
-                    }
-                } else {
-                    vec![crate::bloom::hash_datum_i64(bloom_probe_encode(
-                        bq.const_datum,
-                        bq.type_oid,
-                    ))]
-                };
+            if let Some(hashes) = bloom_probe_hashes(bq) {
                 bloom_checks.push(BloomCheck {
                     col_idx: ci,
                     hashes,
@@ -3014,6 +3178,9 @@ pub(super) unsafe fn load_segments_heap(
                             }
                             let seg_id = (*tts_values.add(sid_att)).value() as i32;
 
+                            // Skips the partition-level sentinel row
+                            // (_segment_id = -1) too — it was already probed
+                            // in Phase 0pre.
                             if !seg_id_to_idx.contains_key(&seg_id) {
                                 continue;
                             }
