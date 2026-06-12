@@ -1553,10 +1553,98 @@ queries' detoast cost.
 `src/scan/exec/batch_eval.rs` (ensure `Ne` on empty text lands in
 the same constant canonicalization).
 
-### 47. Partition-level bloom filter for point lookups
+### 47. Partition-level bloom filter for point lookups [IMPLEMENTED — pending isolated EC2 measurement]
 
 **Target: Q19 43 ms → ~15 ms (ClickBench hot run)**
 **Complexity: Low-Medium**
+
+**Status (2026-06-11): implemented; verified locally (unit +
+integration tests, incl. a sentinel-only pruning test). Ran on EC2
+(100M) as part of a larger batch of changes; the isolated per-query
+delta was not separately re-measured.**
+
+Local ClickBench (1M rows, 1 partition, 34 segments): Q19's probed
+UserID is absent from the subset, so the sentinel rejects the whole
+partition — `segments=0 segments_bloom_skipped=34`, DeltaX scan time
+0.96 ms → 0.106 ms (9×), `meta hit` 142 → 0. All 43 bench queries
+still match uncompressed PG. Sentinel storage: 77 columns, ~5.1 MiB
+per partition (~3 % of the 173 MiB compressed partition; the WatchID
+2 MiB sentinel dominates and will self-prune via the density gate at
+full 100M scale where its per-partition ndistinct is ~5M).
+
+Implementation notes (deviations from the spec below):
+
+- **Storage:** sentinel row `_segment_id = -1` in the existing
+  `<partition>_blooms` table — no new companion table.
+- **Query side — Phase 0pre, not the bloom phase.** The original plan
+  (test the sentinel inside the per-segment bloom phase) turned out to
+  miss the queries that matter: point lookups with
+  `skip_blob_load`/single-Eq shapes take the Phase 0a/0b colstats
+  minmax-index fast paths in `load_segments_heap`, which return before
+  the bloom phase ever runs (observed locally: `bloom hit=0` on
+  `SELECT * FROM t WHERE id = const LIMIT n`). The sentinel probe
+  (`partition_bloom_sentinel_rejects`, a 2-key PK index probe on
+  `(_col_idx, -1)`) therefore runs as **Phase 0pre**, before Phase 0a:
+  a rejected partition skips the colstats probes *and* the meta scan
+  entirely, which is also strictly better than the original in-scan
+  plan. Probe cost when the sentinel passes: one index descent + one
+  detoast (≤2 MiB) per probed column per partition. Probe constants go
+  through `bloom_probe_encode`, the same datum→i64 mapping the build
+  side hashes (Unix-epoch µs for timestamps/dates, raw bit patterns
+  for floats).
+- **Sizing:** built in memory at a fixed power-of-two 2 MiB
+  (`PARTITION_BLOOM_BUILD_BYTES`, k=4), then **folded** (OR-halving,
+  no false negatives — positions are `hash % 2^n`) down to ~10
+  bits/element using the partition-level HLL ndistinct at flush time.
+  Sentinels whose folded density exceeds 0.6 are dropped (saturated
+  filters prune nothing). The spec's original "256 KB at 4 hashes ≈
+  1% FPR for 5.5 M rows" math was wrong (that's <0.4 bits/element);
+  at the 2 MiB cap a ~1.5 M-distinct column lands near 1% FPR and a
+  ~3.5 M-distinct one near 10%, both still useful for partition
+  rejection.
+- **No cardinality gate — density decides at flush.** A per-segment
+  ndistinct gate (`nd > min(1024, rows/2)`, with any below-gate segment
+  permanently opting the column out for correctness) was implemented
+  first and **withdrawn after local ClickBench inspection**: with
+  `order_by = [counterid, userid, eventtime]`, UserID is sort-clustered,
+  individual segments routinely have low local ndistinct, and the
+  opt-out disqualified the UserID sentinel — i.e. exactly the Q19
+  target column. Any first-segment-based sizing heuristic has the same
+  failure mode (segment-local nd is a bad predictor of partition nd for
+  sort-clustered columns). So: every bloom-supported column accumulates
+  a full-size filter, and `finalize_partition_blooms` simply doesn't
+  store filters whose folded density exceeds 0.6 (genuinely
+  too-high-cardinality columns like WatchID at full scale self-prune
+  this way; low-cardinality ones fold to the 64 B minimum and cost
+  nothing).
+- **Build paths:** all three are covered — SPI compress
+  (`compress_partition_streaming`), buffered COPY backfill
+  (`flush_segment`), and the threaded parquet backfill, where
+  `compress_segment` (worker thread) ships per-segment value hashes to
+  the main thread (`CompressedSegment::partition_bloom_hashes`) which
+  owns the per-partition accumulators.
+- **Correctness invariants** (why plain INSERT with no merge logic is
+  safe): companion tables are always built fresh
+  (`compress_partition_impl` early-returns on `is_compressed`); DML on
+  compressed partitions is rejected by trigger; decompression drops
+  the whole blooms table. Absence of a sentinel is always safe — no
+  sentinel just means no partition-level skipping. For a future
+  incremental-compaction path, `BloomFilter::merge_fold` (OR-merge
+  with fold-down, no false negatives) is the only valid way to update
+  a stored sentinel in place.
+- **GUC:** `pg_deltax.partition_bloom_filters` (default on) gates the
+  query side only; build follows `pg_deltax.bloom_filters`.
+- **Transient build memory:** 2 MiB per bloom-supported (numeric)
+  column per active partition — ~160 MiB per partition on ClickBench
+  hits (~80 numeric columns) for the SPI path, and up to ~2.9 GiB on a
+  full-dataset parquet backfill with all 18 partition buffers active
+  (32 GiB machine; load-time only). Typical time-series schemas
+  (tens of columns) stay well under 100 MiB. If a very wide table ×
+  many-partition backfill ever needs bounding, add a budget GUC.
+- Possible follow-up: a dedicated `segments_partition_bloom_skipped`
+  EXPLAIN counter (currently partition-level prunes count into
+  `segments_bloom_skipped`); the integration test distinguishes the
+  paths by deleting per-segment bloom rows instead.
 
 Q19 (`WHERE UserID = <const>`) already benefits from per-segment
 min/max pruning (1870 segments skipped) and per-segment bloom

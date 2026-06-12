@@ -1728,6 +1728,7 @@ pub(crate) fn flush_segment_metadata(
     ndistinct_values: &[i64],
     row_count: u32,
     segment_id: i32,
+    partition_blooms: Option<&mut PartitionBlooms>,
 ) -> FlushResult {
     // Returns (compressed_size, blobs, bloom_entries)
     // Compress each non-segment column, collect blobs for caller
@@ -1861,7 +1862,7 @@ pub(crate) fn flush_segment_metadata(
 
     // Compute per-column bloom filters (if enabled via GUC) — stored separately
     let bloom_entries = if crate::BLOOM_FILTERS.get() {
-        compute_segment_blooms(typed_cols, columns, ndistinct_values)
+        compute_segment_blooms(typed_cols, columns, ndistinct_values, partition_blooms)
     } else {
         Vec::new()
     };
@@ -2074,16 +2075,31 @@ pub(crate) fn compute_segment_ndistinct(
     (estimates, sketches)
 }
 
+/// Partition-level bloom accumulators, keyed by non-segment-by column index.
+/// Every bloom-supported column accumulates one (correctness requires the
+/// sentinel to cover every segment's values, so there is no per-segment
+/// gate); the flush-time density check in `finalize_partition_blooms` drops
+/// the ones too saturated to prune anything. Transient build memory is
+/// `PARTITION_BLOOM_BUILD_BYTES` per numeric column per active partition.
+pub(crate) type PartitionBlooms = std::collections::HashMap<u16, crate::bloom::BloomFilter>;
+
 /// Compute per-column bloom filters for a segment.
 /// Returns one (col_idx, num_hashes, bloom_bytes) entry per column that got a bloom,
 /// or empty if no columns qualify. Only builds bloom filters for numeric/date/timestamp
 /// columns with ndistinct > 0.
+///
+/// When `partition_blooms` is given, each value's hash is also folded into
+/// the column's partition-level accumulator; those are stored as
+/// `_segment_id = -1` sentinel rows when the partition flushes.
 pub(crate) fn compute_segment_blooms(
     typed_cols: &[TypedColumn],
     columns: &[ColumnMeta],
     ndistinct_values: &[i64],
+    mut partition_blooms: Option<&mut PartitionBlooms>,
 ) -> Vec<(u16, u8, Vec<u8>)> {
-    use crate::bloom::{BloomFilter, hash_datum_i64};
+    use crate::bloom::{
+        BloomFilter, PARTITION_BLOOM_BUILD_BYTES, PARTITION_BLOOM_HASHES, hash_datum_i64,
+    };
 
     let mut entries: Vec<(u16, u8, Vec<u8>)> = Vec::new();
     let mut nd_idx: usize = 0;
@@ -2105,37 +2121,61 @@ pub(crate) fn compute_segment_blooms(
             continue;
         }
 
+        if !matches!(
+            &typed_cols[i],
+            TypedColumn::Int16(_)
+                | TypedColumn::Int32(_)
+                | TypedColumn::Int64(_)
+                | TypedColumn::Float32(_)
+                | TypedColumn::Float64(_)
+        ) {
+            col_idx += 1;
+            continue;
+        }
+
+        // Partition-bloom accumulator for this column, created at the
+        // column's first values-bearing segment. Every later segment inserts
+        // too — the sentinel must cover the whole partition.
+        let mut pbf: Option<&mut BloomFilter> = partition_blooms.as_deref_mut().map(|map| {
+            map.entry(col_idx).or_insert_with(|| {
+                BloomFilter::with_bytes(PARTITION_BLOOM_BUILD_BYTES, PARTITION_BLOOM_HASHES)
+            })
+        });
+
         let mut bf = BloomFilter::for_ndistinct(nd as usize);
+        let mut insert = |bf: &mut BloomFilter, h: u64| {
+            bf.insert(h);
+            if let Some(p) = pbf.as_deref_mut() {
+                p.insert(h);
+            }
+        };
         match &typed_cols[i] {
             TypedColumn::Int16(v) => {
                 for x in v.iter().flatten() {
-                    bf.insert(hash_datum_i64(*x as i64));
+                    insert(&mut bf, hash_datum_i64(*x as i64));
                 }
             }
             TypedColumn::Int32(v) => {
                 for x in v.iter().flatten() {
-                    bf.insert(hash_datum_i64(*x as i64));
+                    insert(&mut bf, hash_datum_i64(*x as i64));
                 }
             }
             TypedColumn::Int64(v) => {
                 for x in v.iter().flatten() {
-                    bf.insert(hash_datum_i64(*x));
+                    insert(&mut bf, hash_datum_i64(*x));
                 }
             }
             TypedColumn::Float32(v) => {
                 for x in v.iter().flatten() {
-                    bf.insert(hash_datum_i64(x.to_bits() as i64));
+                    insert(&mut bf, hash_datum_i64(x.to_bits() as i64));
                 }
             }
             TypedColumn::Float64(v) => {
                 for x in v.iter().flatten() {
-                    bf.insert(hash_datum_i64(x.to_bits() as i64));
+                    insert(&mut bf, hash_datum_i64(x.to_bits() as i64));
                 }
             }
-            _ => {
-                col_idx += 1;
-                continue;
-            }
+            _ => unreachable!("gated by the supported-type check above"),
         }
 
         entries.push((col_idx, bf.num_hashes(), bf.as_bytes().to_vec()));
@@ -2143,6 +2183,99 @@ pub(crate) fn compute_segment_blooms(
     }
 
     entries
+}
+
+/// Per-segment partition-bloom contribution for paths where segments are
+/// compressed off the main thread (parquet COPY): the raw value hashes for
+/// every bloom-supported column, merged into the per-partition accumulators
+/// on the main thread (which owns them).
+pub(crate) fn compute_partition_bloom_hashes(
+    typed_cols: &[TypedColumn],
+    columns: &[ColumnMeta],
+    ndistinct_values: &[i64],
+) -> Vec<(u16, Vec<u64>)> {
+    use crate::bloom::hash_datum_i64;
+
+    let mut hashes: Vec<(u16, Vec<u64>)> = Vec::new();
+    let mut nd_idx: usize = 0;
+    let mut col_idx: u16 = 0;
+
+    for (i, col) in columns.iter().enumerate() {
+        if col.is_segment_by {
+            continue;
+        }
+        let nd = if nd_idx < ndistinct_values.len() {
+            ndistinct_values[nd_idx]
+        } else {
+            0
+        };
+        nd_idx += 1;
+
+        if !supports_minmax(&col.data_type) || nd <= 0 {
+            col_idx += 1;
+            continue;
+        }
+
+        let col_hashes: Vec<u64> = match &typed_cols[i] {
+            TypedColumn::Int16(v) => v
+                .iter()
+                .flatten()
+                .map(|x| hash_datum_i64(*x as i64))
+                .collect(),
+            TypedColumn::Int32(v) => v
+                .iter()
+                .flatten()
+                .map(|x| hash_datum_i64(*x as i64))
+                .collect(),
+            TypedColumn::Int64(v) => v.iter().flatten().map(|x| hash_datum_i64(*x)).collect(),
+            TypedColumn::Float32(v) => v
+                .iter()
+                .flatten()
+                .map(|x| hash_datum_i64(x.to_bits() as i64))
+                .collect(),
+            TypedColumn::Float64(v) => v
+                .iter()
+                .flatten()
+                .map(|x| hash_datum_i64(x.to_bits() as i64))
+                .collect(),
+            _ => {
+                col_idx += 1;
+                continue;
+            }
+        };
+        hashes.push((col_idx, col_hashes));
+        col_idx += 1;
+    }
+
+    hashes
+}
+
+/// Fold each accumulated partition bloom down to its storage size (~10 bits
+/// per element, from the partition-level ndistinct estimate) and drop
+/// saturated entries (density above `PARTITION_BLOOM_MAX_DENSITY` — too many
+/// distinct values for the build size; such a filter wouldn't prune).
+/// Returns rows sorted by col_idx, ready to be inserted as
+/// `_segment_id = -1` sentinel rows in the blooms table.
+pub(crate) fn finalize_partition_blooms(
+    partition_blooms: PartitionBlooms,
+    partition_hll: &[CardinalityEstimator<u64>],
+) -> Vec<(u16, u8, Vec<u8>)> {
+    use crate::bloom::{PARTITION_BLOOM_MAX_DENSITY, partition_bloom_target_bytes};
+
+    let mut rows: Vec<(u16, u8, Vec<u8>)> = Vec::new();
+    for (col_idx, mut bf) in partition_blooms {
+        let nd = partition_hll
+            .get(col_idx as usize)
+            .map(|h| h.estimate() as u64)
+            .unwrap_or(0);
+        bf.fold_to(partition_bloom_target_bytes(nd));
+        if bf.density() > PARTITION_BLOOM_MAX_DENSITY {
+            continue; // saturated — wouldn't prune anything, not worth a row
+        }
+        rows.push((col_idx, bf.num_hashes(), bf.as_bytes().to_vec()));
+    }
+    rows.sort_by_key(|&(c, _, _)| c);
+    rows
 }
 
 /// Flush typed column data, splitting into segment_size chunks if needed.
@@ -2165,6 +2298,7 @@ pub(crate) fn flush_with_splitting(
     valbitmap_value_buffer: &mut Vec<(u16, i32, SegValueCounts)>,
     partition_hll: &mut [CardinalityEstimator<u64>],
     partition_topvals: &mut TopVals,
+    mut partition_blooms: Option<&mut PartitionBlooms>,
 ) -> i64 {
     let mut total_size = 0i64;
     let mut offset = 0;
@@ -2190,6 +2324,7 @@ pub(crate) fn flush_with_splitting(
                     &ndistinct,
                     chunk_rows,
                     seg_id,
+                    partition_blooms.as_deref_mut(),
                 );
             total_size += size;
             for (col_idx, blob) in blobs {
@@ -2226,6 +2361,7 @@ pub(crate) fn flush_with_splitting(
                     &ndistinct,
                     chunk_rows,
                     seg_id,
+                    partition_blooms.as_deref_mut(),
                 );
             total_size += size;
             for (col_idx, blob) in blobs {
@@ -2518,6 +2654,10 @@ fn compress_partition_streaming(
     let mut next_segment_id: i32 = 1;
     let mut blob_buffer: Vec<(u16, i32, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, blob)
     let mut bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, num_hashes, bloom_bytes)
+    // Partition-level bloom accumulators for high-cardinality columns,
+    // flushed as `_segment_id = -1` sentinel rows alongside the per-segment
+    // blooms. Transient memory: PARTITION_BLOOM_BUILD_BYTES per eligible column.
+    let mut partition_blooms: PartitionBlooms = PartitionBlooms::new();
     let mut colstats_buffer: Vec<ColstatsRow> = Vec::new();
     let mut text_length_buffer: Vec<(u16, i32, Vec<u8>)> = Vec::new(); // (col_idx, segment_id, length_blob)
     // (col_idx, segment_id, sorted distinct values). Encoded into per-segment
@@ -2596,6 +2736,7 @@ fn compress_partition_streaming(
                             &mut valbitmap_value_buffer,
                             &mut partition_hll,
                             &mut partition_topvals,
+                            Some(&mut partition_blooms),
                         );
                         typed_cols = init_typed_columns(columns, &kinds);
                         rows_in_segment = 0;
@@ -2641,6 +2782,7 @@ fn compress_partition_streaming(
                         &ndistinct,
                         rows_in_segment as u32,
                         seg_id,
+                        Some(&mut partition_blooms),
                     );
                 total_compressed_size += size;
                 for (col_idx, blob) in blobs {
@@ -2702,6 +2844,7 @@ fn compress_partition_streaming(
             &mut valbitmap_value_buffer,
             &mut partition_hll,
             &mut partition_topvals,
+            Some(&mut partition_blooms),
         );
     }
 
@@ -2797,6 +2940,29 @@ fn compress_partition_streaming(
                     .update(&insert_sql, None, &args)
                     .expect("failed to insert bloom data");
             }
+
+            // Partition-level bloom sentinels (_segment_id = -1). The
+            // companion tables are always built fresh (recompression is
+            // guarded by is_compressed), so plain INSERTs are safe.
+            for (col_idx, num_hashes, bytes) in
+                finalize_partition_blooms(std::mem::take(&mut partition_blooms), &partition_hll)
+            {
+                use pgrx::datum::DatumWithOid;
+                let insert_sql = format!(
+                    "INSERT INTO {} (_col_idx, _segment_id, _num_hashes, _data) VALUES ($1, $2, $3, $4)",
+                    &ddl.blooms_fqn
+                );
+                let args: Vec<DatumWithOid> = vec![
+                    (col_idx as i16).into(),
+                    crate::bloom::PARTITION_BLOOM_SEGMENT_ID.into(),
+                    (num_hashes as i16).into(),
+                    DatumWithOid::from(bytes),
+                ];
+                client
+                    .update(&insert_sql, None, &args)
+                    .expect("failed to insert partition bloom sentinel");
+            }
+
             client
                 .update(&format!("ANALYZE {}", ddl.blooms_fqn), None, &[])
                 .expect("failed to analyze blooms table");
