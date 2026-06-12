@@ -247,3 +247,38 @@ def test_worker_retention_drops_old_partitions(postgres_db):
 
     finally:
         _cleanup(db, table)
+
+
+def test_launcher_spawns_one_named_worker_by_default(postgres_db):
+    """With no pg_deltax.target_database set (default 'postgres'), the launcher
+    fans out to exactly one dynamic maintenance worker bound to `postgres`,
+    surfaced in pg_stat_activity as `pg_deltax maintenance worker (postgres)`.
+
+    Guards two things at once: that the launcher -> dynamic-worker fan-out
+    actually runs (pre-launcher code registered a single *static* worker), and
+    that the per-database naming is correct. The launcher's own
+    `pg_deltax maintenance launcher` is excluded by the LIKE and has exited
+    long before now anyway.
+    """
+    db = postgres_db
+
+    # The worker is up at container boot, but poll briefly to be robust.
+    deadline = time.time() + 10
+    backend_types = []
+    while time.time() < deadline:
+        db.rollback()
+        backend_types = [
+            row[0]
+            for row in db.execute(
+                "SELECT backend_type FROM pg_stat_activity "
+                "WHERE backend_type LIKE 'pg_deltax maintenance worker%' "
+                "ORDER BY backend_type"
+            ).fetchall()
+        ]
+        if backend_types:
+            break
+        time.sleep(0.5)
+
+    assert backend_types == ["pg_deltax maintenance worker (postgres)"], (
+        f"expected exactly one worker on postgres, got {backend_types}"
+    )

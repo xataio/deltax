@@ -9,17 +9,24 @@ use crate::partition;
 
 const DEFAULT_WORKER_INTERVAL_SECS: u64 = 60;
 
-/// Parse `pg_deltax.target_database` into a trimmed, deduplicated,
-/// order-preserving list of database names. An empty/blank GUC yields
-/// the upstream default `["postgres"]`. Only call this from a launched
-/// process (launcher or worker) — custom-GUC values from postgresql.conf
-/// are not reliably visible during `_PG_init` (verified empirically with
-/// both the pgrx GucSetting and GetConfigOption).
+/// Read `pg_deltax.target_database` and parse it into a list of database
+/// names (see [`parse_target_databases`]). Only call this from a launched
+/// process (the launcher) — custom-GUC values from postgresql.conf are not
+/// reliably visible during `_PG_init` (verified empirically with both the
+/// pgrx GucSetting and GetConfigOption).
 pub(crate) fn target_databases() -> Vec<String> {
     let raw = crate::TARGET_DATABASE
         .get()
         .and_then(|c| c.to_str().ok().map(str::to_owned))
         .unwrap_or_default();
+    parse_target_databases(&raw)
+}
+
+/// Parse a raw `pg_deltax.target_database` value into a trimmed,
+/// deduplicated, order-preserving list of database names. A blank value (or
+/// one with only empty entries) yields the upstream default `["postgres"]`.
+/// Duplicates keep their first occurrence; later repeats are dropped.
+pub(crate) fn parse_target_databases(raw: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let dbs: Vec<String> = raw
         .split(',')
@@ -63,14 +70,18 @@ pub fn register_bgworker() {
 pub extern "C-unwind" fn deltax_launcher_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     let dbs = target_databases();
-    for (i, db) in dbs.iter().enumerate() {
+    for db in &dbs {
+        // Pass the target database name to the worker via `bgw_extra` (128
+        // bytes; database names are at most NAMEDATALEN-1 = 63). The worker
+        // connects to exactly this name, so it never has to re-derive the
+        // list or agree with the launcher on its ordering.
         let spawned = BackgroundWorkerBuilder::new(&format!(
             "pg_deltax maintenance worker ({})",
             db
         ))
         .set_function("deltax_worker_main")
         .set_library("pg_deltax")
-        .set_argument((i as i32).into_datum())
+        .set_extra(db)
         .enable_spi_access()
         .set_restart_time(Some(Duration::from_secs(60)))
         .load_dynamic();
@@ -90,19 +101,18 @@ pub extern "C-unwind" fn deltax_launcher_main(_arg: pg_sys::Datum) {
 
 #[pg_guard]
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn deltax_worker_main(arg: pg_sys::Datum) {
+pub extern "C-unwind" fn deltax_worker_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
-    // Each spawned worker carries its index into the target_databases()
-    // list as its argument; re-derive the list (fully initialized in a
-    // worker process) and connect to our entry. The SPI binding is
-    // once-per-worker-lifetime, so list changes take effect on restart.
-    let idx = unsafe { i32::from_datum(arg, false) }.unwrap_or(0).max(0) as usize;
-    let dbs = target_databases();
-    let target_db = dbs
-        .get(idx)
-        .cloned()
-        .unwrap_or_else(|| "postgres".to_string());
-    BackgroundWorker::connect_worker_to_spi(Some(&target_db), None);
+    // The launcher passes this worker's target database name in `bgw_extra`.
+    // Connecting by name (rather than re-deriving the list and indexing into
+    // it) removes any dependency on the launcher and worker computing an
+    // identical, identically-ordered list. The SPI binding is
+    // once-per-worker-lifetime, so target_database changes take effect on a
+    // server restart. An empty `bgw_extra` (e.g. a worker started by some
+    // other means) falls back to the upstream default.
+    let extra = BackgroundWorker::get_extra();
+    let target_db = if extra.is_empty() { "postgres" } else { extra };
+    BackgroundWorker::connect_worker_to_spi(Some(target_db), None);
 
     // The worker runs as superuser (BackgroundWorkerInitializeConnection with
     // username = NULL sets am_superuser = true), so an attacker who can plant
@@ -367,4 +377,57 @@ pub(crate) fn drain_default_partition(
         rows_moved: row_count,
         partitions_created: boundaries.len() as i32,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_target_databases;
+
+    #[test]
+    fn blank_input_defaults_to_postgres() {
+        assert_eq!(parse_target_databases(""), vec!["postgres"]);
+        assert_eq!(parse_target_databases("   "), vec!["postgres"]);
+        // Only-empty entries collapse to the default, not to an empty list.
+        assert_eq!(parse_target_databases(",, ,"), vec!["postgres"]);
+    }
+
+    #[test]
+    fn single_entry() {
+        assert_eq!(parse_target_databases("postgres"), vec!["postgres"]);
+        assert_eq!(parse_target_databases("metrics_db"), vec!["metrics_db"]);
+    }
+
+    #[test]
+    fn multiple_entries_are_trimmed_and_order_preserved() {
+        assert_eq!(
+            parse_target_databases("postgres,metrics_db"),
+            vec!["postgres", "metrics_db"]
+        );
+        assert_eq!(
+            parse_target_databases("  postgres ,  metrics_db  "),
+            vec!["postgres", "metrics_db"]
+        );
+    }
+
+    #[test]
+    fn duplicates_dropped_keeping_first_occurrence() {
+        // Mirrors the PR's smoke config `postgres, smoke_db, postgres`.
+        assert_eq!(
+            parse_target_databases("postgres, smoke_db, postgres"),
+            vec!["postgres", "smoke_db"]
+        );
+        // First-occurrence order wins, regardless of where the repeat sits.
+        assert_eq!(
+            parse_target_databases("b, a, b, c, a"),
+            vec!["b", "a", "c"]
+        );
+    }
+
+    #[test]
+    fn blank_entries_between_real_ones_are_skipped() {
+        assert_eq!(
+            parse_target_databases("a,,b, ,c"),
+            vec!["a", "b", "c"]
+        );
+    }
 }
