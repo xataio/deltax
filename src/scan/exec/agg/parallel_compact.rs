@@ -450,31 +450,57 @@ impl ParallelCompactResult {
     }
 }
 
-/// Shared counting filter for the singleton-skip two-pass top-N scheme.
+/// Shared counting filter for the count-floor two-pass top-N scheme.
 ///
 /// Counting Bloom filter with two byte-wide saturating counters per key,
-/// bumped once per input row in pass 1. A key with either slot reading
-/// < 2 in pass 2 is a *guaranteed* global singleton (every occurrence of
-/// a key hits the same two slots, so two occurrences always leave both
-/// counts >= 2 — no false negatives). Slots can alias across distinct
-/// keys, which only produces false "maybe duplicate" answers; those rows
-/// go through the exact map in pass 2. With two probes a singleton is a
-/// false positive only when *both* its slots see other keys:
-/// (1-e^-l)^2 ~= 3% at the l ~= 0.19 per-probe load this sizing yields.
+/// bumped once per input row in pass 1. Every occurrence of a key hits
+/// the same two slots and slot aliasing across distinct keys only adds
+/// counts, so a slot is always >= the key's true count (up to the
+/// saturation cap). A key with either slot reading < T in pass 2 is
+/// therefore *guaranteed* to have global count < T — no false negatives.
+/// False positives (counts inflated past T by aliasing) just take the
+/// exact-map path. With two probes a small group passes only when *both*
+/// its slots see other keys: (1-e^-l)^2 ~= 3% at the l ~= 0.19 per-probe
+/// load this sizing yields.
+///
+/// The floor `threshold` is picked after pass 1 from a key-coherent
+/// sample (see `pick_count_floor`): the count of the limit-th largest
+/// sampled key proves at least `limit` global groups reach that count,
+/// so every group the floor skips is provably outside the top N.
 pub(super) struct CountingFilter {
     slots: Box<[std::sync::atomic::AtomicU8]>,
     mask: usize,
+    threshold: u8,
 }
 
 impl CountingFilter {
+    /// Bump saturation cap. The load-then-add guard admits one transient
+    /// over-add per concurrent thread, so the cap must leave headroom
+    /// below u8::MAX for the worker count (<= 16) to make wraparound
+    /// impossible. Floors are clamped to this value.
+    pub(super) const SATURATE: u8 = 235;
+
     pub(super) fn new(rows: usize) -> Self {
         // 2 probes/row at ~8 slots/row → per-probe load ~0.25, FP ~4.7%;
         // the 1 GiB cap puts ClickBench-scale inputs (100M rows) at load
-        // 0.19 / FP 2.9%.
+        // 0.19 / FP 2.9%. This sizing is what the singleton floor (T=2)
+        // needs: there a slot's collision noise directly becomes false
+        // "maybe duplicate" answers.
+        Self::with_max_size(rows, 30)
+    }
+
+    /// `new` with a caller-chosen size cap (log2 of the slot count). High
+    /// floors tolerate dense filters: collisions only *add* to a slot, so
+    /// a key is falsely retained only when its collision noise reaches the
+    /// floor — at ~3 expected colliding rows per slot (100M rows in 2^26
+    /// slots) that's negligible against floors >= 16, and the smaller
+    /// footprint keeps the filter (mostly) cache-resident instead of
+    /// paying a DRAM miss per bump/probe.
+    pub(super) fn with_max_size(rows: usize, max_log2: u32) -> Self {
         let size = rows
             .saturating_mul(8)
             .next_power_of_two()
-            .clamp(1 << 22, 1 << 30);
+            .clamp(1 << 22, 1usize << max_log2);
         // calloc-backed zeroed alloc; AtomicU8 is repr(transparent) over u8.
         let zeroed = vec![0u8; size].into_boxed_slice();
         let slots = unsafe {
@@ -483,7 +509,35 @@ impl CountingFilter {
         Self {
             slots,
             mask: size - 1,
+            threshold: 2,
         }
+    }
+
+    /// Floor chosen after pass 1; 2 (the singleton floor) until then.
+    pub(super) fn threshold(&self) -> u8 {
+        self.threshold
+    }
+
+    pub(super) fn set_threshold(&mut self, t: u8) {
+        debug_assert!((2..=Self::SATURATE).contains(&t));
+        self.threshold = t;
+    }
+
+    /// The shared 64-bit hash behind both the slot addressing and the
+    /// pass-1 key-coherent sample. Sampling must depend only on the key
+    /// so that a sampled key's count is its exact global count.
+    #[inline(always)]
+    pub(super) fn key_hash(key: u128) -> u64 {
+        let folded = (key as u64) ^ ((key >> 64) as u64).wrapping_mul(0x9e3779b97f4a7c15);
+        mix64(folded)
+    }
+
+    /// Pass-1 sample membership for a pre-computed `key_hash`: 1/128 of
+    /// keys, chosen from hash bits disjoint from the slot-addressing bits
+    /// below.
+    #[inline(always)]
+    pub(super) fn is_sampled_hashed(h: u64) -> bool {
+        (h >> 44) & 127 == 0
     }
 
     /// Two slot indices within one 64-byte block (blocked Bloom layout):
@@ -491,43 +545,61 @@ impl CountingFilter {
     /// instead of two. Per-slot load — and thus the FP rate — matches the
     /// unblocked layout up to block-occupancy variance. The xor delta is
     /// forced odd so the two offsets never coincide (a coinciding pair
-    /// would double-bump one slot and flag every such key as a duplicate).
+    /// would double-bump one slot and undercount every key mapped there).
     #[inline(always)]
-    fn slot_pair(
+    fn slot_pair_hashed(
         &self,
-        key: u128,
+        h: u64,
     ) -> (&std::sync::atomic::AtomicU8, &std::sync::atomic::AtomicU8) {
-        let folded = (key as u64) ^ ((key >> 64) as u64).wrapping_mul(0x9e3779b97f4a7c15);
-        let h = mix64(folded);
         let block = ((h as usize) & self.mask) & !63;
         let o1 = ((h >> 32) & 63) as usize;
         let o2 = o1 ^ (((h >> 38) as usize & 62) | 1);
         (&self.slots[block | o1], &self.slots[block | o2])
     }
 
-    /// Pass 1: bump the key's counters, saturating at 2 (the only state we
-    /// care about). The load-then-add guard also makes u8 wraparound
-    /// impossible: once a slot reads >= 2 no thread adds to it again, so
-    /// transient over-add is bounded by the thread count.
+    /// Pass 1: bump the key's counters, saturating at `SATURATE`. The
+    /// load-then-add guard bounds transient over-add by the thread count,
+    /// which the `SATURATE` headroom absorbs — u8 wraparound impossible.
+    /// Takes the pre-computed `key_hash` so callers can share it with the
+    /// sample-membership check.
     #[inline(always)]
-    pub(super) fn bump(&self, key: u128) {
+    pub(super) fn bump_hashed(&self, h: u64) {
         use std::sync::atomic::Ordering::Relaxed;
-        let (s1, s2) = self.slot_pair(key);
-        if s1.load(Relaxed) < 2 {
+        let (s1, s2) = self.slot_pair_hashed(h);
+        if s1.load(Relaxed) < Self::SATURATE {
             s1.fetch_add(1, Relaxed);
         }
-        if s2.load(Relaxed) < 2 {
+        if s2.load(Relaxed) < Self::SATURATE {
             s2.fetch_add(1, Relaxed);
         }
     }
 
-    /// Pass 2: may this key occur more than once in the input?
-    #[inline(always)]
-    pub(super) fn maybe_dup(&self, key: u128) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
-        let (s1, s2) = self.slot_pair(key);
-        s1.load(Relaxed) >= 2 && s2.load(Relaxed) >= 2
+    #[cfg(test)]
+    pub(super) fn bump(&self, key: u128) {
+        self.bump_hashed(Self::key_hash(key));
     }
+
+    /// Pass 2: may this key's global count reach the floor?
+    #[inline(always)]
+    pub(super) fn above_floor(&self, key: u128) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (s1, s2) = self.slot_pair_hashed(Self::key_hash(key));
+        s1.load(Relaxed) >= self.threshold && s2.load(Relaxed) >= self.threshold
+    }
+}
+
+/// Pick the count floor from the merged pass-1 sample: the exact count of
+/// the `limit`-th largest sampled key. At least `limit` global groups
+/// provably reach that count, so the true top-`limit` groups all do too —
+/// skipping every group below it is exact, with no fallback path. Returns
+/// the singleton floor (2) when the sample is too small to prove more.
+pub(super) fn pick_count_floor(sample_counts: &mut [u32], limit: usize) -> u8 {
+    if sample_counts.len() < limit || limit == 0 {
+        return 2;
+    }
+    let idx = limit - 1;
+    let (_, kth, _) = sample_counts.select_nth_unstable_by(idx, |a, b| b.cmp(a));
+    (*kth).clamp(2, CountingFilter::SATURATE as u32) as u8
 }
 
 /// Build the packed u128 group key for one row, or None if any key part is
@@ -623,17 +695,19 @@ fn decompress_segment_cols(
     decompressed
 }
 
-/// Pass 1 of the singleton-skip scheme: decompress only the GROUP BY key
-/// columns and bump the counting filter once per row. No quals or pruning
-/// are evaluated — the dispatch gate restricts this path to unfiltered
-/// scans, and pass 2 must see exactly the same row set.
+/// Pass 1 of the count-floor scheme: decompress only the GROUP BY key
+/// columns and bump the counting filter once per row, while exact-counting
+/// the 1/128 key-coherent sample used to pick the floor. No quals or
+/// pruning are evaluated — the dispatch gate restricts this path to
+/// unfiltered scans, and pass 2 must see exactly the same row set.
 pub(super) fn process_segments_count_filter(
     segments: &[SegmentData],
     claim: &std::sync::atomic::AtomicUsize,
     config: &ParallelCompactConfig,
     key_cols: &[bool],
     filter: &CountingFilter,
-) {
+) -> hashbrown::HashMap<u128, u32> {
+    let mut sample: hashbrown::HashMap<u128, u32> = hashbrown::HashMap::new();
     loop {
         let seg_idx = claim.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if seg_idx >= segments.len() {
@@ -646,10 +720,15 @@ pub(super) fn process_segments_count_filter(
         let decompressed = decompress_segment_cols(seg, config, key_cols);
         for row in 0..seg.row_count as usize {
             if let Some(packed) = build_packed_key(config.group_specs, &decompressed, row) {
-                filter.bump(packed);
+                let h = CountingFilter::key_hash(packed);
+                filter.bump_hashed(h);
+                if CountingFilter::is_sampled_hashed(h) {
+                    *sample.entry(packed).or_insert(0) += 1;
+                }
             }
         }
     }
+    sample
 }
 
 /// Process a chunk of segments on a worker thread using the compact path.
@@ -786,11 +865,14 @@ pub(super) fn process_segments_compact_filtered(
                 continue;
             };
 
-            // Singleton-skip: a key the filter proves globally unique can
-            // only ever be a count=1 group. The top-N merge needs at most
-            // `limit` of those as tie fillers; skip the rest entirely.
+            // Count-floor skip: a key the filter proves below the floor
+            // can never reach the top N. With the singleton floor (2) the
+            // merge may still need up to `limit` count=1 groups as tie
+            // fillers (their single-row aggregates are exact); higher
+            // floors are sample-proven to leave >= limit groups, so the
+            // filler budget is zero there.
             if let Some((filter, _)) = singleton
-                && !filter.maybe_dup(packed)
+                && !filter.above_floor(packed)
             {
                 if filler_budget == 0 {
                     continue;
@@ -2863,23 +2945,30 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
         // to amortize thread::scope overhead; otherwise single scope.
         let use_pipeline = use_lazy && all_segments.len() >= n_workers * 16;
 
-        // ---- Singleton-skip two-pass top-N eligibility ----
+        // ---- Count-floor two-pass top-N eligibility ----
         // Targets `GROUP BY <int keys> ORDER BY COUNT(*) DESC LIMIT n` over
-        // unfiltered scans whose keys are nearly all unique (ClickBench
-        // Q32: 99.997M groups in 99.997M rows). Building the full
-        // 100M-entry map only to pick 10 winners is almost entirely wasted
-        // work — a count=1 group can never beat a count>=2 group, so a
-        // cheap counting filter (pass 1) lets pass 2 aggregate only rows
-        // whose key might repeat, plus `limit` filler singletons per
-        // worker to pad out ties (their single-row aggregates are exact,
-        // and any count=1 group is as valid a tie pick as any other).
+        // unfiltered scans with high group cardinality (ClickBench Q32:
+        // 99.997M groups in 99.997M rows; Q35: 21M). Building the full map
+        // only to pick 10 winners is mostly wasted work — a group whose
+        // total count is below the limit-th largest can never reach the
+        // top N, so a cheap counting filter (pass 1) lets pass 2 aggregate
+        // only rows whose key might reach that floor. The floor itself is
+        // proven by an exact-counted key sample taken during pass 1 (see
+        // `pick_count_floor`); when the sample can't prove a floor above
+        // 2, pass 2 falls back to singleton-skip semantics with `limit`
+        // filler singletons per worker to pad out count=1 ties.
         // `nd_hint` is the catalog HLL ndistinct of the most distinct
         // single group column summed across partitions — a lower bound on
         // the true group count that's immune to the planner's clamping of
         // `plan_rows` to its (underestimated) input-row count. Requiring
         // it to be ~= the exact row count keeps this path off queries
-        // where duplicates are common; there pass 2 would degenerate into
-        // the normal full map with pass 1 as pure overhead.
+        // where the per-entry map cost is too small for pass 1 to pay for
+        // itself: at mid cardinality (ClickBench Q35, 21M int groups in
+        // 100M rows) the measured map+merge savings only break even
+        // against the extra key scan. The text-keyed mixed path, whose
+        // per-entry cost is several times higher, runs the same scheme
+        // from a much lower cardinality bound — see
+        // `dispatch_parallel_mixed_path`.
         let total_rows: u64 = all_segments.iter().map(|s| s.row_count as u64).sum();
         let singleton_mode = topn_limit > 0
             && topn_limit <= 10_000
@@ -2962,13 +3051,21 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
         // next); once it finishes every segment is detoasted, so pass 2
         // below runs as a plain single scope.
         let singleton_filter: Option<CountingFilter> = if singleton_mode {
-            let filter = CountingFilter::new(total_rows as usize);
+            let mut filter = CountingFilter::new(total_rows as usize);
             let mut key_cols = vec![false; meta.col_names.len()];
             for gs in &group_specs {
                 key_cols[gs.col_idx as usize] = true;
             }
             let key_cols = &key_cols;
             let filter_ref = &filter;
+            let mut sample_counts: hashbrown::HashMap<u128, u32> = hashbrown::HashMap::new();
+            let mut merge_samples = |maps: Vec<hashbrown::HashMap<u128, u32>>| {
+                for map in maps {
+                    for (k, c) in map {
+                        *sample_counts.entry(k).or_insert(0) += c;
+                    }
+                }
+            };
             let t_p1 = Instant::now();
             if use_pipeline {
                 let n_batches = (n_workers * 2).max(2).min(all_segments.len());
@@ -2981,21 +3078,23 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                     let (done, pending) = all_segments.split_at_mut(batch_end);
                     let current_batch = &done[batch_start..];
                     let claim = std::sync::atomic::AtomicUsize::new(0);
-                    std::thread::scope(|s| {
+                    let batch_samples = std::thread::scope(|s| {
                         let n_threads = n_workers.min(current_batch.len()).max(1);
-                        for _ in 0..n_threads {
-                            let cfg = &config;
-                            let claim = &claim;
-                            s.spawn(move || {
-                                process_segments_count_filter(
-                                    current_batch,
-                                    claim,
-                                    cfg,
-                                    key_cols,
-                                    filter_ref,
-                                )
-                            });
-                        }
+                        let handles: Vec<_> = (0..n_threads)
+                            .map(|_| {
+                                let cfg = &config;
+                                let claim = &claim;
+                                s.spawn(move || {
+                                    process_segments_count_filter(
+                                        current_batch,
+                                        claim,
+                                        cfg,
+                                        key_cols,
+                                        filter_ref,
+                                    )
+                                })
+                            })
+                            .collect();
                         if batch_end < total_segs {
                             let t_pd = Instant::now();
                             for seg in &mut pending[..next_end - batch_end] {
@@ -3006,27 +3105,47 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                             }
                             pipeline_detoast_us += t_pd.elapsed().as_micros() as u64;
                         }
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().unwrap())
+                            .collect::<Vec<_>>()
                     });
+                    merge_samples(batch_samples);
                     batch_start = batch_end;
                 }
             } else {
                 let claim = std::sync::atomic::AtomicUsize::new(0);
                 let segs: &[SegmentData] = all_segments;
-                std::thread::scope(|s| {
+                let maps = std::thread::scope(|s| {
                     let n_threads = n_workers.min(segs.len()).max(1);
-                    for _ in 0..n_threads {
-                        let cfg = &config;
-                        let claim = &claim;
-                        s.spawn(move || {
-                            process_segments_count_filter(segs, claim, cfg, key_cols, filter_ref)
-                        });
-                    }
+                    let handles: Vec<_> = (0..n_threads)
+                        .map(|_| {
+                            let cfg = &config;
+                            let claim = &claim;
+                            s.spawn(move || {
+                                process_segments_count_filter(
+                                    segs, claim, cfg, key_cols, filter_ref,
+                                )
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap())
+                        .collect::<Vec<_>>()
                 });
+                merge_samples(maps);
             }
+            let sampled_keys = sample_counts.len();
+            let mut counts: Vec<u32> = sample_counts.into_values().collect();
+            let floor = pick_count_floor(&mut counts, topn_limit as usize);
+            filter.set_threshold(floor);
             pgrx::log!(
-                "pg_deltax compact: singleton-skip pass1 rows={} nd_hint={} pass1_ms={}",
+                "pg_deltax compact: count-floor pass1 rows={} nd_hint={} sampled_keys={} floor={} pass1_ms={}",
                 total_rows,
                 nd_hint,
+                sampled_keys,
+                floor,
                 t_p1.elapsed().as_millis(),
             );
             Some(filter)
@@ -3035,11 +3154,16 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
         };
 
         let partial_results: Vec<ParallelCompactResult> = if let Some(filter) = &singleton_filter {
-            // Singleton-skip pass 2: aggregate maybe-duplicate keys plus
-            // up to `limit` filler singletons per worker.
+            // Count-floor pass 2: aggregate keys that may reach the floor.
+            // Only the singleton floor needs fillers — higher floors are
+            // sample-proven to leave >= limit groups in the map.
             let claim = std::sync::atomic::AtomicUsize::new(0);
             let segs: &[SegmentData] = all_segments;
-            let filler_limit = topn_limit as usize;
+            let filler_limit = if filter.threshold() == 2 {
+                topn_limit as usize
+            } else {
+                0
+            };
             std::thread::scope(|s| {
                 let n_threads = n_workers.min(segs.len()).max(1);
                 let handles: Vec<_> = (0..n_threads)
@@ -3213,15 +3337,16 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
 
 #[cfg(test)]
 mod tests {
-    use super::CountingFilter;
+    use super::{pick_count_floor, CountingFilter};
 
-    /// The singleton-skip scheme is only exact if the filter never
-    /// produces a false negative: every key bumped at least twice must
-    /// report `maybe_dup`. False positives (unique keys reported as
-    /// maybe-dup) are allowed — they just take the exact-map path.
+    /// The count-floor scheme is only exact if the filter never produces
+    /// a false negative: every key bumped at least `threshold` times must
+    /// report `above_floor`. False positives (small keys reported above
+    /// the floor) are allowed — they just take the exact-map path.
     #[test]
     fn counting_filter_has_no_false_negatives() {
-        let filter = CountingFilter::new(100_000);
+        let mut filter = CountingFilter::new(100_000);
+        filter.set_threshold(2);
         // Duplicate keys: bumped twice, must always be flagged.
         for i in 0..50_000u128 {
             let key = i.wrapping_mul(0x9e37_79b9_7f4a_7c15_2545_f491_4f6c_dd1d);
@@ -3230,18 +3355,43 @@ mod tests {
         }
         for i in 0..50_000u128 {
             let key = i.wrapping_mul(0x9e37_79b9_7f4a_7c15_2545_f491_4f6c_dd1d);
-            assert!(filter.maybe_dup(key), "false negative for dup key {}", i);
+            assert!(filter.above_floor(key), "false negative for dup key {}", i);
+        }
+    }
+
+    /// Same exactness requirement at a floor above the singleton level:
+    /// keys reaching the floor must pass, keys below it (absent
+    /// collisions, which only inflate) must be skippable.
+    #[test]
+    fn counting_filter_no_false_negatives_at_higher_floor() {
+        let mut filter = CountingFilter::new(100_000);
+        for i in 0..10_000u128 {
+            let key = i.wrapping_mul(0x9e37_79b9_7f4a_7c15_2545_f491_4f6c_dd1d);
+            let bumps = if i % 2 == 0 { 20 } else { 5 };
+            for _ in 0..bumps {
+                filter.bump(key);
+            }
+        }
+        filter.set_threshold(20);
+        for i in (0..10_000u128).step_by(2) {
+            let key = i.wrapping_mul(0x9e37_79b9_7f4a_7c15_2545_f491_4f6c_dd1d);
+            assert!(
+                filter.above_floor(key),
+                "false negative for floor-reaching key {}",
+                i
+            );
         }
     }
 
     #[test]
     fn counting_filter_mostly_clears_singletons() {
-        let filter = CountingFilter::new(1_000_000);
+        let mut filter = CountingFilter::new(1_000_000);
+        filter.set_threshold(2);
         for i in 0..1_000_000u128 {
             filter.bump(i << 32 | 0xabcd);
         }
         let false_positives = (0..1_000_000u128)
-            .filter(|&i| filter.maybe_dup(i << 32 | 0xabcd))
+            .filter(|&i| filter.above_floor(i << 32 | 0xabcd))
             .count();
         // Expected FP rate at this load is ~5%; 15% leaves slack for
         // block-occupancy variance while still catching a broken hash
@@ -3253,14 +3403,28 @@ mod tests {
         );
     }
 
-    /// Saturating bump must not wrap: 300+ bumps of one key still reads
-    /// as maybe-dup (a u8 wraparound would read < 2 again).
+    /// Saturating bump must not wrap: many more bumps than SATURATE still
+    /// reads above any legal floor (a u8 wraparound would read low again).
     #[test]
     fn counting_filter_saturates_without_wraparound() {
-        let filter = CountingFilter::new(100_000);
-        for _ in 0..300 {
+        let mut filter = CountingFilter::new(100_000);
+        for _ in 0..10_000 {
             filter.bump(42);
         }
-        assert!(filter.maybe_dup(42));
+        filter.set_threshold(CountingFilter::SATURATE);
+        assert!(filter.above_floor(42));
+    }
+
+    /// The floor is the exact count of the limit-th largest sampled key,
+    /// clamped to [2, SATURATE]; an undersized sample proves nothing
+    /// beyond the singleton floor.
+    #[test]
+    fn pick_count_floor_takes_kth_largest() {
+        let mut counts = vec![1, 500, 3, 80, 40, 7, 2, 1, 1, 9, 25, 4];
+        assert_eq!(pick_count_floor(&mut counts.clone(), 3), 40);
+        assert_eq!(pick_count_floor(&mut counts.clone(), 1), 235);
+        assert_eq!(pick_count_floor(&mut counts.clone(), 10), 2);
+        assert_eq!(pick_count_floor(&mut counts, 13), 2);
+        assert_eq!(pick_count_floor(&mut [], 5), 2);
     }
 }

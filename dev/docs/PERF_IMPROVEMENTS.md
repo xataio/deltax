@@ -1979,3 +1979,70 @@ count>=2 groups + all aggregate values are exact.
 (`CountingFilter`, `process_segments_count_filter`,
 `process_segments_compact_filtered`, dispatch gating),
 `src/scan/exec/agg/callbacks.rs` (`nd_hint` from catalog ndistinct).
+
+### 56. Sampled count-floor two-pass top-N on the mixed (text) path [DONE]
+
+**Landed 2026-06-12. Full bench protocol: hot geomean(+10ms) 0.288 →
+0.282 (−2.1%), hot total 28.25 → 26.73 s. Q18 2.72 → 1.90 s,
+Q16 1.33 → 0.98 s, Q33 1.97 → 1.82 s, Q34 1.98 → 1.82 s.**
+
+Generalizes #55 from "skip count=1 groups" to "skip every group whose
+total count is provably below the limit-th largest" and extends it to
+the mixed/text aggregation path, where unfiltered
+`GROUP BY … ORDER BY COUNT(*) DESC LIMIT n` queries spend nearly all
+their time building tens-of-millions-entry digest maps (Q18: 57.8M
+groups in 100M rows; Q16: 26.9M; Q33/Q34: 27.7M).
+
+Three pieces on top of #55:
+
+- **Sample-proven floor.** Pass 1 exact-counts a key-coherent 1/128
+  sample alongside the filter bumps (membership depends only on the
+  key hash, so a sampled key's count is its exact global count). The
+  floor is the count of the `limit`-th largest sampled key
+  (`pick_count_floor`): that many global groups provably reach it, so
+  the true top-N all do, and pass 2 skipping every key the filter
+  reads below the floor is exact — no fallback or verification pass.
+  Sampled floors on ClickBench: Q18 59, Q16/Q33/Q34 235 (saturation
+  cap). When the sample can't prove more than the singleton floor
+  (2), the #55 filler semantics kick in unchanged (Q32's top 10 is
+  count-1 ties; its sampled floor stays 2).
+- **Cache-resident filter.** The mixed path sizes the
+  `CountingFilter` at 2^25 slots (32 MB) instead of #55's 1 GiB: at
+  100M rows the full-size filter pays a DRAM miss per bump and per
+  probe (~0.5 s per pass, measured — it ate the entire two-pass gain;
+  Q18 was 2.72 s with the 1 GiB filter, 1.90 s with 32 MB). Collision
+  noise at this density (~6 rows/slot) only matters to floors below
+  ~16; pass 2 drops the filter entirely when the sampled floor lands
+  below that (pass 1 sunk, correctness unaffected — collisions only
+  inflate counts, so skips stay sound at any size).
+- **Mixed-path pass 1** (`process_segments_mixed_count_filter`)
+  decompresses only the GROUP BY key columns and folds each row into
+  the same 128-bit digest the aggregation loop keys its map on
+  (int components then text components; per-dict-entry digests for
+  dict-encoded text, matching the multi-key dict fast path). Pass-2
+  probes sit at the digest sites: the generic/multi-key insert path
+  probes per row, the single-dict-key fast path caches a `GIDX_SKIP`
+  sentinel per dict entry so skipped entries cost one branch per
+  subsequent row.
+
+Gating mirrors #55 (`ORDER BY COUNT(*) DESC LIMIT <=10K`, unfiltered,
+>= 16M rows, plain Column/AddConst/DateTrunc/Extract keys, no
+sidecar-only key columns) but from `nd_hint >= 0.125 ×` rows instead
+of 0.9: text-keyed map entries cost several times an int-keyed one
+(arena + key storage + digest map), so the two-pass overhead breaks
+even at much lower cardinality. The compact path keeps the 0.9 gate —
+measured at Q35/Q15-class mid-cardinality (21M/100M int groups), the
+map+merge savings only offset the extra key scan (±50 ms), so the
+near-unique regime stays its only target.
+
+Results verified against ground truth on EC2 (subquery form that
+disables the top-N pushdown): Q18/Q16 count sequences and Q33 exact
+URL sets match; Q32 unchanged (boundary=1, filler path).
+
+**Files touched:** `src/scan/exec/agg/parallel_compact.rs`
+(`CountingFilter::{with_max_size, bump_hashed, above_floor,
+is_sampled_hashed}`, `pick_count_floor`, sampled pass 1),
+`src/scan/exec/agg/parallel_mixed.rs`
+(`process_segments_mixed_count_filter`, floor gate + pass-1 dispatch,
+probe sites, `GIDX_SKIP`), `src/scan/exec/agg/callbacks.rs`
+(`compute_group_nd_hint` shared by both paths).

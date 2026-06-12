@@ -235,6 +235,48 @@ unsafe fn current_agg_worker_slot() -> usize {
     }
 }
 
+/// Lower bound on the GROUP BY cardinality for the count-floor two-pass
+/// top-N gate: catalog HLL ndistinct of the most distinct single group
+/// column, summed across the scanned partitions. The group count is >=
+/// any one (bijective) key component's ndistinct. Planner estimates
+/// won't do here — `plan_rows` is clamped to the input-row estimate,
+/// which runs ~3x low. Cheap: the planner already populated the
+/// per-backend ndistinct cache for this query's partitions.
+fn compute_group_nd_hint(
+    group_specs: &[GroupByColSpec],
+    meta: &crate::scan::exec::segments::MetadataInfo,
+    companion_oids: &[pg_sys::Oid],
+    topn_limit: i64,
+    where_quals: *mut pg_sys::List,
+) -> usize {
+    if topn_limit <= 0 || !where_quals.is_null() {
+        return 0;
+    }
+    group_specs
+        .iter()
+        .filter(|gs| {
+            matches!(
+                gs.expr,
+                GroupByExpr::Column | GroupByExpr::AddConst { .. }
+            ) && (gs.col_idx as usize) < meta.col_names.len()
+        })
+        .map(|gs| {
+            let col_name = &meta.col_names[gs.col_idx as usize];
+            companion_oids
+                .iter()
+                .map(|&oid| {
+                    crate::scan::cost::get_column_ndistinct(oid)
+                        .get(col_name)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(0) as usize
+                })
+                .sum()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// Static CustomExecMethods struct for DeltaXAgg.
 pub(crate) static DELTAX_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
@@ -841,41 +883,13 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
             &meta.col_types,
             &batch_quals,
         ) {
-            // Lower bound on the GROUP BY cardinality for the singleton-skip
-            // gate: catalog HLL ndistinct of the most distinct single group
-            // column, summed across the scanned partitions. The group count
-            // is >= any one (bijective) key component's ndistinct. Planner
-            // estimates won't do here — `plan_rows` is clamped to the
-            // input-row estimate, which runs ~3x low. Cheap: the planner
-            // already populated the per-backend ndistinct cache for this
-            // query's partitions.
-            let nd_hint: usize = if topn_limit > 0 && where_quals.is_null() {
-                group_specs
-                    .iter()
-                    .filter(|gs| {
-                        matches!(
-                            gs.expr,
-                            GroupByExpr::Column | GroupByExpr::AddConst { .. }
-                        ) && (gs.col_idx as usize) < meta.col_names.len()
-                    })
-                    .map(|gs| {
-                        let col_name = &meta.col_names[gs.col_idx as usize];
-                        companion_oids
-                            .iter()
-                            .map(|&oid| {
-                                crate::scan::cost::get_column_ndistinct(oid)
-                                    .get(col_name)
-                                    .copied()
-                                    .unwrap_or(0)
-                                    .max(0) as usize
-                            })
-                            .sum()
-                    })
-                    .max()
-                    .unwrap_or(0)
-            } else {
-                0
-            };
+            let nd_hint = compute_group_nd_hint(
+                &group_specs,
+                &meta,
+                &companion_oids,
+                topn_limit,
+                where_quals,
+            );
             let state = dispatch_parallel_compact_path(
                 agg_specs,
                 group_specs,
@@ -1034,6 +1048,13 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
             );
 
         if can_parallel_mixed_flag {
+            let nd_hint = compute_group_nd_hint(
+                &group_specs,
+                &meta,
+                &companion_oids,
+                topn_limit,
+                where_quals,
+            );
             let state = dispatch_parallel_mixed_path(
                 agg_specs,
                 group_specs,
@@ -1055,6 +1076,7 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 time_max,
                 n_workers,
                 est_groups,
+                nd_hint,
                 use_lazy,
                 num_result_cols,
                 metadata_us,
