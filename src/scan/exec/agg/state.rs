@@ -706,7 +706,7 @@ pub(super) fn keys_match(stored: &GroupKey, temp: &[GroupKeyRef], arena: &String
 /// for accumulators, saving ~130ms cleanup for 275K groups.
 pub(super) type GroupMap = hashbrown::HashMap<GroupKey, u32, BuildHasherDefault<ahash::AHasher>>;
 
-#[cfg(any(test, feature = "pg_test"))]
+#[cfg(test)]
 mod tests {
     use super::super::cd_set::new_cd_set_int;
     use super::super::compact::StringArena;

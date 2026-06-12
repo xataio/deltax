@@ -732,8 +732,7 @@ pub(super) fn strcoll_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
+#[cfg(test)]
 mod tests {
     use super::*;
 

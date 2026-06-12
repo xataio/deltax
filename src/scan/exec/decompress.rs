@@ -4324,8 +4324,7 @@ unsafe fn fill_slot(slot: *mut pg_sys::TupleTableSlot, state: &DecompressState) 
     }
 }
 
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::cmp::Ordering;

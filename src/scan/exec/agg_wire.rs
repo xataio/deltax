@@ -459,8 +459,7 @@ pub(super) unsafe fn deserialize_partial(
     }
 }
 
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::scan::exec::agg::{AggExpr, AggType, OutputTransform};

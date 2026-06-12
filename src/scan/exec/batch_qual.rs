@@ -827,8 +827,7 @@ pub(super) unsafe fn extract_batch_quals(
     (batch_quals, handled_count)
 }
 
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
+#[cfg(test)]
 mod tests {
     use super::*;
 
