@@ -301,11 +301,14 @@ class TestValbitmap:
             ts = f"'{BASE_TS}'::timestamptz + interval '{i} seconds'"
             rows.append(f"({ts}, {i}, 'ov{i % 40:02d}')")
         # Segment 1 (order_id 200..399): 2 distinct values → bitmap row
-        # written; the partition valmap ends up ['common', 'meh'] only.
+        # written; the partition valmap ends up ['aaa', 'zzz'] only. The
+        # values straddle the 'ov*' band so segment 1's [min,max] range
+        # covers the probe constants below — text minmax pruning stays out
+        # of the picture and only the valbitmap decides.
         for i in range(segment_size):
             order_id = segment_size + i
             ts = f"'{BASE_TS}'::timestamptz + interval '{order_id} seconds'"
-            et = "common" if i % 2 == 0 else "meh"
+            et = "aaa" if i % 2 == 0 else "zzz"
             rows.append(f"({ts}, {order_id}, '{et}')")
         db.execute(
             "INSERT INTO evt_ov (ts, order_id, event_type) VALUES "
@@ -337,13 +340,31 @@ class TestValbitmap:
             FROM deltax.deltax_partition
             WHERE table_name LIKE 'evt_ov_%' AND is_compressed = true
         """).fetchone()[0]
-        assert valmap is not None and '"common"' in valmap
+        assert valmap is not None and '"aaa"' in valmap
         assert '"ov07"' not in valmap, (
             f"expected overflowed segment's values absent from valmap, "
             f"got: {valmap}"
         )
 
-        # The rows in the overflowed segment must come back.
+        # The rows in the overflowed segment must come back. Plan shape:
+        # the bitmap-covered segment is skipped via its bitmap row
+        # (vb_skipped=1; 'ov07' misses the ['aaa','zzz'] valmap and segment
+        # 1's [min,max] covers 'ov07', so only the valbitmap can skip it)
+        # while the overflowed segment — with NO bitmap row — must be
+        # decompressed and batch-filtered. Pre-fix, the valmap miss pruned
+        # BOTH segments without reading the bitmap table → zero rows.
+        decomp, vb_skipped = _explain_skip_counts(
+            db,
+            "SELECT * FROM evt_ov WHERE event_type = 'ov07' LIMIT 1000",
+        )
+        assert vb_skipped == 1, (
+            f"expected exactly the bitmap-covered segment skipped, "
+            f"got vb_skipped={vb_skipped}"
+        )
+        assert decomp == 1, (
+            f"expected the overflowed segment to be scanned, got "
+            f"segments={decomp}"
+        )
         got = [
             r[0]
             for r in db.execute(
@@ -355,23 +376,12 @@ class TestValbitmap:
             f"overflowed segment was wrongly pruned, got rows: {got}"
         )
 
-        # A value present nowhere still returns nothing — and only the
-        # segment WITH a bitmap row may be skipped; the overflowed one must
-        # be decompressed and batch-filtered.
-        decomp, vb_skipped = _explain_skip_counts(
-            db,
-            "SELECT * FROM evt_ov WHERE event_type = 'never' LIMIT 1000",
-        )
-        assert vb_skipped == 1, (
-            f"expected exactly the bitmap-covered segment skipped, "
-            f"got vb_skipped={vb_skipped}"
-        )
-        assert decomp == 1, (
-            f"expected the overflowed segment to be scanned, got "
-            f"segments={decomp}"
-        )
+        # A value present nowhere still returns nothing. (No plan-shape
+        # assertion here: the overflowed segment may legitimately be
+        # skipped by exact per-segment evidence at decompress time, e.g.
+        # the dictionary codec's value check.)
         n = db.execute(
-            "SELECT count(*) FROM evt_ov WHERE event_type = 'never'"
+            "SELECT count(*) FROM evt_ov WHERE event_type = 'ov0a'"
         ).fetchone()[0]
         assert n == 0
 
