@@ -520,6 +520,23 @@ pub(super) fn apply_text_in_filter(
     }
 }
 
+/// Decide whether an `Lz4` positive/negative `LIKE '%needle%'` should use the
+/// full-buffer SIMD sweep (`apply_lz4_contains_filter`) rather than the
+/// per-row fallback, given the selection already accumulated by prior quals.
+///
+/// The sweep cost is fixed (one `memmem` pass over the segment buffer); the
+/// per-row cost scales with the number of *surviving* rows. The sweep wins
+/// once more than ~1/16 of the rows still survive — comfortably separating
+/// ClickBench Q21 (`SearchPhrase <> ''` leaves ~13%, sweep) from Q22 (a dict
+/// LIKE narrows to ≪1% before the URL NOT LIKE, per-row).
+fn should_sweep_lz4_contains(sel: &[bool], row_count: usize) -> bool {
+    if sel.is_empty() {
+        return true; // no prior selection — every row is evaluated anyway
+    }
+    let surviving = sel.iter().filter(|&&s| s).count();
+    surviving.saturating_mul(16) >= row_count
+}
+
 /// Apply a text LIKE filter to a SegTextColumn, AND-ing into an existing selection.
 ///
 /// If `sel` is empty, it is initialized (all rows evaluated).
@@ -558,13 +575,19 @@ pub(super) fn apply_text_like_filter(
                 .collect();
             apply_via_dict(sel, row_count, row_to_entry, &dict_matches);
         }
-        // Buffer-sweep fast path only for the *initial* evaluation: when an
-        // earlier qual already narrowed `sel` (e.g. ClickBench Q22's dict
-        // Title LIKE before the URL NOT LIKE), the per-row path below visits
-        // only surviving rows, which beats sweeping the whole buffer for a
-        // sparse selection.
+        // Buffer-sweep fast path. The full-buffer SIMD `memmem` sweep is
+        // selection-independent: it always costs one pass over the segment's
+        // decompressed bytes (with the searcher built once) and skips per-row
+        // UTF-8 re-validation entirely. The per-row path below costs one
+        // `from_utf8` + one searcher set-up *per surviving row*, so it only
+        // wins once an earlier qual has narrowed `sel` to a sparse remainder
+        // (e.g. ClickBench Q22's dict Title LIKE before the URL NOT LIKE).
+        // When a non-trivial fraction of rows still survive (e.g. ClickBench
+        // Q21's `SearchPhrase <> ''` leaves ~13%), the sweep is far cheaper —
+        // 13M per-row `str::contains` calls otherwise dominate the scan.
         SegTextColumn::Lz4 { buf, row_to_range }
-            if sel.is_empty() && matches!(strategy, LikeStrategy::Contains(s) if !s.is_empty()) =>
+            if matches!(strategy, LikeStrategy::Contains(s) if !s.is_empty())
+                && should_sweep_lz4_contains(sel, row_count) =>
         {
             let LikeStrategy::Contains(needle) = strategy else {
                 unreachable!()
@@ -943,6 +966,50 @@ mod tests {
 
         // AND into an existing selection: already-false rows stay false.
         let mut sel = vec![false, true, true, true, true];
+        apply_text_like_filter(
+            &c,
+            &LikeStrategy::Contains("google".into()),
+            false,
+            5,
+            &mut sel,
+        );
+        assert_eq!(sel, vec![false, false, false, false, true]);
+    }
+
+    #[test]
+    fn should_sweep_lz4_contains_density_threshold() {
+        // Empty selection (initial evaluation) always sweeps.
+        assert!(should_sweep_lz4_contains(&[], 1000));
+        // A dense surviving selection (>= 1/16) favors the full-buffer sweep
+        // (ClickBench Q21: `SearchPhrase <> ''` leaves ~13%).
+        let dense = vec![true; 130]
+            .into_iter()
+            .chain(vec![false; 870])
+            .collect::<Vec<_>>();
+        assert!(should_sweep_lz4_contains(&dense, 1000));
+        // A sparse surviving selection (< 1/16) keeps the per-row path
+        // (ClickBench Q22: a dict LIKE narrows to ≪1% before the URL NOT LIKE).
+        let sparse = vec![true; 50]
+            .into_iter()
+            .chain(vec![false; 950])
+            .collect::<Vec<_>>();
+        assert!(!should_sweep_lz4_contains(&sparse, 1000));
+    }
+
+    #[test]
+    fn apply_text_like_filter_lz4_contains_sparse_selection_matches_sweep() {
+        // Whichever path the density gate picks, results are identical.
+        // Drive the per-row path with a sparse prior selection and confirm
+        // it agrees with the buffer sweep's semantics (NULL/empty handling).
+        let c = lz4_col(&[
+            Some("http://google.com/q"),
+            Some("http://example.com"),
+            None,
+            Some(""),
+            Some("agooglea"),
+        ]);
+        // Only one row survives the prior filter (< 1/16) → per-row path.
+        let mut sel = vec![false, false, false, false, true];
         apply_text_like_filter(
             &c,
             &LikeStrategy::Contains("google".into()),
