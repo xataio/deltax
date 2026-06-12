@@ -451,6 +451,7 @@ unsafe fn lookup_point_segments_by_minmax_index(
                 col_sums: HashMap::new(),
                 toast_pointers: vec![Vec::new(); num_blob_cols],
                 cached_blob_pins: Vec::new(),
+                blob_file_backing: None,
             });
         }
 
@@ -869,9 +870,10 @@ pub(super) fn segment_skippable_by_dict(
 /// keeps working without changes.
 pub(crate) enum BlobBytes {
     Owned(Vec<u8>),
-    /// Borrowed bytes from the blob cache. Valid for the lifetime of
-    /// the surrounding `SegmentData` (i.e. until the matching pin in
-    /// `cached_blob_pins` drops).
+    /// Borrowed bytes from the blob cache (lifetime guaranteed by the
+    /// matching pin in `cached_blob_pins`) or from an mmap'd segment file
+    /// (lifetime guaranteed by `blob_file_backing`). Valid for the
+    /// lifetime of the surrounding `SegmentData`.
     Cached {
         data: *const u8,
         len: u32,
@@ -936,6 +938,12 @@ pub(super) struct SegmentData {
     /// runs on the leader before worker dispatch and segments are owned by
     /// the leader's `DecompressState`). Released automatically on drop.
     pub(super) cached_blob_pins: Vec<crate::blob_cache::BlobCachePin>,
+    /// Keeps the mmap'd segment file alive while `compressed_blobs` holds
+    /// `BlobBytes::Cached` raw-pointer views into it (file-backed
+    /// partitions, see `segment_file::mapped_file_for_companion`). Declared
+    /// after `compressed_blobs` so the views drop first — same drop-order
+    /// discipline as `cached_blob_pins`. `None` for TOAST-backed reads.
+    pub(super) blob_file_backing: Option<std::sync::Arc<crate::segment_file::MappedSegmentFile>>,
 }
 
 // SAFETY: SegmentData is shared across threads only via immutable references
@@ -2192,6 +2200,7 @@ pub(super) unsafe fn load_segments_heap(
                 col_sums,
                 toast_pointers,
                 cached_blob_pins: Vec::new(),
+                blob_file_backing: None,
             });
         }
 
@@ -3232,7 +3241,78 @@ pub(super) unsafe fn load_segments_heap(
             .enumerate()
             .any(|(i, name)| !segment_by.contains(name) && needed_cols[i]);
 
-        if !segments.is_empty() && any_blobs_needed && !skip_blob_load {
+        // ================================================================
+        // Phase 2 (file-backed): serve blob slices straight from the
+        // partition's mmap'd segment file when the catalog points at one
+        // (`blob_storage = 'dual'` compressions). No B-tree probe, no TOAST
+        // reassembly, no copy — `BlobBytes::Cached` views point into the
+        // mapping, kept alive by each segment's `blob_file_backing`.
+        // `lazy_cols` is intentionally ignored here: a "fetch" is pointer
+        // arithmetic, so eager filling is strictly cheaper than deferring
+        // (toast_pointers stay empty → the lazy machinery no-ops).
+        // Any problem (missing/corrupt file) falls back to the TOAST blobs
+        // table below, which dual mode guarantees is populated.
+        // ================================================================
+        let mut file_loaded = false;
+        if !segments.is_empty()
+            && any_blobs_needed
+            && !skip_blob_load
+            && let Some(file) = crate::segment_file::mapped_file_for_companion(meta_oid)
+        {
+            use crate::segment_file::BlobLookup;
+            let t_file = std::time::Instant::now();
+            let verify = crate::segment_file::verify_checksums();
+            let mut needed_col_indices: Vec<(u16, usize)> = Vec::new(); // (col_idx, blob_slot_idx)
+            for i in 0..col_names.len() {
+                let Some(ci) = col_idx_map[i] else {
+                    continue;
+                };
+                if needed_cols[i] {
+                    needed_col_indices.push((ci, ci as usize));
+                }
+            }
+            file_loaded = true;
+            'fill: for seg in segments.iter_mut() {
+                for &(col_idx, blob_slot) in &needed_col_indices {
+                    match file.get(col_idx, seg.segment_id, verify) {
+                        BlobLookup::Found(slice) => {
+                            seg.compressed_blobs[blob_slot] = BlobBytes::Cached {
+                                data: slice.as_ptr(),
+                                len: slice.len() as u32,
+                            };
+                        }
+                        // Absent mirrors a missing blobs-table row
+                        // (all-null column) — leave the slot empty.
+                        BlobLookup::Absent => {}
+                        BlobLookup::Corrupt => {
+                            pgrx::warning!(
+                                "pg_deltax: segment-file blob (col {}, seg {}) failed checksum; \
+                                 falling back to TOAST blobs",
+                                col_idx,
+                                seg.segment_id
+                            );
+                            file_loaded = false;
+                            break 'fill;
+                        }
+                    }
+                }
+            }
+            if file_loaded {
+                for seg in segments.iter_mut() {
+                    seg.blob_file_backing = Some(std::sync::Arc::clone(&file));
+                }
+                detoast_us = t_file.elapsed().as_micros() as u64;
+            } else {
+                // Drop the partially-filled mmap views before falling back.
+                for seg in segments.iter_mut() {
+                    for slot in seg.compressed_blobs.iter_mut() {
+                        *slot = BlobBytes::default();
+                    }
+                }
+            }
+        }
+
+        if !segments.is_empty() && any_blobs_needed && !skip_blob_load && !file_loaded {
             // Derive blob table OID from meta table name
             let meta_name_ptr = pg_sys::get_rel_name(meta_oid);
             let meta_name = std::ffi::CStr::from_ptr(meta_name_ptr)
@@ -3673,6 +3753,56 @@ pub(super) unsafe fn fetch_segment_blobs(
             seg.compressed_blobs = Vec::with_capacity(num_blob_cols);
             seg.compressed_blobs
                 .resize_with(num_blob_cols, BlobBytes::default);
+        }
+
+        // File-backed fast path: serve blob slices straight from the
+        // partition's mmap'd segment file (dual-mode compressions). On a
+        // checksum failure the slots filled here are reset and the TOAST
+        // path below takes over for the whole segment.
+        if let Some(file) = crate::segment_file::mapped_file_for_companion(companion_oid) {
+            use crate::segment_file::BlobLookup;
+            let verify = crate::segment_file::verify_checksums();
+            let mut filled: Vec<usize> = Vec::new();
+            let mut corrupt = false;
+            'cols: for i in 0..col_names.len() {
+                if !needed_cols[i] {
+                    continue;
+                }
+                let Some(ci) = blob_idx[i] else {
+                    continue;
+                };
+                let blob_slot = ci as usize;
+                if !seg.compressed_blobs[blob_slot].is_empty() {
+                    continue; // already fetched
+                }
+                match file.get(ci, segment_id, verify) {
+                    BlobLookup::Found(slice) => {
+                        seg.compressed_blobs[blob_slot] = BlobBytes::Cached {
+                            data: slice.as_ptr(),
+                            len: slice.len() as u32,
+                        };
+                        filled.push(blob_slot);
+                    }
+                    // Absent mirrors a missing blobs-table row — leave empty.
+                    BlobLookup::Absent => {}
+                    BlobLookup::Corrupt => {
+                        corrupt = true;
+                        break 'cols;
+                    }
+                }
+            }
+            if !corrupt {
+                seg.blob_file_backing = Some(file);
+                return t_start.elapsed().as_micros() as u64;
+            }
+            pgrx::warning!(
+                "pg_deltax: segment-file blob lookup failed checksum for segment {}; \
+                 falling back to TOAST blobs",
+                segment_id
+            );
+            for blob_slot in filled {
+                seg.compressed_blobs[blob_slot] = BlobBytes::default();
+            }
         }
 
         let blob_oid = sibling_table_oid(companion_oid, "_blobs");

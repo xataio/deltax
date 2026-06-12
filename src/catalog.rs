@@ -1008,12 +1008,45 @@ pub fn mark_partition_decompressed(
     client.update(
         "UPDATE deltax.deltax_partition
          SET is_compressed = false, compressed_size = NULL, raw_size = NULL,
-             row_count = NULL, compressed_at = NULL
+             row_count = NULL, compressed_at = NULL, blob_file = NULL
          WHERE id = $1",
         None,
         &[partition_id.into()],
     )?;
     Ok(())
+}
+
+/// Record the data-directory-relative path of a partition's dual-mode
+/// segment file (see `segment_file::write_partition_blob_file`). NULL means
+/// the TOAST-backed `_blobs` companion table is the only blob source.
+pub fn update_partition_blob_file(
+    client: &mut SpiClient,
+    partition_id: i32,
+    rel_path: &str,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_partition SET blob_file = $1 WHERE id = $2",
+        None,
+        &[rel_path.into(), partition_id.into()],
+    )?;
+    Ok(())
+}
+
+/// Read back a partition's segment-file path (used by decompress to unlink
+/// the file before the catalog row is cleared).
+pub fn get_partition_blob_file(
+    client: &SpiClient,
+    partition_id: i32,
+) -> spi::SpiResult<Option<String>> {
+    let result = client.select(
+        "SELECT blob_file FROM deltax.deltax_partition WHERE id = $1",
+        None,
+        &[partition_id.into()],
+    )?;
+    if result.is_empty() {
+        return Ok(None);
+    }
+    result.first().get_one::<String>()
 }
 
 /// Install the DML rejection trigger on a compressed leaf partition.

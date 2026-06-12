@@ -917,6 +917,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         mut column_valmap,
         mut column_valcounts,
         partition_topvals,
+        blob_file_rel,
     ) = compress_partition_streaming(
         client,
         &part_fqn,
@@ -925,6 +926,7 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         &ht.order_by,
         &ht.segment_by,
         segment_size,
+        part_info.id,
     );
 
     // Empty partition — clean up tables and return
@@ -989,6 +991,13 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
     .expect("failed to update catalog");
     catalog::install_compressed_dml_trigger(client, &schema, &part_table)
         .expect("failed to install compressed partition DML trigger");
+
+    // Dual mode: point the catalog at the fsynced segment file. Reads
+    // branch on this column per partition; NULL means TOAST-only.
+    if let Some(rel_path) = &blob_file_rel {
+        catalog::update_partition_blob_file(client, part_info.id, rel_path)
+            .expect("failed to update partition blob_file");
+    }
 
     // Persist per-column ndistinct from the partition-level HLL merge
     // (strictly more accurate than the old MAX-over-segments approach,
@@ -2377,7 +2386,11 @@ pub(crate) fn build_companion_ddl(part_table: &str, columns: &[ColumnMeta]) -> C
 /// `{column_name: [val0, val1, ...]}` where the array index is the bit
 /// position in each segment's bitmap; absent columns means "no bitmap"
 /// (e.g. > 32 distinct values across the partition or non-text type).
-#[allow(clippy::type_complexity)]
+/// The final `Option<String>` is the data-directory-relative path of the
+/// dual-mode segment file (`pg_deltax.blob_storage = 'dual'`), written and
+/// fsynced before this function returns — i.e. before the surrounding
+/// transaction can commit.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn compress_partition_streaming(
     client: &mut SpiClient,
     part_fqn: &str,
@@ -2386,6 +2399,7 @@ fn compress_partition_streaming(
     order_by: &[String],
     segment_by: &[String],
     segment_size: usize,
+    partition_id: i32,
 ) -> (
     i64,
     i64,
@@ -2393,6 +2407,7 @@ fn compress_partition_streaming(
     std::collections::HashMap<String, Vec<String>>,
     ColumnValcounts,
     TopVals,
+    Option<String>,
 ) {
     let batch_size = segment_size;
 
@@ -2698,6 +2713,7 @@ fn compress_partition_streaming(
     }
 
     // Flush blobs column-major into the blobs table
+    let mut blob_file_rel: Option<String> = None;
     if !blob_buffer.is_empty() {
         client
             .update(&ddl.blobs_ddl, None, &[])
@@ -2705,6 +2721,22 @@ fn compress_partition_streaming(
 
         // Sort by (col_idx, segment_id) for column-major insertion order
         blob_buffer.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
+
+        // Dual mode: additionally persist the same blob bytes as one
+        // immutable segment file, fsynced before the compression
+        // transaction commits (dev/docs/STORAGE_V2.md §3). Failure aborts
+        // the compression — the partition heap is still intact and any
+        // partial file is an orphan for the (P2) GC sweep.
+        if crate::blob_storage_dual() {
+            match crate::segment_file::write_partition_blob_file(partition_id, &blob_buffer) {
+                Ok(rel_path) => blob_file_rel = Some(rel_path),
+                Err(e) => pgrx::error!(
+                    "pg_deltax: failed to write segment file for partition {}: {}",
+                    partition_id,
+                    e
+                ),
+            }
+        }
 
         for (col_idx, seg_id, blob) in blob_buffer {
             use pgrx::datum::DatumWithOid;
@@ -2827,6 +2859,7 @@ fn compress_partition_streaming(
         column_valmap,
         column_valcounts,
         partition_topvals,
+        blob_file_rel,
     )
 }
 
@@ -3615,8 +3648,16 @@ fn decompress_partition_inner(client: &mut SpiClient, partition: &str) -> String
         .update(&format!("DROP TABLE IF EXISTS {}", meta_fqn), None, &[])
         .expect("failed to drop meta table");
 
-    // 5. Update catalog
+    // 5. Update catalog (clears blob_file) and unlink the dual-mode segment
+    // file, if any. Unlink is best-effort and happens before commit: if the
+    // transaction later aborts, the catalog still references a missing file
+    // and reads fall back to the TOAST blobs table (which dual mode keeps
+    // populated), so no data is lost.
+    let blob_file = catalog::get_partition_blob_file(client, part_info.id).unwrap_or(None);
     catalog::mark_partition_decompressed(client, part_info.id).expect("failed to update catalog");
+    if let Some(rel_path) = blob_file {
+        crate::segment_file::unlink_blob_file(&rel_path);
+    }
 
     crate::scan::invalidate_compressed_cache();
 

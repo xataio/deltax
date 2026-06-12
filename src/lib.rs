@@ -21,6 +21,7 @@ mod ddl;
 mod functions;
 mod partition;
 mod scan;
+mod segment_file;
 mod stats;
 mod timeparse;
 mod worker;
@@ -65,6 +66,20 @@ pub(crate) static DISABLE_PARALLEL_AGG: GucSetting<bool> = GucSetting::<bool>::n
 /// Default is `none` until Step 5 (executor synthetic slot population) lands.
 pub(crate) static JSON_EXTRACT_MODE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"none"));
+
+/// Where new compressions put the bulk compressed blob bytes
+/// (`dev/docs/STORAGE_V2.md`). `toast` (default) — companion `_blobs`
+/// table only, current behaviour. `dual` — additionally write one
+/// immutable mmap-able segment file per partition under
+/// `$PGDATA/pg_deltax/<db_oid>/`; reads prefer the file and fall back to
+/// TOAST on any file problem. Controls *new* compressions only; reads
+/// always follow the per-partition `blob_file` catalog column.
+pub(crate) static BLOB_STORAGE: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"toast"));
+
+/// Verify per-blob CRC32C on every segment-file lookup. Debug builds
+/// always verify regardless of this setting.
+pub(crate) static VERIFY_FILE_CHECKSUMS: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 /// Size of the process-shared blob cache, in MiB. `0` disables the cache.
 /// Default `-1` means auto: 25% of physical RAM, clamped to
@@ -118,6 +133,25 @@ pub(crate) fn get_scan_parallel_workers() -> i32 {
 
 pub(crate) fn get_parallel_regex() -> bool {
     PARALLEL_REGEX.get()
+}
+
+/// Resolve `pg_deltax.blob_storage` to "should the compress path also
+/// write a segment file". Errors out on unknown values (`file` is reserved
+/// for the post-P1 file-only mode).
+pub(crate) fn blob_storage_dual() -> bool {
+    let raw = BLOB_STORAGE.get();
+    let s = raw
+        .as_ref()
+        .and_then(|c| c.to_str().ok())
+        .unwrap_or("toast");
+    match s {
+        "toast" | "" => false,
+        "dual" => true,
+        other => pgrx::error!(
+            "pg_deltax.blob_storage: unknown value {:?} (expected: toast, dual)",
+            other
+        ),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +229,7 @@ ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_mcv JSONB;
 ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract JSONB;
 ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract_added_at TIMESTAMPTZ;
 ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS compressed_columns JSONB;
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS blob_file TEXT;
 
 CREATE OR REPLACE FUNCTION deltax.deltax_reject_compressed_partition_dml()
 RETURNS trigger
@@ -279,6 +314,22 @@ pub extern "C-unwind" fn _PG_init() {
         c"How COPY extracts JSON paths into extra columnar columns: none, fields, or all (all not yet implemented)",
         c"none disables extraction; fields uses the path list configured in deltax_enable_compression; all auto-discovers scalar leaves (not yet implemented).",
         &JSON_EXTRACT_MODE,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_string_guc(
+        c"pg_deltax.blob_storage",
+        c"Where new compressions store bulk compressed blob bytes: toast or dual",
+        c"toast (default) stores blobs only in the TOAST-backed companion table. dual additionally writes one immutable segment file per partition under $PGDATA/pg_deltax/<db_oid>/; reads prefer the file and silently fall back to TOAST on any file problem. Applies to new compressions only — reads always follow the per-partition blob_file catalog column. See dev/docs/STORAGE_V2.md.",
+        &BLOB_STORAGE,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.verify_file_checksums",
+        c"Verify per-blob CRC32C on every segment-file read",
+        c"Default OFF in release builds (debug builds always verify). A CRC mismatch makes the scan fall back to the TOAST blobs table for the partition.",
+        &VERIFY_FILE_CHECKSUMS,
         GucContext::Userset,
         GucFlags::default(),
     );

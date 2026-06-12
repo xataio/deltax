@@ -601,14 +601,14 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
     // Find partitions eligible for dropping: range_end < now() - drop_after
     let eligible = client
         .select(
-            "SELECT schema_name, table_name, is_compressed FROM deltax.deltax_partition
+            "SELECT schema_name, table_name, is_compressed, blob_file FROM deltax.deltax_partition
              WHERE deltatable_id = $1 AND range_end < $2::timestamptz - $3::interval",
             None,
             &[ht.id.into(), now.into(), (*drop_after).into()],
         )
         .expect("failed to query eligible partitions for retention");
 
-    let mut partitions: Vec<(String, String, bool)> = Vec::new();
+    let mut partitions: Vec<(String, String, bool, Option<String>)> = Vec::new();
     for row in eligible {
         let schema: String = row
             .get_datum_by_ordinal(1)
@@ -628,12 +628,17 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
             .value::<bool>()
             .unwrap()
             .unwrap_or(false);
-        partitions.push((schema, name, is_compressed));
+        let blob_file: Option<String> = row
+            .get_datum_by_ordinal(4)
+            .unwrap()
+            .value::<String>()
+            .unwrap();
+        partitions.push((schema, name, is_compressed, blob_file));
     }
 
     let parent_fqn = fqn(&ht.schema_name, &ht.table_name);
 
-    for (schema, name, is_compressed) in &partitions {
+    for (schema, name, is_compressed, blob_file) in &partitions {
         if *is_compressed {
             for suffix in ["blobs", "blooms", "text_lengths", "colstats", "meta"] {
                 let fqn = format!("\"_deltax_compressed\".\"{}_{}\"", name, suffix);
@@ -641,6 +646,11 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
                     .update(&format!("DROP TABLE IF EXISTS {}", fqn), None, &[])
                     .expect("failed to drop companion table");
             }
+        }
+        // Best-effort unlink of the dual-mode segment file; failure leaves
+        // an orphan for the (P2) GC sweep.
+        if let Some(rel_path) = blob_file {
+            crate::segment_file::unlink_blob_file(rel_path);
         }
 
         let part_fqn = fqn(schema, name);
