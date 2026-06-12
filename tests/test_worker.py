@@ -247,3 +247,98 @@ def test_worker_retention_drops_old_partitions(postgres_db):
 
     finally:
         _cleanup(db, table)
+
+
+def test_worker_survives_error_in_cycle(postgres_db):
+    """An ERROR mid-cycle must not kill the worker process.
+
+    Plants a catalog row whose backing table doesn't exist — the steady-state
+    equivalent of the race where _cleanup() drops a table between the worker's
+    catalog read and its per-table SQL (pg_reload_conf in _cleanup wakes the
+    worker via SIGHUP right before the DELETE + DROP commit). The worker's
+    cycle hits `relation "..._default" does not exist`; before the per-cycle
+    error isolation this terminated the worker permanently (pgrx registers
+    bgworkers with BGW_NEVER_RESTART by default), making every later worker
+    test time out.
+    """
+    db = postgres_db
+    table = _unique_table()
+    ghost = "wt_ghost_" + uuid.uuid4().hex[:8]
+
+    try:
+        db.execute("SET pg_deltax.mock_now = '2025-06-15 00:00:00+00'")
+        db.execute(
+            f'CREATE TABLE "{table}" (ts TIMESTAMPTZ NOT NULL, val FLOAT8)'
+        )
+        db.commit()
+        db.execute(
+            f"SELECT deltax.deltax_create_table('{table}', 'ts', '1 day', 1)"
+        )
+        db.commit()
+        initial = db.execute(
+            f"SELECT count(*) FROM deltax.deltax_partition_info('{table}')"
+        ).fetchone()[0]
+
+        # Ghost entry: catalog row without a backing table. Every worker
+        # cycle that sees it raises ERROR on `SELECT count(*) FROM
+        # "<ghost>_default"`.
+        db.execute(
+            "INSERT INTO deltax.deltax_deltatable "
+            "(schema_name, table_name, time_column, partition_interval) "
+            "VALUES ('public', %s, 'ts', '1 day')",
+            (ghost,),
+        )
+        db.commit()
+
+        # Wake the worker (pg_reload_conf sends SIGHUP). Its next cycle reads
+        # the catalog after our commit, so it is guaranteed to trip over the
+        # ghost row.
+        _alter_system(
+            "ALTER SYSTEM SET pg_deltax.mock_now = '2025-06-15 00:00:00+00'"
+        )
+        time.sleep(10)
+
+        # Since #38 the launcher spawns one dynamic worker per target
+        # database, named 'pg_deltax maintenance worker (<db>)'.
+        alive = db.execute(
+            "SELECT count(*) FROM pg_stat_activity "
+            "WHERE backend_type LIKE 'pg_deltax maintenance worker%'"
+        ).fetchone()[0]
+        db.commit()
+        assert alive >= 1, "Worker process died after an error in its cycle"
+
+        # Remove the ghost and verify the worker still does useful work:
+        # jump time forward so it has new partitions to create.
+        db.execute(
+            "DELETE FROM deltax.deltax_deltatable WHERE table_name = %s",
+            (ghost,),
+        )
+        db.commit()
+        _alter_system(
+            "ALTER SYSTEM SET pg_deltax.mock_now = '2025-06-20 00:00:00+00'"
+        )
+
+        deadline = time.time() + 90
+        new_count = initial
+        while time.time() < deadline:
+            time.sleep(5)
+            new_count = db.execute(
+                f"SELECT count(*) FROM deltax.deltax_partition_info('{table}')"
+            ).fetchone()[0]
+            db.commit()
+            if new_count > initial:
+                break
+
+        assert new_count > initial, (
+            "Worker did not resume maintenance after the failing catalog "
+            "entry was removed"
+        )
+
+    finally:
+        db.rollback()
+        db.execute(
+            "DELETE FROM deltax.deltax_deltatable WHERE table_name = %s",
+            (ghost,),
+        )
+        db.commit()
+        _cleanup(db, table)

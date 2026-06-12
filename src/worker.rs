@@ -9,6 +9,13 @@ use crate::partition;
 
 const DEFAULT_WORKER_INTERVAL_SECS: u64 = 60;
 
+/// How long the postmaster waits before restarting a maintenance worker
+/// after an abnormal exit. Without a restart time (BGW_NEVER_RESTART, the
+/// pgrx default) an unexpected worker death would turn into a permanent,
+/// silent loss of all partition maintenance for that database until the
+/// next server restart.
+const WORKER_RESTART_SECS: u64 = 5;
+
 /// Parse `pg_deltax.target_database` into a trimmed, deduplicated,
 /// order-preserving list of database names. An empty/blank GUC yields
 /// the upstream default `["postgres"]`. Only call this from a launched
@@ -48,6 +55,11 @@ pub(crate) fn target_databases() -> Vec<String> {
 /// the same pattern pg_cron and pg_partman use. Launcher + each worker
 /// consume one max_worker_processes slot apiece; list changes require a
 /// restart (the GUC is Postmaster context).
+///
+/// The launcher itself is deliberately registered WITHOUT a restart time:
+/// it exits normally after fan-out, and a restarting launcher would spawn
+/// duplicate dynamic workers. Crash resilience lives on the dynamic
+/// workers via `WORKER_RESTART_SECS`.
 pub fn register_bgworker() {
     BackgroundWorkerBuilder::new("pg_deltax maintenance launcher")
         .set_function("deltax_launcher_main")
@@ -70,7 +82,7 @@ pub extern "C-unwind" fn deltax_launcher_main(_arg: pg_sys::Datum) {
                 .set_library("pg_deltax")
                 .set_argument((i as i32).into_datum())
                 .enable_spi_access()
-                .set_restart_time(Some(Duration::from_secs(60)))
+                .set_restart_time(Some(Duration::from_secs(WORKER_RESTART_SECS)))
                 .load_dynamic();
         match spawned {
             Ok(_) => log!("pg_deltax: launched maintenance worker for database {}", db),
@@ -122,6 +134,28 @@ pub extern "C-unwind" fn deltax_worker_main(arg: pg_sys::Datum) {
     );
 
     while BackgroundWorker::wait_latch(Some(Duration::from_secs(DEFAULT_WORKER_INTERVAL_SECS))) {
+        run_maintenance_cycle();
+    }
+
+    log!("pg_deltax: background worker shutting down");
+}
+
+/// Run one maintenance pass, isolated from Postgres ERRORs.
+///
+/// Any ERROR raised mid-cycle would otherwise unwind out of
+/// `deltax_worker_main` and terminate the worker process. The most common
+/// source is a deltatable dropped concurrently between our catalog read and
+/// the per-table SQL: `relation "<table>_default" does not exist`. The
+/// integration-test `_cleanup()` produces exactly that window — it calls
+/// `pg_reload_conf()` (whose SIGHUP wakes this worker) immediately before
+/// committing the catalog DELETE + DROP TABLE. Before the worker had a
+/// restart time (see `WORKER_RESTART_SECS`), one such transient error
+/// silently disabled all maintenance until the next server restart.
+///
+/// On error: log it, tear down the aborted transaction, and return — the
+/// next wakeup retries with a fresh catalog snapshot.
+fn run_maintenance_cycle() {
+    PgTryBuilder::new(|| {
         // Check if we're on a replica — skip all maintenance if so
         let is_replica = BackgroundWorker::transaction(|| {
             Spi::get_one::<bool>("SELECT pg_is_in_recovery()")
@@ -130,7 +164,7 @@ pub extern "C-unwind" fn deltax_worker_main(arg: pg_sys::Datum) {
         });
 
         if is_replica {
-            continue;
+            return;
         }
 
         BackgroundWorker::transaction(|| {
@@ -238,9 +272,28 @@ pub extern "C-unwind" fn deltax_worker_main(arg: pg_sys::Datum) {
                 }
             })
         });
-    }
-
-    log!("pg_deltax: background worker shutting down");
+    })
+    .catch_others(|e| {
+        // The unwind escaped `BackgroundWorker::transaction` before its
+        // commit, so the failed transaction (and its active snapshot) is
+        // still open. Tear it down the way C background workers do in their
+        // sigsetjmp recovery block (cf. autovacuum.c): get out of the
+        // transaction's memory context (about to be deleted) and abort
+        // whatever transaction state remains. `PgTryBuilder` calls
+        // `FlushErrorState()` after this handler returns.
+        unsafe {
+            pg_sys::MemoryContextSwitchTo(pg_sys::TopMemoryContext);
+            pg_sys::AbortOutOfAnyTransaction();
+        }
+        use pgrx::pg_sys::panic::CaughtError;
+        let msg = match &e {
+            CaughtError::PostgresError(r)
+            | CaughtError::ErrorReport(r)
+            | CaughtError::RustPanic { ereport: r, .. } => r.message().to_string(),
+        };
+        log!("pg_deltax: maintenance cycle aborted, will retry on next wakeup: {msg}");
+    })
+    .execute();
 }
 
 /// Outcome of a single drain pass: how many rows were moved from the
