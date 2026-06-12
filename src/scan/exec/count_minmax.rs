@@ -879,8 +879,7 @@ fn sum_i128_to_datum(acc: i128, result_oid: pg_sys::Oid, _col_oid: pg_sys::Oid) 
     }
 }
 
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::compress::{

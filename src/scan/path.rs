@@ -2943,8 +2943,7 @@ pub unsafe extern "C-unwind" fn plan_deltax_append_path(
     }
 }
 
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
+#[cfg(test)]
 mod tests {
     use super::*;
 

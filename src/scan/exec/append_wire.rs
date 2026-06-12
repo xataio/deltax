@@ -559,8 +559,7 @@ impl DeltaXAppendView {
 unsafe impl Send for DeltaXAppendView {}
 unsafe impl Sync for DeltaXAppendView {}
 
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;

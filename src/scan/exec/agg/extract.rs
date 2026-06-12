@@ -165,7 +165,7 @@ pub(super) fn extract_subday_from_bigint_scaled(value: i64, divisor: i64, unit: 
     }
 }
 
-#[cfg(any(test, feature = "pg_test"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

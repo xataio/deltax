@@ -709,6 +709,11 @@ mod tests {
     /// Differential check: SimplePattern must agree with the Rust regex
     /// engine (which itself is verified against PG semantics above) on
     /// every input.
+    ///
+    /// Only called from `#[test]` fns, which rustc strips outside `--test`
+    /// builds, so gate it on `cfg(test)` to keep `pg_test`-feature builds
+    /// of the cdylib warning-free.
+    #[cfg(test)]
     fn assert_simple_matches_regex(pattern: &str, replacement: &str, inputs: &[&str]) {
         let sp = SimplePattern::try_parse(pattern, replacement)
             .unwrap_or_else(|| panic!("pattern should parse: {pattern}"));

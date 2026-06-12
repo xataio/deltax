@@ -4029,8 +4029,7 @@ pub(super) unsafe fn extract_segment_filters(
     (segment_by_filters, time_min, time_max)
 }
 
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
+#[cfg(test)]
 mod tests {
     use super::*;
 

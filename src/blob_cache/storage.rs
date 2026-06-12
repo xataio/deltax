@@ -1012,8 +1012,7 @@ unsafe fn evict_in_shard(
     }
 }
 
-#[cfg(any(test, feature = "pg_test"))]
-#[pgrx::pg_schema]
+#[cfg(test)]
 mod tests {
     use super::*;
 
