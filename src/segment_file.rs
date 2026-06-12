@@ -39,6 +39,8 @@ use std::sync::Arc;
 use memmap2::Mmap;
 use pgrx::pg_sys;
 
+use crate::scan::exec::datum_utils::tupdesc_get_attr;
+
 const MAGIC: [u8; 6] = *b"DXSEG\0";
 const FOOTER_MAGIC: [u8; 4] = *b"DXSE";
 const VERSION: u16 = 1;
@@ -112,9 +114,8 @@ fn round_up(v: u64, align: u64) -> u64 {
     v.div_ceil(align) * align
 }
 
-/// Serialize the 64-byte header. Shared by the one-shot encoder (SPI
-/// compress path) and the incremental `SegmentFileWriter` (COPY
-/// direct-backfill path) so the two can never drift.
+/// Serialize the 64-byte header. Shared by `SegmentFileWriter` and the
+/// test-only one-shot encoder so the two can never drift.
 fn encode_header(
     partition_id: u32,
     n_columns: u32,
@@ -179,9 +180,12 @@ fn count_distinct(entries: &[IndexEntry]) -> (u32, u32) {
     (n_columns, n_segments)
 }
 
-/// Serialize the full `.dxs` image for one partition. `blobs` must be
-/// sorted by `(col_idx, segment_id)` — the same column-major order the
-/// blobs-table flush uses — and segment ids must be non-negative.
+/// Serialize the full `.dxs` image for one partition in one shot. Test-only
+/// oracle: `incremental_writer_matches_one_shot_encoder` pins the
+/// `SegmentFileWriter` (the single production write path) to this pure
+/// encoding. `blobs` must be sorted by `(col_idx, segment_id)` and segment
+/// ids must be non-negative.
+#[cfg(test)]
 pub(crate) fn encode_segment_file(partition_id: u32, blobs: &[(u16, i32, Vec<u8>)]) -> Vec<u8> {
     debug_assert!(
         blobs
@@ -339,43 +343,18 @@ pub(crate) fn parse_and_validate(
 // Writer (durable: tmp + fsync + rename + dir fsync)
 // ============================================================================
 
-/// Write `image` to `dir/file_name` durably: write to a `.tmp` sibling,
-/// fsync it, rename into place, then fsync the directory (and its parent,
-/// covering a freshly-created `pg_deltax/<db>` hierarchy). Must complete
-/// before the surrounding compression transaction commits so a committed
-/// catalog row never references a missing/torn file.
-pub(crate) fn write_segment_file(dir: &Path, file_name: &str, image: &[u8]) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let tmp_path = dir.join(format!("{file_name}.tmp"));
-    let final_path = dir.join(file_name);
-    {
-        let mut f = File::create(&tmp_path)?;
-        f.write_all(image)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp_path, &final_path)?;
-    File::open(dir)?.sync_all()?;
-    if let Some(parent) = dir.parent() {
-        // Best-effort: makes the <db_oid> dir entry itself durable.
-        let _ = File::open(parent).and_then(|d| d.sync_all());
-    }
-    Ok(())
-}
-
-// ============================================================================
-// Incremental writer (COPY direct-backfill path)
-// ============================================================================
-
-/// Streaming `.dxs` writer for the COPY direct-backfill path, where blob
-/// batches arrive across multiple `flush_partition_blobs` drains
-/// (`BLOB_BUFFER_THRESHOLD` early flushes) and the total may exceed what we
-/// want to hold in memory. Blobs are appended as they drain (column-major
-/// within each batch; global order across batches is not required — the
-/// format only needs index entries to carry correct offsets, and `finish`
-/// sorts the index). The index, footer, and final header are written once
-/// in `finish()`, followed by the same fsync + rename + dir-fsync dance as
-/// `write_segment_file` — so `finish()` must complete before the COPY
-/// transaction commits a `blob_file` reference (STORAGE_V2.md §3).
+/// Streaming `.dxs` writer — the single production write path, used one-shot
+/// by the SPI compress path (`write_partition_blob_file`) and incrementally
+/// by the COPY direct-backfill path, where blob batches arrive across
+/// multiple `flush_partition_blobs` drains (`BLOB_BUFFER_THRESHOLD` early
+/// flushes) and the total may exceed what we want to hold in memory. Blobs
+/// are appended as they drain (column-major within each batch; global order
+/// across batches is not required — the format only needs index entries to
+/// carry correct offsets, and `finish` sorts the index). The index, footer,
+/// and final header are written once in `finish()`, followed by fsync +
+/// rename + dir fsync — so `finish()` must complete before the surrounding
+/// transaction commits a `blob_file` reference (STORAGE_V2.md §3): a
+/// committed catalog row never references a missing/torn file.
 ///
 /// Until `finish()` succeeds only the `.tmp` sibling exists; an errored or
 /// abandoned writer leaves at most a `.tmp` orphan (removed best-effort by
@@ -591,9 +570,12 @@ pub(crate) fn write_partition_blob_file(
     partition_id: i32,
     blobs: &[(u16, i32, Vec<u8>)],
 ) -> std::io::Result<String> {
-    let (dir, file_name, rel_path) = partition_file_location(partition_id);
-    let image = encode_segment_file(partition_id as u32, blobs);
-    write_segment_file(&dir, &file_name, &image)?;
+    let (mut writer, rel_path) = SegmentFileWriter::create_for_partition(partition_id)?;
+    if let Err(e) = writer.append_blobs(blobs) {
+        writer.abandon();
+        return Err(e);
+    }
+    writer.finish()?;
     Ok(rel_path)
 }
 
@@ -664,36 +646,6 @@ fn resolve_and_open(meta_oid: pg_sys::Oid) -> Option<Arc<MappedSegmentFile>> {
             );
             None
         }
-    }
-}
-
-/// Get a pointer to the i-th `FormData_pg_attribute` from a TupleDesc.
-/// PG17 stores attrs directly; PG18 stores CompactAttribute first, then
-/// attrs. (Local copy of `scan::exec::datum_utils::tupdesc_get_attr`,
-/// which is scoped to the scan module.)
-#[cfg(feature = "pg17")]
-#[inline]
-unsafe fn tupdesc_get_attr(
-    tupdesc: pg_sys::TupleDesc,
-    i: usize,
-) -> *const pg_sys::FormData_pg_attribute {
-    unsafe { (*tupdesc).attrs.as_ptr().add(i) }
-}
-
-#[cfg(feature = "pg18")]
-#[inline]
-unsafe fn tupdesc_get_attr(
-    tupdesc: pg_sys::TupleDesc,
-    i: usize,
-) -> *const pg_sys::FormData_pg_attribute {
-    unsafe {
-        let natts = (*tupdesc).natts as usize;
-        let att_pointer = (*tupdesc)
-            .compact_attrs
-            .as_ptr()
-            .add(natts)
-            .cast::<pg_sys::FormData_pg_attribute>();
-        att_pointer.add(i)
     }
 }
 
@@ -863,7 +815,7 @@ mod tests {
         let blobs = sample_blobs();
         let image = encode_segment_file(7, &blobs);
         let dir = tmp_dir();
-        write_segment_file(&dir, "7_1.dxs", &image).unwrap();
+        std::fs::write(dir.join("7_1.dxs"), &image).unwrap();
         let f = MappedSegmentFile::open(&dir.join("7_1.dxs")).unwrap();
         for (ci, sid, blob) in &blobs {
             match f.get(*ci, *sid, true) {
@@ -886,7 +838,7 @@ mod tests {
         let victim = entries[1];
         image[victim.offset as usize + 3] ^= 0xFF;
         let dir = tmp_dir();
-        write_segment_file(&dir, "7_2.dxs", &image).unwrap();
+        std::fs::write(dir.join("7_2.dxs"), &image).unwrap();
         let f = MappedSegmentFile::open(&dir.join("7_2.dxs")).unwrap();
         assert!(matches!(
             f.get(victim.col_idx, victim.segment_id, true),

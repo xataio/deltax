@@ -13,7 +13,6 @@ decompression.
 """
 
 import psycopg
-import pytest
 
 from conftest import HOST_PORT, PG_PASSWORD, PG_USER
 
@@ -153,6 +152,26 @@ def _delete_file(conn, rel_path):
     conn.commit()
 
 
+def _corrupt_file(conn, rel_path, offset=64, nbytes=2048):
+    """Zero `nbytes` at `offset` (the blob-data region starts at byte 64)."""
+    datadir = conn.execute("SHOW data_directory").fetchone()[0]
+    conn.execute(
+        "COPY (SELECT 1) TO PROGRAM "
+        f"'dd if=/dev/zero of={datadir}/{rel_path} bs=1 seek={offset} "
+        f"count={nbytes} conv=notrunc status=none'"
+    )
+    conn.commit()
+
+
+def _truncate_file(conn, rel_path, size=100):
+    """Truncate a file inside the container's data directory."""
+    datadir = conn.execute("SHOW data_directory").fetchone()[0]
+    conn.execute(
+        f"COPY (SELECT 1) TO PROGRAM 'truncate -s {size} {datadir}/{rel_path}'"
+    )
+    conn.commit()
+
+
 def _setup_backfill_table(conn, name, blob_storage):
     """Create an empty deltax table and load it via direct backfill
     (COPY ... FORMAT deltax_compress_csv), exercising src/copy.rs.
@@ -267,6 +286,33 @@ class TestBlobFile:
             assert _run_queries(fresh) == expected
         # Catalog still references the (gone) file — fallback is per-read.
         assert all(bf for _, bf in _blob_files(db))
+
+    def test_corrupt_file_falls_back_to_toast(self, db):
+        """A corrupted or truncated .dxs file must never change results:
+        per-blob CRC verification (data corruption, verify_file_checksums=on)
+        and open-time header/footer/index validation (truncation) both fall
+        back to the TOAST blobs table."""
+        _setup_event_table(db, blob_storage="dual")
+        expected = _run_queries(db)
+        files = _blob_files(db)
+        assert files and all(bf for _, bf in files)
+
+        # Zero 2 KiB of the blob-data region: blob CRCs no longer match
+        # (lookup-time fallback); if the file is small enough that the zeros
+        # reach the index, open-time validation rejects it instead — reads
+        # must fall back either way.
+        for _, blob_file in files:
+            _corrupt_file(db, blob_file)
+        with _fresh_conn(db) as fresh:
+            fresh.execute("SET pg_deltax.verify_file_checksums = on")
+            assert _run_queries(fresh) == expected
+
+        # Truncate below the minimum header+footer size — rejected at
+        # open/validate time, before any blob is served.
+        for _, blob_file in files:
+            _truncate_file(db, blob_file)
+        with _fresh_conn(db) as fresh:
+            assert _run_queries(fresh) == expected
 
     def test_verify_checksums_guc_roundtrip(self, db):
         """With pg_deltax.verify_file_checksums=on every blob is CRC-checked

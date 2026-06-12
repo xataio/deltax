@@ -70,7 +70,7 @@ pub(super) unsafe fn exec_qual(
 /// PG17 stores attrs directly; PG18 stores CompactAttribute first, then attrs.
 #[cfg(feature = "pg17")]
 #[inline]
-pub(in crate::scan) unsafe fn tupdesc_get_attr(
+pub(crate) unsafe fn tupdesc_get_attr(
     tupdesc: pg_sys::TupleDesc,
     i: usize,
 ) -> *const pg_sys::FormData_pg_attribute {
@@ -79,7 +79,7 @@ pub(in crate::scan) unsafe fn tupdesc_get_attr(
 
 #[cfg(feature = "pg18")]
 #[inline]
-pub(in crate::scan) unsafe fn tupdesc_get_attr(
+pub(crate) unsafe fn tupdesc_get_attr(
     tupdesc: pg_sys::TupleDesc,
     i: usize,
 ) -> *const pg_sys::FormData_pg_attribute {

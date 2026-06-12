@@ -898,11 +898,13 @@ impl std::ops::Deref for BlobBytes {
     }
 }
 
-// SAFETY: Cached's raw pointer references DSA shared memory whose
+// SAFETY: Cached's raw pointer references either DSA shared memory whose
 // lifetime is guaranteed by the matching `BlobCachePin` in the same
-// `SegmentData`. The pin uses atomic pin_count to keep the entry
-// resident across all readers and prevents eviction. The bytes are
-// only ever read, never written.
+// `SegmentData` (the pin's atomic pin_count keeps the entry resident and
+// prevents eviction), or an mmap'd segment file kept alive by the
+// `Arc<MappedSegmentFile>` in the same `SegmentData`'s `blob_file_backing`.
+// Either way the backing is process-local, immutable, and outlives the
+// pointer. The bytes are only ever read, never written.
 unsafe impl Send for BlobBytes {}
 unsafe impl Sync for BlobBytes {}
 

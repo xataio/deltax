@@ -6,7 +6,10 @@ remaining a pure PostgreSQL extension (no forked server, no embedded
 foreign engine). Meta, colstats, blooms, and text-length companion tables
 stay as ordinary Postgres heaps; only the bulk compressed bytes move out.
 
-Status: design. Nothing here is implemented.
+Status: P1/P1b implemented behind `pg_deltax.blob_storage = 'dual'`
+(default `toast`, unchanged) — see `src/segment_file.rs` and the exit
+measurement in §8. The `file`-only mode, GC sweep, and the rest of
+§4–§8 remain design.
 
 ## 1. Why — the detoast wall
 
@@ -70,11 +73,12 @@ all compressed column blobs for the partition into a single immutable
 file:
 
 ```
-$PGDATA/pg_deltax/<database_oid>/<partition_relfilenode>_<generation>.dxs
+$PGDATA/pg_deltax/<database_oid>/<partition_id>_<generation>.dxs
 ```
 
 - **`database_oid`** namespaces per database, mirroring `base/`.
-- **`partition_relfilenode`** ties the file to the partition relation.
+- **`partition_id`** is `deltax_partition.id` — stable across pg_upgrade,
+  unlike a relfilenode (see the §6 decision note).
 - **`generation`** is a monotonically increasing counter (epoch micros
   is fine) so recompression never reuses a name — the same trick the
   blob cache uses with companion OIDs for free invalidation.
