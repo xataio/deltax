@@ -19,7 +19,8 @@ const MAX_BLOOM_BYTES: usize = 8192;
 /// and every per-segment bloom.
 pub const PARTITION_BLOOM_SEGMENT_ID: i32 = -1;
 /// Hash count for partition-level blooms. Fixed (rather than derived from
-/// ndistinct) so filters built at different times stay OR-mergeable.
+/// ndistinct like per-segment blooms) because the accumulator is created
+/// before the partition's final ndistinct is known.
 pub const PARTITION_BLOOM_HASHES: u8 = 4;
 /// In-memory build size for partition-level blooms (power of two so the
 /// filter can be folded down before storage). 2 MiB ≈ 16.8M bits keeps a
@@ -172,46 +173,6 @@ impl BloomFilter {
         }
     }
 
-    /// OR-merge `other` into `self`, folding both down to the smaller of the
-    /// two sizes first. Returns `false` (and leaves `self` untouched) when the
-    /// filters are not fold-compatible: different `num_hashes`, or either size
-    /// is not a power of two. Because positions are `hash % 2^n` and folding
-    /// OR-halves, the merged filter reports every value inserted into either
-    /// input as present — no false negatives (PERF #47 invariant).
-    ///
-    /// No production caller yet: sentinels are written only at compress
-    /// time and dropped wholesale on decompress (DML on compressed
-    /// partitions is rejected). The incremental-compaction path that folds
-    /// new batches into existing sentinels lands separately and uses this.
-    #[allow(dead_code)]
-    pub fn merge_fold(&mut self, other: &BloomFilter) -> bool {
-        if self.num_hashes != other.num_hashes
-            || self.bits.is_empty()
-            || other.bits.is_empty()
-            || !self.bits.len().is_power_of_two()
-            || !other.bits.len().is_power_of_two()
-        {
-            return false;
-        }
-        let target = self.bits.len().min(other.bits.len());
-        self.fold_to(target);
-        let mut folded;
-        let other_bits: &[u8] = if other.bits.len() > target {
-            folded = BloomFilter {
-                bits: other.bits.clone(),
-                num_hashes: other.num_hashes,
-            };
-            folded.fold_to(target);
-            &folded.bits
-        } else {
-            &other.bits
-        };
-        for (a, b) in self.bits.iter_mut().zip(other_bits.iter()) {
-            *a |= b;
-        }
-        true
-    }
-
     /// Check if a value might be in the filter. False = definitely not present.
     pub fn might_contain(&self, hash: u64) -> bool {
         let mut positions = [0usize; 10];
@@ -356,42 +317,6 @@ mod tests {
         }
         let fpr = false_positives as f64 / probes as f64;
         assert!(fpr < 0.10, "FPR too high after fold: {:.1}%", fpr * 100.0);
-    }
-
-    #[test]
-    fn test_merge_fold_no_false_negatives() {
-        // Sentinel (smaller, already folded) merged with a fresh accumulator
-        // (larger build size) must keep every value from both sides.
-        let mut sentinel = BloomFilter::with_bytes(1 << 10, PARTITION_BLOOM_HASHES);
-        let old_values: Vec<i64> = (0..500).map(|i| i * 31 + 7).collect();
-        for &v in &old_values {
-            sentinel.insert(hash_datum_i64(v));
-        }
-        let mut acc = BloomFilter::with_bytes(1 << 14, PARTITION_BLOOM_HASHES);
-        let new_values: Vec<i64> = (1_000_000..1_000_500).collect();
-        for &v in &new_values {
-            acc.insert(hash_datum_i64(v));
-        }
-        assert!(sentinel.merge_fold(&acc));
-        assert_eq!(sentinel.as_bytes().len(), 1 << 10);
-        for &v in old_values.iter().chain(new_values.iter()) {
-            assert!(
-                sentinel.might_contain(hash_datum_i64(v)),
-                "false negative after merge_fold for {}",
-                v
-            );
-        }
-    }
-
-    #[test]
-    fn test_merge_fold_rejects_incompatible() {
-        let mut a = BloomFilter::with_bytes(1 << 10, PARTITION_BLOOM_HASHES);
-        // Different num_hashes — must refuse.
-        let b = BloomFilter::with_bytes(1 << 10, PARTITION_BLOOM_HASHES + 1);
-        assert!(!a.merge_fold(&b));
-        // Non-power-of-two size — must refuse.
-        let c = BloomFilter::from_bytes(&[0u8; 100], PARTITION_BLOOM_HASHES);
-        assert!(!a.merge_fold(&c));
     }
 
     #[test]

@@ -1628,10 +1628,11 @@ Implementation notes (deviations from the spec below):
   (`compress_partition_impl` early-returns on `is_compressed`); DML on
   compressed partitions is rejected by trigger; decompression drops
   the whole blooms table. Absence of a sentinel is always safe — no
-  sentinel just means no partition-level skipping. For a future
-  incremental-compaction path, `BloomFilter::merge_fold` (OR-merge
-  with fold-down, no false negatives) is the only valid way to update
-  a stored sentinel in place.
+  sentinel just means no partition-level skipping. If an incremental
+  segment-append path is ever added, a stored sentinel must be
+  OR-merged with the new values (folding down to the smaller
+  power-of-two size, which preserves `hash % 2^n` membership) or
+  dropped — never overwritten or left stale.
 - **GUC:** `pg_deltax.partition_bloom_filters` (default on) gates the
   query side only; build follows `pg_deltax.bloom_filters`.
 - **Transient build memory:** 2 MiB per bloom-supported (numeric)

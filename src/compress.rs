@@ -2083,6 +2083,40 @@ pub(crate) fn compute_segment_ndistinct(
 /// `PARTITION_BLOOM_BUILD_BYTES` per numeric column per active partition.
 pub(crate) type PartitionBlooms = std::collections::HashMap<u16, crate::bloom::BloomFilter>;
 
+/// Hash every non-null value of a bloom-supported column into the i64 hash
+/// domain probed at scan time via `bloom_probe_encode`: integers
+/// sign-extended, floats as raw bit patterns, timestamps/dates already
+/// Unix-epoch µs in their `TypedColumn`. Returns `None` for unsupported
+/// column types. Single source of truth for the build-side value→hash
+/// mapping of both per-segment blooms and partition-level sentinels.
+fn bloom_value_hashes(col: &TypedColumn) -> Option<Vec<u64>> {
+    use crate::bloom::hash_datum_i64;
+    Some(match col {
+        TypedColumn::Int16(v) => v
+            .iter()
+            .flatten()
+            .map(|x| hash_datum_i64(*x as i64))
+            .collect(),
+        TypedColumn::Int32(v) => v
+            .iter()
+            .flatten()
+            .map(|x| hash_datum_i64(*x as i64))
+            .collect(),
+        TypedColumn::Int64(v) => v.iter().flatten().map(|x| hash_datum_i64(*x)).collect(),
+        TypedColumn::Float32(v) => v
+            .iter()
+            .flatten()
+            .map(|x| hash_datum_i64(x.to_bits() as i64))
+            .collect(),
+        TypedColumn::Float64(v) => v
+            .iter()
+            .flatten()
+            .map(|x| hash_datum_i64(x.to_bits() as i64))
+            .collect(),
+        _ => return None,
+    })
+}
+
 /// Compute per-column bloom filters for a segment.
 /// Returns one (col_idx, num_hashes, bloom_bytes) entry per column that got a bloom,
 /// or empty if no columns qualify. Only builds bloom filters for numeric/date/timestamp
@@ -2097,9 +2131,7 @@ pub(crate) fn compute_segment_blooms(
     ndistinct_values: &[i64],
     mut partition_blooms: Option<&mut PartitionBlooms>,
 ) -> Vec<(u16, u8, Vec<u8>)> {
-    use crate::bloom::{
-        BloomFilter, PARTITION_BLOOM_BUILD_BYTES, PARTITION_BLOOM_HASHES, hash_datum_i64,
-    };
+    use crate::bloom::{BloomFilter, PARTITION_BLOOM_BUILD_BYTES, PARTITION_BLOOM_HASHES};
 
     let mut entries: Vec<(u16, u8, Vec<u8>)> = Vec::new();
     let mut nd_idx: usize = 0;
@@ -2109,73 +2141,33 @@ pub(crate) fn compute_segment_blooms(
         if col.is_segment_by {
             continue;
         }
-        let nd = if nd_idx < ndistinct_values.len() {
-            ndistinct_values[nd_idx]
-        } else {
-            0
-        };
+        let nd = ndistinct_values.get(nd_idx).copied().unwrap_or(0);
         nd_idx += 1;
 
         if !supports_minmax(&col.data_type) || nd <= 0 {
             col_idx += 1;
             continue;
         }
-
-        if !matches!(
-            &typed_cols[i],
-            TypedColumn::Int16(_)
-                | TypedColumn::Int32(_)
-                | TypedColumn::Int64(_)
-                | TypedColumn::Float32(_)
-                | TypedColumn::Float64(_)
-        ) {
+        let Some(hashes) = bloom_value_hashes(&typed_cols[i]) else {
             col_idx += 1;
             continue;
+        };
+
+        let mut bf = BloomFilter::for_ndistinct(nd as usize);
+        for &h in &hashes {
+            bf.insert(h);
         }
 
         // Partition-bloom accumulator for this column, created at the
         // column's first values-bearing segment. Every later segment inserts
         // too — the sentinel must cover the whole partition.
-        let mut pbf: Option<&mut BloomFilter> = partition_blooms.as_deref_mut().map(|map| {
-            map.entry(col_idx).or_insert_with(|| {
+        if let Some(map) = partition_blooms.as_deref_mut() {
+            let pbf = map.entry(col_idx).or_insert_with(|| {
                 BloomFilter::with_bytes(PARTITION_BLOOM_BUILD_BYTES, PARTITION_BLOOM_HASHES)
-            })
-        });
-
-        let mut bf = BloomFilter::for_ndistinct(nd as usize);
-        let mut insert = |bf: &mut BloomFilter, h: u64| {
-            bf.insert(h);
-            if let Some(p) = pbf.as_deref_mut() {
-                p.insert(h);
+            });
+            for &h in &hashes {
+                pbf.insert(h);
             }
-        };
-        match &typed_cols[i] {
-            TypedColumn::Int16(v) => {
-                for x in v.iter().flatten() {
-                    insert(&mut bf, hash_datum_i64(*x as i64));
-                }
-            }
-            TypedColumn::Int32(v) => {
-                for x in v.iter().flatten() {
-                    insert(&mut bf, hash_datum_i64(*x as i64));
-                }
-            }
-            TypedColumn::Int64(v) => {
-                for x in v.iter().flatten() {
-                    insert(&mut bf, hash_datum_i64(*x));
-                }
-            }
-            TypedColumn::Float32(v) => {
-                for x in v.iter().flatten() {
-                    insert(&mut bf, hash_datum_i64(x.to_bits() as i64));
-                }
-            }
-            TypedColumn::Float64(v) => {
-                for x in v.iter().flatten() {
-                    insert(&mut bf, hash_datum_i64(x.to_bits() as i64));
-                }
-            }
-            _ => unreachable!("gated by the supported-type check above"),
         }
 
         entries.push((col_idx, bf.num_hashes(), bf.as_bytes().to_vec()));
@@ -2188,14 +2180,14 @@ pub(crate) fn compute_segment_blooms(
 /// Per-segment partition-bloom contribution for paths where segments are
 /// compressed off the main thread (parquet COPY): the raw value hashes for
 /// every bloom-supported column, merged into the per-partition accumulators
-/// on the main thread (which owns them).
+/// on the main thread (which owns them). Column eligibility and hashing
+/// mirror `compute_segment_blooms` (both go through `bloom_value_hashes`),
+/// so the sentinel covers exactly the columns that get per-segment blooms.
 pub(crate) fn compute_partition_bloom_hashes(
     typed_cols: &[TypedColumn],
     columns: &[ColumnMeta],
     ndistinct_values: &[i64],
 ) -> Vec<(u16, Vec<u64>)> {
-    use crate::bloom::hash_datum_i64;
-
     let mut hashes: Vec<(u16, Vec<u64>)> = Vec::new();
     let mut nd_idx: usize = 0;
     let mut col_idx: u16 = 0;
@@ -2204,46 +2196,16 @@ pub(crate) fn compute_partition_bloom_hashes(
         if col.is_segment_by {
             continue;
         }
-        let nd = if nd_idx < ndistinct_values.len() {
-            ndistinct_values[nd_idx]
-        } else {
-            0
-        };
+        let nd = ndistinct_values.get(nd_idx).copied().unwrap_or(0);
         nd_idx += 1;
 
         if !supports_minmax(&col.data_type) || nd <= 0 {
             col_idx += 1;
             continue;
         }
-
-        let col_hashes: Vec<u64> = match &typed_cols[i] {
-            TypedColumn::Int16(v) => v
-                .iter()
-                .flatten()
-                .map(|x| hash_datum_i64(*x as i64))
-                .collect(),
-            TypedColumn::Int32(v) => v
-                .iter()
-                .flatten()
-                .map(|x| hash_datum_i64(*x as i64))
-                .collect(),
-            TypedColumn::Int64(v) => v.iter().flatten().map(|x| hash_datum_i64(*x)).collect(),
-            TypedColumn::Float32(v) => v
-                .iter()
-                .flatten()
-                .map(|x| hash_datum_i64(x.to_bits() as i64))
-                .collect(),
-            TypedColumn::Float64(v) => v
-                .iter()
-                .flatten()
-                .map(|x| hash_datum_i64(x.to_bits() as i64))
-                .collect(),
-            _ => {
-                col_idx += 1;
-                continue;
-            }
-        };
-        hashes.push((col_idx, col_hashes));
+        if let Some(col_hashes) = bloom_value_hashes(&typed_cols[i]) {
+            hashes.push((col_idx, col_hashes));
+        }
         col_idx += 1;
     }
 

@@ -264,6 +264,50 @@ fn bloom_probe_encode(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> i64 {
     }
 }
 
+/// Probe hashes for an Eq/InList batch qual, in the bloom build-side hash
+/// domain (constants go through `bloom_probe_encode` first — same value→i64
+/// mapping `compress.rs` hashed at build time). Returns `None` when the qual
+/// isn't bloom-probeable: wrong op, a non-numeric/temporal column type, or
+/// an in-list whose constants weren't captured as i64. Shared by the
+/// partition-sentinel probe (Phase 0pre) and the per-segment bloom checks so
+/// the two can't diverge.
+fn bloom_probe_hashes(bq: &BatchQual) -> Option<Vec<u64>> {
+    if !matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::InList) {
+        return None;
+    }
+    let is_numeric_type = matches!(
+        bq.type_oid,
+        pg_sys::INT2OID
+            | pg_sys::INT4OID
+            | pg_sys::INT8OID
+            | pg_sys::FLOAT4OID
+            | pg_sys::FLOAT8OID
+            | pg_sys::DATEOID
+            | pg_sys::TIMESTAMPOID
+            | pg_sys::TIMESTAMPTZOID
+    );
+    if !is_numeric_type {
+        return None;
+    }
+    Some(if bq.op == BatchCompareOp::InList {
+        bq.in_list_i64
+            .as_ref()?
+            .iter()
+            .map(|&v| {
+                crate::bloom::hash_datum_i64(bloom_probe_encode(
+                    pg_sys::Datum::from(v as usize),
+                    bq.type_oid,
+                ))
+            })
+            .collect()
+    } else {
+        vec![crate::bloom::hash_datum_i64(bloom_probe_encode(
+            bq.const_datum,
+            bq.type_oid,
+        ))]
+    })
+}
+
 /// Resolve `{partition}_<suffix>` (where the partition name is derived
 /// from `meta_oid` by stripping the `_meta` suffix) to a relation OID in
 /// the same namespace as `meta_oid`. Returns `InvalidOid` when the table
@@ -1753,51 +1797,14 @@ pub(super) unsafe fn load_segments_heap(
             let mut blooms_oid: Option<pg_sys::Oid> = None; // resolved lazily
             let mut sentinel_rejected = false;
             for bq in batch_quals {
-                if !matches!(bq.op, BatchCompareOp::Eq | BatchCompareOp::InList) {
-                    continue;
-                }
                 if segment_by.contains(&col_names[bq.col_idx]) {
                     continue;
                 }
                 let Some(ci) = col_idx_map[bq.col_idx] else {
                     continue;
                 };
-                let is_numeric_type = matches!(
-                    bq.type_oid,
-                    pg_sys::INT2OID
-                        | pg_sys::INT4OID
-                        | pg_sys::INT8OID
-                        | pg_sys::FLOAT4OID
-                        | pg_sys::FLOAT8OID
-                        | pg_sys::DATEOID
-                        | pg_sys::TIMESTAMPOID
-                        | pg_sys::TIMESTAMPTZOID
-                );
-                if !is_numeric_type {
+                let Some(hashes) = bloom_probe_hashes(bq) else {
                     continue;
-                }
-                // Same value→hash mapping the bloom BUILD side used:
-                // `bloom_probe_encode` converts the raw PG datum into the
-                // i64 domain `compress.rs` hashed (Unix-epoch µs for
-                // timestamps/dates, raw bit patterns for floats).
-                let hashes: Vec<u64> = if bq.op == BatchCompareOp::InList {
-                    match bq.in_list_i64 {
-                        Some(ref vals) => vals
-                            .iter()
-                            .map(|&v| {
-                                crate::bloom::hash_datum_i64(bloom_probe_encode(
-                                    pg_sys::Datum::from(v as usize),
-                                    bq.type_oid,
-                                ))
-                            })
-                            .collect(),
-                        None => continue,
-                    }
-                } else {
-                    vec![crate::bloom::hash_datum_i64(bloom_probe_encode(
-                        bq.const_datum,
-                        bq.type_oid,
-                    ))]
                 };
 
                 let oid = *blooms_oid.get_or_insert_with(|| sibling_table_oid(meta_oid, "_blooms"));
@@ -2108,37 +2115,7 @@ pub(super) unsafe fn load_segments_heap(
             };
 
             // Numeric / temporal types → bloom (existing path).
-            let is_numeric_type = matches!(
-                bq.type_oid,
-                pg_sys::INT2OID
-                    | pg_sys::INT4OID
-                    | pg_sys::INT8OID
-                    | pg_sys::FLOAT4OID
-                    | pg_sys::FLOAT8OID
-                    | pg_sys::DATEOID
-                    | pg_sys::TIMESTAMPOID
-                    | pg_sys::TIMESTAMPTZOID
-            );
-            if is_numeric_type {
-                let hashes = if bq.op == BatchCompareOp::InList {
-                    if let Some(ref vals) = bq.in_list_i64 {
-                        vals.iter()
-                            .map(|&v| {
-                                crate::bloom::hash_datum_i64(bloom_probe_encode(
-                                    pg_sys::Datum::from(v as usize),
-                                    bq.type_oid,
-                                ))
-                            })
-                            .collect()
-                    } else {
-                        continue;
-                    }
-                } else {
-                    vec![crate::bloom::hash_datum_i64(bloom_probe_encode(
-                        bq.const_datum,
-                        bq.type_oid,
-                    ))]
-                };
+            if let Some(hashes) = bloom_probe_hashes(bq) {
                 bloom_checks.push(BloomCheck {
                     col_idx: ci,
                     hashes,
