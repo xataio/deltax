@@ -30,7 +30,8 @@ use super::super::segments::{
 };
 use super::extract::decode_encoded_to_pg_i64;
 use super::state::{
-    AggAccumulator, AggExecSpec, AggExpr, AggScanState, AggType, OutputEntry, ParsedAggPlan,
+    AggAccumulator, AggExecSpec, AggExpr, AggScanState, AggType, GroupByExpr, OutputEntry,
+    ParsedAggPlan,
 };
 use crate::compress::{decode_i64_to_f32, decode_i64_to_f64};
 
@@ -404,6 +405,239 @@ pub(super) fn try_metadata_fast_path(
     })
 }
 
+/// Fast path for `SELECT col, COUNT(*) FROM t [WHERE ...] GROUP BY col` on a
+/// low-cardinality integer column, answered entirely from the per-(segment,
+/// value) COUNT sidecar (R5) — no blob is touched.
+///
+/// The caller loads segments metadata-only and attaches each segment's
+/// decoded `(value, count)` list for the GROUP BY column to
+/// `SegmentData::valcounts` (via `load_groupcol_valcounts`).
+///
+/// Exactness rules (returns `None` → normal path whenever any fails):
+/// - exactly one GROUP BY key: a bare integer column (INT2/4/8);
+/// - every aggregate is `COUNT(*)`, or `COUNT(<group col>)`;
+/// - no HAVING / Top-N / LIMIT / partial mode;
+/// - WHERE quals must be fully batch-extracted (caller passes `[]` otherwise);
+///   quals **on the group column** must be plain integer comparisons
+///   (Eq/Ne/Lt/Le/Gt/Ge) — they are applied exactly per distinct value;
+///   every **other** qual (including time-range quals) must be provably
+///   all-pass or none-pass per segment via `classify_segment_quals` —
+///   an ambiguous (partially covered) segment bails the whole query;
+/// - every surviving segment must carry sidecar counts whose sum is
+///   consistent with `row_count` (NULL count = row_count − Σ counts).
+///
+/// NULL-group semantics match PG exactly: rows whose group column is NULL
+/// form one group, emitted only when no qual references the group column
+/// (any comparison qual eliminates NULLs).
+pub(super) fn try_groupby_count_fast_path(
+    plan: &ParsedAggPlan,
+    meta: &MetadataInfo,
+    segments: &[SegmentData],
+    batch_quals: &[BatchQual],
+    metadata_us: u64,
+    heap_scan_us: u64,
+) -> Option<AggScanState> {
+    // ---- Plan-shape gates -------------------------------------------------
+    if plan.group_specs.len() != 1
+        || !plan.having_filters.is_empty()
+        || plan.is_partial
+        || plan.topn_limit > 0
+        || plan.bare_limit > 0
+        || plan.derived_minmax_topn.is_some()
+    {
+        return None;
+    }
+    let gs = &plan.group_specs[0];
+    if !matches!(gs.expr, GroupByExpr::Column) {
+        return None;
+    }
+    if !matches!(
+        gs.type_oid,
+        pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+    ) {
+        return None;
+    }
+    if gs.col_idx < 0 || (gs.col_idx as usize) >= meta.col_names.len() {
+        return None;
+    }
+    let group_col_idx = gs.col_idx as usize;
+
+    // Every aggregate must be COUNT(*) or COUNT(<group col>).
+    for spec in &plan.agg_specs {
+        match spec.agg_type {
+            AggType::CountStar => {}
+            AggType::Count if spec.col_idx == gs.col_idx && spec.expr_kind == AggExpr::Column => {}
+            _ => return None,
+        }
+    }
+    if plan
+        .output_map
+        .iter()
+        .any(|e| matches!(e, OutputEntry::DerivedGroup { .. }))
+    {
+        return None;
+    }
+
+    // ---- Qual gates -------------------------------------------------------
+    let has_where = !plan.where_quals.is_null();
+    if has_where && batch_quals.is_empty() {
+        return None; // quals not fully batch-extractable
+    }
+
+    // Split quals: comparisons on the group column are applied exactly per
+    // distinct value; everything else must classify per segment.
+    let mut group_quals: Vec<(BatchCompareOp, i64)> = Vec::new();
+    let mut rest_quals: Vec<BatchQual> = Vec::new();
+    for bq in batch_quals {
+        if bq.col_idx == group_col_idx {
+            let c = match (bq.op, bq.type_oid) {
+                (
+                    BatchCompareOp::Eq
+                    | BatchCompareOp::Ne
+                    | BatchCompareOp::Lt
+                    | BatchCompareOp::Le
+                    | BatchCompareOp::Gt
+                    | BatchCompareOp::Ge,
+                    pg_sys::INT2OID,
+                ) => bq.const_datum.value() as i16 as i64,
+                (
+                    BatchCompareOp::Eq
+                    | BatchCompareOp::Ne
+                    | BatchCompareOp::Lt
+                    | BatchCompareOp::Le
+                    | BatchCompareOp::Gt
+                    | BatchCompareOp::Ge,
+                    pg_sys::INT4OID,
+                ) => bq.const_datum.value() as i32 as i64,
+                (
+                    BatchCompareOp::Eq
+                    | BatchCompareOp::Ne
+                    | BatchCompareOp::Lt
+                    | BatchCompareOp::Le
+                    | BatchCompareOp::Gt
+                    | BatchCompareOp::Ge,
+                    pg_sys::INT8OID,
+                ) => bq.const_datum.value() as i64,
+                _ => return None, // InList / LIKE / non-int typed qual on group col
+            };
+            group_quals.push((bq.op, c));
+        } else {
+            rest_quals.push(bq.clone());
+        }
+    }
+
+    // ---- Per-segment accumulation ------------------------------------------
+    let mut totals: std::collections::BTreeMap<i64, i64> = std::collections::BTreeMap::new();
+    let mut null_total: i64 = 0;
+    let mut included: u64 = 0;
+    for seg in segments {
+        if seg.row_count == 0 {
+            continue;
+        }
+        if !rest_quals.is_empty() {
+            match classify_segment_quals(seg, &rest_quals, &meta.col_names) {
+                SegmentQualResult::AllPass => {}
+                SegmentQualResult::NonePass => continue,
+                SegmentQualResult::Ambiguous => return None, // partial coverage
+            }
+        }
+        // Sidecar must be present for every contributing segment.
+        let vc = seg.valcounts.as_ref()?;
+        let mut sum: i64 = 0;
+        for &(v, c) in vc {
+            if c < 0 {
+                return None;
+            }
+            sum += c;
+            *totals.entry(v).or_insert(0) += c;
+        }
+        // NULL count derives from row_count − Σ counts; a negative result
+        // means the sidecar is inconsistent with the segment — bail.
+        let nulls = seg.row_count as i64 - sum;
+        if nulls < 0 {
+            return None;
+        }
+        null_total += nulls;
+        included += 1;
+    }
+
+    // ---- Emit one row per surviving group ----------------------------------
+    let value_passes = |v: i64| -> bool {
+        group_quals.iter().all(|&(op, c)| match op {
+            BatchCompareOp::Eq => v == c,
+            BatchCompareOp::Ne => v != c,
+            BatchCompareOp::Lt => v < c,
+            BatchCompareOp::Le => v <= c,
+            BatchCompareOp::Gt => v > c,
+            BatchCompareOp::Ge => v >= c,
+            _ => false, // unreachable: gated above
+        })
+    };
+
+    let num_result_cols = plan.output_map.len();
+    let mut result_rows: Vec<Vec<(pg_sys::Datum, bool)>> = Vec::new();
+    let mut emit_group = |group: Option<i64>, count_star: i64| {
+        let mut agg_results: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(plan.agg_specs.len());
+        for spec in &plan.agg_specs {
+            let val = match spec.agg_type {
+                AggType::CountStar => count_star,
+                // COUNT(group col): all rows in a value group are non-NULL by
+                // construction; the NULL group counts zero.
+                AggType::Count => {
+                    if group.is_some() {
+                        count_star
+                    } else {
+                        0
+                    }
+                }
+                _ => unreachable!("gated above"),
+            };
+            agg_results.push((pg_sys::Datum::from(val as usize), false));
+        }
+        let mut row: Vec<(pg_sys::Datum, bool)> = Vec::with_capacity(num_result_cols);
+        for entry in &plan.output_map {
+            match entry {
+                OutputEntry::Agg(ai) => row.push(agg_results[*ai]),
+                OutputEntry::Group(_) => match group {
+                    // Same sign-extended bit-pattern encoding PG's
+                    // Int{16,32,64}GetDatum macros produce.
+                    Some(v) => row.push((pg_sys::Datum::from(v as usize), false)),
+                    None => row.push((pg_sys::Datum::from(0usize), true)),
+                },
+                OutputEntry::DerivedGroup { .. } => unreachable!("gated above"),
+                OutputEntry::Const(d, n) => row.push((*d, *n)),
+            }
+        }
+        result_rows.push(row);
+    };
+
+    for (&v, &total) in &totals {
+        if total <= 0 || !value_passes(v) {
+            continue;
+        }
+        emit_group(Some(v), total);
+    }
+    // The NULL group exists only when no qual touches the group column (a
+    // comparison against NULL is never true) and NULLs actually occur.
+    if group_quals.is_empty() && null_total > 0 {
+        emit_group(None, null_total);
+    }
+
+    Some(AggScanState {
+        result_rows,
+        _num_result_cols: num_result_cols,
+        metadata_us,
+        heap_scan_us,
+        total_segments: segments.len() as u64,
+        batch_quals_count: batch_quals.len(),
+        where_quals_null: !has_where,
+        segments_metadata_resolved: included,
+        topn_ascending: true,
+        buf_stats: super::super::segments::take_scan_buf_stats(),
+        ..AggScanState::default()
+    })
+}
+
 /// Merge a source accumulator into a destination (used for parallel reduction).
 /// Only Count/SumInt/SumFloat are used in filtered fast path (Min/Max/CountDistinct bail earlier).
 pub(super) fn merge_accumulator(dst: &mut AggAccumulator, src: &AggAccumulator) {
@@ -758,12 +992,13 @@ pub(super) unsafe fn load_agg_metadata_from_plan(
 #[cfg(any(test, feature = "pg_test"))]
 #[pgrx::pg_schema]
 mod tests {
-    use super::super::super::segments::{ColMinMax, ColSum};
+    use super::super::super::batch_qual::{BatchCompareOp, BatchQual};
+    use super::super::super::segments::{ColMinMax, ColSum, SegmentData};
     use super::super::state::{
         AggExpr, AggType, GroupByColSpec, GroupByExpr, HavingFilter, HavingOp,
     };
     use super::super::test_utils::{make_agg_spec, make_empty_segment, make_meta, make_plan};
-    use super::{try_catalog_shortcut, try_metadata_fast_path};
+    use super::{try_catalog_shortcut, try_groupby_count_fast_path, try_metadata_fast_path};
     use pgrx::pg_sys;
     use pgrx::prelude::*;
 
@@ -1349,5 +1584,275 @@ mod tests {
         assert_eq!(state.total_segments, 2);
         assert_eq!(state.metadata_us, 123);
         assert_eq!(state.heap_scan_us, 456);
+    }
+
+    // -------------------------------------------------------------------
+    // try_groupby_count_fast_path tests (R5 per-value count sidecar)
+    // -------------------------------------------------------------------
+
+    /// Plan: `SELECT adv, COUNT(*) GROUP BY adv` over make_meta(["ts","adv"]).
+    /// Output rows are [Agg(0), Group(0)] = (count, group value).
+    fn make_groupby_count_plan(where_null: bool) -> super::super::state::ParsedAggPlan {
+        make_plan(
+            vec![make_agg_spec(AggType::CountStar, -1, 23)],
+            vec![GroupByColSpec {
+                col_idx: 1,
+                type_oid: pg_sys::Oid::from(23u32), // INT4
+                expr: GroupByExpr::Column,
+            }],
+            Vec::new(),
+            where_null,
+        )
+    }
+
+    fn seg_with_counts(row_count: i32, counts: &[(i64, i64)]) -> SegmentData {
+        let mut seg = make_empty_segment(row_count);
+        seg.valcounts = Some(counts.to_vec());
+        seg
+    }
+
+    /// Extract `(group, count)` pairs from result rows shaped [Agg, Group].
+    fn rows_to_pairs(state: &super::super::state::AggScanState) -> Vec<(Option<i64>, i64)> {
+        state
+            .result_rows
+            .iter()
+            .map(|row| {
+                let count = row[0].0.value() as i64;
+                let group = if row[1].1 {
+                    None
+                } else {
+                    Some(row[1].0.value() as i64)
+                };
+                (group, count)
+            })
+            .collect()
+    }
+
+    #[pg_test]
+    fn test_groupby_count_basic() {
+        let meta = make_meta(&["ts", "adv"]);
+        let plan = make_groupby_count_plan(true);
+        // seg1: 10×1, 5×2, 2 NULLs (row_count 17); seg2: 3×1, no NULLs.
+        let segs = vec![
+            seg_with_counts(17, &[(1, 10), (2, 5)]),
+            seg_with_counts(3, &[(1, 3)]),
+        ];
+        let state = try_groupby_count_fast_path(&plan, &meta, &segs, &[], 0, 0).unwrap();
+        assert_eq!(
+            rows_to_pairs(&state),
+            vec![(Some(1), 13), (Some(2), 5), (None, 2)]
+        );
+        assert_eq!(state.segments_metadata_resolved, 2);
+        assert_eq!(state.total_segments, 2);
+    }
+
+    #[pg_test]
+    fn test_groupby_count_where_ne_zero_excludes_zero_and_nulls() {
+        // Q7 shape: WHERE adv <> 0 GROUP BY adv. Value 0 is filtered and the
+        // NULL group disappears (NULL <> 0 is not true).
+        let meta = make_meta(&["ts", "adv"]);
+        let plan = make_groupby_count_plan(false);
+        let bq = BatchQual {
+            col_idx: 1,
+            op: BatchCompareOp::Ne,
+            const_datum: pg_sys::Datum::from(0usize),
+            type_oid: pg_sys::Oid::from(23u32),
+            ..BatchQual::default()
+        };
+        let segs = vec![
+            seg_with_counts(100, &[(0, 80), (3, 15), (7, 4)]), // +1 NULL
+            seg_with_counts(50, &[(0, 40), (3, 10)]),
+        ];
+        let state = try_groupby_count_fast_path(&plan, &meta, &segs, &[bq], 0, 0).unwrap();
+        assert_eq!(rows_to_pairs(&state), vec![(Some(3), 25), (Some(7), 4)]);
+    }
+
+    #[pg_test]
+    fn test_groupby_count_missing_sidecar_bails() {
+        let meta = make_meta(&["ts", "adv"]);
+        let plan = make_groupby_count_plan(true);
+        let segs = vec![
+            seg_with_counts(10, &[(1, 10)]),
+            make_empty_segment(5), // no valcounts → bail
+        ];
+        assert!(try_groupby_count_fast_path(&plan, &meta, &segs, &[], 0, 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_groupby_count_inconsistent_sidecar_bails() {
+        // Σ counts > row_count → corrupt sidecar → bail.
+        let meta = make_meta(&["ts", "adv"]);
+        let plan = make_groupby_count_plan(true);
+        let segs = vec![seg_with_counts(5, &[(1, 10)])];
+        assert!(try_groupby_count_fast_path(&plan, &meta, &segs, &[], 0, 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_groupby_count_ambiguous_other_qual_bails() {
+        // Qual on `ts` with no per-segment minmax → classify Ambiguous → bail.
+        let meta = make_meta(&["ts", "adv"]);
+        let plan = make_groupby_count_plan(false);
+        let bq = BatchQual {
+            col_idx: 0,
+            op: BatchCompareOp::Gt,
+            const_datum: pg_sys::Datum::from(100usize),
+            type_oid: pg_sys::Oid::from(23u32),
+            ..BatchQual::default()
+        };
+        let segs = vec![seg_with_counts(10, &[(1, 10)])];
+        assert!(try_groupby_count_fast_path(&plan, &meta, &segs, &[bq], 0, 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_groupby_count_other_qual_full_coverage() {
+        // Qual on `ts`: seg1 provably none-pass (excluded), seg2 provably
+        // all-pass (counted fully) — exact, no bail.
+        let meta = make_meta(&["ts", "adv"]);
+        let plan = make_groupby_count_plan(false);
+        let bq = BatchQual {
+            col_idx: 0,
+            op: BatchCompareOp::Gt,
+            const_datum: pg_sys::Datum::from(100usize),
+            type_oid: pg_sys::Oid::from(23u32),
+            ..BatchQual::default()
+        };
+        let mk_seg = |row_count: i32, ts_min: i64, ts_max: i64, counts: &[(i64, i64)]| {
+            let mut seg = seg_with_counts(row_count, counts);
+            seg.col_minmax.insert(
+                "ts".to_string(),
+                ColMinMax {
+                    min_encoded: ts_min,
+                    max_encoded: ts_max,
+                    min_null: false,
+                    max_null: false,
+                    type_oid: pg_sys::Oid::from(23u32),
+                },
+            );
+            seg.col_sums.insert(
+                "ts".to_string(),
+                ColSum {
+                    sum_datum: pg_sys::Datum::from(0usize),
+                    sum_null: true,
+                    sum_i128: None,
+                    sum_f64: None,
+                    nonnull_count: row_count as i64, // no NULLs in ts
+                    nonzero_count: -1,
+                    type_oid: pg_sys::Oid::from(1700u32),
+                },
+            );
+            seg
+        };
+        let segs = vec![
+            mk_seg(10, 0, 50, &[(1, 10)]),    // ts ≤ 50 → none pass → skipped
+            mk_seg(20, 200, 300, &[(1, 20)]), // ts > 100 → all pass → counted
+        ];
+        let state = try_groupby_count_fast_path(&plan, &meta, &segs, &[bq], 0, 0).unwrap();
+        assert_eq!(rows_to_pairs(&state), vec![(Some(1), 20)]);
+        assert_eq!(state.segments_metadata_resolved, 1);
+    }
+
+    #[pg_test]
+    fn test_groupby_count_of_group_col_null_group_zero() {
+        // COUNT(adv) GROUP BY adv: NULL group emits 0 (COUNT skips NULLs).
+        let meta = make_meta(&["ts", "adv"]);
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Count, 1, 23)],
+            vec![GroupByColSpec {
+                col_idx: 1,
+                type_oid: pg_sys::Oid::from(23u32),
+                expr: GroupByExpr::Column,
+            }],
+            Vec::new(),
+            true,
+        );
+        let segs = vec![seg_with_counts(12, &[(4, 10)])]; // 2 NULLs
+        let state = try_groupby_count_fast_path(&plan, &meta, &segs, &[], 0, 0).unwrap();
+        assert_eq!(rows_to_pairs(&state), vec![(Some(4), 10), (None, 0)]);
+    }
+
+    #[pg_test]
+    fn test_groupby_count_rejects_unsupported_shapes() {
+        let meta = make_meta(&["ts", "adv"]);
+        let segs = vec![seg_with_counts(10, &[(1, 10)])];
+
+        // HAVING bails.
+        let mut plan = make_groupby_count_plan(true);
+        plan.having_filters = vec![HavingFilter {
+            agg_idx: 0,
+            op: HavingOp::Gt,
+            const_val: 1,
+        }];
+        assert!(try_groupby_count_fast_path(&plan, &meta, &segs, &[], 0, 0).is_none());
+
+        // Top-N / bare LIMIT bail.
+        let mut plan = make_groupby_count_plan(true);
+        plan.topn_limit = 5;
+        assert!(try_groupby_count_fast_path(&plan, &meta, &segs, &[], 0, 0).is_none());
+        let mut plan = make_groupby_count_plan(true);
+        plan.bare_limit = 5;
+        assert!(try_groupby_count_fast_path(&plan, &meta, &segs, &[], 0, 0).is_none());
+
+        // Non-count aggregate bails.
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::Sum, 1, 23)],
+            vec![GroupByColSpec {
+                col_idx: 1,
+                type_oid: pg_sys::Oid::from(23u32),
+                expr: GroupByExpr::Column,
+            }],
+            Vec::new(),
+            true,
+        );
+        assert!(try_groupby_count_fast_path(&plan, &meta, &segs, &[], 0, 0).is_none());
+
+        // Text group column bails.
+        let plan = make_plan(
+            vec![make_agg_spec(AggType::CountStar, -1, 23)],
+            vec![GroupByColSpec {
+                col_idx: 1,
+                type_oid: pg_sys::Oid::from(25u32), // TEXT
+                expr: GroupByExpr::Column,
+            }],
+            Vec::new(),
+            true,
+        );
+        assert!(try_groupby_count_fast_path(&plan, &meta, &segs, &[], 0, 0).is_none());
+
+        // WHERE present but quals not batch-extractable (empty list) bails.
+        let plan = make_groupby_count_plan(false);
+        assert!(try_groupby_count_fast_path(&plan, &meta, &segs, &[], 0, 0).is_none());
+
+        // InList on the group column bails.
+        let plan = make_groupby_count_plan(false);
+        let bq = BatchQual {
+            col_idx: 1,
+            op: BatchCompareOp::InList,
+            const_datum: pg_sys::Datum::from(0usize),
+            type_oid: pg_sys::Oid::from(23u32),
+            in_list_i64: Some(vec![1, 2]),
+            ..BatchQual::default()
+        };
+        assert!(try_groupby_count_fast_path(&plan, &meta, &segs, &[bq], 0, 0).is_none());
+    }
+
+    #[pg_test]
+    fn test_groupby_count_range_qual_on_group_col() {
+        // WHERE adv >= 3 AND adv < 7 applied exactly per distinct value.
+        let meta = make_meta(&["ts", "adv"]);
+        let plan = make_groupby_count_plan(false);
+        let mk_bq = |op: BatchCompareOp, c: usize| BatchQual {
+            col_idx: 1,
+            op,
+            const_datum: pg_sys::Datum::from(c),
+            type_oid: pg_sys::Oid::from(23u32),
+            ..BatchQual::default()
+        };
+        let quals = vec![mk_bq(BatchCompareOp::Ge, 3), mk_bq(BatchCompareOp::Lt, 7)];
+        let segs = vec![seg_with_counts(
+            100,
+            &[(1, 20), (3, 30), (5, 25), (7, 15), (9, 10)],
+        )];
+        let state = try_groupby_count_fast_path(&plan, &meta, &segs, &quals, 0, 0).unwrap();
+        assert_eq!(rows_to_pairs(&state), vec![(Some(3), 30), (Some(5), 25)]);
     }
 }

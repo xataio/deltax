@@ -4290,7 +4290,23 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         // is cheaper. add_agg_path's complete variant always lands first
         // so correctness is never at risk if the partial variant is
         // rejected for any reason.
-        if !topn_active && having_filters.is_empty() {
+        //
+        // R5 exception: when the query shape is fully answerable from the
+        // per-(segment, value) COUNT sidecar (single low-cardinality int
+        // GROUP BY + COUNT(*), quals only on the group column, sidecar
+        // present on every partition), skip the Gather variant — its cost
+        // formula would otherwise undercut the complete path and shadow the
+        // metadata fast path, which only runs in the complete (serial-begin)
+        // executor. Worst case the exec-side fast path still bails and the
+        // complete path's internal parallelism handles the query.
+        let valcounts_fast_path_likely = groupby_valcounts_shape_likely(
+            root,
+            &classified_aggs,
+            &group_specs,
+            group_by_relid,
+            &companion_oids,
+        );
+        if !topn_active && having_filters.is_empty() && !valcounts_fast_path_likely {
             path::add_agg_partial_path(
                 root,
                 output_rel,
@@ -4301,6 +4317,95 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 extra as *mut pg_sys::GroupPathExtraData,
             );
         }
+    }
+}
+
+/// Plan-time predictor for the R5 GROUP-BY-valcounts metadata fast path
+/// (`try_groupby_count_fast_path`): single bare integer GROUP BY column,
+/// all aggregates COUNT(*) (or COUNT(<group col>)), WHERE quals referencing
+/// no column other than the group column, and every companion partition's
+/// `column_valmap` covering the column with integer-parseable values (i.e.
+/// the per-(segment, value) COUNT sidecar was written for it).
+///
+/// Used only to *skip* the Gather-partial path so the complete DeltaXAgg
+/// path (which hosts the fast path) wins on cost — a false positive loses
+/// the Gather plan but never affects correctness.
+unsafe fn groupby_valcounts_shape_likely(
+    root: *mut pg_sys::PlannerInfo,
+    agg_specs: &[path::AggSpec],
+    group_specs: &[super::exec::GroupByColSpec],
+    group_by_relid: pg_sys::Oid,
+    companion_oids: &[pg_sys::Oid],
+) -> bool {
+    use super::exec::{AggExpr, AggType, GroupByExpr};
+    unsafe {
+        if group_specs.len() != 1 || companion_oids.is_empty() {
+            return false;
+        }
+        let gs = &group_specs[0];
+        if !matches!(gs.expr, GroupByExpr::Column)
+            || gs.col_idx < 0
+            || !matches!(
+                gs.type_oid,
+                pg_sys::INT2OID | pg_sys::INT4OID | pg_sys::INT8OID
+            )
+        {
+            return false;
+        }
+        if agg_specs.is_empty()
+            || !agg_specs.iter().all(|s| {
+                s.agg_type == AggType::CountStar
+                    || (s.agg_type == AggType::Count
+                        && s.col_idx == gs.col_idx
+                        && s.expr_kind == AggExpr::Column)
+            })
+        {
+            return false;
+        }
+        if group_by_relid == pg_sys::InvalidOid {
+            return false;
+        }
+        let attno = (gs.col_idx + 1) as i16;
+        let name_ptr = pg_sys::get_attname(group_by_relid, attno, true);
+        if name_ptr.is_null() {
+            return false;
+        }
+        let col_name = std::ffi::CStr::from_ptr(name_ptr)
+            .to_string_lossy()
+            .into_owned();
+
+        // WHERE quals must reference only the group column — any other
+        // qual column makes per-segment classification (and thus an exec
+        // bail-out) likely, so keep the Gather path in play.
+        let parse = (*root).parse;
+        if !parse.is_null() {
+            let jointree = (*parse).jointree;
+            if !jointree.is_null() && !(*jointree).quals.is_null() {
+                let vars = pg_sys::pull_var_clause((*jointree).quals, 0);
+                if !vars.is_null() {
+                    let nvars = (*vars).length;
+                    for j in 0..nvars {
+                        let v = (*(*vars).elements.add(j as usize)).ptr_value as *mut pg_sys::Var;
+                        if v.is_null() {
+                            continue;
+                        }
+                        if (*v).varattno != attno {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Every companion partition must have the column in its valmap with
+        // integer-parseable values (= the count sidecar was written for it).
+        companion_oids.iter().all(|&oid| {
+            cost::get_column_valmap(oid)
+                .get(&col_name)
+                .is_some_and(|vals| {
+                    !vals.is_empty() && vals.iter().all(|v| v.parse::<i64>().is_ok())
+                })
+        })
     }
 }
 

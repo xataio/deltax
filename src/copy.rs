@@ -3089,96 +3089,38 @@ fn finalize_and_insert_valbitmap(
     std::collections::HashMap<String, Vec<String>>,
     crate::compress::ColumnValcounts,
 ) {
-    use std::collections::{BTreeMap, HashMap};
-
     let value_buffer = std::mem::take(&mut buf.valbitmap_value_buffer);
-    if value_buffer.is_empty() {
-        return (HashMap::new(), HashMap::new());
+    let fin = crate::compress::finalize_valbitmap_buffer(columns, value_buffer);
+    if fin.valmap.is_empty() {
+        return (fin.valmap, fin.valcounts);
     }
 
-    // Aggregate per-col_idx distinct values + summed counts, dropping columns
-    // that overflow VALBITMAP_MAX_DISTINCT.
-    let mut count_by_col: HashMap<u16, BTreeMap<String, i64>> = HashMap::new();
-    let mut overflow_cols: std::collections::HashSet<u16> = std::collections::HashSet::new();
-    for (col_idx, _seg_id, vals) in &value_buffer {
-        if overflow_cols.contains(col_idx) {
-            continue;
-        }
-        let entry = count_by_col.entry(*col_idx).or_default();
-        for (v, c) in vals {
-            if entry.len() >= crate::compress::VALBITMAP_MAX_DISTINCT && !entry.contains_key(v) {
-                overflow_cols.insert(*col_idx);
-                count_by_col.remove(col_idx);
-                break;
-            }
-            *entry.entry(v.clone()).or_insert(0) += *c as i64;
-        }
-    }
-
-    if count_by_col.is_empty() {
-        return (HashMap::new(), HashMap::new());
-    }
-
-    // Finalize per-column sorted value list + value→bit_idx index (BTreeMap
-    // keys are already sorted).
-    let mut finalized: HashMap<u16, (Vec<String>, HashMap<String, u8>)> = HashMap::new();
-    for (col_idx, counts) in &count_by_col {
-        let sorted: Vec<String> = counts.keys().cloned().collect();
-        let mut idx: HashMap<String, u8> = HashMap::new();
-        for (i, v) in sorted.iter().enumerate() {
-            idx.insert(v.clone(), i as u8);
-        }
-        finalized.insert(*col_idx, (sorted, idx));
-    }
-
-    // Map non-segment-by col_idx → user column name for the catalog payload.
-    let col_idx_to_name: HashMap<u16, String> = {
-        let mut m = HashMap::new();
-        let mut idx: u16 = 0;
-        for col in columns {
-            if col.is_segment_by {
-                continue;
-            }
-            m.insert(idx, col.name.clone());
-            idx += 1;
-        }
-        m
-    };
-
-    // Create the valbitmap table (without PK; we'll add it after bulk insert,
-    // mirroring the blobs/blooms pattern in this file for fast heap_insert).
+    // Create the valbitmap table.
     spi_exec(&ddl.valbitmap_ddl);
 
-    // Encode + bulk-insert per-segment bitmaps.
-    let mut entries: Vec<(u16, i32, Vec<u8>)> = Vec::with_capacity(value_buffer.len());
-    for (col_idx, seg_id, vals) in value_buffer {
-        let Some((_, idx_map)) = finalized.get(&col_idx) else {
-            continue;
-        };
-        let n_bits = idx_map.len();
-        let n_bytes = n_bits.div_ceil(8);
-        let mut bits: Vec<u8> = vec![0; n_bytes];
-        for (v, _c) in &vals {
-            if let Some(&bit_idx) = idx_map.get(v) {
-                bits[(bit_idx / 8) as usize] |= 1u8 << (bit_idx % 8);
-            }
-        }
-        entries.push((col_idx, seg_id, bits));
-    }
-
-    // Sort by (col_idx, seg_id) for column-major insertion order, then
-    // bulk-insert as multi-row VALUES (~100 rows/batch).
-    entries.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
+    // Bulk-insert as multi-row VALUES (~100 rows/batch). `_counts` is NULL
+    // for text columns; integer columns carry the per-(segment, value) COUNT
+    // sidecar blob (R5).
     let batch_size = 100;
-    for chunk in entries.chunks(batch_size) {
+    for chunk in fin.entries.chunks(batch_size) {
         let mut values: Vec<String> = Vec::with_capacity(chunk.len());
-        for (col_idx, seg_id, bits) in chunk {
+        for (col_idx, seg_id, bits, counts) in chunk {
             // Hex-encode bytes as `'\x...'::bytea`.
             let hex: String = bits.iter().map(|b| format!("{:02x}", b)).collect();
-            values.push(format!("({}, {}, '\\x{}'::bytea)", col_idx, seg_id, hex));
+            let counts_sql = match counts {
+                Some(cb) => {
+                    let chex: String = cb.iter().map(|b| format!("{:02x}", b)).collect();
+                    format!("'\\x{}'::bytea", chex)
+                }
+                None => "NULL".to_string(),
+            };
+            values.push(format!(
+                "({}, {}, '\\x{}'::bytea, {})",
+                col_idx, seg_id, hex, counts_sql
+            ));
         }
         let sql = format!(
-            "INSERT INTO {} (_col_idx, _segment_id, _bits) VALUES {}",
+            "INSERT INTO {} (_col_idx, _segment_id, _bits, _counts) VALUES {}",
             ddl.valbitmap_fqn,
             values.join(", ")
         );
@@ -3189,21 +3131,7 @@ fn finalize_and_insert_valbitmap(
     // those use isn't worth it here).
     spi_exec(&format!("ANALYZE {}", ddl.valbitmap_fqn));
 
-    // Build the catalog payloads: column name → sorted value list (valmap) and
-    // column name → summed per-value counts (valcounts).
-    let mut valmap: HashMap<String, Vec<String>> = HashMap::new();
-    for (col_idx, (vals, _)) in finalized {
-        if let Some(name) = col_idx_to_name.get(&col_idx) {
-            valmap.insert(name.clone(), vals);
-        }
-    }
-    let mut valcounts: crate::compress::ColumnValcounts = HashMap::new();
-    for (col_idx, counts) in count_by_col {
-        if let Some(name) = col_idx_to_name.get(&col_idx) {
-            valcounts.insert(name.clone(), counts.into_iter().collect());
-        }
-    }
-    (valmap, valcounts)
+    (fin.valmap, fin.valcounts)
 }
 
 /// Binary search for partition by time value.

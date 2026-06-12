@@ -1613,6 +1613,17 @@ pub(crate) type FlushResult = (
 /// exceeds this cap are dropped from valbitmap entirely (no entry written).
 pub(crate) const VALBITMAP_MAX_DISTINCT: usize = 32;
 
+/// Cap on distinct values for the per-(segment, value) COUNT sidecar on
+/// low-cardinality *integer* columns (R5). Integer columns with at most this
+/// many distinct values partition-wide get an exact per-segment value→count
+/// list stored next to the presence bitmap (`_counts` on the `_valbitmap`
+/// companion table), letting `GROUP BY <col> + COUNT(*)` queries resolve
+/// entirely from metadata. Columns exceeding the cap are dropped (no entry).
+/// (col_idx, segment_id, bitmap_bits, optional counts blob).
+pub(crate) type ValbitmapEntry = (u16, i32, Vec<u8>, Option<Vec<u8>>);
+
+pub(crate) const VALCOUNTS_MAX_DISTINCT_INT: usize = 64;
+
 /// Cap on distinct values tracked per text column for the partial-MCV
 /// (heavy-hitter) summary. Generous enough to hold every distinct value of a
 /// real categorical column exactly; for higher-cardinality columns we stop
@@ -1831,11 +1842,17 @@ pub(crate) fn flush_segment_metadata(
     )
 }
 
-/// Collect per-segment distinct text values for low-cardinality columns.
-/// Returns one `(col_idx, sorted_values)` entry per text column whose
-/// distinct count in this segment is ≤ `VALBITMAP_MAX_DISTINCT`. Columns
-/// that overflow the cap are simply omitted — the partition-level finalize
-/// pass treats a missing entry as "give up on bitmap for this column".
+/// Collect per-segment distinct values for low-cardinality columns.
+/// Returns one `(col_idx, (value, count) list)` entry per:
+/// - text column with ≤ `VALBITMAP_MAX_DISTINCT` distinct values in this
+///   segment (feeds the value-presence bitmap + catalog valmap/valcounts);
+/// - integer column (`smallint`/`integer`/`bigint`, not timestamps/dates)
+///   with ≤ `VALCOUNTS_MAX_DISTINCT_INT` distinct values in this segment
+///   (feeds the per-(segment, value) COUNT sidecar — R5). Integer values
+///   are stringified in canonical decimal so they share the text plumbing.
+///
+/// Columns that overflow their cap are simply omitted — the partition-level
+/// finalize pass treats a missing entry as "give up on this column".
 pub(crate) fn compute_segment_valbitmap_values(
     typed_cols: &[TypedColumn],
     columns: &[ColumnMeta],
@@ -1846,28 +1863,118 @@ pub(crate) fn compute_segment_valbitmap_values(
         if col.is_segment_by {
             continue;
         }
-        if let TypedColumn::Text(vals) = &typed_cols[i] {
-            // Count occurrences per distinct value. As soon as the distinct
-            // count would exceed the cap we know this column can't get a
-            // bitmap, so we bail and skip counting the rest.
-            let mut counts: std::collections::BTreeMap<String, u32> =
-                std::collections::BTreeMap::new();
-            let mut overflow = false;
-            for v in vals.iter().flatten() {
-                if counts.len() >= VALBITMAP_MAX_DISTINCT && !counts.contains_key(v) {
-                    overflow = true;
-                    break;
+        match &typed_cols[i] {
+            TypedColumn::Text(vals) => {
+                // Count occurrences per distinct value. As soon as the distinct
+                // count would exceed the cap we know this column can't get a
+                // bitmap, so we bail and skip counting the rest.
+                let mut counts: std::collections::BTreeMap<String, u32> =
+                    std::collections::BTreeMap::new();
+                let mut overflow = false;
+                for v in vals.iter().flatten() {
+                    if counts.len() >= VALBITMAP_MAX_DISTINCT && !counts.contains_key(v) {
+                        overflow = true;
+                        break;
+                    }
+                    *counts.entry(v.clone()).or_insert(0) += 1;
                 }
-                *counts.entry(v.clone()).or_insert(0) += 1;
+                if !overflow {
+                    // BTreeMap iteration is already sorted by value.
+                    entries.push((col_idx, counts.into_iter().collect()));
+                }
             }
-            if !overflow {
-                // BTreeMap iteration is already sorted by value.
-                entries.push((col_idx, counts.into_iter().collect()));
+            // Integer columns: only true int types (TypedColumn::Int64 also
+            // carries timestamps/dates, which are never low-cardinality and
+            // would just waste counting work).
+            TypedColumn::Int16(vals) if is_intcount_data_type(&col.data_type.to_lowercase()) => {
+                if let Some(vc) = collect_int_value_counts(vals.iter().copied()) {
+                    entries.push((col_idx, vc));
+                }
             }
+            TypedColumn::Int32(vals) if is_intcount_data_type(&col.data_type.to_lowercase()) => {
+                if let Some(vc) = collect_int_value_counts(vals.iter().copied()) {
+                    entries.push((col_idx, vc));
+                }
+            }
+            TypedColumn::Int64(vals) if is_intcount_data_type(&col.data_type.to_lowercase()) => {
+                if let Some(vc) = collect_int_value_counts(vals.iter().copied()) {
+                    entries.push((col_idx, vc));
+                }
+            }
+            _ => {}
         }
         col_idx += 1;
     }
     entries
+}
+
+/// Count occurrences per distinct integer value, bailing with `None` once the
+/// distinct count exceeds `VALCOUNTS_MAX_DISTINCT_INT`. Values are stringified
+/// in canonical decimal (exact i64 round-trip on the read side).
+fn collect_int_value_counts<T: Into<i64>>(
+    vals: impl Iterator<Item = Option<T>>,
+) -> Option<SegValueCounts> {
+    let mut counts: std::collections::BTreeMap<i64, u32> = std::collections::BTreeMap::new();
+    for v in vals.flatten() {
+        let k: i64 = v.into();
+        if counts.len() >= VALCOUNTS_MAX_DISTINCT_INT && !counts.contains_key(&k) {
+            return None;
+        }
+        *counts.entry(k).or_insert(0) += 1;
+    }
+    Some(
+        counts
+            .into_iter()
+            .map(|(k, c)| (k.to_string(), c))
+            .collect(),
+    )
+}
+
+/// True for PostgreSQL integer-family types eligible for the per-(segment,
+/// value) COUNT sidecar (R5). Expects a lowercased type name. Deliberately
+/// excludes bool / float / date / timestamp.
+pub(crate) fn is_intcount_data_type(dt: &str) -> bool {
+    matches!(
+        dt,
+        "smallint" | "int2" | "integer" | "int" | "int4" | "bigint" | "int8"
+    )
+}
+
+/// Encode a per-segment `(bit_idx, count)` list into the `_counts` sidecar
+/// blob. `bit_idx` indexes the partition-level sorted value list persisted in
+/// `deltax.deltax_partition.column_valmap`. Format:
+/// `[version=1 u8][n u8][n × (bit_idx u8, count u32 LE)]` with n ≤ 64.
+pub(crate) fn encode_segment_value_counts(pairs: &[(u8, u32)]) -> Vec<u8> {
+    debug_assert!(pairs.len() <= VALCOUNTS_MAX_DISTINCT_INT);
+    let mut out = Vec::with_capacity(2 + pairs.len() * 5);
+    out.push(1u8);
+    out.push(pairs.len() as u8);
+    for &(bit_idx, count) in pairs {
+        out.push(bit_idx);
+        out.extend_from_slice(&count.to_le_bytes());
+    }
+    out
+}
+
+/// Decode a `_counts` sidecar blob (see [`encode_segment_value_counts`]).
+/// Returns `None` on unknown version / truncated payload — the read-side
+/// fast path bails to the normal scan in that case.
+pub(crate) fn decode_segment_value_counts(blob: &[u8]) -> Option<Vec<(u8, u32)>> {
+    if blob.len() < 2 || blob[0] != 1 {
+        return None;
+    }
+    let n = blob[1] as usize;
+    if blob.len() != 2 + n * 5 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let off = 2 + i * 5;
+        let bit_idx = blob[off];
+        let count = u32::from_le_bytes(blob[off + 1..off + 5].try_into().ok()?);
+        out.push((bit_idx, count));
+    }
+    Some(out)
 }
 
 /// Slice a TypedColumn to a sub-range [start..end).
@@ -2344,9 +2451,13 @@ pub(crate) fn build_companion_ddl(part_table: &str, columns: &[ColumnMeta]) -> C
     // One bit per distinct partition-level value (mapping persisted in
     // `deltax.deltax_partition.column_valmap`). Lets `WHERE col = const` queries skip
     // segments where the constant's bit is clear, with no false positives.
+    // `_counts` (nullable; populated for low-cardinality (≤64) integer columns
+    // only) holds the exact per-(segment, value) occurrence counts — see
+    // `encode_segment_value_counts` — serving `GROUP BY <int col> + COUNT(*)`
+    // entirely from metadata (R5).
     let valbitmap_ddl = format!(
-        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _bits BYTEA{} NOT NULL, PRIMARY KEY (_col_idx, _segment_id))",
-        valbitmap_fqn, lz4
+        "CREATE TABLE {} (_col_idx SMALLINT NOT NULL, _segment_id INT NOT NULL, _bits BYTEA{} NOT NULL, _counts BYTEA{}, PRIMARY KEY (_col_idx, _segment_id))",
+        valbitmap_fqn, lz4, lz4
     );
 
     CompanionDdl {
@@ -2830,38 +2941,83 @@ fn compress_partition_streaming(
     )
 }
 
-/// Build partition-level value→bit_idx maps from per-segment value sets,
-/// encode each segment's bitmap, bulk-insert into the valbitmap table.
-/// Returns the partition-level value map (column name → sorted distinct values,
-/// for `column_valmap`) plus the summed per-value occurrence counts (column
-/// name → (value, count) list, for `column_valcounts` → real MCV frequencies).
-fn finalize_and_insert_valbitmaps(
-    client: &mut SpiClient,
-    ddl: &CompanionDdl,
+/// Output of [`finalize_valbitmap_buffer`]: the catalog payloads plus the
+/// encoded per-(col, segment) sidecar rows ready for insertion.
+pub(crate) struct ValbitmapFinal {
+    /// Column name → sorted distinct value list (`column_valmap`). The array
+    /// index is the bit position in each segment's `_bits` bitmap and the
+    /// `bit_idx` key in each `_counts` blob.
+    pub(crate) valmap: std::collections::HashMap<String, Vec<String>>,
+    /// Column name → summed per-value occurrence counts (`column_valcounts`).
+    pub(crate) valcounts: ColumnValcounts,
+    /// `(col_idx, segment_id, bits, counts_blob)` sorted by (col_idx,
+    /// segment_id). `counts_blob` is `Some` only for integer columns — the
+    /// per-(segment, value) COUNT sidecar (R5), encoded via
+    /// [`encode_segment_value_counts`].
+    pub(crate) entries: Vec<ValbitmapEntry>,
+}
+
+/// Build partition-level value→bit_idx maps from per-segment value sets and
+/// encode each segment's bitmap (+ per-value count blob for integer columns).
+/// Pure aggregation/encoding half shared by `compress.rs` (SPI inserts) and
+/// `copy.rs` (spi_exec inserts).
+///
+/// Per-column distinct cap: `VALBITMAP_MAX_DISTINCT` (32) for text columns,
+/// `VALCOUNTS_MAX_DISTINCT_INT` (64) for integer columns. Columns that
+/// overflow their cap partition-wide are dropped entirely. Note the cap
+/// equality with `compute_segment_valbitmap_values`'s per-segment cap
+/// guarantees that a kept column has an entry for *every* segment (a segment
+/// exceeding the cap alone would push the partition union over the cap too) —
+/// the read-side fast path still re-verifies per-segment presence.
+pub(crate) fn finalize_valbitmap_buffer(
     columns: &[ColumnMeta],
     value_buffer: Vec<(u16, i32, SegValueCounts)>,
-) -> (
-    std::collections::HashMap<String, Vec<String>>,
-    ColumnValcounts,
-) {
+) -> ValbitmapFinal {
     use std::collections::{BTreeMap, HashMap};
 
+    let empty = || ValbitmapFinal {
+        valmap: HashMap::new(),
+        valcounts: HashMap::new(),
+        entries: Vec::new(),
+    };
     if value_buffer.is_empty() {
-        return (HashMap::new(), HashMap::new());
+        return empty();
     }
+
+    // Map non-segment-by col_idx → (user column name, is_integer).
+    let col_idx_info: HashMap<u16, (String, bool)> = {
+        let mut m = HashMap::new();
+        let mut idx: u16 = 0;
+        for col in columns {
+            if col.is_segment_by {
+                continue;
+            }
+            let is_int = is_intcount_data_type(&col.data_type.to_lowercase());
+            m.insert(idx, (col.name.clone(), is_int));
+            idx += 1;
+        }
+        m
+    };
+    let cap_for = |col_idx: &u16| -> usize {
+        match col_idx_info.get(col_idx) {
+            Some((_, true)) => VALCOUNTS_MAX_DISTINCT_INT,
+            _ => VALBITMAP_MAX_DISTINCT,
+        }
+    };
 
     // Aggregate per-col_idx: distinct value set (for the bitmap/valmap) and the
     // summed occurrence counts (for valcounts). Stop accumulating into a column
-    // as soon as it crosses VALBITMAP_MAX_DISTINCT (we'll drop it anyway).
+    // as soon as it crosses its cap (we'll drop it anyway).
     let mut count_by_col: HashMap<u16, BTreeMap<String, i64>> = HashMap::new();
     let mut overflow_cols: std::collections::HashSet<u16> = std::collections::HashSet::new();
     for (col_idx, _seg_id, vals) in &value_buffer {
         if overflow_cols.contains(col_idx) {
             continue;
         }
+        let cap = cap_for(col_idx);
         let entry = count_by_col.entry(*col_idx).or_default();
         for (v, c) in vals {
-            if entry.len() >= VALBITMAP_MAX_DISTINCT && !entry.contains_key(v) {
+            if entry.len() >= cap && !entry.contains_key(v) {
                 overflow_cols.insert(*col_idx);
                 count_by_col.remove(col_idx);
                 break;
@@ -2871,7 +3027,7 @@ fn finalize_and_insert_valbitmaps(
     }
 
     if count_by_col.is_empty() {
-        return (HashMap::new(), HashMap::new());
+        return empty();
     }
 
     // Finalize per-column sorted value list + value→bit_idx index. The
@@ -2886,26 +3042,9 @@ fn finalize_and_insert_valbitmaps(
         finalized.insert(*col_idx, (sorted, idx));
     }
 
-    // Map non-segment-by col_idx → user column name for the catalog payload.
-    let col_idx_to_name: HashMap<u16, String> = {
-        let mut m = HashMap::new();
-        let mut idx: u16 = 0;
-        for col in columns {
-            if col.is_segment_by {
-                continue;
-            }
-            m.insert(idx, col.name.clone());
-            idx += 1;
-        }
-        m
-    };
-
-    // Encode + bulk-insert per-segment bitmaps. n_bytes = ceil(ndistinct/8).
-    client
-        .update(&ddl.valbitmap_ddl, None, &[])
-        .expect("failed to create valbitmap table");
-
-    let mut entries: Vec<(u16, i32, Vec<u8>)> = Vec::with_capacity(value_buffer.len());
+    // Encode per-segment bitmaps (+ count blobs for integer columns).
+    // n_bytes = ceil(ndistinct/8).
+    let mut entries: Vec<ValbitmapEntry> = Vec::with_capacity(value_buffer.len());
     for (col_idx, seg_id, vals) in value_buffer {
         let Some((_, idx_map)) = finalized.get(&col_idx) else {
             // Column overflowed at partition level — skip.
@@ -2919,46 +3058,107 @@ fn finalize_and_insert_valbitmaps(
                 bits[(bit_idx / 8) as usize] |= 1u8 << (bit_idx % 8);
             }
         }
-        entries.push((col_idx, seg_id, bits));
+        let is_int = col_idx_info.get(&col_idx).map(|(_, i)| *i).unwrap_or(false);
+        let counts_blob = if is_int {
+            let mut pairs: Vec<(u8, u32)> = vals
+                .iter()
+                .filter_map(|(v, c)| idx_map.get(v).map(|&b| (b, *c)))
+                .collect();
+            pairs.sort_by_key(|&(b, _)| b);
+            Some(encode_segment_value_counts(&pairs))
+        } else {
+            None
+        };
+        entries.push((col_idx, seg_id, bits, counts_blob));
     }
 
     // Sort by (col_idx, seg_id) for column-major insertion order.
-    entries.sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
-    for (col_idx, seg_id, bits) in entries {
+    entries.sort_by_key(|e| (e.0, e.1));
+
+    // Build the catalog payloads keyed by user column name: the sorted value
+    // list (valmap) and the summed per-value counts (valcounts).
+    let mut valmap: HashMap<String, Vec<String>> = HashMap::new();
+    for (col_idx, (vals, _)) in finalized {
+        if let Some((name, _)) = col_idx_info.get(&col_idx) {
+            valmap.insert(name.clone(), vals);
+        }
+    }
+    let mut valcounts: ColumnValcounts = HashMap::new();
+    for (col_idx, counts) in count_by_col {
+        if let Some((name, _)) = col_idx_info.get(&col_idx) {
+            valcounts.insert(name.clone(), counts.into_iter().collect());
+        }
+    }
+    ValbitmapFinal {
+        valmap,
+        valcounts,
+        entries,
+    }
+}
+
+/// Build partition-level value→bit_idx maps from per-segment value sets,
+/// encode each segment's bitmap (+ per-value count blobs for integer
+/// columns), bulk-insert into the valbitmap table.
+/// Returns the partition-level value map (column name → sorted distinct values,
+/// for `column_valmap`) plus the summed per-value occurrence counts (column
+/// name → (value, count) list, for `column_valcounts` → real MCV frequencies).
+fn finalize_and_insert_valbitmaps(
+    client: &mut SpiClient,
+    ddl: &CompanionDdl,
+    columns: &[ColumnMeta],
+    value_buffer: Vec<(u16, i32, SegValueCounts)>,
+) -> (
+    std::collections::HashMap<String, Vec<String>>,
+    ColumnValcounts,
+) {
+    let fin = finalize_valbitmap_buffer(columns, value_buffer);
+    if fin.valmap.is_empty() {
+        return (fin.valmap, fin.valcounts);
+    }
+
+    client
+        .update(&ddl.valbitmap_ddl, None, &[])
+        .expect("failed to create valbitmap table");
+
+    for (col_idx, seg_id, bits, counts) in fin.entries {
         use pgrx::datum::DatumWithOid;
-        let insert_sql = format!(
-            "INSERT INTO {} (_col_idx, _segment_id, _bits) VALUES ($1, $2, $3)",
-            &ddl.valbitmap_fqn
-        );
-        let args: Vec<DatumWithOid> = vec![
-            (col_idx as i16).into(),
-            seg_id.into(),
-            DatumWithOid::from(bits),
-        ];
-        client
-            .update(&insert_sql, None, &args)
-            .expect("failed to insert valbitmap row");
+        match counts {
+            Some(counts_blob) => {
+                let insert_sql = format!(
+                    "INSERT INTO {} (_col_idx, _segment_id, _bits, _counts) VALUES ($1, $2, $3, $4)",
+                    &ddl.valbitmap_fqn
+                );
+                let args: Vec<DatumWithOid> = vec![
+                    (col_idx as i16).into(),
+                    seg_id.into(),
+                    DatumWithOid::from(bits),
+                    DatumWithOid::from(counts_blob),
+                ];
+                client
+                    .update(&insert_sql, None, &args)
+                    .expect("failed to insert valbitmap row");
+            }
+            None => {
+                let insert_sql = format!(
+                    "INSERT INTO {} (_col_idx, _segment_id, _bits) VALUES ($1, $2, $3)",
+                    &ddl.valbitmap_fqn
+                );
+                let args: Vec<DatumWithOid> = vec![
+                    (col_idx as i16).into(),
+                    seg_id.into(),
+                    DatumWithOid::from(bits),
+                ];
+                client
+                    .update(&insert_sql, None, &args)
+                    .expect("failed to insert valbitmap row");
+            }
+        }
     }
     client
         .update(&format!("ANALYZE {}", ddl.valbitmap_fqn), None, &[])
         .expect("failed to analyze valbitmap table");
 
-    // Build the catalog payloads keyed by user column name: the sorted value
-    // list (valmap) and the summed per-value counts (valcounts).
-    let mut valmap: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
-    for (col_idx, (vals, _)) in finalized {
-        if let Some(name) = col_idx_to_name.get(&col_idx) {
-            valmap.insert(name.clone(), vals);
-        }
-    }
-    let mut valcounts: ColumnValcounts = std::collections::HashMap::new();
-    for (col_idx, counts) in count_by_col {
-        if let Some(name) = col_idx_to_name.get(&col_idx) {
-            valcounts.insert(name.clone(), counts.into_iter().collect());
-        }
-    }
-    (valmap, valcounts)
+    (fin.valmap, fin.valcounts)
 }
 
 /// Compress a typed column directly, bypassing string parsing.
@@ -4756,6 +4956,204 @@ mod tests {
         for ty in ["integer", "bigint", "boolean", "jsonb", "timestamp", "date"] {
             assert!(!is_text_data_type(ty), "expected {} to NOT be text", ty);
         }
+    }
+
+    #[test]
+    fn is_intcount_data_type_matrix() {
+        for ty in [
+            "smallint", "int2", "integer", "int", "int4", "bigint", "int8",
+        ] {
+            assert!(is_intcount_data_type(ty), "expected {} to be intcount", ty);
+        }
+        for ty in [
+            "boolean",
+            "real",
+            "double precision",
+            "date",
+            "timestamp",
+            "timestamptz",
+            "timestamp with time zone",
+            "text",
+            "numeric",
+        ] {
+            assert!(
+                !is_intcount_data_type(ty),
+                "expected {} to NOT be intcount",
+                ty
+            );
+        }
+    }
+
+    #[test]
+    fn segment_value_counts_roundtrip() {
+        // Empty, single, and full-cap lists round-trip exactly.
+        for pairs in [
+            vec![],
+            vec![(0u8, 1u32)],
+            vec![(0, 7), (3, 30_000), (63, u32::MAX)],
+            (0..VALCOUNTS_MAX_DISTINCT_INT as u8)
+                .map(|b| (b, b as u32 * 17 + 1))
+                .collect::<Vec<_>>(),
+        ] {
+            let blob = encode_segment_value_counts(&pairs);
+            assert_eq!(
+                decode_segment_value_counts(&blob),
+                Some(pairs.clone()),
+                "roundtrip failed for {} pairs",
+                pairs.len()
+            );
+        }
+    }
+
+    #[test]
+    fn segment_value_counts_decode_rejects_bad_input() {
+        // Empty / truncated / wrong version / trailing garbage all fail.
+        assert_eq!(decode_segment_value_counts(&[]), None);
+        assert_eq!(decode_segment_value_counts(&[1u8]), None);
+        assert_eq!(decode_segment_value_counts(&[2u8, 0]), None); // unknown version
+        let good = encode_segment_value_counts(&[(1, 5), (2, 6)]);
+        assert_eq!(decode_segment_value_counts(&good[..good.len() - 1]), None);
+        let mut padded = good.clone();
+        padded.push(0);
+        assert_eq!(decode_segment_value_counts(&padded), None);
+    }
+
+    /// Test-only ColumnMeta constructor.
+    fn col(name: &str, data_type: &str) -> ColumnMeta {
+        ColumnMeta {
+            name: name.to_string(),
+            data_type: data_type.to_string(),
+            is_segment_by: false,
+            is_time_column: false,
+            extracted: None,
+        }
+    }
+
+    #[test]
+    fn valbitmap_values_collects_lowcard_int_counts() {
+        // Two columns: ts (timestamp-as-int64, skipped) + adv (int4, counted).
+        let columns = vec![col("ts", "timestamp"), col("adv", "integer")];
+        let typed = vec![
+            TypedColumn::Int64(vec![Some(1), Some(2), Some(3), Some(4)]),
+            TypedColumn::Int32(vec![Some(5), Some(0), Some(5), None]),
+        ];
+        let entries = compute_segment_valbitmap_values(&typed, &columns);
+        // Only the int4 column produces an entry (col_idx 1); NULLs aren't counted.
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, 1);
+        assert_eq!(
+            entries[0].1,
+            vec![("0".to_string(), 1u32), ("5".to_string(), 2u32)]
+        );
+    }
+
+    #[test]
+    fn valbitmap_values_int_overflow_dropped() {
+        // 65 distinct ints (> VALCOUNTS_MAX_DISTINCT_INT) → no entry.
+        let columns = vec![col("adv", "bigint")];
+        let vals: Vec<Option<i64>> = (0..(VALCOUNTS_MAX_DISTINCT_INT as i64 + 1))
+            .map(Some)
+            .collect();
+        let typed = vec![TypedColumn::Int64(vals)];
+        assert!(compute_segment_valbitmap_values(&typed, &columns).is_empty());
+        // Exactly at the cap → kept.
+        let vals: Vec<Option<i64>> = (0..(VALCOUNTS_MAX_DISTINCT_INT as i64)).map(Some).collect();
+        let typed = vec![TypedColumn::Int64(vals)];
+        assert_eq!(compute_segment_valbitmap_values(&typed, &columns).len(), 1);
+    }
+
+    #[test]
+    fn finalize_valbitmap_buffer_int_counts_blob() {
+        // One int column, two segments. Counts blobs must decode back to the
+        // per-segment exact counts keyed by the partition valmap order.
+        let columns = vec![col("adv", "integer")];
+        let buffer: Vec<(u16, i32, SegValueCounts)> = vec![
+            (
+                0,
+                1,
+                vec![("0".to_string(), 100u32), ("7".to_string(), 3u32)],
+            ),
+            (
+                0,
+                2,
+                vec![("10".to_string(), 5u32), ("7".to_string(), 9u32)],
+            ),
+        ];
+        let fin = finalize_valbitmap_buffer(&columns, buffer);
+        // Valmap: BTreeMap string order → ["0", "10", "7"].
+        assert_eq!(
+            fin.valmap.get("adv").unwrap(),
+            &vec!["0".to_string(), "10".to_string(), "7".to_string()]
+        );
+        // Valcounts summed across segments.
+        let vc = fin.valcounts.get("adv").unwrap();
+        assert_eq!(
+            vc,
+            &vec![
+                ("0".to_string(), 100i64),
+                ("10".to_string(), 5i64),
+                ("7".to_string(), 12i64)
+            ]
+        );
+        assert_eq!(fin.entries.len(), 2);
+        // Segment 1: bits for "0" (bit 0) and "7" (bit 2); counts blob carries
+        // exact per-value counts.
+        let (ci, sid, bits, counts) = &fin.entries[0];
+        assert_eq!((*ci, *sid), (0, 1));
+        assert_eq!(bits, &vec![0b101u8]);
+        let decoded = decode_segment_value_counts(counts.as_ref().unwrap()).unwrap();
+        assert_eq!(decoded, vec![(0u8, 100u32), (2u8, 3u32)]);
+        // Segment 2: "10" (bit 1) and "7" (bit 2).
+        let (_, sid2, bits2, counts2) = &fin.entries[1];
+        assert_eq!(*sid2, 2);
+        assert_eq!(bits2, &vec![0b110u8]);
+        let decoded2 = decode_segment_value_counts(counts2.as_ref().unwrap()).unwrap();
+        assert_eq!(decoded2, vec![(1u8, 5u32), (2u8, 9u32)]);
+    }
+
+    #[test]
+    fn finalize_valbitmap_buffer_text_has_no_counts_blob() {
+        let columns = vec![col("event_type", "text")];
+        let buffer: Vec<(u16, i32, SegValueCounts)> =
+            vec![(0, 1, vec![("a".to_string(), 4u32), ("b".to_string(), 6u32)])];
+        let fin = finalize_valbitmap_buffer(&columns, buffer);
+        assert_eq!(fin.entries.len(), 1);
+        assert!(
+            fin.entries[0].3.is_none(),
+            "text column must not get _counts"
+        );
+        assert_eq!(fin.valmap.get("event_type").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn finalize_valbitmap_buffer_per_type_caps() {
+        // 40 distinct values: over the 32-cap for text (dropped), under the
+        // 64-cap for int (kept).
+        let mk_vals = || -> SegValueCounts { (0..40).map(|i| (format!("{i:03}"), 1u32)).collect() };
+        let text_cols = vec![col("c", "text")];
+        let fin = finalize_valbitmap_buffer(&text_cols, vec![(0, 1, mk_vals())]);
+        assert!(
+            fin.valmap.is_empty(),
+            "40-distinct text col must be dropped"
+        );
+        assert!(fin.entries.is_empty());
+
+        let int_cols = vec![col("c", "integer")];
+        let fin = finalize_valbitmap_buffer(&int_cols, vec![(0, 1, mk_vals())]);
+        assert_eq!(fin.valmap.get("c").unwrap().len(), 40);
+        assert_eq!(fin.entries.len(), 1);
+        assert!(fin.entries[0].3.is_some());
+    }
+
+    #[test]
+    fn finalize_valbitmap_buffer_int_union_overflow_dropped() {
+        // Two segments, each ≤64 distinct, union > 64 → column dropped.
+        let columns = vec![col("c", "integer")];
+        let seg1: SegValueCounts = (0..60).map(|i| (i.to_string(), 1u32)).collect();
+        let seg2: SegValueCounts = (41..105).map(|i| (i.to_string(), 1u32)).collect();
+        let fin = finalize_valbitmap_buffer(&columns, vec![(0, 1, seg1), (0, 2, seg2)]);
+        assert!(fin.valmap.is_empty());
+        assert!(fin.entries.is_empty());
     }
 
     #[test]

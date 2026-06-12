@@ -451,6 +451,7 @@ unsafe fn lookup_point_segments_by_minmax_index(
                 col_sums: HashMap::new(),
                 toast_pointers: vec![Vec::new(); num_blob_cols],
                 cached_blob_pins: Vec::new(),
+                valcounts: None,
             });
         }
 
@@ -936,6 +937,12 @@ pub(super) struct SegmentData {
     /// runs on the leader before worker dispatch and segments are owned by
     /// the leader's `DecompressState`). Released automatically on drop.
     pub(super) cached_blob_pins: Vec<crate::blob_cache::BlobCachePin>,
+    /// Exact per-value occurrence counts `(value, count)` for the GROUP BY
+    /// fast-path column, decoded from the `_counts` sidecar on the
+    /// `_valbitmap` companion table (R5). Populated only by
+    /// `load_groupcol_valcounts`; `None` means "sidecar not loaded / not
+    /// available for this segment" and the metadata GROUP BY fast path bails.
+    pub(super) valcounts: Option<Vec<(i64, i64)>>,
 }
 
 // SAFETY: SegmentData is shared across threads only via immutable references
@@ -2192,6 +2199,7 @@ pub(super) unsafe fn load_segments_heap(
                 col_sums,
                 toast_pointers,
                 cached_blob_pins: Vec::new(),
+                valcounts: None,
             });
         }
 
@@ -3638,6 +3646,145 @@ pub(super) unsafe fn load_text_length_sidecars(
         pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
 
         t_start.elapsed().as_micros() as u64
+    }
+}
+
+/// Load the per-(segment, value) COUNT sidecar (R5) for one column from the
+/// `<partition>_valbitmap` companion table's `_counts` column, attaching the
+/// decoded `(value, count)` list to each matching segment's `valcounts`.
+///
+/// `sidecar_col_idx` is the persisted `_col_idx` of the column (see
+/// `MetadataInfo::blob_idx`); `bit_values` is the partition-level sorted
+/// value list from `column_valmap`, parsed to i64 — each blob's `bit_idx`
+/// indexes into it.
+///
+/// Missing table / missing `_counts` column (data compressed before R5) /
+/// missing rows / undecodable blobs simply leave the affected segments'
+/// `valcounts` as `None`; the caller bails to the normal path when any
+/// surviving segment lacks counts. Never errors.
+///
+/// # Safety
+///
+/// Opens relations and runs an index scan; must run inside an active PG
+/// transaction.
+pub(super) unsafe fn load_groupcol_valcounts(
+    meta_oid: pg_sys::Oid,
+    sidecar_col_idx: u16,
+    bit_values: &[i64],
+    segments: &mut [SegmentData],
+) {
+    if segments.is_empty() || bit_values.is_empty() {
+        return;
+    }
+
+    unsafe {
+        let vb_oid = sibling_table_oid(meta_oid, "_valbitmap");
+        if vb_oid == pg_sys::InvalidOid {
+            return;
+        }
+
+        let mut seg_id_to_idx: HashMap<i32, usize> = HashMap::new();
+        for (idx, seg) in segments.iter().enumerate() {
+            seg_id_to_idx.insert(seg.segment_id, idx);
+        }
+
+        let rel = pg_sys::table_open(vb_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+        // Resolve `_segment_id` / `_counts` attribute positions by name —
+        // partitions compressed before the `_counts` column existed bail here.
+        let tupdesc = (*rel).rd_att;
+        let natts = (*tupdesc).natts as usize;
+        let mut seg_id_att: Option<usize> = None;
+        let mut counts_att: Option<usize> = None;
+        for i in 0..natts {
+            let attr = &*tupdesc_get_attr(tupdesc, i);
+            let name = std::ffi::CStr::from_ptr(attr.attname.data.as_ptr()).to_string_lossy();
+            if name == "_segment_id" {
+                seg_id_att = Some(i);
+            } else if name == "_counts" {
+                counts_att = Some(i);
+            }
+        }
+        let pk_index_oid = primary_key_index_oid(rel);
+
+        if let (Some(sid_att), Some(cnt_att), true) =
+            (seg_id_att, counts_att, pk_index_oid != pg_sys::InvalidOid)
+        {
+            let snapshot = pg_sys::GetActiveSnapshot();
+            let idx_rel =
+                pg_sys::index_open(pk_index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+            let mut skey = [pg_sys::ScanKeyData::default()];
+            pg_sys::ScanKeyInit(
+                &mut skey[0],
+                1, // attnum 1 = _col_idx
+                pg_sys::BTEqualStrategyNumber as u16,
+                pg_sys::F_INT2EQ.into(),
+                pg_sys::Datum::from(sidecar_col_idx as i16),
+            );
+
+            #[cfg(feature = "pg17")]
+            let scan = pg_sys::index_beginscan(rel, idx_rel, snapshot, 1, 0);
+            #[cfg(feature = "pg18")]
+            let scan = pg_sys::index_beginscan(rel, idx_rel, snapshot, std::ptr::null_mut(), 1, 0);
+            pg_sys::index_rescan(scan, skey.as_mut_ptr(), 1, std::ptr::null_mut(), 0);
+
+            let slot = pg_sys::table_slot_create(rel, std::ptr::null_mut());
+
+            loop {
+                if !pg_sys::index_getnext_slot(
+                    scan,
+                    pg_sys::ScanDirection::ForwardScanDirection,
+                    slot,
+                ) {
+                    break;
+                }
+                pg_sys::slot_getallattrs(slot);
+                let tts_values = (*slot).tts_values;
+                let tts_isnull = (*slot).tts_isnull;
+                if *tts_isnull.add(sid_att) || *tts_isnull.add(cnt_att) {
+                    continue;
+                }
+                let seg_id = (*tts_values.add(sid_att)).value() as i32;
+                let Some(&seg_idx) = seg_id_to_idx.get(&seg_id) else {
+                    continue; // pruned
+                };
+
+                let varlena_ptr = (*tts_values.add(cnt_att)).cast_mut_ptr::<pg_sys::varlena>();
+                let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                let data_ptr = pgrx::vardata_any(detoasted);
+                let data_len = pgrx::varsize_any_exhdr(detoasted);
+                #[allow(clippy::unnecessary_cast)]
+                let blob = std::slice::from_raw_parts(data_ptr as *const u8, data_len);
+
+                // Decode and resolve bit_idx → value via the partition valmap.
+                // Out-of-range bit indices mean the catalog and sidecar are out
+                // of sync — leave the segment's valcounts as None (bail later).
+                let decoded =
+                    crate::compress::decode_segment_value_counts(blob).and_then(|pairs| {
+                        let mut out: Vec<(i64, i64)> = Vec::with_capacity(pairs.len());
+                        for (bit_idx, count) in pairs {
+                            let v = *bit_values.get(bit_idx as usize)?;
+                            out.push((v, count as i64));
+                        }
+                        Some(out)
+                    });
+
+                if detoasted != varlena_ptr {
+                    pg_sys::pfree(detoasted as *mut _);
+                }
+
+                if let Some(vc) = decoded {
+                    segments[seg_idx].valcounts = Some(vc);
+                }
+            }
+
+            pg_sys::ExecDropSingleTupleTableSlot(slot);
+            pg_sys::index_endscan(scan);
+            pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        }
+
+        pg_sys::table_close(rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
     }
 }
 
