@@ -1430,28 +1430,19 @@ fn append_row_to_columns(
             }
             ColumnKind::Jsonb => {
                 // Classic compression path (post-INSERT). SPI returns native
-                // jsonb Datums (not text). Read as JsonB and re-materialize to
-                // extract the binary varlena payload; fall back to jsonb_out
-                // text + jsonb_in for callers that still deliver JSON text.
-                let entry = row.get_datum_by_ordinal(ordinal).unwrap();
-                let bytes_opt = entry
-                    .value::<pgrx::datum::JsonB>()
-                    .ok()
-                    .flatten()
-                    .map(|jb| unsafe {
-                        jsonb_datum_to_binary(
-                            jb.into_datum().expect("jsonb value must convert to datum"),
-                        )
-                    })
-                    .or_else(|| {
-                        entry
-                            .value::<String>()
-                            .ok()
-                            .flatten()
-                            .map(|t| unsafe { jsonb_text_to_binary(&t) })
-                    });
+                // jsonb Datums, so we read the on-disk binary varlena payload
+                // directly via `JsonbRaw` — no jsonb_out/serde_json/jsonb_in
+                // round-trip (which would be lossy for high-precision numbers
+                // and leak a jsonb_in datum per row). The bytes are the same
+                // canonical jsonb container the COPY path produces via
+                // `jsonb_text_to_binary`, so the scan path is unaffected.
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<JsonbRaw>()
+                    .unwrap();
                 if let TypedColumn::Bytes(vec) = &mut typed_cols[i] {
-                    vec.push(bytes_opt);
+                    vec.push(v.map(|j| j.0));
                 }
             }
         }
@@ -1468,15 +1459,52 @@ thread_local! {
         const { std::cell::Cell::new(std::ptr::null_mut()) };
 }
 
-/// Extract the binary jsonb varlena payload (everything after the varlena
-/// header) from an existing jsonb Datum returned by SPI.
-pub(crate) unsafe fn jsonb_datum_to_binary(datum: pgrx::pg_sys::Datum) -> Vec<u8> {
-    unsafe {
-        let varlena = datum.cast_mut_ptr::<pgrx::pg_sys::varlena>();
-        let detoasted = pgrx::pg_sys::pg_detoast_datum(varlena);
-        let total_len = pgrx::varsize_any_exhdr(detoasted);
-        let data_ptr = pgrx::vardata_any(detoasted).cast::<u8>();
-        std::slice::from_raw_parts(data_ptr, total_len).to_vec()
+/// A `jsonb` Datum read as its raw on-disk binary varlena payload (everything
+/// after the varlena header), with no parse/serialize round-trip.
+///
+/// Reading a `jsonb` column via pgrx's `JsonB` would route the value through
+/// `jsonb_out` → `serde_json::Value` → `jsonb_in`, which is both expensive and
+/// lossy: pgrx's `serde_json` has no `arbitrary_precision`, so numbers outside
+/// i64/u64/f64 range (high-precision decimals, large integers) get rounded.
+/// We instead detoast and copy the binary container verbatim — the same bytes
+/// `jsonb_text_to_binary` produces, so the scan path reconstructs identically.
+pub(crate) struct JsonbRaw(pub Vec<u8>);
+
+impl FromDatum for JsonbRaw {
+    unsafe fn from_polymorphic_datum(
+        datum: pgrx::pg_sys::Datum,
+        is_null: bool,
+        _typoid: pgrx::pg_sys::Oid,
+    ) -> Option<Self> {
+        if is_null {
+            return None;
+        }
+        unsafe {
+            let varlena = datum.cast_mut_ptr::<pgrx::pg_sys::varlena>();
+            let detoasted = pgrx::pg_sys::pg_detoast_datum(varlena);
+            let total_len = pgrx::varsize_any_exhdr(detoasted);
+            let data_ptr = pgrx::vardata_any(detoasted).cast::<u8>();
+            let bytes = std::slice::from_raw_parts(data_ptr, total_len).to_vec();
+            // pg_detoast_datum allocates a copy in CurrentMemoryContext only
+            // when the datum was actually toasted; free it so a long compress
+            // loop doesn't accumulate detoasted copies.
+            if detoasted != varlena {
+                pgrx::pg_sys::pfree(detoasted.cast());
+            }
+            Some(JsonbRaw(bytes))
+        }
+    }
+}
+
+impl IntoDatum for JsonbRaw {
+    fn into_datum(self) -> Option<pgrx::pg_sys::Datum> {
+        // Read-only helper: only the FromDatum side is used (via SpiHeapTupleDataEntry::value).
+        // Required by the IntoDatum bound on `value::<T>()` and the binary-coercibility check.
+        unreachable!("JsonbRaw is read-only and must not be converted back into a Datum")
+    }
+
+    fn type_oid() -> pgrx::pg_sys::Oid {
+        pgrx::pg_sys::JSONBOID
     }
 }
 

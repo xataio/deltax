@@ -4500,3 +4500,97 @@ class TestCompressAllPartitions:
         assert results == [], (
             f"expected zero eligible partitions, got {results}"
         )
+
+
+class TestJsonbCompressionFidelity:
+    """The post-INSERT compression path reads jsonb back via SPI. It must store
+    the jsonb container verbatim — NOT round-trip through serde_json, which
+    would silently round numbers outside i64/u64/f64 range.
+
+    Comparisons use server-side `::text` (jsonb_out is full-precision) rather
+    than letting psycopg parse jsonb into Python floats, which would itself lose
+    precision and mask a regression.
+    """
+
+    def _setup(self, db, table="jfidelity"):
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute(f"""
+            CREATE TABLE {table} (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                data JSONB
+            )
+        """)
+        db.execute(
+            f"SELECT deltax.deltax_create_table('{table}', 'ts', '1 day'::interval)"
+        )
+        db.commit()
+
+    def test_high_precision_numbers_survive_compression(self, db):
+        table = "jfidelity"
+        self._setup(db, table)
+
+        # Values chosen to break a serde_json (no arbitrary_precision) round-trip:
+        # - a 29-significant-digit decimal (f64 keeps ~17)
+        # - a 30-digit integer, well beyond u64::MAX (~1.8e19)
+        # - a plain nested object as a control
+        payloads = [
+            '{"amount": 0.12345678901234567890123456789}',
+            '{"big": 123456789012345678901234567890}',
+            '{"nested": {"k": 1, "arr": [1, 2, 3]}, "s": "hello"}',
+        ]
+        for i, p in enumerate(payloads):
+            db.execute(
+                f"INSERT INTO {table} VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"'dev-{i}', '{p}'::jsonb)"
+            )
+        db.commit()
+
+        # Canonical, full-precision text straight from PG, before compression.
+        before = db.execute(
+            f"SELECT data::text FROM {table} ORDER BY ts"
+        ).fetchall()
+        assert len(before) == len(payloads)
+
+        db.execute(
+            f"SELECT deltax.deltax_enable_compression('{table}', "
+            f"segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, table)
+
+        after = db.execute(
+            f"SELECT data::text FROM {table} ORDER BY ts"
+        ).fetchall()
+
+        assert after == before, (
+            "jsonb changed across compression — the SPI compress path is "
+            f"corrupting values.\nbefore={before}\nafter={after}"
+        )
+
+    def test_null_jsonb_survives_compression(self, db):
+        table = "jfidelity_null"
+        self._setup(db, table)
+        db.execute(
+            f"INSERT INTO {table} VALUES "
+            f"('{BASE_TS}'::timestamptz, 'dev-0', NULL), "
+            f"('{BASE_TS}'::timestamptz + interval '1 minute', 'dev-0', '{{\"a\": 1}}'::jsonb)"
+        )
+        db.commit()
+        before = db.execute(
+            f"SELECT data::text FROM {table} ORDER BY ts"
+        ).fetchall()
+
+        db.execute(
+            f"SELECT deltax.deltax_enable_compression('{table}', "
+            f"segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, table)
+
+        after = db.execute(
+            f"SELECT data::text FROM {table} ORDER BY ts"
+        ).fetchall()
+        assert after == before
+        assert before[0][0] is None  # NULL preserved as NULL, not '{}'
