@@ -152,7 +152,7 @@ make -C jsonbench sql EC2=<ip> SQL="SELECT count(*) FROM bluesky"
 make -C jsonbench psql EC2=<ip>
 ```
 
-Results land in `jsonbench/results/pg_deltax.json` and are archived by timestamp+commit in `jsonbench/results/history/`. If `JSONBENCH_DIR` (default `/Users/tsg/src/JSONBench`) exists, `make bench` also copies the result to `<JSONBENCH_DIR>/pg_deltax/results/m6i.8xlarge_bluesky_<scale>.json`, runs the upstream `generate-results.sh`, and opens `<JSONBENCH_DIR>/index.html` in the browser (same model as clickbench).
+Results land in `jsonbench/results/pg_deltax.json` and are archived by timestamp+commit in `jsonbench/results/history/`. If `JSONBENCH_DIR` (default: a `JSONBench` checkout three levels up, sibling-checkout convention like `RTABENCH_DIR`; override via env) exists, `make bench` also copies the result to `<JSONBENCH_DIR>/pg_deltax/results/m6i.8xlarge_bluesky_<scale>.json`, runs the upstream `generate-results.sh`, and opens `<JSONBENCH_DIR>/index.html` in the browser (same model as clickbench).
 
 Schema caveat: the extracted `ts` column and absence of upstream's functional B-tree index mean pg_deltax results aren't a strict apples-to-apples comparison with the upstream `postgresql/` JSONBench numbers — pg_deltax relies on segment-level minmax pruning over the sort key instead. Qualify any side-by-side comparisons with this.
 
