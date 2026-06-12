@@ -75,16 +75,14 @@ pub extern "C-unwind" fn deltax_launcher_main(_arg: pg_sys::Datum) {
         // bytes; database names are at most NAMEDATALEN-1 = 63). The worker
         // connects to exactly this name, so it never has to re-derive the
         // list or agree with the launcher on its ordering.
-        let spawned = BackgroundWorkerBuilder::new(&format!(
-            "pg_deltax maintenance worker ({})",
-            db
-        ))
-        .set_function("deltax_worker_main")
-        .set_library("pg_deltax")
-        .set_extra(db)
-        .enable_spi_access()
-        .set_restart_time(Some(Duration::from_secs(60)))
-        .load_dynamic();
+        let spawned =
+            BackgroundWorkerBuilder::new(&format!("pg_deltax maintenance worker ({})", db))
+                .set_function("deltax_worker_main")
+                .set_library("pg_deltax")
+                .set_extra(db)
+                .enable_spi_access()
+                .set_restart_time(Some(Duration::from_secs(60)))
+                .load_dynamic();
         match spawned {
             Ok(_) => log!("pg_deltax: launched maintenance worker for database {}", db),
             Err(e) => log!(
@@ -417,17 +415,11 @@ mod tests {
             vec!["postgres", "smoke_db"]
         );
         // First-occurrence order wins, regardless of where the repeat sits.
-        assert_eq!(
-            parse_target_databases("b, a, b, c, a"),
-            vec!["b", "a", "c"]
-        );
+        assert_eq!(parse_target_databases("b, a, b, c, a"), vec!["b", "a", "c"]);
     }
 
     #[test]
     fn blank_entries_between_real_ones_are_skipped() {
-        assert_eq!(
-            parse_target_databases("a,,b, ,c"),
-            vec!["a", "b", "c"]
-        );
+        assert_eq!(parse_target_databases("a,,b, ,c"), vec!["a", "b", "c"]);
     }
 }
