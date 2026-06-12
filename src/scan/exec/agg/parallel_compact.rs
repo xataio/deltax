@@ -503,9 +503,8 @@ impl CountingFilter {
             .clamp(1 << 22, 1usize << max_log2);
         // calloc-backed zeroed alloc; AtomicU8 is repr(transparent) over u8.
         let zeroed = vec![0u8; size].into_boxed_slice();
-        let slots = unsafe {
-            Box::from_raw(Box::into_raw(zeroed) as *mut [std::sync::atomic::AtomicU8])
-        };
+        let slots =
+            unsafe { Box::from_raw(Box::into_raw(zeroed) as *mut [std::sync::atomic::AtomicU8]) };
         Self {
             slots,
             mask: size - 1,
@@ -3337,7 +3336,7 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
 
 #[cfg(test)]
 mod tests {
-    use super::{pick_count_floor, CountingFilter};
+    use super::{CountingFilter, pick_count_floor};
 
     /// The count-floor scheme is only exact if the filter never produces
     /// a false negative: every key bumped at least `threshold` times must

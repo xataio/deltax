@@ -255,10 +255,8 @@ fn compute_group_nd_hint(
     group_specs
         .iter()
         .filter(|gs| {
-            matches!(
-                gs.expr,
-                GroupByExpr::Column | GroupByExpr::AddConst { .. }
-            ) && (gs.col_idx as usize) < meta.col_names.len()
+            matches!(gs.expr, GroupByExpr::Column | GroupByExpr::AddConst { .. })
+                && (gs.col_idx as usize) < meta.col_names.len()
         })
         .map(|gs| {
             let col_name = &meta.col_names[gs.col_idx as usize];

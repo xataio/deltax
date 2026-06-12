@@ -113,7 +113,8 @@ impl std::hash::Hasher for DigestFoldHasher {
 }
 
 /// Group map keyed by 128-bit digests (parallel mixed path).
-pub(crate) type DigestGroupMap = hashbrown::HashMap<u128, u32, BuildHasherDefault<DigestFoldHasher>>;
+pub(crate) type DigestGroupMap =
+    hashbrown::HashMap<u128, u32, BuildHasherDefault<DigestFoldHasher>>;
 
 /// Set of 128-bit digests (F8 preselect, speculative top-N candidates).
 pub(crate) type DigestSet = hashbrown::HashSet<u128, BuildHasherDefault<DigestFoldHasher>>;

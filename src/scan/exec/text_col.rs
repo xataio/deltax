@@ -261,12 +261,11 @@ pub(super) fn decompress_text_to_seg_col(
 
     match cc.type_tag {
         compression::CompressionType::Dictionary | compression::CompressionType::DictionaryLz4 => {
-            let (flat, nn_indices) =
-                if cc.type_tag == compression::CompressionType::DictionaryLz4 {
-                    compression::dictionary::decode_flat_lz4(cc.data, nn_count)
-                } else {
-                    compression::dictionary::decode_flat(cc.data, nn_count)
-                };
+            let (flat, nn_indices) = if cc.type_tag == compression::CompressionType::DictionaryLz4 {
+                compression::dictionary::decode_flat_lz4(cc.data, nn_count)
+            } else {
+                compression::dictionary::decode_flat(cc.data, nn_count)
+            };
 
             let row_to_entry = if cc.null_bitmap.is_empty() {
                 nn_indices.iter().map(|&idx| idx as u32).collect()

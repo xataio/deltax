@@ -1148,10 +1148,8 @@ pub(super) fn process_segments_mixed(
                     let blob = &seg.compressed_blobs[slot];
                     if config.text_group_col_flags[col_idx] {
                         // Text GROUP BY column — decompress to SegTextColumn
-                        text_seg_cols.push(decompress_text_to_seg_col(
-                            blob,
-                            want_char_lens[col_idx],
-                        ));
+                        text_seg_cols
+                            .push(decompress_text_to_seg_col(blob, want_char_lens[col_idx]));
                         numeric_cols.push(Vec::new());
                     } else if skip_numeric_decompress[col_idx] {
                         numeric_cols.push(Vec::new());
@@ -1163,10 +1161,8 @@ pub(super) fn process_segments_mixed(
                     } else {
                         // Text column needed for WHERE quals and/or aggregates
                         // (e.g. MIN(col), AVG(length(col))) but not GROUP BY
-                        text_seg_cols.push(decompress_text_to_seg_col(
-                            blob,
-                            want_char_lens[col_idx],
-                        ));
+                        text_seg_cols
+                            .push(decompress_text_to_seg_col(blob, want_char_lens[col_idx]));
                         numeric_cols.push(Vec::new());
                     }
                 }
@@ -1319,32 +1315,30 @@ pub(super) fn process_segments_mixed(
         // component's 128-bit digest is precomputed once per dict entry, so
         // the per-row hash is pure integer mixing — string bytes are only
         // touched when a brand-new group stores its key in MixedKeyStorage.
-        let multikey_dict: Option<&SegTextColumn> = if text_key_fast.is_none()
-            && n_str_keys == 1
-            && n_int_keys >= 1
-        {
-            let sc = config
-                .group_specs
-                .iter()
-                .enumerate()
-                .find(|(_, gs)| is_text_group_col(gs))
-                .and_then(|(gi, gs)| match &gs.expr {
-                    GroupByExpr::Column => text_seg_cols[gs.col_idx as usize].as_ref(),
-                    GroupByExpr::RegexpReplace { .. } if !regex_text_cols.is_empty() => {
-                        regex_text_cols[gs.col_idx as usize].as_ref()
-                    }
-                    GroupByExpr::CaseWhen(_) => {
-                        case_when_text_cols.get(gi).and_then(|c| c.as_ref())
-                    }
+        let multikey_dict: Option<&SegTextColumn> =
+            if text_key_fast.is_none() && n_str_keys == 1 && n_int_keys >= 1 {
+                let sc = config
+                    .group_specs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, gs)| is_text_group_col(gs))
+                    .and_then(|(gi, gs)| match &gs.expr {
+                        GroupByExpr::Column => text_seg_cols[gs.col_idx as usize].as_ref(),
+                        GroupByExpr::RegexpReplace { .. } if !regex_text_cols.is_empty() => {
+                            regex_text_cols[gs.col_idx as usize].as_ref()
+                        }
+                        GroupByExpr::CaseWhen(_) => {
+                            case_when_text_cols.get(gi).and_then(|c| c.as_ref())
+                        }
+                        _ => None,
+                    });
+                match sc {
+                    Some(c @ SegTextColumn::Dict { .. }) => Some(c),
                     _ => None,
-                });
-            match sc {
-                Some(c @ SegTextColumn::Dict { .. }) => Some(c),
-                _ => None,
-            }
-        } else {
-            None
-        };
+                }
+            } else {
+                None
+            };
         let multikey_entry_digests: Vec<u128> = match multikey_dict {
             Some(SegTextColumn::Dict {
                 buf, entry_ranges, ..
@@ -2891,11 +2885,10 @@ unsafe fn mixed_speculative_topn(
             let t_spec = Instant::now();
 
             // Phase 1: Collect pre-computed top-K candidates from workers
-            let mut candidate_set: DigestSet =
-                DigestSet::with_capacity_and_hasher(
-                    k * partial_results.len(),
-                    BuildHasherDefault::default(),
-                );
+            let mut candidate_set: DigestSet = DigestSet::with_capacity_and_hasher(
+                k * partial_results.len(),
+                BuildHasherDefault::default(),
+            );
             let mut floor_sum: i64 = 0;
             for result in partial_results {
                 if let Some((keys, floor)) = &result.topk {
@@ -4111,7 +4104,9 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             sidecar_only_cols,
             preselected_keys: preselected_keys.as_ref(),
             dict_distinct_remaps: &dict_distinct_remaps,
-            count_floor: count_floor_filter.as_ref().map(|f| (f, count_floor_fillers)),
+            count_floor: count_floor_filter
+                .as_ref()
+                .map(|f| (f, count_floor_fillers)),
             reserve_groups: {
                 // One partial per worker thread per batch. Gate small
                 // estimates (default growth handles them fine) and cap
