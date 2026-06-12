@@ -1325,6 +1325,128 @@ fn agg_specs_partial_emittable(agg_specs: &[AggSpec]) -> bool {
     })
 }
 
+/// True iff a scalar (no GROUP BY) aggregate's WHERE clause is fully
+/// answerable from per-segment colstats metadata — i.e. the serial
+/// metadata fast path (`try_metadata_fast_path`) resolves the whole query
+/// without decompressing any blob. Two shapes qualify:
+///
+///   * No WHERE clause at all — COUNT / SUM / AVG / MIN / MAX over every
+///     row come straight from the stored per-segment sums / counts / minmax.
+///   * A single `col = 0` / `col <> 0` predicate on a numeric column — the
+///     `nonzero_count` colstat (populated for every sum-supporting column at
+///     compression time) answers it per segment with zero decompression.
+///
+/// For these, parallel DeltaXAgg is a pessimisation: the leader's parallel
+/// branch skips the metadata fast path and every worker decompresses the
+/// filter column, on top of ~150 ms of worker-fork overhead that dwarfs the
+/// ~20 ms metadata scan. ClickBench Q1 (`COUNT(*) WHERE AdvEngineID <> 0`)
+/// goes 219 ms → 21 ms by staying serial. GROUP BY aggregates are never
+/// affected — the caller gates on `group_specs.is_empty()`.
+///
+/// Conservative by construction: anything else (ranges, non-zero equality,
+/// multi-qual ANDs, text predicates) returns false and keeps the parallel
+/// path, which genuinely wins when real decompression is required.
+unsafe fn scalar_where_is_metadata_resolvable(root: *mut pg_sys::PlannerInfo) -> bool {
+    unsafe {
+        let parse = (*root).parse;
+        if parse.is_null() {
+            return false;
+        }
+        let jointree = (*parse).jointree;
+        if jointree.is_null() {
+            return true;
+        }
+        let mut quals = (*jointree).quals;
+        if quals.is_null() {
+            // No WHERE clause: scalar aggregate over all rows is pure metadata.
+            return true;
+        }
+        // `jointree->quals` is an implicit-AND `List` of qual expressions.
+        // A single predicate is a 1-element list; unwrap it to the bare
+        // expression. Multiple AND'd quals (length > 1) are conservatively
+        // treated as not metadata-resolvable — keep the parallel path.
+        if (*quals).type_ == pg_sys::NodeTag::T_List {
+            let list = quals as *mut pg_sys::List;
+            if (*list).length != 1 {
+                return false;
+            }
+            quals = (*(*list).elements.add(0)).ptr_value as *mut pg_sys::Node;
+            if quals.is_null() {
+                return false;
+            }
+        }
+        is_zero_comparison_opexpr(quals as *const pg_sys::Node)
+    }
+}
+
+/// True iff `node` is a single `Var = Const(0)` / `Var <> Const(0)`
+/// comparison (in either argument order, RelabelType-unwrapped). Mirrors the
+/// `OpExpr` parsing in `extract_batch_quals`.
+unsafe fn is_zero_comparison_opexpr(node: *const pg_sys::Node) -> bool {
+    unsafe {
+        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_OpExpr {
+            return false;
+        }
+        let opexpr = node as *const pg_sys::OpExpr;
+        let args = (*opexpr).args;
+        if args.is_null() || (*args).length != 2 {
+            return false;
+        }
+        let opname_ptr = pg_sys::get_opname((*opexpr).opno);
+        if opname_ptr.is_null() {
+            return false;
+        }
+        let opname = std::ffi::CStr::from_ptr(opname_ptr).to_str().unwrap_or("");
+        if opname != "=" && opname != "<>" && opname != "!=" {
+            return false;
+        }
+
+        let raw0 = (*(*args).elements.add(0)).ptr_value as *const pg_sys::Node;
+        let raw1 = (*(*args).elements.add(1)).ptr_value as *const pg_sys::Node;
+        if raw0.is_null() || raw1.is_null() {
+            return false;
+        }
+        // PG inserts RelabelType for width-coercing casts (int2→int4 etc.).
+        let unwrap = |n: *const pg_sys::Node| -> *const pg_sys::Node {
+            if !n.is_null() && (*n).type_ == pg_sys::NodeTag::T_RelabelType {
+                (*(n as *const pg_sys::RelabelType)).arg as *const pg_sys::Node
+            } else {
+                n
+            }
+        };
+        let a0 = unwrap(raw0);
+        let a1 = unwrap(raw1);
+
+        let const_node = if (*a0).type_ == pg_sys::NodeTag::T_Var
+            && (*a1).type_ == pg_sys::NodeTag::T_Const
+        {
+            a1 as *const pg_sys::Const
+        } else if (*a0).type_ == pg_sys::NodeTag::T_Const && (*a1).type_ == pg_sys::NodeTag::T_Var {
+            a0 as *const pg_sys::Const
+        } else {
+            return false;
+        };
+        if (*const_node).constisnull {
+            return false;
+        }
+        is_zero_const_datum((*const_node).constvalue, (*const_node).consttype)
+    }
+}
+
+/// Local copy of the numeric zero-test (mirrors `segments::is_zero_const`,
+/// which is private to `scan::exec`). Only the types that carry a
+/// `nonzero_count` colstat need handling.
+fn is_zero_const_datum(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> bool {
+    match type_oid {
+        pg_sys::INT2OID => datum.value() as i16 == 0,
+        pg_sys::INT4OID => datum.value() as i32 == 0,
+        pg_sys::INT8OID => datum.value() as i64 == 0,
+        pg_sys::FLOAT4OID => f32::from_bits(datum.value() as u32) == 0.0,
+        pg_sys::FLOAT8OID => f64::from_bits(datum.value() as u64) == 0.0,
+        _ => false,
+    }
+}
+
 /// Phase C.2 activation — true iff every `Var` reachable from `qual_list`
 /// has a numeric `vartype` (int / float / timestamp / date / bool). Used
 /// to gate the partial-mode CustomPath: `process_segments_compact` only
@@ -1453,6 +1575,18 @@ pub unsafe fn add_agg_partial_path(
                 }
             }
         }
+        // Scalar aggregates that the serial metadata fast path resolves with
+        // zero decompression (no filter, or a single `col = 0` / `col <> 0`
+        // predicate answered from colstats) are an order of magnitude faster
+        // serially — the parallel leader bypasses the metadata fast path and
+        // every worker decompresses the filter column, plus ~150 ms of
+        // worker-fork overhead. Keep them serial; GROUP BY aggregates and
+        // anything needing real decompression still parallelise. See
+        // `scalar_where_is_metadata_resolvable`.
+        if group_specs.is_empty() && scalar_where_is_metadata_resolvable(root) {
+            return;
+        }
+
         let workers = cost::recommend_agg_workers(companion_oids);
         if workers <= 0 {
             return;
@@ -2846,6 +2980,42 @@ mod tests {
         // the -1 list-sentinel used elsewhere in the wire format.
         const _: () = assert!(TOPN_SORT_COL_DERIVED < 0);
         const _: () = assert!(TOPN_SORT_COL_DERIVED != -1);
+    }
+
+    #[test]
+    fn is_zero_const_datum_matches_each_numeric_type() {
+        // Gates the serial metadata fast path for `col = 0` / `col <> 0`
+        // (ClickBench Q1). A misfire here would wrongly route a non-zero
+        // predicate to the no-decompress path — only zero must match.
+        assert!(is_zero_const_datum(
+            pg_sys::Datum::from(0i32 as usize),
+            pg_sys::INT4OID
+        ));
+        assert!(!is_zero_const_datum(
+            pg_sys::Datum::from(1i32 as usize),
+            pg_sys::INT4OID
+        ));
+        assert!(is_zero_const_datum(
+            pg_sys::Datum::from(0i16 as usize),
+            pg_sys::INT2OID
+        ));
+        assert!(is_zero_const_datum(
+            pg_sys::Datum::from(0i64 as usize),
+            pg_sys::INT8OID
+        ));
+        assert!(is_zero_const_datum(
+            pg_sys::Datum::from(0.0f32.to_bits() as usize),
+            pg_sys::FLOAT4OID
+        ));
+        assert!(!is_zero_const_datum(
+            pg_sys::Datum::from(1.5f64.to_bits() as usize),
+            pg_sys::FLOAT8OID
+        ));
+        // Non-numeric / unsupported const types never match.
+        assert!(!is_zero_const_datum(
+            pg_sys::Datum::from(0usize),
+            pg_sys::TEXTOID
+        ));
     }
 
     #[test]
