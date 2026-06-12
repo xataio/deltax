@@ -4602,7 +4602,42 @@ pub(crate) unsafe fn check_compressed_partition(rel_oid: pg_sys::Oid) -> pg_sys:
         // Check if _deltax_compressed.<rel_name>_meta exists
         let meta_name = format!("{}_meta", rel_name);
         let companion_cname = std::ffi::CString::new(meta_name).unwrap();
-        pg_sys::get_relname_relid(companion_cname.as_ptr(), compressed_ns_oid)
+        let meta_oid = pg_sys::get_relname_relid(companion_cname.as_ptr(), compressed_ns_oid);
+        if meta_oid == pg_sys::InvalidOid {
+            return pg_sys::InvalidOid;
+        }
+
+        // Companion names embed only the table name and `_deltax_compressed`
+        // is a single shared namespace, so a same-named partition in ANOTHER
+        // schema finds this meta table too. Confirm via the catalog that THIS
+        // (schema-qualified) partition is the compressed one. At most one
+        // partition of a given name can be compressed — companion creation
+        // would collide otherwise — so `is_compressed` on the exact
+        // (schema, name) pair disambiguates.
+        let ns_name_ptr = pg_sys::get_namespace_name(rel_ns_oid);
+        if ns_name_ptr.is_null() {
+            return pg_sys::InvalidOid;
+        }
+        let rel_schema = std::ffi::CStr::from_ptr(ns_name_ptr)
+            .to_string_lossy()
+            .into_owned();
+        let confirmed = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT 1 FROM deltax.deltax_partition \
+                     WHERE schema_name = $1 AND table_name = $2 AND is_compressed",
+                    Some(1),
+                    &[rel_schema.into(), rel_name.into()],
+                )
+                .ok()
+                .and_then(|table| table.first().get_one::<i32>().ok().flatten())
+                .is_some()
+        });
+        if confirmed {
+            meta_oid
+        } else {
+            pg_sys::InvalidOid
+        }
     }
 }
 

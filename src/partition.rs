@@ -635,7 +635,14 @@ pub fn auto_drop_partitions(client: &mut SpiClient, ht: &catalog::DeltatableInfo
 
     for (schema, name, is_compressed) in &partitions {
         if *is_compressed {
-            for suffix in ["blobs", "blooms", "text_lengths", "colstats", "meta"] {
+            for suffix in [
+                "blobs",
+                "blooms",
+                "text_lengths",
+                "valbitmap",
+                "colstats",
+                "meta",
+            ] {
                 let fqn = format!("\"_deltax_compressed\".\"{}_{}\"", name, suffix);
                 client
                     .update(&format!("DROP TABLE IF EXISTS {}", fqn), None, &[])

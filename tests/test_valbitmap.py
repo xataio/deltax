@@ -270,6 +270,111 @@ class TestValbitmap:
             f"expected vb_skipped > 0, got {match.group(1)}"
         )
 
+    def test_overflowed_segment_survives_valmap_miss(self, db):
+        """Regression: a segment that exceeds VALBITMAP_MAX_DISTINCT (32)
+        writes no valbitmap row and contributes nothing to the partition
+        valmap. Querying a value that lives ONLY in that segment used to hit
+        the "constant absent from the valmap → prune every segment" shortcut
+        and return zero rows. The valmap-miss path may only skip segments
+        that wrote a bitmap row — never the overflowed one."""
+        db.execute("DROP TABLE IF EXISTS evt_ov CASCADE")
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE evt_ov (
+                ts          timestamptz NOT NULL,
+                order_id    integer NOT NULL,
+                event_type  text NOT NULL
+            )
+        """)
+        db.execute(
+            "SELECT deltax.deltax_create_table('evt_ov', 'ts', '1 day'::interval)"
+        )
+        db.commit()
+
+        segment_size = 200
+        rows = []
+        # Segment 0 (order_id 0..199): 40 distinct values 'ov00'..'ov39' —
+        # exceeds the 32-distinct cap, so this segment gets NO bitmap row
+        # and its values are missing from the partition valmap. 'ov07'
+        # exists only here (order_id 7, 47, 87, 127, 167).
+        for i in range(segment_size):
+            ts = f"'{BASE_TS}'::timestamptz + interval '{i} seconds'"
+            rows.append(f"({ts}, {i}, 'ov{i % 40:02d}')")
+        # Segment 1 (order_id 200..399): 2 distinct values → bitmap row
+        # written; the partition valmap ends up ['common', 'meh'] only.
+        for i in range(segment_size):
+            order_id = segment_size + i
+            ts = f"'{BASE_TS}'::timestamptz + interval '{order_id} seconds'"
+            et = "common" if i % 2 == 0 else "meh"
+            rows.append(f"({ts}, {order_id}, '{et}')")
+        db.execute(
+            "INSERT INTO evt_ov (ts, order_id, event_type) VALUES "
+            + ", ".join(rows)
+        )
+        db.commit()
+
+        db.execute(
+            "SELECT deltax.deltax_enable_compression('evt_ov', "
+            f"order_by => ARRAY['order_id'], segment_size => {segment_size})"
+        )
+        db.commit()
+        parts = db.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('evt_ov') "
+            "WHERE partition_name NOT LIKE '%default%'"
+        ).fetchall()
+        for (part_name,) in parts:
+            n = db.execute(f'SELECT count(*) FROM "{part_name}"').fetchone()[0]
+            if n:
+                db.execute(
+                    f"SELECT deltax.deltax_compress_partition('{part_name}')"
+                )
+        db.commit()
+
+        # Sanity: the partition valmap must NOT contain the overflowed
+        # segment's values — that's exactly the shape that triggered the bug.
+        valmap = db.execute("""
+            SELECT column_valmap::text
+            FROM deltax.deltax_partition
+            WHERE table_name LIKE 'evt_ov_%' AND is_compressed = true
+        """).fetchone()[0]
+        assert valmap is not None and '"common"' in valmap
+        assert '"ov07"' not in valmap, (
+            f"expected overflowed segment's values absent from valmap, "
+            f"got: {valmap}"
+        )
+
+        # The rows in the overflowed segment must come back.
+        got = [
+            r[0]
+            for r in db.execute(
+                "SELECT order_id FROM evt_ov WHERE event_type = 'ov07' "
+                "ORDER BY order_id"
+            ).fetchall()
+        ]
+        assert got == [7, 47, 87, 127, 167], (
+            f"overflowed segment was wrongly pruned, got rows: {got}"
+        )
+
+        # A value present nowhere still returns nothing — and only the
+        # segment WITH a bitmap row may be skipped; the overflowed one must
+        # be decompressed and batch-filtered.
+        decomp, vb_skipped = _explain_skip_counts(
+            db,
+            "SELECT * FROM evt_ov WHERE event_type = 'never' LIMIT 1000",
+        )
+        assert vb_skipped == 1, (
+            f"expected exactly the bitmap-covered segment skipped, "
+            f"got vb_skipped={vb_skipped}"
+        )
+        assert decomp == 1, (
+            f"expected the overflowed segment to be scanned, got "
+            f"segments={decomp}"
+        )
+        n = db.execute(
+            "SELECT count(*) FROM evt_ov WHERE event_type = 'never'"
+        ).fetchone()[0]
+        assert n == 0
+
     def test_catalog_column_valmap_populated(self, db):
         """After compression, deltax.deltax_partition.column_valmap should hold
         the sorted value list for the low-cardinality `event_type`

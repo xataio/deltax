@@ -1879,13 +1879,15 @@ pub(super) unsafe fn load_segments_heap(
         // Build valbitmap checks from batch quals (text Eq on low-card columns
         // whose partition-level value list is in `column_valmap`). Each check
         // carries the bit indices the segment must contain at least one of.
-        // `prune_all = true` means the queried constant doesn't appear in
-        // ANY segment of this partition — every segment can be skipped without
-        // even reading the bitmap table.
+        // An empty `wanted_bits` means the queried constant is absent from
+        // the partition-level valmap — every segment that wrote a bitmap row
+        // fails the check and gets pruned. Segments WITHOUT a bitmap row
+        // (they overflowed VALBITMAP_MAX_DISTINCT at compress time, so the
+        // valmap doesn't cover their values) must never be pruned: the
+        // constant may well live only in them.
         struct ValbitmapCheck {
             col_idx: u16,
             wanted_bits: Vec<u8>,
-            prune_all: bool,
         }
         let mut bloom_checks: Vec<BloomCheck> = Vec::new();
         let mut valbitmap_checks: Vec<ValbitmapCheck> = Vec::new();
@@ -1948,25 +1950,20 @@ pub(super) unsafe fn load_segments_heap(
                 && let Some(ref needle) = bq.text_const
                 && let Some(values) = valmap.get(col_name)
             {
-                let bit = values.iter().position(|v| v == needle);
-                match bit {
-                    Some(idx) => {
-                        valbitmap_checks.push(ValbitmapCheck {
-                            col_idx: ci,
-                            wanted_bits: vec![idx as u8],
-                            prune_all: false,
-                        });
-                    }
-                    None => {
-                        // Constant never appeared at compress time → no segment
-                        // can match. Mark the column for "prune everything".
-                        valbitmap_checks.push(ValbitmapCheck {
-                            col_idx: ci,
-                            wanted_bits: vec![],
-                            prune_all: true,
-                        });
-                    }
-                }
+                // A valmap miss leaves `wanted_bits` empty: no segment that
+                // contributed to the valmap can match. Segments that
+                // overflowed the per-segment distinct cap contributed
+                // nothing (and have no bitmap row), so presence is still
+                // re-checked per segment below.
+                let wanted_bits: Vec<u8> = values
+                    .iter()
+                    .position(|v| v == needle)
+                    .map(|idx| vec![idx as u8])
+                    .unwrap_or_default();
+                valbitmap_checks.push(ValbitmapCheck {
+                    col_idx: ci,
+                    wanted_bits,
+                });
             }
         }
         let mut segments_bloom_skipped: u64 = 0;
@@ -3041,172 +3038,159 @@ pub(super) unsafe fn load_segments_heap(
         // PK on `(_col_idx, _segment_id)`, fetch `_bits`, test the bit
         // recorded in `valmap` for the queried constant. Exact (no false
         // positives), so a clear bit guarantees the segment can be skipped.
+        //
+        // Presence is decided strictly per segment: only segments that wrote
+        // a bitmap row for the column are candidates for pruning. A segment
+        // with no row exceeded VALBITMAP_MAX_DISTINCT at compress time — its
+        // values are not covered by the partition valmap, so neither a clear
+        // bit nor a valmap miss (empty `wanted_bits`) says anything about it.
         // ----------------------------------------------------------------
         if !valbitmap_checks.is_empty() && !segments.is_empty() {
-            // First handle "constant absent from partition entirely" — no
-            // need to even open the bitmap table for those.
-            if valbitmap_checks.iter().any(|c| c.prune_all) {
-                let pruned = segments.len();
-                segments.clear();
-                surviving_segment_ids.clear();
-                segments_skipped += pruned as u64;
-                segments_valbitmap_skipped += pruned as u64;
-            } else {
-                let meta_name_ptr = pg_sys::get_rel_name(meta_oid);
-                let meta_name_str = std::ffi::CStr::from_ptr(meta_name_ptr)
-                    .to_string_lossy()
-                    .into_owned();
-                let meta_ns_oid = pg_sys::get_rel_namespace(meta_oid);
-                let partition_name = meta_name_str
-                    .strip_suffix("_meta")
-                    .unwrap_or(&meta_name_str);
-                let valbitmap_name = format!("{}_valbitmap", partition_name);
-                let valbitmap_cname = std::ffi::CString::new(valbitmap_name).unwrap();
-                let valbitmap_oid =
-                    pg_sys::get_relname_relid(valbitmap_cname.as_ptr(), meta_ns_oid);
+            let meta_name_ptr = pg_sys::get_rel_name(meta_oid);
+            let meta_name_str = std::ffi::CStr::from_ptr(meta_name_ptr)
+                .to_string_lossy()
+                .into_owned();
+            let meta_ns_oid = pg_sys::get_rel_namespace(meta_oid);
+            let partition_name = meta_name_str
+                .strip_suffix("_meta")
+                .unwrap_or(&meta_name_str);
+            let valbitmap_name = format!("{}_valbitmap", partition_name);
+            let valbitmap_cname = std::ffi::CString::new(valbitmap_name).unwrap();
+            let valbitmap_oid = pg_sys::get_relname_relid(valbitmap_cname.as_ptr(), meta_ns_oid);
 
-                if valbitmap_oid != pg_sys::InvalidOid {
-                    let mut seg_id_to_idx: HashMap<i32, usize> = HashMap::new();
-                    for (idx, &sid) in surviving_segment_ids.iter().enumerate() {
-                        seg_id_to_idx.insert(sid, idx);
+            if valbitmap_oid != pg_sys::InvalidOid {
+                let mut seg_id_to_idx: HashMap<i32, usize> = HashMap::new();
+                for (idx, &sid) in surviving_segment_ids.iter().enumerate() {
+                    seg_id_to_idx.insert(sid, idx);
+                }
+
+                let vb_rel =
+                    pg_sys::table_open(valbitmap_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                let vb_tupdesc = (*vb_rel).rd_att;
+                let vb_natts = (*vb_tupdesc).natts as usize;
+
+                let mut seg_id_att: Option<usize> = None;
+                let mut bits_att: Option<usize> = None;
+                for i in 0..vb_natts {
+                    let attr = &*tupdesc_get_attr(vb_tupdesc, i);
+                    let name =
+                        std::ffi::CStr::from_ptr(attr.attname.data.as_ptr()).to_string_lossy();
+                    if name == "_segment_id" {
+                        seg_id_att = Some(i);
+                    } else if name == "_bits" {
+                        bits_att = Some(i);
                     }
+                }
 
-                    let vb_rel = pg_sys::table_open(
-                        valbitmap_oid,
+                let pk_index_oid = primary_key_index_oid(vb_rel);
+
+                if let (Some(sid_att), Some(bits_a), true) =
+                    (seg_id_att, bits_att, pk_index_oid != pg_sys::InvalidOid)
+                {
+                    let snapshot = pg_sys::GetActiveSnapshot();
+                    let idx_rel = pg_sys::index_open(
+                        pk_index_oid,
                         pg_sys::AccessShareLock as pg_sys::LOCKMODE,
                     );
-                    let vb_tupdesc = (*vb_rel).rd_att;
-                    let vb_natts = (*vb_tupdesc).natts as usize;
+                    let mut vb_pruned_ids: std::collections::HashSet<i32> =
+                        std::collections::HashSet::new();
 
-                    let mut seg_id_att: Option<usize> = None;
-                    let mut bits_att: Option<usize> = None;
-                    for i in 0..vb_natts {
-                        let attr = &*tupdesc_get_attr(vb_tupdesc, i);
-                        let name =
-                            std::ffi::CStr::from_ptr(attr.attname.data.as_ptr()).to_string_lossy();
-                        if name == "_segment_id" {
-                            seg_id_att = Some(i);
-                        } else if name == "_bits" {
-                            bits_att = Some(i);
-                        }
-                    }
-
-                    let pk_index_oid = primary_key_index_oid(vb_rel);
-
-                    if let (Some(sid_att), Some(bits_a), true) =
-                        (seg_id_att, bits_att, pk_index_oid != pg_sys::InvalidOid)
-                    {
-                        let snapshot = pg_sys::GetActiveSnapshot();
-                        let idx_rel = pg_sys::index_open(
-                            pk_index_oid,
-                            pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+                    // Valmap-miss checks carry an empty `wanted_bits`,
+                    // so every segment with a bitmap row fails `passes`
+                    // below and is pruned; segments without a row
+                    // survive.
+                    for vc in &valbitmap_checks {
+                        let mut skey = [pg_sys::ScanKeyData::default()];
+                        pg_sys::ScanKeyInit(
+                            &mut skey[0],
+                            1, // attnum 1 = _col_idx
+                            pg_sys::BTEqualStrategyNumber as u16,
+                            pg_sys::F_INT2EQ.into(),
+                            pg_sys::Datum::from(vc.col_idx as i16),
                         );
-                        let mut vb_pruned_ids: std::collections::HashSet<i32> =
-                            std::collections::HashSet::new();
 
-                        for vc in &valbitmap_checks {
-                            if vc.prune_all {
+                        #[cfg(feature = "pg17")]
+                        let scan = pg_sys::index_beginscan(vb_rel, idx_rel, snapshot, 1, 0);
+                        #[cfg(feature = "pg18")]
+                        let scan = pg_sys::index_beginscan(
+                            vb_rel,
+                            idx_rel,
+                            snapshot,
+                            std::ptr::null_mut(),
+                            1,
+                            0,
+                        );
+                        pg_sys::index_rescan(scan, skey.as_mut_ptr(), 1, std::ptr::null_mut(), 0);
+
+                        let slot = pg_sys::table_slot_create(vb_rel, std::ptr::null_mut());
+
+                        loop {
+                            if !pg_sys::index_getnext_slot(
+                                scan,
+                                pg_sys::ScanDirection::ForwardScanDirection,
+                                slot,
+                            ) {
+                                break;
+                            }
+                            pg_sys::slot_getallattrs(slot);
+                            let tts_values = (*slot).tts_values;
+                            let tts_isnull = (*slot).tts_isnull;
+                            if *tts_isnull.add(sid_att) || *tts_isnull.add(bits_a) {
                                 continue;
                             }
-                            let mut skey = [pg_sys::ScanKeyData::default()];
-                            pg_sys::ScanKeyInit(
-                                &mut skey[0],
-                                1, // attnum 1 = _col_idx
-                                pg_sys::BTEqualStrategyNumber as u16,
-                                pg_sys::F_INT2EQ.into(),
-                                pg_sys::Datum::from(vc.col_idx as i16),
-                            );
-
-                            #[cfg(feature = "pg17")]
-                            let scan = pg_sys::index_beginscan(vb_rel, idx_rel, snapshot, 1, 0);
-                            #[cfg(feature = "pg18")]
-                            let scan = pg_sys::index_beginscan(
-                                vb_rel,
-                                idx_rel,
-                                snapshot,
-                                std::ptr::null_mut(),
-                                1,
-                                0,
-                            );
-                            pg_sys::index_rescan(
-                                scan,
-                                skey.as_mut_ptr(),
-                                1,
-                                std::ptr::null_mut(),
-                                0,
-                            );
-
-                            let slot = pg_sys::table_slot_create(vb_rel, std::ptr::null_mut());
-
-                            loop {
-                                if !pg_sys::index_getnext_slot(
-                                    scan,
-                                    pg_sys::ScanDirection::ForwardScanDirection,
-                                    slot,
-                                ) {
-                                    break;
-                                }
-                                pg_sys::slot_getallattrs(slot);
-                                let tts_values = (*slot).tts_values;
-                                let tts_isnull = (*slot).tts_isnull;
-                                if *tts_isnull.add(sid_att) || *tts_isnull.add(bits_a) {
-                                    continue;
-                                }
-                                let seg_id = (*tts_values.add(sid_att)).value() as i32;
-                                if !seg_id_to_idx.contains_key(&seg_id) {
-                                    continue;
-                                }
-
-                                let varlena_ptr =
-                                    (*tts_values.add(bits_a)).cast_mut_ptr::<pg_sys::varlena>();
-                                let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
-                                let data_ptr = pgrx::vardata_any(detoasted);
-                                let data_len = pgrx::varsize_any_exhdr(detoasted);
-                                #[allow(clippy::unnecessary_cast)]
-                                let bits =
-                                    std::slice::from_raw_parts(data_ptr as *const u8, data_len);
-
-                                // A segment passes if any wanted bit is set.
-                                let passes = vc.wanted_bits.iter().any(|&bi| {
-                                    let byte = (bi / 8) as usize;
-                                    let mask = 1u8 << (bi % 8);
-                                    byte < bits.len() && (bits[byte] & mask) != 0
-                                });
-
-                                if detoasted != varlena_ptr {
-                                    pg_sys::pfree(detoasted as *mut _);
-                                }
-
-                                if !passes {
-                                    vb_pruned_ids.insert(seg_id);
-                                }
+                            let seg_id = (*tts_values.add(sid_att)).value() as i32;
+                            if !seg_id_to_idx.contains_key(&seg_id) {
+                                continue;
                             }
 
-                            pg_sys::ExecDropSingleTupleTableSlot(slot);
-                            pg_sys::index_endscan(scan);
-                        }
+                            let varlena_ptr =
+                                (*tts_values.add(bits_a)).cast_mut_ptr::<pg_sys::varlena>();
+                            let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                            let data_ptr = pgrx::vardata_any(detoasted);
+                            let data_len = pgrx::varsize_any_exhdr(detoasted);
+                            #[allow(clippy::unnecessary_cast)]
+                            let bits = std::slice::from_raw_parts(data_ptr as *const u8, data_len);
 
-                        pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                            // A segment passes if any wanted bit is set.
+                            let passes = vc.wanted_bits.iter().any(|&bi| {
+                                let byte = (bi / 8) as usize;
+                                let mask = 1u8 << (bi % 8);
+                                byte < bits.len() && (bits[byte] & mask) != 0
+                            });
 
-                        if !vb_pruned_ids.is_empty() {
-                            let before = segments.len();
-                            let mut i = 0;
-                            while i < segments.len() {
-                                if vb_pruned_ids.contains(&surviving_segment_ids[i]) {
-                                    segments.swap_remove(i);
-                                    surviving_segment_ids.swap_remove(i);
-                                } else {
-                                    i += 1;
-                                }
+                            if detoasted != varlena_ptr {
+                                pg_sys::pfree(detoasted as *mut _);
                             }
-                            let pruned = before - segments.len();
-                            segments_skipped += pruned as u64;
-                            segments_valbitmap_skipped += pruned as u64;
+
+                            if !passes {
+                                vb_pruned_ids.insert(seg_id);
+                            }
                         }
+
+                        pg_sys::ExecDropSingleTupleTableSlot(slot);
+                        pg_sys::index_endscan(scan);
                     }
 
-                    pg_sys::table_close(vb_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                    pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+                    if !vb_pruned_ids.is_empty() {
+                        let before = segments.len();
+                        let mut i = 0;
+                        while i < segments.len() {
+                            if vb_pruned_ids.contains(&surviving_segment_ids[i]) {
+                                segments.swap_remove(i);
+                                surviving_segment_ids.swap_remove(i);
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        let pruned = before - segments.len();
+                        segments_skipped += pruned as u64;
+                        segments_valbitmap_skipped += pruned as u64;
+                    }
                 }
+
+                pg_sys::table_close(vb_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
             }
         }
 

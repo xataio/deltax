@@ -247,3 +247,110 @@ def test_worker_retention_drops_old_partitions(postgres_db):
 
     finally:
         _cleanup(db, table)
+
+
+def test_worker_retention_drops_compressed_companions(postgres_db):
+    """When retention drops a COMPRESSED partition, every companion table in
+    _deltax_compressed (meta, colstats, blobs, blooms, text_lengths,
+    valbitmap) must be dropped with it — no orphans left behind."""
+    db = postgres_db
+    table = _unique_table()
+
+    try:
+        db.execute("SET pg_deltax.mock_now = '2025-06-15 00:00:00+00'")
+        db.execute(
+            f'CREATE TABLE "{table}" '
+            "(ts TIMESTAMPTZ NOT NULL, event_type TEXT NOT NULL, val FLOAT8)"
+        )
+        db.commit()
+        db.execute(
+            f"SELECT deltax.deltax_create_table('{table}', 'ts', '1 day', 2)"
+        )
+        db.commit()
+
+        # Fill the June 14 partition. The low-cardinality text column makes
+        # compression create a `_valbitmap` companion; the text column also
+        # produces `_text_lengths`.
+        values = ", ".join(
+            f"('2025-06-14 12:00:00+00'::timestamptz + interval '{i} seconds', "
+            f"'type{i % 4}', {i})"
+            for i in range(100)
+        )
+        db.execute(
+            f'INSERT INTO "{table}" (ts, event_type, val) VALUES {values}'
+        )
+        db.commit()
+
+        db.execute(
+            f"SELECT deltax.deltax_enable_compression('{table}', "
+            "order_by => ARRAY['ts'])"
+        )
+        # The June 14 partition is the only one with rows — find its name
+        # rather than hardcoding it (partition names render range_start in
+        # the session timezone).
+        old_part = None
+        parts = db.execute(
+            f"SELECT partition_name FROM deltax.deltax_partition_info('{table}') "
+            "WHERE partition_name NOT LIKE '%default%'"
+        ).fetchall()
+        for (p,) in parts:
+            if db.execute(f'SELECT count(*) FROM "{p}"').fetchone()[0]:
+                old_part = p
+                break
+        assert old_part is not None, f"no non-empty partition among {parts}"
+        db.execute(f"SELECT deltax.deltax_compress_partition('{old_part}')")
+        db.commit()
+
+        def list_companions():
+            return [
+                r[0]
+                for r in db.execute(
+                    "SELECT c.relname FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = '_deltax_compressed' "
+                    "AND c.relname LIKE %s AND c.relkind = 'r'",
+                    (old_part + r"\_%",),
+                ).fetchall()
+            ]
+
+        before = set(list_companions())
+        assert f"{old_part}_meta" in before, f"companions missing: {before}"
+        assert f"{old_part}_valbitmap" in before, (
+            f"expected a _valbitmap companion for the low-card text column, "
+            f"got: {before}"
+        )
+
+        db.execute(f"SELECT deltax.deltax_set_retention('{table}', '3 days')")
+        db.commit()
+
+        # Jump time so the June 14 partition exceeds the retention window.
+        _alter_system(
+            "ALTER SYSTEM SET pg_deltax.mock_now = '2025-06-20 00:00:00+00'"
+        )
+
+        deadline = time.time() + 150
+        dropped = False
+        while time.time() < deadline:
+            time.sleep(5)
+            still = {
+                row[0]
+                for row in db.execute(
+                    f"SELECT partition_name FROM deltax.deltax_partition_info('{table}')"
+                ).fetchall()
+            }
+            db.commit()
+            if old_part not in still:
+                dropped = True
+                break
+
+        assert dropped, f"worker did not drop partition {old_part}"
+
+        leftovers = list_companions()
+        db.commit()
+        assert leftovers == [], (
+            f"orphaned companion tables left in _deltax_compressed after "
+            f"retention drop: {leftovers}"
+        )
+
+    finally:
+        _cleanup(db, table)

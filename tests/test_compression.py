@@ -4594,3 +4594,93 @@ class TestJsonbCompressionFidelity:
         ).fetchall()
         assert after == before
         assert before[0][0] is None  # NULL preserved as NULL, not '{}'
+
+
+# ---------------------------------------------------------------------------
+# Cross-schema companion disambiguation
+# ---------------------------------------------------------------------------
+
+def test_same_named_partition_in_other_schema_not_hijacked(db):
+    """Two deltax tables with the same name in different schemas produce
+    identically-named partitions. Companion tables live in the single shared
+    `_deltax_compressed` namespace and embed only the partition NAME, so the
+    scan hook's companion lookup must verify via the catalog that the
+    (schema-qualified) partition it is planning is actually the compressed
+    one. Regression: compressing s1's partition made the hook treat s2's
+    same-named, UNCOMPRESSED partition as compressed and serve s1's data."""
+    db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+    for s in ("s1", "s2"):
+        db.execute(f"CREATE SCHEMA {s}")
+        db.execute(f"""
+            CREATE TABLE {s}.events (
+                ts  TIMESTAMPTZ NOT NULL,
+                val INT NOT NULL
+            )
+        """)
+        db.execute(
+            f"SELECT deltax.deltax_create_table('{s}.events', 'ts', "
+            "'1 day'::interval)"
+        )
+    db.commit()
+
+    # Distinct payloads per schema so any cross-wiring is visible.
+    for s, base in (("s1", 1000), ("s2", 2000)):
+        values = ", ".join(
+            f"('{BASE_TS}'::timestamptz + interval '{i} minutes', {base + i})"
+            for i in range(50)
+        )
+        db.execute(f"INSERT INTO {s}.events (ts, val) VALUES {values}")
+    db.commit()
+
+    # Sanity: the partition names collide across the two schemas.
+    parts1 = {
+        r[0]
+        for r in db.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('s1.events')"
+        ).fetchall()
+    }
+    parts2 = {
+        r[0]
+        for r in db.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('s2.events')"
+        ).fetchall()
+    }
+    assert parts1 == parts2, f"expected colliding names, got {parts1} vs {parts2}"
+
+    # Compress only s1's data-bearing partition.
+    db.execute(
+        "SELECT deltax.deltax_enable_compression('s1.events', "
+        "order_by => ARRAY['ts'])"
+    )
+    db.commit()
+    target = None
+    for p in sorted(parts1):
+        if "default" in p:
+            continue
+        if db.execute(f'SELECT count(*) FROM s1."{p}"').fetchone()[0]:
+            target = p
+            break
+    assert target is not None
+    db.execute(f"SELECT deltax.deltax_compress_partition('s1.{target}')")
+    db.commit()
+
+    # s1 reads its data through the companion.
+    vals1 = [
+        r[0]
+        for r in db.execute("SELECT val FROM s1.events ORDER BY val").fetchall()
+    ]
+    assert vals1 == list(range(1000, 1050))
+
+    # s2 is NOT compressed — it must read its own heap, not s1's companion.
+    vals2 = [
+        r[0]
+        for r in db.execute("SELECT val FROM s2.events ORDER BY val").fetchall()
+    ]
+    assert vals2 == list(range(2000, 2050)), (
+        f"s2.events returned wrong rows — its partition was hijacked by "
+        f"s1's same-named compressed partition: {vals2[:5]}..."
+    )
+
+    # Scanning s2's partition directly must hit its heap too.
+    n = db.execute(f'SELECT count(*) FROM s2."{target}"').fetchone()[0]
+    assert n == 50, f"direct scan of s2 partition returned {n} rows"
