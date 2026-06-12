@@ -63,7 +63,8 @@ REFERENCE_AWS_NAME = clickbench-pg-deltax-reference
 
 .PHONY: launch-ec2 destroy-ec2 launch-reference-ec2 destroy-reference-ec2 ssh setup deploy bench bench-full bench-concurrent query sql psql reference verify
 
-# Launch a new EC2 instance (terminates any existing one with the same name)
+# Launch a new EC2 instance. Aborts if the name is already taken (never
+# terminates implicitly); requires KEY_NAME — see launch-ec2.sh.
 launch-ec2:
 	@bash launch-ec2.sh
 

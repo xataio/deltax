@@ -11,6 +11,10 @@ KEY_FILE=${KEY_FILE:-~/.ssh/${KEY_NAME}.pem}
 SUBNET=subnet-228cc17d
 SG=sg-add473b4
 VOLUME_SIZE=500
+# Track whether the name was given explicitly (env or --name): teardown
+# refuses to run against the implicit default name.
+NAME_EXPLICIT=false
+[ -n "${NAME:-}" ] && NAME_EXPLICIT=true
 NAME=${NAME:-clickbench-pg-deltax}
 TERMINATE_ONLY=false
 REFERENCE_MODE=false
@@ -23,7 +27,12 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --name)
+      if [ $# -lt 2 ] || [ -z "$2" ]; then
+        echo "ERROR: --name requires a non-empty value" >&2
+        exit 1
+      fi
       NAME="$2"
+      NAME_EXPLICIT=true
       shift 2
       ;;
     --reference)
@@ -34,23 +43,28 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Unknown option: $1" >&2
-      echo "Usage: $0 [--terminate-only] [--name <tag-name>] [--reference]" >&2
+      echo "Usage: $0 [--name <tag-name>] [--reference]" >&2
+      echo "       $0 --terminate-only --name <tag-name>" >&2
       exit 1
       ;;
   esac
 done
 
+# Teardown must name its target explicitly — never terminate whatever
+# happens to hold the default name.
+if $TERMINATE_ONLY && ! $NAME_EXPLICIT; then
+  echo "ERROR: --terminate-only requires an explicit instance name." >&2
+  echo "  $0 --terminate-only --name <tag-name>" >&2
+  exit 1
+fi
+
 # Launching needs an SSH key pair; teardown (--terminate-only) does not.
 if ! $TERMINATE_ONLY && [ -z "$KEY_NAME" ]; then
   echo "ERROR: KEY_NAME is not set." >&2
   echo "Set it to your EC2 key pair, e.g.:" >&2
-  echo "  KEY_NAME=mykey KEY_FILE=~/.ssh/mykey.pem $0 --name $NAME-$USER" >&2
+  echo "  KEY_NAME=mykey KEY_FILE=~/.ssh/mykey.pem $0 --name $NAME-${USER:-$(whoami)}" >&2
   exit 1
 fi
-
-# Enable serial console access (idempotent, account-level setting)
-echo "Ensuring serial console access is enabled..."
-aws ec2 enable-serial-console-access --profile "$PROFILE" --region us-east-1 >/dev/null 2>&1 || true
 
 # Existing instances with the same name are NEVER torn down implicitly —
 # multiple people run benches in this account in parallel (e.g. tsg's
@@ -75,10 +89,15 @@ fi
 if [ -n "$EXISTING" ]; then
   echo "ERROR: instance(s) named '$NAME' already exist: $EXISTING" >&2
   echo "Someone may be using them. Pick a unique name, e.g.:" >&2
-  echo "  $0 --name $NAME-$USER" >&2
+  echo "  $0 --name $NAME-${USER:-$(whoami)}" >&2
   echo "Or tear down explicitly first: $0 --terminate-only --name $NAME" >&2
   exit 1
 fi
+
+# Enable serial console access (idempotent, account-level setting; only
+# needed for the launch flow's serial-console fallback)
+echo "Ensuring serial console access is enabled..."
+aws ec2 enable-serial-console-access --profile "$PROFILE" --region us-east-1 >/dev/null 2>&1 || true
 
 # User-data script: OOM diagnostics + serial console access
 USER_DATA=$(cat <<'USERDATA'

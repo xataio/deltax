@@ -4,6 +4,12 @@ Validates the session's improvements on the full 100M-row ClickBench
 (c6a.4xlarge, the ClickHouse reference machine). Reference numbers to
 beat: ClickHouse ~33.5 s hot total; pg_deltax main ~53 s (post-#26).
 
+> **Note:** some features referenced below — partition blooms, the
+> `pg_deltax.partition_bloom_filters` and `pg_deltax.blob_storage` GUCs,
+> `.dxs` files (storage-v2) — do not exist on `main` yet; they land in
+> sibling PRs split from the same session. `#NN` numbers refer to the
+> improvement numbering in `PERF_IMPROVEMENTS.md`, not GitHub PRs.
+
 ## 0. Setup (once)
 
     make -C clickbench setup EC2=<ip>           # installs PG18 + builds main, loads 100M, compresses
@@ -14,7 +20,7 @@ Run the full bench on **main** first for a same-machine baseline:
 
 ## 1. Deploy the branch
 
-    git checkout perf/clickhouse-gap-session
+    git checkout <branch-under-validation>      # a sibling PR branch, or the combined session branch
     make -C clickbench deploy EC2=<ip>          # rsync + recompile + restart
 
 **Reload + recompress is required** (partition blooms and `.dxs` files are
@@ -40,12 +46,12 @@ rewrite) — A/B it by deploying main vs branch on the same loaded data
 
 ## 4. Leaderboard page (official ClickBench format)
 
-Upstream repo is cloned at `~/src/ClickBench`. After `make bench`:
-
-    python3 clickbench/build-result.py <bench log> --template ... \
-        --machine c6a.4xlarge > ~/src/ClickBench/pg_deltax/results/c6a.4xlarge.json
-    mkdir -p ~/src/ClickBench/pg_deltax/results   # first time (model the dir on timescaledb/)
-    cd ~/src/ClickBench && ./generate-results.sh && open index.html
+`make -C clickbench bench` already does this: it builds the result JSON
+via `clickbench/build-result.py --template`, copies it into the upstream
+checkout, runs `generate-results.sh`, and opens `index.html`. It needs a
+local ClickBench clone with a `pg_deltax/` dir containing `template.json`
+(model it on `timescaledb/`); the default location is `../../../ClickBench`
+relative to `clickbench/` — override with `CLICKBENCH_REPO=`/`CLICKBENCH_DIR=`.
 
 This renders pg_deltax as a column on the official leaderboard page next
 to ClickHouse/Postgres/Timescale — including the geomean ranking metric
