@@ -64,16 +64,14 @@ pub extern "C-unwind" fn deltax_launcher_main(_arg: pg_sys::Datum) {
     BackgroundWorker::attach_signal_handlers(SignalWakeFlags::SIGHUP | SignalWakeFlags::SIGTERM);
     let dbs = target_databases();
     for (i, db) in dbs.iter().enumerate() {
-        let spawned = BackgroundWorkerBuilder::new(&format!(
-            "pg_deltax maintenance worker ({})",
-            db
-        ))
-        .set_function("deltax_worker_main")
-        .set_library("pg_deltax")
-        .set_argument((i as i32).into_datum())
-        .enable_spi_access()
-        .set_restart_time(Some(Duration::from_secs(60)))
-        .load_dynamic();
+        let spawned =
+            BackgroundWorkerBuilder::new(&format!("pg_deltax maintenance worker ({})", db))
+                .set_function("deltax_worker_main")
+                .set_library("pg_deltax")
+                .set_argument((i as i32).into_datum())
+                .enable_spi_access()
+                .set_restart_time(Some(Duration::from_secs(60)))
+                .load_dynamic();
         match spawned {
             Ok(_) => log!("pg_deltax: launched maintenance worker for database {}", db),
             Err(e) => log!(
