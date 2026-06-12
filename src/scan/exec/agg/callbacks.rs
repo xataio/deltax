@@ -26,8 +26,7 @@ use super::compact::{
 use super::keys::{CompactGroupMap, can_use_compact_keys, unpack_int_keys};
 use super::metadata::{
     groupby_count_shape, load_agg_metadata_from_plan, try_catalog_shortcut,
-    try_groupby_count_fast_path,
-    try_metadata_fast_path,
+    try_groupby_count_fast_path, try_metadata_fast_path,
 };
 use super::parallel_cd::{dispatch_parallel_count_distinct_path, parallel_count_distinct_eligible};
 use super::parallel_compact::{
