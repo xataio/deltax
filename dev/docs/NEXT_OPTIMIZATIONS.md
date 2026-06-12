@@ -4,10 +4,13 @@ Ranked list of **new** optimization candidates derived from the same-machine
 10M-row ClickBench comparison (2026-06-11): pg_deltax vs ClickHouse 24.8, both
 in Docker on an M4 Pro (14 cores visible to the VM). Sources:
 
-- pg_deltax per-query best-of-3:
+- pg_deltax per-query best-of-3: local bench artifact
   `tests/.bench_results/history/20260611_173727_10e133c/pg_deltax.json`
-  (`compressed_queries`, ms, commit `10e133c`)
-- ClickHouse per-query best-of-3: `/tmp/ch_times.txt` (seconds)
+  (`compressed_queries`, ms; untracked — `.bench_results` is not in git).
+  The run was main @ `10e133c` plus session prototypes since extracted into
+  pending PRs; rows affected are flagged inline (e.g. Q32 "post-#36 rework").
+- ClickHouse per-query best-of-3: local run of the official ClickBench
+  queries against CH 24.8 in Docker, same machine (not checked in)
 - 100M phase breakdowns: `QUERY_ANALYSIS.md` (c6a.4xlarge, warm)
 
 Totals: pg_deltax **5.74 s** vs ClickHouse **2.59 s**. We are faster on only
@@ -17,8 +20,9 @@ The local regime exposes different bottlenecks than EC2: detoast is cheap
 per-query fixed costs dominate the gap.
 
 Everything in `PERF_IMPROVEMENTS.md` #1–#49 is treated as tried; overlaps are
-flagged per candidate. **Already in flight from the same perf session**
-(extracted into separate PRs; not re-proposed here, listed for context):
+flagged per candidate. **Already handled in the same perf session** (extracted
+into separate pending PRs, or tried and reverted; not re-proposed here, listed
+for context):
 
 - **Storage v2 P1 + P1b**: dual-write segment files + mmap read — attacks the
   F3 detoast wall (~12–15 s at 100M). EC2 validation pending.
@@ -26,8 +30,9 @@ flagged per candidate. **Already in flight from the same perf session**
   vectors, a warm-run lever for the ~11 s cumulative decode CPU. Prototyped
   and **reverted** — the shmem machinery and invalidation complexity were not
   justified by what it measured; the decode-CPU pool remains open (see N8).
-- **#36 merge-side two-level rework**: Q32 local 587→471 ms.
-- **#47 partition bloom sentinels**: Q19, EC2 numbers pending.
+- **#36 merge-side two-level rework** (pending PR; follow-up to PERF #36's
+  reverted phase 1): Q32 local 587→471 ms.
+- **#47 partition bloom sentinels** (pending PR): Q19, EC2 numbers pending.
 
 ## 1. Per-query ratio table (local 10M)
 
@@ -124,6 +129,11 @@ Projections marked (est.) are sized from the QUERY_ANALYSIS phase tables and
 local recorded times; none are measured. 100M baselines are the QUERY_ANALYSIS
 column (pre-storage-v2).
 
+> **Round-1 outcome (added after the fact):** N1–N3 were implemented and
+> measured — N1 landed −8% (vs −70% projected); N2/N3 measured ~nothing and
+> were shelved. The write-ups below are kept as originally sized; see
+> "Round 2 candidates" for the calibration lesson.
+
 ### N1. Input-keyed regex memoization in the mixed-path transform
 
 **Queries: Q28.** **Projected: local −300–450 ms (1.77 → ~1.4 s); 100M
@@ -188,7 +198,7 @@ Risk: low (falls back to existing path for LZ4 segments).**
 rejected dict-sidecar (#45); this variant needs no sidecar and was never
 implemented.**
 
-`exec_topn_text` (`src/scan/exec/decompress.rs:1349`) collects candidates by
+`exec_topn_text` (`src/scan/exec/decompress.rs:2435`) collects candidates by
 iterating **every row** of every surviving segment with byte-order pruning
 (#37). For dict-encoded segments, the candidate set per segment is fully
 determined by the **dict entries**: the K lexicographically-smallest entries
@@ -306,7 +316,8 @@ from SIMD, so the win is capped to scan/filter-bound shapes.
 - **N9 = #36 follow-up: bucket `CompactAccStorage`/`CountDistinctSideCar` by
   sub-partition.** Q32/Q15/Q35 merge: −1.5–2.5 s at 100M, −80–150 ms local.
   Medium-high complexity (every accumulator accessor). The merge-side rework
-  just landed; measure it on EC2 first — it changes this item's residual.
+  is in a pending PR; measure it on EC2 once merged — it changes this item's
+  residual.
 - **Storage v2 P2/P3 (text forms)**: the remaining storage-v2 phases own the
   detoast pool (~12–15 s) at 100M; the warm decode pool (~6–8 s) is open
   again after the decompressed-cache revert. Local 10M barely sees detoast,
@@ -331,8 +342,9 @@ Local column shows the 10M gap actually addressed.
 
 Recommended order: **N1 → N2** (same files, Q28 alone is a third of the local
 gap; N1 is an afternoon, N2 builds on its measurement), then **N3** (worst
-local ratio in the bench), then re-evaluate **N9** once the landed #36 rework
-has EC2 numbers. N4/N6 are cheap fillers that can ride along; N7 is worth it
+local ratio in the bench), then re-evaluate **N9** once the pending #36 rework
+PR is merged and has EC2 numbers. N4/N6 are cheap fillers that can ride
+along; N7 is worth it
 if local/interactive latency is a product goal, not for the bench total; N8
 needs an SoA decode representation to exist first (the reverted
 decompressed-cache prototype sketched one).
@@ -354,9 +366,9 @@ territory) — both owned by in-flight tracks.
   rearchitecture; internal threads already saturate cores.
 - **Selection-based sparse Phase 2 decode** — #29, icache regressions; N4
   deliberately parallelizes the *existing* decode instead.
-- **Cross-backend compressed-blob/colstats shmem cache** — `shmem_query_cache`
-  post-mortem stands; N7 is backend-local (no LWLocks) and caches decoded
-  rows, not bytes.
+- **Cross-backend compressed-blob/colstats shmem cache** — the
+  `shmem_query_cache` post-mortem (QUERY_ANALYSIS.md) stands; N7 is
+  backend-local (no LWLocks) and caches decoded rows, not bytes.
 - **Per-(AdvEngineID, segment) pre-aggregated counters** (Q7-class) — storage
   schema change for one query shape; Q7's local gap is 8 ms.
 
@@ -364,10 +376,10 @@ territory) — both owned by in-flight tracks.
 
 ## Round 2 candidates (2026-06-11, post-N1/N2/N3 calibration)
 
-Lesson applied from round 1: N2/N3 were built from projections without
-fresh per-query profiles and measured ~nothing (N1 −8% vs −70%
-projected). Every candidate below requires an EXPLAIN-grounded profile
-on the 100M EC2 box BEFORE implementation.
+Lesson applied from round 1: the candidates were sized from projections
+without fresh per-query profiles — N1 measured −8% vs −70% projected;
+N2/N3 measured ~nothing and were shelved. Every candidate below requires
+an EXPLAIN-grounded profile on the 100M EC2 box BEFORE implementation.
 
 Lanes chosen to change *what work exists* rather than micro-optimize
 existing loops:
@@ -438,8 +450,8 @@ Investigated and rejected — worker counts are CPU-derived
 fire at 330 segments/10M rows, thread-spawn overhead is ~10% on full
 scans only. Sole residual: pipeline detoast batch_size floors at
 `2*n_workers` (~2–4 ms local, no-op at 100M); not worth touching the
-empirically calibrated batching constants for that without EC2 bench
-access to validate.
+empirically calibrated batching constants for that until it can be
+validated on EC2.
 
 ### R7 answered + a new lead: possible superlinear cost in segment_size (2026-06-11)
 
@@ -455,7 +467,7 @@ raise it.
 ### Prefetch verdict (2026-06-12): whole-relation variant REVERTED
 
 Cold A/B on 100M (its own regime): catastrophic regression — Q23 cold
-1.9s -> 50.5s, Q20 17.2 -> 54.4s, Q28 16.4 -> 54.7s, Q33 17.3 -> 55.5s.
+1.9 s → 50.5 s, Q20 17.2 → 54.4 s, Q28 16.4 → 54.7 s, Q33 17.3 → 55.5 s.
 The prototype's whole-relation streaming reads the entire blobs TOAST
 relation (~14GB at gp2 throughput) regardless of how few segments
 survive pruning; the >50%-surviving gate fired far too often at

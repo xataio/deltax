@@ -166,8 +166,8 @@ Relevant items, each with the pg_deltax angle:
   (only matters for COPY TO of bytea, not detoast).
 
 Net: PG19 gives us better plumbing under read_stream and better observability,
-but nothing that removes the detoast tax by itself. Item 1 and item 4 remain
-on us.
+but nothing that removes the detoast tax by itself. The read_stream prefetch
+(§1) and the chunked-MAIN layout (§4) remain on us.
 
 ## 3. TOAST mechanics in PG18/19: effectively unchanged
 
@@ -205,9 +205,9 @@ Mechanics, from
   (small fixed PK columns + one bytea) whose total tuple size ≤ 8160 stays
   inline — exactly one tuple per page.
 - Payload budget: 8160 − 24 (tuple header) − null bitmap/padding − PK columns
-  (e.g. `_col_idx int4` + `_segment_id int4` + `_chunk_no int4` = 12) − 4
-  (varlena header) ≈ **~8.1 KB max, ~7.8 KB with margin**. Size the chunk so
-  it can *never* exceed the budget — if one row tips over, MAIN silently falls
+  (e.g. `_col_idx int2` + `_segment_id int4` + `_chunk_no int4` ≈ 12 with
+  alignment) − 4 (varlena header) ≈ **~8.1 KB max, ~7.8 KB with margin**.
+  Size the chunk so it can *never* exceed the budget — if one row tips over, MAIN silently falls
   back to TOAST for that row and you get the worst of both worlds. Don't use
   `PLAIN` (oversize row → hard error).
 
