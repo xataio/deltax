@@ -42,6 +42,8 @@ LIMIT_TIE_QUERIES = {
     "Q9": 2,   # COUNT(*) AS c
     "Q11": 2,  # COUNT(DISTINCT UserID) AS u
     "Q18": 3,  # COUNT(*)
+    "Q21": 2,  # COUNT(*) AS c — at subset scales (≤10M rows) the top-10
+    #            boundary ties at c=1-2, so any tie-filler set is valid
     "Q22": 3,  # COUNT(*) AS c
     "Q23": 4,  # EventTime (col 4 in SELECT *)
     "Q30": 2,  # COUNT(*) AS c
