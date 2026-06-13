@@ -1,20 +1,17 @@
-"""Integration test for `pg_deltax.target_database` with multiple databases.
+"""Integration tests for the maintenance-worker launcher and
+`pg_deltax.target_database`.
 
-The shared session container (conftest) runs with the default config (no
-`target_database`), and the GUC is Postmaster-context — so changing it needs a
-full server restart, not the ALTER SYSTEM + reload trick the other worker tests
-use. This test therefore spins up its *own* dedicated container configured with
-a multi-entry, intentionally-duplicated list and asserts the launcher spawns
-exactly one worker per *distinct* database.
+`target_database` is Postmaster-context, so it can only be set at server start
+— the shared session container (conftest) runs with the default config and its
+worker is continuously churned by the other worker tests, which makes asserting
+"exactly these workers exist right now" racy. These tests therefore each spin
+up a *fresh, dedicated* container whose worker set is stable (nothing creates or
+drops deltatables in it), and assert on `pg_stat_activity.backend_type`.
 
-`smoke_db` must already exist when the real server starts, otherwise its worker
-crash-loops on the 60s restart_time until the database appears. We let the
-official image's `POSTGRES_DB` env create it during the entrypoint's init phase
-(alongside the always-present `postgres` database), so both target databases
-exist by the time the pg_deltax-loaded server starts. This keeps the test to a
-single container with no volume/bind-mount — earlier volume-based attempts hit
-the PG18 image's data-directory layout change, and bind-mounted initdb scripts
-were slow/flaky on CI.
+`smoke_db` is created during the entrypoint's init phase via the official
+image's `POSTGRES_DB` env (alongside the always-present `postgres`), so both
+target databases exist before the pg_deltax server starts — no volume mount
+(which broke on the PG18 image layout) and no missing-database worker retry.
 """
 
 import os
@@ -25,11 +22,13 @@ import psycopg
 import pytest
 
 IMAGE = os.environ.get("PG_DELTAX_IMAGE")
-CONTAINER = "pg_deltax_multidb_test"
-PORT = int(os.environ.get("PG_DELTAX_MULTIDB_PORT", 15455))
-# Duplicate `postgres` is intentional — it must be deduplicated to a single
-# worker, so we expect 2 workers total, not 3.
-TARGET_DATABASE = "postgres, smoke_db, postgres"
+BASE_PORT = int(os.environ.get("PG_DELTAX_MULTIDB_PORT", 15455))
+
+WORKER_QUERY = (
+    "SELECT backend_type FROM pg_stat_activity "
+    "WHERE backend_type LIKE 'pg_deltax maintenance worker%' "
+    "ORDER BY backend_type"
+)
 
 
 def _wait_ready(container, timeout=120):
@@ -52,54 +51,72 @@ def _wait_ready(container, timeout=120):
     )
 
 
-@pytest.mark.skipif(not IMAGE, reason="PG_DELTAX_IMAGE not set")
-def test_launcher_spawns_one_worker_per_distinct_database():
-    subprocess.run(["docker", "rm", "-f", CONTAINER], capture_output=True)
+def _worker_backend_types(container, port, env=None, server_args=None,
+                          expected=1, timeout=60):
+    """Boot a dedicated container, then poll until at least `expected`
+    pg_deltax maintenance workers are registered (or timeout). Returns the
+    sorted list of their backend_type strings. Always tears the container down.
+    """
+    subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+    cmd = [
+        "docker", "run", "-d",
+        "--name", container,
+        "-p", f"{port}:5432",
+        "-e", "POSTGRES_PASSWORD=postgres",
+        "--shm-size=512m",
+    ]
+    for k, v in (env or {}).items():
+        cmd += ["-e", f"{k}={v}"]
+    cmd += [IMAGE, "-c", "shared_preload_libraries=pg_deltax"]
+    cmd += server_args or []
     try:
-        # POSTGRES_DB=smoke_db creates that database during the entrypoint's
-        # init phase, in addition to the built-in `postgres` — so both target
-        # databases exist before the real (pg_deltax-loaded) server starts.
-        subprocess.check_call([
-            "docker", "run", "-d",
-            "--name", CONTAINER,
-            "-p", f"{PORT}:5432",
-            "-e", "POSTGRES_PASSWORD=postgres",
-            "-e", "POSTGRES_DB=smoke_db",
-            "--shm-size=512m",
-            IMAGE,
-            "-c", "shared_preload_libraries=pg_deltax",
-            "-c", f"pg_deltax.target_database={TARGET_DATABASE}",
-        ])
-        _wait_ready(CONTAINER)
-
+        subprocess.check_call(cmd)
+        _wait_ready(container)
         conn = psycopg.connect(
-            host="localhost", port=PORT, user="postgres",
+            host="localhost", port=port, user="postgres",
             password="postgres", dbname="postgres", autocommit=True,
         )
         try:
-            # Both workers register shortly after the real server starts; poll.
-            deadline = time.time() + 60
+            deadline = time.time() + timeout
             workers = []
             while time.time() < deadline:
-                workers = [
-                    row[0]
-                    for row in conn.execute(
-                        "SELECT backend_type FROM pg_stat_activity "
-                        "WHERE backend_type LIKE 'pg_deltax maintenance worker%' "
-                        "ORDER BY backend_type"
-                    ).fetchall()
-                ]
-                if len(workers) >= 2:
+                workers = [r[0] for r in conn.execute(WORKER_QUERY).fetchall()]
+                if len(workers) >= expected:
                     break
                 time.sleep(1)
+            return workers
         finally:
             conn.close()
-
-        # Exactly two: one per distinct database, in alphabetical order. The
-        # duplicate `postgres` entry must NOT produce a third worker.
-        assert workers == [
-            "pg_deltax maintenance worker (postgres)",
-            "pg_deltax maintenance worker (smoke_db)",
-        ], workers
     finally:
-        subprocess.run(["docker", "rm", "-f", CONTAINER], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+
+
+@pytest.mark.skipif(not IMAGE, reason="PG_DELTAX_IMAGE not set")
+def test_default_config_spawns_single_postgres_worker():
+    """With no `target_database` set, the launcher spawns exactly one dynamic
+    maintenance worker bound to `postgres`, named per-database in
+    pg_stat_activity (the pre-launcher code registered a single *static*,
+    differently-named worker)."""
+    workers = _worker_backend_types(
+        "pg_deltax_worker_default", BASE_PORT, expected=1,
+    )
+    assert workers == ["pg_deltax maintenance worker (postgres)"], workers
+
+
+@pytest.mark.skipif(not IMAGE, reason="PG_DELTAX_IMAGE not set")
+def test_multiple_databases_spawn_one_worker_each_deduplicated():
+    """A multi-entry, intentionally-duplicated `target_database` yields exactly
+    one worker per *distinct* database — the duplicate `postgres` must not
+    produce a third worker."""
+    workers = _worker_backend_types(
+        "pg_deltax_worker_multi", BASE_PORT + 1,
+        env={"POSTGRES_DB": "smoke_db"},
+        server_args=[
+            "-c", "pg_deltax.target_database=postgres, smoke_db, postgres",
+        ],
+        expected=2,
+    )
+    assert workers == [
+        "pg_deltax maintenance worker (postgres)",
+        "pg_deltax maintenance worker (smoke_db)",
+    ], workers
