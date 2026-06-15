@@ -585,6 +585,7 @@ mod tests {
             col_sums: HashMap::new(),
             toast_pointers: Vec::new(),
             cached_blob_pins: Vec::new(),
+            blob_file_backing: None,
         }
     }
 

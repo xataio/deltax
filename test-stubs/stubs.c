@@ -17,6 +17,8 @@
 /* Data globals (hooks + memory contexts + GUC-backing variables). */
 __attribute__((weak)) void *create_upper_paths_hook = 0;
 __attribute__((weak)) void *CurrentMemoryContext = 0;
+__attribute__((weak)) char *DataDir = 0;
+__attribute__((weak)) unsigned int MyDatabaseId = 0;
 __attribute__((weak)) void *ErrorContext = 0;
 __attribute__((weak)) void *error_context_stack = 0;
 __attribute__((weak)) void *get_relation_info_hook = 0;
@@ -32,6 +34,7 @@ __attribute__((weak)) void *TopMemoryContext = 0;
 /* Functions: no-op stubs. Signatures are reduced to void(void) because the
  * test binary never invokes them — only the dynamic loader walks the
  * relocation table at load time. */
+__attribute__((weak)) void ActiveSnapshotSet(void) {}
 __attribute__((weak)) void add_partial_path(void) {}
 __attribute__((weak)) void add_path(void) {}
 __attribute__((weak)) void AllocSetContextCreateInternal(void) {}

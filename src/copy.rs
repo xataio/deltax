@@ -698,6 +698,20 @@ struct PartitionBuffer {
     text_lengths_fqn_cached: Option<String>,
     text_lengths_oid_cached: Option<pg_sys::Oid>,
     text_lengths_table_created: bool,
+    /// Dual-mode (`pg_deltax.blob_storage = 'dual'`) incremental segment-file
+    /// writer (STORAGE_V2 P1). Created lazily on the first blob drain,
+    /// appended to on every `flush_partition_blobs` (which may run multiple
+    /// times per partition via BLOB_BUFFER_THRESHOLD early flushes), and
+    /// finished — index + footer + fsync + rename — in `finalize_partition`
+    /// before the catalog row records `blob_file`.
+    blob_file_writer: Option<crate::segment_file::SegmentFileWriter>,
+    /// Data-directory-relative path for `deltax_partition.blob_file`;
+    /// recorded in the catalog only after `finish()` succeeds.
+    blob_file_rel: Option<String>,
+    /// Set after any file-side error so we warn once and leave `blob_file`
+    /// NULL for this partition — the TOAST blobs table stays authoritative
+    /// and the COPY itself never fails because of the file side.
+    blob_file_disabled: bool,
 }
 
 /// State for the entire backfill operation.
@@ -988,6 +1002,9 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_
             text_lengths_fqn_cached: None,
             text_lengths_oid_cached: None,
             text_lengths_table_created: false,
+            blob_file_writer: None,
+            blob_file_rel: None,
+            blob_file_disabled: false,
         });
     }
 
@@ -2710,6 +2727,36 @@ fn flush_partition_blobs(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
         return;
     }
 
+    // Sort blobs column-major (col_idx, segment_id): the TOAST heap insert
+    // below relies on this for sequential TOAST I/O on read, and the
+    // dual-mode segment file gets the same order within each drain batch.
+    buf.blob_buffer
+        .sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
+
+    // Dual mode (STORAGE_V2 P1): append this drain batch to the partition's
+    // incremental segment file before the buffer is drained into the TOAST
+    // blobs table. Main thread only — the threaded parquet path funnels
+    // every drain through this function on the main thread. File-side
+    // errors must never fail the COPY: warn once, abandon the writer, and
+    // leave `blob_file` NULL (the TOAST copy stays authoritative).
+    if crate::blob_storage_dual()
+        && !buf.blob_file_disabled
+        && !buf.blob_buffer.is_empty()
+        && let Err(e) = append_to_blob_file(buf)
+    {
+        pgrx::warning!(
+            "pg_deltax: disabling dual-mode segment file for partition '{}' ({}); \
+                 the TOAST blobs table remains authoritative",
+            buf.partition_table,
+            e
+        );
+        if let Some(w) = buf.blob_file_writer.take() {
+            w.abandon();
+        }
+        buf.blob_file_rel = None;
+        buf.blob_file_disabled = true;
+    }
+
     // Cache companion table FQNs on first call
     if buf.blobs_fqn_cached.is_none() {
         let ddl = build_companion_ddl(&buf.partition_table, columns);
@@ -2742,10 +2789,7 @@ fn flush_partition_blobs(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
     // CurrentMemoryContext; without resetting between rows these accumulate
     // for the entire transaction (~30 GB on ClickBench).
 
-    // Sort blobs column-major (col_idx, segment_id) for sequential TOAST I/O on read.
     if !buf.blob_buffer.is_empty() {
-        buf.blob_buffer
-            .sort_by_key(|&(col_idx, seg_id, _)| (col_idx, seg_id));
         let blobs_oid = *buf
             .blobs_oid_cached
             .get_or_insert_with(|| resolve_relation_oid(blobs_fqn));
@@ -2821,6 +2865,22 @@ fn flush_partition_blobs(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
     );
     buf.blob_buffer_size = 0;
     buf.blobs_flushed = true;
+}
+
+/// Append the (already column-major-sorted) blob buffer to the partition's
+/// dual-mode segment file, creating the incremental writer on first use.
+/// The caller handles errors by disabling the file side for this partition.
+fn append_to_blob_file(buf: &mut PartitionBuffer) -> std::io::Result<()> {
+    if buf.blob_file_writer.is_none() {
+        let (writer, rel_path) =
+            crate::segment_file::SegmentFileWriter::create_for_partition(buf.partition_id)?;
+        buf.blob_file_writer = Some(writer);
+        buf.blob_file_rel = Some(rel_path);
+    }
+    buf.blob_file_writer
+        .as_mut()
+        .expect("blob_file_writer just created")
+        .append_blobs(&buf.blob_buffer)
 }
 
 /// Write a pre-compressed segment into the partition buffer and flush to PG when threshold is reached.
@@ -2948,6 +3008,28 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
         spi_exec(&format!("ANALYZE {}", ddl.text_lengths_fqn));
     }
 
+    // Dual mode: finish the segment file (write footer index, fsync, rename
+    // into place) BEFORE the catalog update below records `blob_file`, so a
+    // committed reference always points at a durable, complete file
+    // (dev/docs/STORAGE_V2.md §3). On failure leave `blob_file` NULL — the
+    // TOAST blobs table is fully populated and remains authoritative.
+    let blob_file_rel: Option<String> = match buf.blob_file_writer.take() {
+        Some(writer) => match writer.finish() {
+            Ok(()) => buf.blob_file_rel.take(),
+            Err(e) => {
+                pgrx::warning!(
+                    "pg_deltax: failed to finalize dual-mode segment file for partition '{}' \
+                     ({}); the TOAST blobs table remains authoritative",
+                    buf.partition_table,
+                    e
+                );
+                buf.blob_file_rel = None;
+                None
+            }
+        },
+        None => None,
+    };
+
     // Use a short-lived SPI connection for catalog update
     let partition_id = buf.partition_id;
     let total_compressed_size = buf.total_compressed_size;
@@ -2966,6 +3048,10 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
             total_rows,
         )
         .expect("failed to update partition catalog");
+        if let Some(rel_path) = &blob_file_rel {
+            catalog::update_partition_blob_file(client, partition_id, rel_path)
+                .expect("failed to update partition blob_file");
+        }
         catalog::install_compressed_dml_trigger(
             client,
             &buf.partition_schema,

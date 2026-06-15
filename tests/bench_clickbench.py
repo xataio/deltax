@@ -75,6 +75,11 @@ def compress_all_partitions(conn):
     ).fetchall()
 
     results = []
+    # GUC A/B hook: PG_DELTAX_BLOB_STORAGE=dual makes compression also write
+    # .dxs segment files (storage-v2); queries then read via mmap.
+    blob_storage = os.environ.get("PG_DELTAX_BLOB_STORAGE")
+    if blob_storage:
+        conn.execute(f"SET pg_deltax.blob_storage = '{blob_storage}'")
     for (part_name,) in partitions:
         row_count = conn.execute(
             f'SELECT count(*) FROM "{part_name}"'

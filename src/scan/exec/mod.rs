@@ -3,7 +3,7 @@ mod agg_wire;
 mod append_wire;
 mod batch_qual;
 pub(crate) mod count_minmax;
-pub(in crate::scan) mod datum_utils;
+pub(crate) mod datum_utils;
 mod decompress;
 pub(in crate::scan) mod segments;
 mod text_col;

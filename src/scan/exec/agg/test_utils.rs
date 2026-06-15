@@ -110,5 +110,6 @@ pub(super) fn make_empty_segment(row_count: i32) -> SegmentData {
         col_sums: HashMap::new(),
         toast_pointers: Vec::new(),
         cached_blob_pins: Vec::new(),
+        blob_file_backing: None,
     }
 }
