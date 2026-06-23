@@ -527,9 +527,12 @@ pub(crate) fn drain_default_partition(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "pg_test"))]
+#[pgrx::pg_schema]
 mod tests {
     use super::parse_target_databases;
+    #[cfg(any(test, feature = "pg_test"))]
+    use pgrx::prelude::*;
 
     #[test]
     fn blank_input_defaults_to_postgres() {
@@ -571,5 +574,124 @@ mod tests {
     #[test]
     fn blank_entries_between_real_ones_are_skipped() {
         assert_eq!(parse_target_databases("a,,b, ,c"), vec!["a", "b", "c"]);
+    }
+
+    // ---- run_in_subtransaction: the per-table isolation primitive ----------
+
+    /// On success the subtransaction is released and its work persists in the
+    /// surrounding transaction.
+    #[pg_test]
+    fn subtransaction_commits_on_success() {
+        Spi::run("CREATE TEMP TABLE sx (n int)").unwrap();
+        let out = super::run_in_subtransaction(|| {
+            Spi::run("INSERT INTO sx VALUES (1)").unwrap();
+            42
+        });
+        assert_eq!(out, Ok(42));
+        let n = Spi::get_one::<i64>("SELECT count(*) FROM sx")
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 1, "successful subtransaction work must persist");
+    }
+
+    /// A Postgres error (here division-by-zero, the `CaughtError::PostgresError`
+    /// path) inside the body rolls back only that body's work, is returned as
+    /// `Err`, and leaves the surrounding transaction usable.
+    #[pg_test]
+    fn subtransaction_rolls_back_postgres_error() {
+        Spi::run("CREATE TEMP TABLE sx (n int)").unwrap();
+        let out = super::run_in_subtransaction(|| {
+            Spi::run("INSERT INTO sx VALUES (1)").unwrap();
+            // Raises ERROR 22012 mid-body, after the insert.
+            Spi::run("SELECT 1 / 0").unwrap();
+            99
+        });
+        assert!(out.is_err(), "expected Err from a failing subtransaction");
+
+        // Outer transaction still alive and the insert was rolled back.
+        let n = Spi::get_one::<i64>("SELECT count(*) FROM sx")
+            .unwrap()
+            .unwrap();
+        assert_eq!(n, 0, "failed subtransaction work must be rolled back");
+    }
+
+    /// The Err carries the underlying message (what the worker logs). Exercises
+    /// the `CaughtError::ErrorReport` path via `pgrx::error!`.
+    #[pg_test]
+    fn subtransaction_captures_error_message() {
+        let out: Result<(), String> = super::run_in_subtransaction(|| {
+            pgrx::error!("deliberate boom 4242");
+        });
+        match out {
+            Err(msg) => assert!(msg.contains("deliberate boom 4242"), "got: {msg}"),
+            Ok(()) => panic!("expected Err"),
+        }
+    }
+
+    /// The loop pattern: one unit failing does not stop the next from
+    /// committing — i.e. real per-table isolation.
+    #[pg_test]
+    fn subtransaction_failure_does_not_block_next() {
+        Spi::run("CREATE TEMP TABLE sx (n int)").unwrap();
+
+        let first = super::run_in_subtransaction(|| {
+            Spi::run("INSERT INTO sx VALUES (1)").unwrap();
+            Spi::run("SELECT 1 / 0").unwrap(); // boom — rolls back the insert
+        });
+        assert!(first.is_err());
+
+        let second = super::run_in_subtransaction(|| {
+            Spi::run("INSERT INTO sx VALUES (2)").unwrap();
+        });
+        assert!(second.is_ok());
+
+        let rows = Spi::get_one::<i64>("SELECT count(*) FROM sx")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rows, 1, "only the successful unit's row should remain");
+        let val = Spi::get_one::<i32>("SELECT n FROM sx").unwrap().unwrap();
+        assert_eq!(val, 2);
+    }
+
+    /// Nested subtransactions compose: an inner failure is contained and the
+    /// outer body can still succeed and commit.
+    #[pg_test]
+    fn subtransaction_nesting_isolates_inner_failure() {
+        Spi::run("CREATE TEMP TABLE sx (n int)").unwrap();
+        let outer = super::run_in_subtransaction(|| {
+            Spi::run("INSERT INTO sx VALUES (10)").unwrap();
+            let inner = super::run_in_subtransaction(|| {
+                Spi::run("INSERT INTO sx VALUES (20)").unwrap();
+                Spi::run("SELECT 1 / 0").unwrap(); // inner boom
+            });
+            assert!(inner.is_err());
+            // Outer continues after the contained inner failure.
+            Spi::run("INSERT INTO sx VALUES (30)").unwrap();
+        });
+        assert!(outer.is_ok());
+
+        // 10 and 30 committed; 20 rolled back with the inner subtransaction.
+        let cnt = Spi::get_one::<i64>("SELECT count(*) FROM sx")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cnt, 2);
+        let has20 = Spi::get_one::<bool>("SELECT EXISTS(SELECT 1 FROM sx WHERE n = 20)")
+            .unwrap()
+            .unwrap();
+        assert!(!has20, "inner-subtransaction row must be rolled back");
+        let mn = Spi::get_one::<i32>("SELECT min(n) FROM sx").unwrap().unwrap();
+        let mx = Spi::get_one::<i32>("SELECT max(n) FROM sx").unwrap().unwrap();
+        assert_eq!((mn, mx), (10, 30));
+    }
+
+    // ---- run_maintenance_pass smoke ---------------------------------------
+
+    /// A pass over an empty/absent catalog must be a clean no-op (replica check
+    /// → advisory lock → catalog-present check → return), never an error.
+    #[pg_test]
+    fn run_maintenance_pass_is_noop_smoke() {
+        Spi::connect_mut(|client| {
+            super::run_maintenance_pass(client);
+        });
     }
 }

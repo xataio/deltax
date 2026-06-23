@@ -222,14 +222,11 @@ $$;
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
-    GucRegistry::define_string_guc(
-        c"pg_deltax.target_database",
-        c"Comma-separated database(s) the pg_deltax maintenance worker services",
-        c"One maintenance worker is registered per listed database; each connects to exactly one database and services only deltatables registered there. Each entry consumes a max_worker_processes slot. Changing the list requires a server restart.",
-        &TARGET_DATABASE,
-        GucContext::Postmaster,
-        GucFlags::default(),
-    );
+    // NOTE: `PGC_POSTMASTER` GUCs (target_database, blob_cache_mb,
+    // blob_cache_shards) are defined ONLY in the shared-preload branch below —
+    // PostgreSQL FATALs ("cannot create PGC_POSTMASTER variables after startup")
+    // if they are defined in a backend loaded via session_preload / LOAD / fmgr.
+    // Everything here is PGC_USERSET / PGC_SUSET, which is safe in any load mode.
     GucRegistry::define_string_guc(
         c"pg_deltax.mock_now",
         c"Override current time for testing (timestamptz literal, empty = use real time)",
@@ -298,26 +295,6 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Userset,
         GucFlags::default(),
     );
-    GucRegistry::define_int_guc(
-        c"pg_deltax.blob_cache_mb",
-        c"Size of the process-shared blob cache, in MiB. -1 = auto (1/6 of physical RAM, clamped to [256, 16384]); 0 = disabled; N > 0 = explicit MiB.",
-        c"The blob cache stores detoasted compressed segment blobs keyed by (companion_oid, segment_id, col_idx). Repeated queries against the same segments skip the pg_detoast_datum path. -1 (default) auto-sizes at postmaster start from /proc/meminfo, falling back to the 256 MB floor if it can't be read. Explicit values override the auto heuristic. See dev/docs/BLOB_CACHE.md. Restart required — the shmem reservation is captured at postmaster start.",
-        &BLOB_CACHE_MB,
-        -1,
-        32768,
-        GucContext::Postmaster,
-        GucFlags::default(),
-    );
-    GucRegistry::define_int_guc(
-        c"pg_deltax.blob_cache_shards",
-        c"Number of shards (power of two) in the blob cache. Restart required.",
-        c"Each shard owns an LWLock and an LRU list. More shards reduce contention under high concurrency; fewer save shmem overhead. Must be a power of two between 1 and 1024.",
-        &BLOB_CACHE_SHARDS,
-        1,
-        1024,
-        GucContext::Postmaster,
-        GucFlags::default(),
-    );
     GucRegistry::define_bool_guc(
         c"pg_deltax.use_lz4",
         c"Declare internal columnar BYTEA companion columns with COMPRESSION lz4",
@@ -349,19 +326,49 @@ pub extern "C-unwind" fn _PG_init() {
         copy::register_process_utility_hook();
     }
 
-    // Postmaster-only registrations. The static maintenance worker
-    // (`RegisterBackgroundWorker`) and the shared blob cache
-    // (`RequestAddinShmemSpace`) both reserve postmaster-level resources that
-    // can only be requested while the postmaster is processing
+    // Postmaster-only setup. The `PGC_POSTMASTER` GUCs, the static maintenance
+    // worker (`RegisterBackgroundWorker`), and the shared blob cache
+    // (`RequestAddinShmemSpace`) all require the postmaster to be processing
     // `shared_preload_libraries`; `process_shared_preload_libraries_in_progress`
-    // is true exactly then. When pg_deltax is loaded any other way
-    // (`session_preload_libraries`, `LOAD`, or on-demand via fmgr) these are
-    // skipped: maintenance is driven externally via `deltax_run_maintenance()`
-    // and the blob cache stays off (a performance feature, not correctness).
-    // This mirrors pg_stat_statements, which gates its shmem machinery on the
-    // same flag. Listing pg_deltax in both preload lists is harmless — Postgres
-    // won't re-run `_PG_init` for an already-loaded library.
+    // is true exactly then. Defining the GUCs (not just registering the worker /
+    // shmem) MUST be gated here too — PostgreSQL FATALs if a PGC_POSTMASTER GUC
+    // is defined outside postmaster startup, which would crash every
+    // session_preload / LOAD / fmgr backend. When pg_deltax is loaded any other
+    // way these are all skipped: maintenance is driven externally via
+    // `deltax_run_maintenance()`, the blob cache stays off (a performance
+    // feature, not correctness), and the three full-mode-only GUCs are simply
+    // absent. This mirrors pg_stat_statements, which gates its GUC + shmem
+    // machinery on the same flag. Listing pg_deltax in both preload lists is
+    // harmless — Postgres won't re-run `_PG_init` for an already-loaded library.
     if unsafe { pg_sys::process_shared_preload_libraries_in_progress } {
+        GucRegistry::define_string_guc(
+            c"pg_deltax.target_database",
+            c"Comma-separated database(s) the pg_deltax maintenance worker services",
+            c"One maintenance worker is registered per listed database; each connects to exactly one database and services only deltatables registered there. Each entry consumes a max_worker_processes slot. Changing the list requires a server restart.",
+            &TARGET_DATABASE,
+            GucContext::Postmaster,
+            GucFlags::default(),
+        );
+        GucRegistry::define_int_guc(
+            c"pg_deltax.blob_cache_mb",
+            c"Size of the process-shared blob cache, in MiB. -1 = auto (1/6 of physical RAM, clamped to [256, 16384]); 0 = disabled; N > 0 = explicit MiB.",
+            c"The blob cache stores detoasted compressed segment blobs keyed by (companion_oid, segment_id, col_idx). Repeated queries against the same segments skip the pg_detoast_datum path. -1 (default) auto-sizes at postmaster start from /proc/meminfo, falling back to the 256 MB floor if it can't be read. Explicit values override the auto heuristic. See dev/docs/BLOB_CACHE.md. Restart required — the shmem reservation is captured at postmaster start.",
+            &BLOB_CACHE_MB,
+            -1,
+            32768,
+            GucContext::Postmaster,
+            GucFlags::default(),
+        );
+        GucRegistry::define_int_guc(
+            c"pg_deltax.blob_cache_shards",
+            c"Number of shards (power of two) in the blob cache. Restart required.",
+            c"Each shard owns an LWLock and an LRU list. More shards reduce contention under high concurrency; fewer save shmem overhead. Must be a power of two between 1 and 1024.",
+            &BLOB_CACHE_SHARDS,
+            1,
+            1024,
+            GucContext::Postmaster,
+            GucFlags::default(),
+        );
         blob_cache::register_hooks();
         worker::register_bgworker();
     }

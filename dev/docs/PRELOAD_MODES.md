@@ -235,11 +235,18 @@ CREATE EXTENSION pg_deltax;
 ALTER DATABASE analytics SET session_preload_libraries = 'pg_deltax';
 ```
 
-Inert GUCs in session mode: `pg_deltax.target_database`, `pg_deltax.blob_cache_mb`,
-and `pg_deltax.blob_cache_shards` are all `PGC_POSTMASTER` context. In session mode
-they cannot be set per-database/session (PG rejects or ignores the change) and
-have no effect — there is no postmaster launcher to read `target_database` and
-no shared cache. Treat them as full-mode-only knobs.
+Absent GUCs in session mode: `pg_deltax.target_database`, `pg_deltax.blob_cache_mb`,
+and `pg_deltax.blob_cache_shards` are all `PGC_POSTMASTER` context and are
+**not defined at all** in session mode — `SHOW` on them errors with
+"unrecognized configuration parameter". This is not just a nicety: PostgreSQL
+*FATALs* ("cannot create PGC_POSTMASTER variables after startup") if a
+`PGC_POSTMASTER` GUC is defined outside postmaster startup, so `_PG_init` must
+gate the `define_*_guc` calls for these three behind
+`process_shared_preload_libraries_in_progress` — defining them in a
+session_preload / LOAD / fmgr backend would crash that backend. (The
+`PGC_USERSET` / `PGC_SUSET` GUCs — `mock_now`, `parallel_workers`, etc. — are
+defined unconditionally and work in both modes.) They are full-mode-only knobs:
+there is no postmaster launcher to read `target_database` and no shared cache.
 
 Cluster-wide session mode (closest to shared_preload minus the postmaster powers):
 
