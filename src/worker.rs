@@ -9,6 +9,17 @@ use crate::partition;
 
 const DEFAULT_WORKER_INTERVAL_SECS: u64 = 60;
 
+/// Fixed key for the transaction-level advisory lock that serializes
+/// maintenance passes. The background worker and any manual or externally
+/// scheduled `deltax_run_maintenance()` call all take this lock with
+/// `pg_try_advisory_xact_lock` before touching any table; whoever loses simply
+/// skips the pass (maintenance is periodic and idempotent, so a skipped
+/// redundant pass is harmless). This is what keeps a manual call from
+/// deadlocking against the worker in full mode — both would otherwise run the
+/// same detach/attach/compress DDL concurrently. The value is an arbitrary
+/// pg_deltax-namespaced constant ("pdltx_mt" in ASCII).
+const MAINTENANCE_ADVISORY_LOCK_KEY: i64 = 0x7064_6C74_785F_6D74;
+
 /// Read `pg_deltax.target_database` and parse it into a list of database
 /// names (see [`parse_target_databases`]). Only call this from a launched
 /// process (the launcher) — custom-GUC values from postgresql.conf are not
@@ -132,125 +143,264 @@ pub extern "C-unwind" fn deltax_worker_main(_arg: pg_sys::Datum) {
     );
 
     while BackgroundWorker::wait_latch(Some(Duration::from_secs(DEFAULT_WORKER_INTERVAL_SECS))) {
-        // Check if we're on a replica — skip all maintenance if so
-        let is_replica = BackgroundWorker::transaction(|| {
-            Spi::get_one::<bool>("SELECT pg_is_in_recovery()")
-                .unwrap_or(Some(true))
-                .unwrap_or(true)
-        });
-
-        if is_replica {
-            continue;
-        }
-
+        // One maintenance pass per tick, wrapped in a single transaction. The
+        // replica guard, catalog-present check, and per-table error isolation
+        // all live inside `run_maintenance_pass`, which is shared with the
+        // SQL-callable `deltax_run_maintenance()` so both paths behave
+        // identically.
         BackgroundWorker::transaction(|| {
             Spi::connect_mut(|client| {
-                // Skip if the extension hasn't been installed yet (catalog tables missing)
-                let has_catalog = client.select(
-                    "SELECT 1 FROM pg_tables WHERE schemaname = 'deltax' AND tablename = 'deltax_deltatable'",
-                    None,
-                    &[],
-                ).map(|r| !r.is_empty()).unwrap_or(false);
-                if !has_catalog {
-                    return;
-                }
-
-                let deltatables = match catalog::get_all_deltatables(client) {
-                    Ok(hts) => hts,
-                    Err(e) => {
-                        log!("pg_deltax: failed to get deltatables: {:?}", e);
-                        return;
-                    }
-                };
-
-                for ht in &deltatables {
-                    // Drain default partition first — rows in the default
-                    // would block creation of new partitions whose range
-                    // overlaps with those rows.
-                    match drain_default_partition(client, ht) {
-                        Ok(drained) => {
-                            if drained.rows_moved > 0 {
-                                log!(
-                                    "pg_deltax: drained {} rows from {}_default into {} partition(s)",
-                                    drained.rows_moved,
-                                    ht.table_name,
-                                    drained.partitions_created
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            log!(
-                                "pg_deltax: failed to drain default partition for {}.{}: {:?}",
-                                ht.schema_name,
-                                ht.table_name,
-                                e
-                            );
-                        }
-                    }
-
-                    // Pre-create future partitions (default premake = 3)
-                    match partition::ensure_future_partitions(client, ht, 3) {
-                        Ok(created) => {
-                            if created > 0 {
-                                log!(
-                                    "pg_deltax: created {} new partitions for {}.{}",
-                                    created,
-                                    ht.schema_name,
-                                    ht.table_name
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            log!(
-                                "pg_deltax: failed to create partitions for {}.{}: {:?}",
-                                ht.schema_name,
-                                ht.table_name,
-                                e
-                            );
-                        }
-                    }
-
-                    // Auto-compress eligible partitions
-                    let compressed = crate::compress::auto_compress_partitions(client, ht);
-                    if compressed > 0 {
-                        log!(
-                            "pg_deltax: auto-compressed {} partitions for {}.{}",
-                            compressed,
-                            ht.schema_name,
-                            ht.table_name
-                        );
-                        // Per-partition stats are written at compress time; the
-                        // parent-relation merged stats (join/range selectivity)
-                        // need re-merging across all partitions whenever new
-                        // ones are compressed.
-                        if let Err(e) =
-                            crate::stats::write_table_stats(client, &ht.schema_name, &ht.table_name)
-                        {
-                            log!(
-                                "pg_deltax: failed to refresh parent stats for {}.{}: {:?}",
-                                ht.schema_name,
-                                ht.table_name,
-                                e
-                            );
-                        }
-                    }
-
-                    // Auto-drop expired partitions (retention policy)
-                    let dropped = partition::auto_drop_partitions(client, ht);
-                    if dropped > 0 {
-                        log!(
-                            "pg_deltax: dropped {} expired partitions for {}.{}",
-                            dropped,
-                            ht.schema_name,
-                            ht.table_name
-                        );
-                    }
-                }
-            })
+                run_maintenance_pass(client);
+            });
         });
     }
 
     log!("pg_deltax: background worker shutting down");
+}
+
+/// SQL-callable maintenance entry point: run one full pass synchronously over
+/// every deltatable in the **current** database.
+///
+/// This is what session mode uses in place of the static background worker
+/// (which can only be registered from a `shared_preload_libraries` postmaster
+/// load). Schedule it externally — e.g. once a minute with pg_cron:
+/// `SELECT cron.schedule_in_database(..., 'SELECT deltax.deltax_run_maintenance()', 'mydb')`.
+/// It performs the same drain → premake → compress → retention steps the
+/// background worker runs, with the same per-table error isolation, and no-ops
+/// on a replica. Calling it via fmgr loads pg_deltax on demand, so it works
+/// regardless of preload mode.
+#[pg_extern]
+fn deltax_run_maintenance() {
+    Spi::connect_mut(|client| {
+        run_maintenance_pass(client);
+    });
+}
+
+/// Run one maintenance pass over every deltatable in the current database:
+/// drain the default partition, pre-create future partitions, auto-compress
+/// eligible partitions (refreshing parent stats), and drop partitions past
+/// their retention. No-ops on a replica or before the extension catalog
+/// exists.
+///
+/// Shared by the background worker (full mode) and `deltax_run_maintenance()`
+/// (session mode / manual ops) so there is a single maintenance code path. The
+/// caller supplies a connected `SpiClient` inside an open transaction. Each
+/// deltatable is processed in its own internal subtransaction, so a failure on
+/// one table rolls back only that table's partial work and the pass continues
+/// with the rest.
+pub(crate) fn run_maintenance_pass(client: &mut SpiClient) {
+    // Replica guard: an external scheduler (pg_cron) could fire this against a
+    // standby, where the maintenance DDL would error. Skip the whole pass.
+    // Default to "replica" on any error so we never attempt DDL on a standby.
+    let is_replica = match client.select("SELECT pg_is_in_recovery()", None, &[]) {
+        Ok(t) => t
+            .first()
+            .get_one::<bool>()
+            .unwrap_or(Some(true))
+            .unwrap_or(true),
+        Err(_) => true,
+    };
+    if is_replica {
+        return;
+    }
+
+    // Serialize against any other maintenance pass (the background worker vs. a
+    // manual/scheduled deltax_run_maintenance(), or two scheduled calls). The
+    // lock is always taken before any table-level lock, so two passes can never
+    // deadlock on the maintenance DDL; the loser skips this pass. Auto-released
+    // when the surrounding transaction ends.
+    let got_lock = match client.select(
+        "SELECT pg_try_advisory_xact_lock($1)",
+        None,
+        &[MAINTENANCE_ADVISORY_LOCK_KEY.into()],
+    ) {
+        Ok(t) => t
+            .first()
+            .get_one::<bool>()
+            .unwrap_or(Some(false))
+            .unwrap_or(false),
+        Err(_) => false,
+    };
+    if !got_lock {
+        return;
+    }
+
+    // Skip if the extension hasn't been installed yet (catalog tables missing).
+    let has_catalog = client
+        .select(
+            "SELECT 1 FROM pg_tables WHERE schemaname = 'deltax' AND tablename = 'deltax_deltatable'",
+            None,
+            &[],
+        )
+        .map(|r| !r.is_empty())
+        .unwrap_or(false);
+    if !has_catalog {
+        return;
+    }
+
+    let deltatables = match catalog::get_all_deltatables(client) {
+        Ok(hts) => hts,
+        Err(e) => {
+            log!("pg_deltax: failed to get deltatables: {:?}", e);
+            return;
+        }
+    };
+
+    for ht in &deltatables {
+        // Per-table isolation: a Postgres error in any step (e.g. a failed
+        // compression) rolls back only this table's subtransaction so the rest
+        // of the pass still runs. Without this, one broken deltatable would
+        // abort the whole tick for every table.
+        if let Err(msg) = run_in_subtransaction(|| maintain_one_table(client, ht)) {
+            log!(
+                "pg_deltax: maintenance failed for {}.{}: {}",
+                ht.schema_name,
+                ht.table_name,
+                msg
+            );
+        }
+    }
+}
+
+/// One deltatable's maintenance steps, in order. Informational counts are
+/// logged here; a hard error in any step propagates to the caller's
+/// subtransaction (see [`run_in_subtransaction`]), which rolls back this
+/// table's work and continues with the next table.
+fn maintain_one_table(client: &mut SpiClient, ht: &catalog::DeltatableInfo) {
+    // Drain default partition first — rows in the default would block creation
+    // of new partitions whose range overlaps with those rows.
+    match drain_default_partition(client, ht) {
+        Ok(drained) => {
+            if drained.rows_moved > 0 {
+                log!(
+                    "pg_deltax: drained {} rows from {}_default into {} partition(s)",
+                    drained.rows_moved,
+                    ht.table_name,
+                    drained.partitions_created
+                );
+            }
+        }
+        Err(e) => {
+            log!(
+                "pg_deltax: failed to drain default partition for {}.{}: {:?}",
+                ht.schema_name,
+                ht.table_name,
+                e
+            );
+        }
+    }
+
+    // Pre-create future partitions (default premake = 3)
+    match partition::ensure_future_partitions(client, ht, 3) {
+        Ok(created) => {
+            if created > 0 {
+                log!(
+                    "pg_deltax: created {} new partitions for {}.{}",
+                    created,
+                    ht.schema_name,
+                    ht.table_name
+                );
+            }
+        }
+        Err(e) => {
+            log!(
+                "pg_deltax: failed to create partitions for {}.{}: {:?}",
+                ht.schema_name,
+                ht.table_name,
+                e
+            );
+        }
+    }
+
+    // Auto-compress eligible partitions
+    let compressed = crate::compress::auto_compress_partitions(client, ht);
+    if compressed > 0 {
+        log!(
+            "pg_deltax: auto-compressed {} partitions for {}.{}",
+            compressed,
+            ht.schema_name,
+            ht.table_name
+        );
+        // Per-partition stats are written at compress time; the parent-relation
+        // merged stats (join/range selectivity) need re-merging across all
+        // partitions whenever new ones are compressed.
+        if let Err(e) = crate::stats::write_table_stats(client, &ht.schema_name, &ht.table_name) {
+            log!(
+                "pg_deltax: failed to refresh parent stats for {}.{}: {:?}",
+                ht.schema_name,
+                ht.table_name,
+                e
+            );
+        }
+    }
+
+    // Auto-drop expired partitions (retention policy)
+    let dropped = partition::auto_drop_partitions(client, ht);
+    if dropped > 0 {
+        log!(
+            "pg_deltax: dropped {} expired partitions for {}.{}",
+            dropped,
+            ht.schema_name,
+            ht.table_name
+        );
+    }
+}
+
+/// Run `body` inside an internal subtransaction (savepoint). On success the
+/// subtransaction is released and its work persists in the surrounding
+/// transaction. On any Postgres error or Rust panic the subtransaction is
+/// rolled back and the error message is returned as `Err`, leaving the
+/// surrounding transaction intact so the caller can log and continue.
+///
+/// Modeled on PL/pgSQL's `BEGIN ... EXCEPTION` block (`exec_stmt_block` in
+/// `pl_exec.c`): save the surrounding memory context + resource owner, begin
+/// the subtransaction, run the body, and restore the saved context/owner on
+/// both the commit and abort paths. The error message captured in `caught` is
+/// an owned copy (pgrx reads it off the error stack before invoking the
+/// handler), so it is safe to flush the error state and unwind the
+/// subtransaction inside the handler.
+fn run_in_subtransaction<R>(body: impl FnOnce() -> R) -> Result<R, String> {
+    let old_context = unsafe { pg_sys::CurrentMemoryContext };
+    let old_owner = unsafe { pg_sys::CurrentResourceOwner };
+
+    unsafe {
+        pg_sys::BeginInternalSubTransaction(std::ptr::null());
+        // BeginInternalSubTransaction switches into the subtransaction's
+        // context; switch back so the body allocates where the caller expects.
+        pg_sys::MemoryContextSwitchTo(old_context);
+    }
+
+    PgTryBuilder::new(std::panic::AssertUnwindSafe(|| {
+        let r = body();
+        unsafe {
+            pg_sys::ReleaseCurrentSubTransaction();
+            pg_sys::MemoryContextSwitchTo(old_context);
+            pg_sys::CurrentResourceOwner = old_owner;
+        }
+        Ok(r)
+    }))
+    .catch_others(move |caught| {
+        let msg = caught_message(&caught);
+        unsafe {
+            pg_sys::MemoryContextSwitchTo(old_context);
+            pg_sys::FlushErrorState();
+            pg_sys::RollbackAndReleaseCurrentSubTransaction();
+            pg_sys::MemoryContextSwitchTo(old_context);
+            pg_sys::CurrentResourceOwner = old_owner;
+        }
+        Err(msg)
+    })
+    .execute()
+}
+
+/// Extract an owned error message from a caught error for logging.
+fn caught_message(caught: &pg_sys::panic::CaughtError) -> String {
+    use pg_sys::panic::CaughtError;
+    match caught {
+        CaughtError::PostgresError(e)
+        | CaughtError::ErrorReport(e)
+        | CaughtError::RustPanic { ereport: e, .. } => e.message().to_string(),
+    }
 }
 
 /// Outcome of a single drain pass: how many rows were moved from the

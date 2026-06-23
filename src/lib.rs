@@ -334,8 +334,11 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Userset,
         GucFlags::default(),
     );
-    blob_cache::register_hooks();
-    worker::register_bgworker();
+    // Query hooks are per-backend function pointers — install them in EVERY
+    // load mode (shared_preload, session_preload, LOAD, on-demand fmgr) so query
+    // correctness is identical regardless of how the library was loaded. This
+    // mirrors auto_explain, whose _PG_init installs its executor hooks
+    // unconditionally.
     unsafe {
         scan::register_hook();
     }
@@ -344,6 +347,23 @@ pub extern "C-unwind" fn _PG_init() {
     }
     unsafe {
         copy::register_process_utility_hook();
+    }
+
+    // Postmaster-only registrations. The static maintenance worker
+    // (`RegisterBackgroundWorker`) and the shared blob cache
+    // (`RequestAddinShmemSpace`) both reserve postmaster-level resources that
+    // can only be requested while the postmaster is processing
+    // `shared_preload_libraries`; `process_shared_preload_libraries_in_progress`
+    // is true exactly then. When pg_deltax is loaded any other way
+    // (`session_preload_libraries`, `LOAD`, or on-demand via fmgr) these are
+    // skipped: maintenance is driven externally via `deltax_run_maintenance()`
+    // and the blob cache stays off (a performance feature, not correctness).
+    // This mirrors pg_stat_statements, which gates its shmem machinery on the
+    // same flag. Listing pg_deltax in both preload lists is harmless — Postgres
+    // won't re-run `_PG_init` for an already-loaded library.
+    if unsafe { pg_sys::process_shared_preload_libraries_in_progress } {
+        blob_cache::register_hooks();
+        worker::register_bgworker();
     }
 }
 

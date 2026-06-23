@@ -159,6 +159,78 @@ def test_worker_drains_default_partition(postgres_db):
         _cleanup(db, table)
 
 
+def test_run_maintenance_drains_synchronously(postgres_db):
+    """deltax_run_maintenance() runs the same drain/premake/compress/retention
+    pass as the background worker, but synchronously in the calling session.
+
+    This is the entry point session mode schedules externally (e.g. pg_cron).
+    The test drives it directly (rather than waiting for the 60s worker), which
+    exercises the shared maintenance path including the per-table subtransaction
+    wrapper. Because a maintenance pass takes a transaction-level advisory lock,
+    a given call can lose the race to the always-running full-mode worker, so we
+    call it in a short loop until the default is drained — whichever pass wins,
+    the default converges to empty quickly.
+
+    The worker's clock is aligned via ALTER SYSTEM so its concurrent passes stay
+    bounded and consistent with the session's view (the same pattern the other
+    worker tests use)."""
+    db = postgres_db
+    table = _unique_table()
+
+    try:
+        # Keep the session and the background worker on the same clock so the
+        # worker's concurrent maintenance stays bounded.
+        _alter_system("ALTER SYSTEM SET pg_deltax.mock_now = '2025-07-01 00:00:00+00'")
+        db.execute("SET pg_deltax.mock_now = '2025-06-15 00:00:00+00'")
+        db.execute(
+            f'CREATE TABLE "{table}" (ts TIMESTAMPTZ NOT NULL, val FLOAT8)'
+        )
+        db.commit()
+
+        # premake=1 → 3 partitions: [June 14-15), [June 15-16), [June 16-17)
+        db.execute(
+            f"SELECT deltax.deltax_create_table('{table}', 'ts', '1 day', 1)"
+        )
+        db.commit()
+
+        # Insert a row far in the future — lands in the default partition.
+        db.execute(
+            f"INSERT INTO \"{table}\" VALUES ('2025-07-01 12:00:00+00', 99.0)"
+        )
+        db.commit()
+
+        assert db.execute(
+            f'SELECT count(*) FROM "{table}_default"'
+        ).fetchone()[0] == 1, "Row should be in the default partition"
+
+        # Advance the session clock so the synchronous pass can create a July 1
+        # partition, then drive maintenance ourselves until the default drains.
+        db.execute("SET pg_deltax.mock_now = '2025-07-01 00:00:00+00'")
+        deadline = time.time() + 30
+        drained = False
+        while time.time() < deadline:
+            db.execute("SELECT deltax.deltax_run_maintenance()")
+            db.commit()
+            if db.execute(
+                f'SELECT count(*) FROM "{table}_default"'
+            ).fetchone()[0] == 0:
+                drained = True
+                break
+            time.sleep(2)
+            db.commit()
+
+        assert drained, "Expected deltax_run_maintenance() to drain the default"
+
+        # Row still visible from the parent, and a further call is a clean no-op.
+        assert db.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0] == 1
+        db.execute("SELECT deltax.deltax_run_maintenance()")
+        db.commit()
+        assert db.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0] == 1
+
+    finally:
+        _cleanup(db, table)
+
+
 def test_worker_retention_drops_old_partitions(postgres_db):
     """Retention policy causes the worker to drop partitions older than drop_after."""
     db = postgres_db

@@ -1,9 +1,17 @@
 # Preload Modes: `shared_preload_libraries` vs `session_preload_libraries`
 
-Status: design / proposal. The "Decided" section is settled in principle, with
-two carve-outs that are still open: the *mechanism* of the runtime guard (#3 —
-the guarantee is decided, the implementation is not) and the session-mode
-background-worker scheduling (options listed below).
+Status: design / proposal, **Phase 1 implemented**. The "Decided" section is
+settled in principle, with two carve-outs that are still open: the *mechanism*
+of the runtime guard (#3 — the guarantee is decided, the implementation is not)
+and the session-mode background-worker scheduling (options listed below).
+
+Phase 1 (shipped): the dual-mode `_PG_init` branch (#1), the factored
+`deltax_run_maintenance()` SQL entry point with per-table subtransaction
+isolation + replica guard + pass-level advisory-lock mutual exclusion, and the
+worker reusing the same code path. **Not** yet implemented and required before
+session mode is *safe to expose*: the runtime guard (#3). Until then session
+mode can be loaded but a mis-scoped backend can still silently return zero rows
+from compressed partitions.
 
 ## Motivation
 
@@ -316,10 +324,29 @@ factored function:
    only that unit and the loop logs-and-continues. This is new code, not a
    straight lift of the existing loop. If we instead lift the loop verbatim, the
    worker should ideally gain the same isolation so both paths behave identically.
+
+   **Implemented** (`worker::run_maintenance_pass` / `maintain_one_table` /
+   `run_in_subtransaction`): the loop body is factored into a shared function
+   that both the worker and `deltax_run_maintenance()` call. Each deltatable is
+   wrapped in an internal subtransaction modeled on PL/pgSQL's `BEGIN …
+   EXCEPTION` block, so a Postgres error in any step rolls back only that table's
+   work and the pass logs-and-continues. The worker now gets this isolation too.
 3. **Replica guard.** The worker skips the whole pass when `pg_is_in_recovery()`.
    An external scheduler firing `deltax_run_maintenance()` against a standby would
    attempt DDL and error, so this guard belongs **inside the function** (no-op on
-   a replica).
+   a replica). **Implemented** inside `run_maintenance_pass`.
+4. **Pass-level mutual exclusion (added during implementation).** In full mode
+   the static worker is always running, so a manual or scheduled
+   `deltax_run_maintenance()` call would run the same detach/attach/compress DDL
+   concurrently with a worker tick and could **deadlock** (observed: worker
+   holding a freshly-created partition's lock while waiting on the caller's
+   catalog-row lock, and vice-versa). The factored pass therefore takes a
+   transaction-level advisory lock (`pg_try_advisory_xact_lock`, fixed
+   pg_deltax-namespaced key) before touching any table; whoever loses skips the
+   pass. Because the advisory lock is always acquired before any table-level
+   lock, two maintenance passes can never deadlock on the DDL, and a skipped
+   redundant pass is harmless (maintenance is periodic and idempotent). This
+   makes `deltax_run_maintenance()` safe to call manually even in full mode.
 
 Note on loading: a scheduler's backend (e.g. the pg_cron worker) is not a
 `session_preload` client connection, but calling `deltax.deltax_run_maintenance()`
