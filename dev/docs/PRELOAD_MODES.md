@@ -1,17 +1,20 @@
 # Preload Modes: `shared_preload_libraries` vs `session_preload_libraries`
 
 Status: design / proposal, **Phase 1 implemented**. The "Decided" section is
-settled in principle, with two carve-outs that are still open: the *mechanism*
-of the runtime guard (#3 — the guarantee is decided, the implementation is not)
-and the session-mode background-worker scheduling (options listed below).
+settled, including the runtime-guard question (#3): we decided **not** to build a
+guard and to document the limitation instead. The one item still genuinely open
+is session-mode background-worker scheduling (options listed below).
 
 Phase 1 (shipped): the dual-mode `_PG_init` branch (#1), the factored
 `deltax_run_maintenance()` SQL entry point with per-table subtransaction
 isolation + replica guard + pass-level advisory-lock mutual exclusion, and the
-worker reusing the same code path. **Not** yet implemented and required before
-session mode is *safe to expose*: the runtime guard (#3). Until then session
-mode can be loaded but a mis-scoped backend can still silently return zero rows
-from compressed partitions.
+worker reusing the same code path.
+
+Known limitation (decided, #3): in session mode a mis-scoped or hook-less backend
+(notably superuser/owner `pg_dump`, ETL, and replication connections) can
+**silently return zero rows from compressed partitions**. There is no runtime
+guard against this — it is documented and mitigated by configuration, not code.
+Users who can't guarantee every reader loads the library should use full mode.
 
 ## Motivation
 
@@ -56,8 +59,11 @@ With `shared_preload_libraries` this can't happen: the postmaster loads the
 library and every forked backend inherits the hooks. With
 `session_preload_libraries` it *can* happen if the setting is mis-scoped (set
 for one role but not another, a database forgotten, a tool connecting
-differently). So offering this mode **requires** a guard that fails loudly
-instead of returning partial data.
+differently). We considered a runtime guard that fails loudly instead of
+returning partial data, but **decided against building one** — it is both hard to
+implement and ineffective for the highest-stakes readers (superuser/owner dumps).
+This is therefore a **documented limitation** of session mode, mitigated by
+configuration; see §3 for the full rationale and the operational guidance.
 
 Concrete mis-scoping vector to design against: `session_preload_libraries` is
 applied from the **database and role** settings at connection start. A
@@ -74,8 +80,8 @@ user never schedules maintenance, **no compression runs → nothing is truncated
 reads stay correct** (the default and uncompressed partitions are scanned
 normally); the database is merely unmaintained (default partition grows, no
 premake/retention). The silent-empty risk is therefore confined to: a partition
-that *was* compressed, later read by a backend with no hooks. This bounds what
-the guard must protect.
+that *was* compressed, later read by a backend with no hooks. This bounds the
+exposure of the documented limitation in §3.
 
 ## Decided
 
@@ -90,16 +96,21 @@ branches on it:
 _PG_init():
     define_gucs()                 # always
     install_query_hooks()         # always — scan + executor + ProcessUtility hooks
-    mark_hooks_installed()        # always — sets the per-backend sentinel (see #3)
 
     if process_shared_preload_libraries_in_progress:
-        worker::register_bgworker()      # static launcher; postmaster-only
         blob_cache::register_hooks()     # RequestAddinShmemSpace; postmaster-only
-    else:
-        # loaded via session_preload / LOAD / fmgr:
-        #  - no static worker (see "Background worker" below)
-        #  - blob cache stays off for now (see "Blob cache")
+        worker::register_bgworker()      # static launcher; postmaster-only
+    # else (session_preload / LOAD / fmgr): query hooks only —
+    #   no static worker (maintenance via deltax_run_maintenance(); see below),
+    #   blob cache stays off (see "Blob cache").
 ```
+
+This matches the shipped `_PG_init`: the query hooks (`scan::register_hook`,
+`scan::register_executor_start_hook`, `copy::register_process_utility_hook`) are
+installed unconditionally, and only `blob_cache::register_hooks()` +
+`worker::register_bgworker()` are gated behind the flag. (There is no
+"hooks-installed" sentinel — that idea belonged to the runtime guard in #3, which
+was dropped.)
 
 The precedent for installing hooks in both modes is `auto_explain`
 (`contrib/auto_explain/auto_explain.c`): its `_PG_init` has no
@@ -114,10 +125,9 @@ shmem-dependent machinery is registered only at postmaster time, while the
 extension's SQL functions stay creatable/callable regardless and "must protect
 themselves against being called" when the library isn't active. That is the model
 for `deltax_run_maintenance()` being callable via fmgr in session mode (see
-"Background worker") and for the self-guarding read path (#3). pg_deltax differs
-in that its *query hooks* must be installed in both modes (auto_explain pattern),
-and only the worker + shmem registration is gated behind the flag
-(pg_stat_statements pattern).
+"Background worker"). pg_deltax differs in that its *query hooks* must be
+installed in both modes (auto_explain pattern), and only the worker + shmem
+registration is gated behind the flag (pg_stat_statements pattern).
 
 Listing pg_deltax in **both** preload lists is harmless — Postgres won't re-run
 `_PG_init` for an already-loaded library in a backend.
@@ -135,76 +145,75 @@ Cost difference: `session_preload` pays a per-connection `dlopen` + `_PG_init`
 (the `.so` is in the OS page cache, so it's cheap; negligible behind a
 connection pooler). `shared_preload` pays nothing per connection.
 
-### 3. Mandatory runtime guard against silent data omission
+### 3. Known limitation: no runtime guard against silent data omission (decided)
 
-Because `session_preload` can be mis-scoped, reading a pg_deltax-managed table in
-a backend that does **not** have our hooks installed must **raise an error**
-rather than return rows:
+**Decision: we do not implement a runtime guard. Session mode ships with this as
+a documented limitation.** A backend that reads a pg_deltax-managed table without
+our hooks installed will **silently return zero rows for every compressed
+partition** (recent uncompressed partitions read normally). We accept that and
+document it rather than trying to detect it. The rest of this section records
+*why* a guard was considered and then rejected, so the decision isn't revisited
+blindly.
+
+What an ideal guard would do is convert the silent omission into a loud error:
 
 ```
 ERROR:  pg_deltax is not loaded in this session, cannot read compressed table "<t>"
-HINT:   add 'pg_deltax' to session_preload_libraries (e.g.
-        ALTER DATABASE <db> SET session_preload_libraries = 'pg_deltax')
-        or to shared_preload_libraries.
 ```
 
-This converts the dangerous silent-omission failure into a loud, actionable
-error. (TimescaleDB takes the same stance — it refuses to operate un-preloaded
-rather than misbehave.) The **guarantee** is firm: never serve partial data
-silently. The **mechanism is the hard part**, for a fundamental reason:
+The trouble is that the guard is both hard to build *and*, in the form that's
+buildable, ineffective for the cases that matter most.
 
-> When a backend has *zero* pg_deltax code loaded, none of our code runs. We
-> literally cannot raise our own error from a function pointer we never
-> installed. So a process-local sentinel checked inside any of our hooks is
-> useless for the case that matters most — the hooks are exactly what's absent.
+**Why it's hard to build.** When a backend has *zero* pg_deltax code loaded, none
+of our code runs — we literally cannot raise our own error from a function
+pointer we never installed. A process-local sentinel checked inside a hook is
+useless for exactly the case that matters: the hooks are what's absent. That
+rules out every extension-side mechanism. The only things PostgreSQL core
+evaluates on a plain `SELECT` without our code are catalog-resident: an **RLS
+`USING` qual**, a **security-barrier view**, or an **`ON SELECT` rule**. An RLS
+policy `USING (deltax.assert_loaded())` per deltatable is the least invasive of
+those — but it carries a subtle trap (calling the qual function fmgr-loads the
+`.so` and runs `_PG_init`, so a naive "are we loaded?" check always passes by the
+time it runs). To work at all it would need a **per-query flag set by the
+`set_rel_pathlist` hook** ("did our pathlist hook run for *this* plan?"), plus a
+policy on every deltatable.
 
-Candidate mechanisms, and why most fail:
+**Why even the buildable form doesn't really help.** RLS is bypassed for
+**superusers** (always — it can't be forced on) and for the **table owner**
+(unless `FORCE ROW LEVEL SECURITY` is set). `pg_dump`, ETL, logical-replication
+initial sync, and admin reads are frequently run as a superuser or the table
+owner — precisely the connections most likely to arrive without hooks. For those,
+the `USING` qual never even evaluates, so they'd still get silent zero rows.
+`FORCE ROW LEVEL SECURITY` closes the owner gap but **not** the superuser one, and
+superuser dumps are common. So the one mechanism that's technically feasible
+fails open for the highest-stakes consumer. A rule/`ON SELECT` view *would* fire
+for superusers too, but at the cost of replacing every deltatable with a view —
+too invasive to justify for this.
 
-- **Event trigger** — does *not* fire on `SELECT` (DDL-only). Eliminated.
-- **Process-local sentinel checked in a hook** — the hook doesn't run when
-  un-loaded. Eliminated.
-- **RLS `USING` qual / security-barrier view / `ON SELECT` rule** — these are the
-  *only* core mechanisms that execute on a plain `SELECT` without our hooks.
-  An RLS policy `USING (deltax.assert_loaded())` on each deltatable is the least
-  invasive. But it has a subtle trap: calling that function via fmgr *dlopens the
-  `.so` and runs `_PG_init`*, which would set a naive "hooks installed" sentinel
-  **before** the function body runs — so the check always passes and never fires.
-  To work, the qual must test a **per-query flag set by the `set_rel_pathlist`
-  hook** (i.e. "did our pathlist hook run for *this* plan?"), not a process-local
-  sentinel. If the `.so` was only lazily loaded to call the qual function, the
-  pathlist hook did not run for this query → flag unset → raise. The *next* query
-  in the same session has hooks installed and works. This is workable but
-  intricate (an RLS policy per deltatable, plus a per-query flag), so the
-  mechanism is the **leading candidate** rather than a settled choice — it needs
-  prototyping.
+Given hard-to-build + ineffective-where-it-counts, the guard isn't worth its
+complexity. We document the limitation instead (see below) and rely on correct
+configuration.
 
-  **RLS bypass hole — prototype against this first.** RLS has two built-in
-  bypasses that hit exactly the connections this guard most needs to protect:
-  - **Superusers always bypass RLS** (it can't be forced on for them).
-  - **The table owner bypasses RLS** unless the table has `FORCE ROW LEVEL
-    SECURITY` set.
+**This is not new to session mode.** The same silent-empty behavior already
+affects `pg_dump` and logical-replication initial sync in **full mode** today if
+a tool connects in a way that bypasses the hooks — a dump from a hook-less
+backend writes zero rows for every compressed partition. Session mode widens the
+exposure (mis-scoping is easier) but does not introduce a new class of bug.
 
-  `pg_dump`, ETL jobs, logical-replication initial sync, and admin reads are
-  frequently run as the table owner or a superuser — precisely the backup/
-  replication scenarios the "silent zero rows" section below worries about. For
-  those roles an RLS `USING (deltax.assert_loaded())` qual would never fire, so
-  they'd still silently get zero rows from compressed partitions. Enabling
-  `FORCE ROW LEVEL SECURITY` closes the *owner* hole but not the *superuser* one.
-  So before treating RLS as settled, prototype it specifically against a
-  superuser dump connection with no hooks loaded, and decide whether the residual
-  superuser gap is acceptable or forces a different mechanism.
+**Operational guidance to document for users.** The mitigation is configuration,
+not code:
 
-Backup / replication interaction:
-
-- This silent-empty behavior already affects `pg_dump` and logical-replication
-  initial sync in *any* backend without hooks — including in **full mode** today,
-  if a tool connects in a way that bypasses the hooks. A dump connection without
-  the custom scan dumps **zero rows** for every compressed partition.
-- The guard turning that into a loud error is strictly safer, but it is an
-  **operational behavior change**: backup/ETL/replication tooling must also load
-  pg_deltax (e.g. via the same `session_preload_libraries` scope), or those jobs
-  start erroring instead of silently producing empty output. Document this
-  explicitly; it is arguably a bug-fix for full mode too.
+- Scope the library at the **database** level — `ALTER DATABASE <db> SET
+  session_preload_libraries = 'pg_deltax'` — not per-role, so every backend on
+  the database loads it regardless of which role connects (this is the main
+  mis-scoping vector; see Motivation).
+- Ensure **backup / ETL / replication / admin** tooling connects to a database
+  (or cluster) where pg_deltax is loaded — i.e. they must be inside the same
+  `session_preload_libraries` (or `shared_preload_libraries`) scope. A dump taken
+  from a hook-less backend is **silently incomplete** for compressed partitions.
+- If you cannot guarantee that for all readers, prefer **full mode**
+  (`shared_preload_libraries`), where the postmaster loads the library into every
+  backend and the failure mode cannot occur.
 
 ### 4. Configuration, practically
 
@@ -243,7 +252,8 @@ SELECT pg_reload_conf();
 
 | | full mode (`shared_preload`) | session mode (`session_preload`) |
 | --- | --- | --- |
-| Query correctness (custom scan, agg, utility hooks) | ✅ | ✅ |
+| Query correctness (custom scan, agg, utility hooks) | ✅ | ✅ when loaded |
+| Safe if a reader has no hooks loaded | ✅ postmaster loads every backend | ⚠️ silent zero rows from compressed partitions — no guard (§3); mitigate by scoping at DB level |
 | Background maintenance (drain/premake/compress/retention) | ✅ static worker | scheduled externally (pg_cron / cron → `deltax_run_maintenance()`) |
 | Shared blob cache | ✅ | ❌ off for now (perf only) |
 | Server restart to enable | yes | no |
@@ -416,9 +426,9 @@ last maintenance run).
 ## Out of scope for this document
 
 - Shared blob cache in session mode (left off; see above).
-- The runtime guard (#3): the *guarantee* (never serve partial data silently) is
-  decided, but the *mechanism* is a genuine open problem — see the analysis in #3.
-  The leading candidate is an RLS `USING` qual that checks a per-query
-  "pathlist-hook-ran" flag; needs prototyping before it's considered settled.
-- Backup/replication interaction with the guard (#3) — needs an operational note
-  in user docs once the mechanism lands.
+- The runtime guard (#3) — **resolved as a non-goal**: no guard will be built;
+  the silent-zero-rows behavior is a documented limitation of session mode (see
+  §3 for the rationale and the user-facing operational guidance). If a future
+  need forces a reconsideration, the only feasible mechanism was an RLS `USING`
+  qual with a per-query "pathlist-hook-ran" flag, and its fatal flaw was the RLS
+  superuser/owner bypass — start there.
