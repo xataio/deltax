@@ -305,8 +305,9 @@ for every deltatable in the **current database**. Full mode's worker should call
 the *same* function, so there is a single maintenance code path (this factoring
 is independently useful for tests and manual ops).
 
-Three behaviors of the worker loop (`deltax_worker_main`) must carry over to the
-factored function:
+Behaviors the factored function must get right. The first three carry over from
+the worker loop (`deltax_worker_main`); the last two were added during
+implementation to make the SQL-callable path safe to invoke directly:
 
 1. **Transaction model.** The worker wraps *all* deltatables × all four steps in
    a **single** `BackgroundWorker::transaction(...)` per 60s tick. A regular
@@ -358,12 +359,27 @@ factored function:
    concurrently with a worker tick and could **deadlock** (observed: worker
    holding a freshly-created partition's lock while waiting on the caller's
    catalog-row lock, and vice-versa). The factored pass therefore takes a
-   transaction-level advisory lock (`pg_try_advisory_xact_lock`, fixed
-   pg_deltax-namespaced key) before touching any table; whoever loses skips the
-   pass. Because the advisory lock is always acquired before any table-level
-   lock, two maintenance passes can never deadlock on the DDL, and a skipped
-   redundant pass is harmless (maintenance is periodic and idempotent). This
-   makes `deltax_run_maintenance()` safe to call manually even in full mode.
+   transaction-level advisory lock (`pg_try_advisory_xact_lock`) before touching
+   any table; whoever loses skips the pass. Because the advisory lock is always
+   acquired before any table-level lock, two maintenance passes can never
+   deadlock on the DDL, and a skipped redundant pass is harmless (maintenance is
+   periodic and idempotent). This makes `deltax_run_maintenance()` safe to call
+   manually even in full mode.
+
+   The key is **per-database** (`maintenance_lock_key()` = a fixed pg_deltax tag
+   in the high 32 bits, `MyDatabaseId` in the low 32). Advisory locks are
+   cluster-wide, so a single fixed key would serialize maintenance across *every*
+   database — the multiple workers in a `target_database` list, or one pg_cron
+   job per database — even though they touch disjoint tables. Folding in the
+   database OID confines mutual exclusion to within a single database.
+5. **search_path safety.** The maintenance SQL uses unqualified names (`now()`,
+   `pg_tables`, operators, casts). The worker runs as superuser and pins
+   `search_path = pg_catalog, pg_temp` at session start to stop a planted object
+   from shadowing them; the SQL-callable path runs with the *caller's*
+   search_path (a pg_cron job typically runs as superuser too), so
+   `run_maintenance_pass` issues `SET LOCAL search_path = pg_catalog, pg_temp` at
+   the top of every pass. `SET LOCAL` reverts at transaction end, so it never
+   leaks into the caller's session.
 
 Note on loading: a scheduler's backend (e.g. the pg_cron worker) is not a
 `session_preload` client connection, but calling `deltax.deltax_run_maintenance()`

@@ -288,6 +288,28 @@ def test_run_maintenance_in_session_mode(session_db):
     conn.close()
 
 
+def test_run_maintenance_preserves_caller_search_path(session_db):
+    """deltax_run_maintenance() pins search_path with SET LOCAL while it runs
+    (so unqualified names can't be shadowed), but must NOT leak that into the
+    caller's session — proving SET LOCAL, not a plain SET."""
+    _set_db_session_preload(session_db)
+    conn = _connect(session_db)
+    conn.execute("CREATE EXTENSION pg_deltax")
+    conn.commit()
+
+    conn.execute("SET search_path = public, pg_catalog")
+    before = conn.execute("SHOW search_path").fetchone()[0]
+    conn.execute("SELECT deltax.deltax_run_maintenance()")
+    conn.commit()
+    after = conn.execute("SHOW search_path").fetchone()[0]
+
+    assert after == before, (
+        "deltax_run_maintenance() must not leak its search_path pin "
+        f"(was {before!r}, now {after!r})"
+    )
+    conn.close()
+
+
 def test_postmaster_gucs_absent_in_session_mode(session_db):
     """The PGC_POSTMASTER GUCs (target_database, blob_cache_mb, blob_cache_shards)
     are NOT defined in session mode: _PG_init must skip them because PostgreSQL

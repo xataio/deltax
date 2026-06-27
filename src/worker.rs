@@ -9,16 +9,26 @@ use crate::partition;
 
 const DEFAULT_WORKER_INTERVAL_SECS: u64 = 60;
 
-/// Fixed key for the transaction-level advisory lock that serializes
+/// Per-database key for the transaction-level advisory lock that serializes
 /// maintenance passes. The background worker and any manual or externally
 /// scheduled `deltax_run_maintenance()` call all take this lock with
 /// `pg_try_advisory_xact_lock` before touching any table; whoever loses simply
 /// skips the pass (maintenance is periodic and idempotent, so a skipped
 /// redundant pass is harmless). This is what keeps a manual call from
 /// deadlocking against the worker in full mode — both would otherwise run the
-/// same detach/attach/compress DDL concurrently. The value is an arbitrary
-/// pg_deltax-namespaced constant ("pdltx_mt" in ASCII).
-const MAINTENANCE_ADVISORY_LOCK_KEY: i64 = 0x7064_6C74_785F_6D74;
+/// same detach/attach/compress DDL concurrently.
+///
+/// Advisory locks are **cluster-wide**, not per-database, so a single fixed key
+/// would needlessly serialize maintenance across *every* database (the multiple
+/// workers in a full-mode `target_database` list, or one pg_cron job per
+/// database). We fold the current database OID into the low 32 bits so passes
+/// only mutually exclude *within the same database*; disjoint databases run
+/// independently. The high 32 bits are an arbitrary pg_deltax tag ("pdlt").
+fn maintenance_lock_key() -> i64 {
+    const TAG: i64 = 0x7064_6C74; // "pdlt"
+    let dboid = u32::from(unsafe { pg_sys::MyDatabaseId }) as i64;
+    (TAG << 32) | dboid
+}
 
 /// Read `pg_deltax.target_database` and parse it into a list of database
 /// names (see [`parse_target_databases`]). Only call this from a launched
@@ -189,6 +199,17 @@ fn deltax_run_maintenance() {
 /// one table rolls back only that table's partial work and the pass continues
 /// with the rest.
 pub(crate) fn run_maintenance_pass(client: &mut SpiClient) {
+    // Pin search_path so unqualified names in the maintenance SQL (now(),
+    // pg_tables, operators, casts, …) can't be shadowed by objects planted on
+    // the caller's search_path. The background worker pins it at session start
+    // because it runs as superuser; the SQL-callable path runs with the
+    // caller's search_path (e.g. a superuser pg_cron job), so pin it per-pass
+    // here too. SET LOCAL reverts at transaction end and never leaks into the
+    // caller's session.
+    client
+        .update("SET LOCAL search_path = pg_catalog, pg_temp", None, &[])
+        .expect("pg_deltax: failed to pin maintenance search_path");
+
     // Replica guard: an external scheduler (pg_cron) could fire this against a
     // standby, where the maintenance DDL would error. Skip the whole pass.
     // Default to "replica" on any error so we never attempt DDL on a standby.
@@ -204,15 +225,15 @@ pub(crate) fn run_maintenance_pass(client: &mut SpiClient) {
         return;
     }
 
-    // Serialize against any other maintenance pass (the background worker vs. a
-    // manual/scheduled deltax_run_maintenance(), or two scheduled calls). The
-    // lock is always taken before any table-level lock, so two passes can never
-    // deadlock on the maintenance DDL; the loser skips this pass. Auto-released
-    // when the surrounding transaction ends.
+    // Serialize against any other maintenance pass in THIS database (the
+    // background worker vs. a manual/scheduled deltax_run_maintenance(), or two
+    // scheduled calls). The lock is always taken before any table-level lock, so
+    // two passes can never deadlock on the maintenance DDL; the loser skips this
+    // pass. Auto-released when the surrounding transaction ends.
     let got_lock = match client.select(
         "SELECT pg_try_advisory_xact_lock($1)",
         None,
-        &[MAINTENANCE_ADVISORY_LOCK_KEY.into()],
+        &[maintenance_lock_key().into()],
     ) {
         Ok(t) => t
             .first()
@@ -684,10 +705,29 @@ mod tests {
         assert_eq!((mn, mx), (10, 30));
     }
 
+    // ---- maintenance advisory-lock key ------------------------------------
+
+    /// The advisory-lock key is per-database: high 32 bits are the fixed
+    /// pg_deltax tag, low 32 bits are the current database OID. This is what
+    /// keeps maintenance in different databases from serializing on a single
+    /// cluster-wide advisory lock.
+    #[pg_test]
+    fn maintenance_lock_key_is_per_database() {
+        let key = super::maintenance_lock_key();
+        assert_eq!((key >> 32) & 0xFFFF_FFFF, 0x7064_6C74, "high bits = pg_deltax tag");
+        let dboid = Spi::get_one::<i64>(
+            "SELECT oid::bigint FROM pg_database WHERE datname = current_database()",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(key & 0xFFFF_FFFF, dboid, "low bits = current database OID");
+    }
+
     // ---- run_maintenance_pass smoke ---------------------------------------
 
-    /// A pass over an empty/absent catalog must be a clean no-op (replica check
-    /// → advisory lock → catalog-present check → return), never an error.
+    /// A pass over an empty/absent catalog must be a clean no-op (search_path
+    /// pin → replica check → advisory lock → catalog-present check → return),
+    /// never an error.
     #[pg_test]
     fn run_maintenance_pass_is_noop_smoke() {
         Spi::connect_mut(|client| {
