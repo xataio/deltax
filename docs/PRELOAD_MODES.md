@@ -10,7 +10,7 @@ compressed partitions.
 
 There are two ways to get the library loaded into your backends:
 
-- **`shared_preload_libraries` (default)** The postmaster loads pg_deltax once 
+- **`shared_preload_libraries`** The postmaster loads pg_deltax once 
   at server startup and every backend inherits it. Requires a one-time server restart to enable.
 - **`session_preload_libraries`** Each backend loads pg_deltax at
   connection time. No restart, it can be scoped to a single database, and a

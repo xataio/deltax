@@ -700,8 +700,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!has20, "inner-subtransaction row must be rolled back");
-        let mn = Spi::get_one::<i32>("SELECT min(n) FROM sx").unwrap().unwrap();
-        let mx = Spi::get_one::<i32>("SELECT max(n) FROM sx").unwrap().unwrap();
+        let mn = Spi::get_one::<i32>("SELECT min(n) FROM sx")
+            .unwrap()
+            .unwrap();
+        let mx = Spi::get_one::<i32>("SELECT max(n) FROM sx")
+            .unwrap()
+            .unwrap();
         assert_eq!((mn, mx), (10, 30));
     }
 
@@ -714,7 +718,11 @@ mod tests {
     #[pg_test]
     fn maintenance_lock_key_is_per_database() {
         let key = super::maintenance_lock_key();
-        assert_eq!((key >> 32) & 0xFFFF_FFFF, 0x7064_6C74, "high bits = pg_deltax tag");
+        assert_eq!(
+            (key >> 32) & 0xFFFF_FFFF,
+            0x7064_6C74,
+            "high bits = pg_deltax tag"
+        );
         let dboid = Spi::get_one::<i64>(
             "SELECT oid::bigint FROM pg_database WHERE datname = current_database()",
         )
