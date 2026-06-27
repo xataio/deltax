@@ -276,6 +276,7 @@ We have four layers of automated tests:
 
 - [Function reference](docs/FUNCTIONS.md) — partitioning, retention, compression, analytics, and blob-cache observability functions.
 - [Configuration reference](docs/CONFIGURATION.md) — all `pg_deltax.*` GUCs.
+- [Preload modes](docs/PRELOAD_MODES.md) — `shared_preload_libraries` (recommended) vs `session_preload_libraries` (no-restart, per-database alternative).
 - [Logical replication](docs/LOGICAL_REPLICATION.md) — setting up native PostgreSQL logical replication with pg_deltax-managed tables.
 
 ## How can I help

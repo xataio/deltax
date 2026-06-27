@@ -1,5 +1,9 @@
 """Integration tests for session mode (`session_preload_libraries`).
 
+The setup these tests exercise (CREATE EXTENSION → ALTER DATABASE SET
+session_preload_libraries → deltax_run_maintenance()) is the same flow
+documented for users in docs/PRELOAD_MODES.md; keep the two in sync.
+
 These are the only tests that exercise the `else` branch of `_PG_init` — i.e.
 pg_deltax loaded *without* `shared_preload_libraries`. They therefore run their
 own dedicated container started without shared_preload, on a separate port, so
