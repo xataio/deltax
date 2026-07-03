@@ -4465,6 +4465,45 @@ mod tests {
     use super::*;
     use std::cmp::Ordering;
 
+    /// `collation_is_byte_order` is the correctness pivot of the Top-N text
+    /// byte-order fast path: a false positive makes Top-N return byte-sorted
+    /// (wrong) rows under a linguistic collation. Pin the classification for
+    /// the collations we can name deterministically across builds.
+    #[pgrx::pg_test]
+    fn test_collation_is_byte_order_classification() {
+        // C and POSIX are memcmp by definition — always byte-order.
+        // regcollation lowercases unquoted names, so the case-sensitive
+        // collation names must be double-quoted inside the literal.
+        let c_oid = pgrx::Spi::get_one::<pgrx::pg_sys::Oid>(r#"SELECT '"C"'::regcollation::oid"#)
+            .expect("spi C")
+            .expect("C collation exists");
+        let posix_oid =
+            pgrx::Spi::get_one::<pgrx::pg_sys::Oid>(r#"SELECT '"POSIX"'::regcollation::oid"#)
+                .expect("spi POSIX")
+                .expect("POSIX collation exists");
+        unsafe {
+            assert!(collation_is_byte_order(c_oid), "C must be byte-order");
+            assert!(collation_is_byte_order(posix_oid), "POSIX must be byte-order");
+            // No collation known → never byte-order (must fall back to strcoll).
+            assert!(!collation_is_byte_order(pgrx::pg_sys::InvalidOid));
+        }
+
+        // An ICU collation is linguistic and must NEVER be classified as
+        // byte-order. `unicode` (the ICU root collation) is predefined
+        // whenever the build has ICU; skip if this build lacks it.
+        if let Ok(Some(icu_oid)) = pgrx::Spi::get_one::<pgrx::pg_sys::Oid>(
+            "SELECT oid FROM pg_collation WHERE collname = 'unicode' \
+             AND collprovider = 'i' LIMIT 1",
+        ) {
+            unsafe {
+                assert!(
+                    !collation_is_byte_order(icu_oid),
+                    "ICU 'unicode' collation must not be treated as byte-order",
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_cmp_topn_key_ascending() {
         // ascending: smaller first

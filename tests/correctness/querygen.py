@@ -554,6 +554,71 @@ def ordering_topn_cases() -> Iterable[QueryCase]:
     )
 
 
+def collation_topn_cases() -> Iterable[QueryCase]:
+    """Top-N text cases for the byte-order collation fast path.
+
+    Run against a table whose text columns carry a specific collation (see
+    ``create_collation_edges_pair``). Every result is compared to plain
+    PostgreSQL under the *same* collation, so any place the fast path uses byte
+    order where the collation is linguistic — or honours the column collation
+    instead of a query-level ``COLLATE`` override — shows up as a mismatch.
+    """
+    # Single-column, distinct sort key: exercises the exact-limit path. Under a
+    # byte-order collation it takes byte comparison; otherwise strcoll. Distinct
+    # values make the top-N total, so no tie ambiguity.
+    yield QueryCase(
+        "sort_text_asc",
+        "SELECT id, sort_text FROM {table} ORDER BY sort_text ASC LIMIT 20",
+    )
+    yield QueryCase(
+        "sort_text_desc",
+        "SELECT id, sort_text FROM {table} ORDER BY sort_text DESC LIMIT 20",
+    )
+    # Low-cardinality first key + unique tiebreaker: multi-column margin path
+    # (rows tied on dup_text must survive worker truncation to be ordered by id).
+    yield QueryCase(
+        "dup_text_multi_asc",
+        "SELECT id, dup_text FROM {table} ORDER BY dup_text ASC, id ASC LIMIT 25",
+    )
+    yield QueryCase(
+        "dup_text_multi_desc",
+        "SELECT id, dup_text FROM {table} ORDER BY dup_text DESC, id DESC LIMIT 25",
+    )
+    # NULL placement through the Top-N path.
+    yield QueryCase(
+        "opt_text_nulls_first",
+        "SELECT id, opt_text FROM {table} "
+        "ORDER BY opt_text ASC NULLS FIRST, id ASC LIMIT 20",
+    )
+    yield QueryCase(
+        "opt_text_nulls_last",
+        "SELECT id, opt_text FROM {table} "
+        "ORDER BY opt_text DESC NULLS LAST, id ASC LIMIT 20",
+    )
+    # Query-level COLLATE overrides: the sort collation differs from the
+    # column's declared collation. On a byte-order-collated table the "unicode"
+    # override forces a linguistic sort; on an ICU-collated table the "C"
+    # override forces byte order. These probe whether the fast path keys off the
+    # column collation (a bug) or the actual sort collation.
+    yield QueryCase(
+        "override_force_c_multi",
+        'SELECT id, sort_text FROM {table} '
+        'ORDER BY sort_text COLLATE "C" ASC, id ASC LIMIT 20',
+    )
+    yield QueryCase(
+        "override_force_icu_multi",
+        'SELECT id, sort_text FROM {table} '
+        'ORDER BY sort_text COLLATE "unicode" ASC, id ASC LIMIT 20',
+    )
+    # Single-column override (distinct key → deterministic): the riskiest shape,
+    # since it can reach the exact-limit path with a mismatched collation.
+    yield QueryCase(
+        "override_force_icu_single",
+        'SELECT id, sort_text FROM {table} '
+        'ORDER BY sort_text COLLATE "unicode" LIMIT 20',
+    )
+
+
 def aggregate_matrix_cases() -> Iterable[QueryCase]:
     yield QueryCase(
         "count_star_and_count_col",

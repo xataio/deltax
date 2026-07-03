@@ -803,6 +803,103 @@ def create_ordering_edges_pair(
     return plain_table, deltax_table
 
 
+# Words chosen so byte order and linguistic (ICU) order diverge sharply:
+# mixed case (uppercase bytes 0x41-5A sort before lowercase 0x61-7A, but ICU
+# folds case), accents (é/ü are multibyte, sorting after ASCII 'z' by bytes
+# but near e/u linguistically), and leading punctuation/space/digit.
+COLLATION_WORDS = (
+    "Apple", "apple", "APPLE",
+    "Banana", "banana",
+    "Cherry", "cherry",
+    "Zebra", "zebra", "ZEBRA",
+    "ant", "Ant",
+    "café", "Café", "cafe", "CAFE",
+    "Éclair", "eclair",
+    "über", "Uber", "UBER",
+    "naïve", "naive",
+    "Zürich", "zürich",
+    "_lead", "-lead", " lead", "9lead", "1lead",
+)
+
+
+def create_collation_edges_pair(
+    conn,
+    *,
+    deltax_table: str,
+    sort_collation: str | None,
+    rows: int = 1500,
+    segment_size: int = 64,
+) -> tuple[str, str]:
+    """Text Top-N dataset for one column collation, for byte-order fast-path
+    correctness.
+
+    ``sort_collation`` is applied to every text column (``"C"``, ``"POSIX"``,
+    ``"unicode"``, ...) or ``None`` for the database default. Columns:
+
+    * ``sort_text`` — distinct (word + zero-padded id), NOT NULL: single-column
+      ``ORDER BY ... LIMIT`` is fully deterministic, so it can exercise the
+      exact-limit byte-order path without tie ambiguity.
+    * ``dup_text`` — low-cardinality (bare word), NOT NULL: ``ORDER BY dup_text,
+      id`` drives the multi-column margin path (ties on key 1 must survive
+      worker truncation).
+    * ``opt_text`` — distinct but with NULLs: NULLS FIRST/LAST coverage.
+
+    The table is time-ordered (``order_by => ts``) so the collated columns are
+    never the segment sort key — this keeps segmentation collation-agnostic
+    while still routing ``ORDER BY <text> LIMIT`` through the Top-N text path.
+    """
+    plain_table = f"{deltax_table}_plain"
+    coll_sql = f' COLLATE "{sort_collation}"' if sort_collation else ""
+    n = len(COLLATION_WORDS)
+
+    conn.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+    for table_name in (plain_table, deltax_table):
+        conn.execute(
+            f"""
+            CREATE TABLE {table_name} (
+                ts timestamptz NOT NULL,
+                id integer NOT NULL,
+                device_id integer,
+                sort_text text{coll_sql} NOT NULL,
+                dup_text text{coll_sql} NOT NULL,
+                opt_text text{coll_sql}
+            )
+            """
+        )
+
+    conn.execute(f"SELECT deltax.deltax_create_table('{deltax_table}', 'ts', '1 day'::interval, 3)")
+    conn.execute(
+        "SELECT deltax.deltax_enable_compression("
+        f"'{deltax_table}', segment_by => ARRAY['device_id'], "
+        "order_by => ARRAY['ts'], segment_size => %s)",
+        (segment_size,),
+    )
+    conn.commit()
+
+    insert_sql = f"""
+        INSERT INTO {{table}} (ts, id, device_id, sort_text, dup_text, opt_text)
+        SELECT
+            '{BASE_TS}'::timestamptz + ((i %% 48) * interval '2 minutes'),
+            i,
+            CASE WHEN i %% 17 = 0 THEN NULL ELSE i %% 7 END,
+            (%(words)s::text[])[(i %% {n}) + 1] || '#' || lpad(i::text, 5, '0'),
+            (%(words)s::text[])[(i %% {n}) + 1],
+            CASE WHEN i %% 10 = 0 THEN NULL
+                 ELSE (%(words)s::text[])[(i %% {n}) + 1] || '#' || lpad(i::text, 5, '0')
+            END
+        FROM generate_series(0, {rows - 1}) AS g(i)
+    """
+    params = {"words": list(COLLATION_WORDS)}
+    conn.execute(insert_sql.format(table=plain_table), params)
+    conn.execute(insert_sql.format(table=deltax_table), params)
+    conn.commit()
+
+    _compress_non_default_partitions(conn, deltax_table)
+    _analyze_tables(conn, plain_table, deltax_table)
+
+    return plain_table, deltax_table
+
+
 def create_aggregate_matrix_pair(
     conn,
     *,
