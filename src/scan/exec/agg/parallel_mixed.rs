@@ -102,23 +102,33 @@ fn digest_int(v: i64) -> u128 {
     ((a as u128) << 64) | b as u128
 }
 
-/// 128-bit digest of a string key component: two independent AHasher passes
-/// (different seeds), 64 bits each.
-#[inline]
-pub(super) fn digest_str(s: &str) -> u128 {
-    let s1 = ahash::RandomState::with_seeds(
+/// Fixed-seed hasher states for `digest_str`. Built once (via `LazyLock`)
+/// rather than reconstructed from seeds on every call — `with_seeds` does
+/// real key-mixing work, and `digest_str` runs once per distinct dict entry
+/// per segment (and per row for non-dict text keys). Seeds are unchanged, so
+/// the digest is byte-identical to the previous per-call construction.
+static DIGEST_STR_S1: std::sync::LazyLock<ahash::RandomState> = std::sync::LazyLock::new(|| {
+    ahash::RandomState::with_seeds(
         0xc4a1_b2e3_d4f5_6789,
         0xa1b2_c3d4_e5f6_7890,
         0x1122_3344_5566_7788,
         0x99aa_bbcc_ddee_ff00,
-    );
-    let s2 = ahash::RandomState::with_seeds(
+    )
+});
+static DIGEST_STR_S2: std::sync::LazyLock<ahash::RandomState> = std::sync::LazyLock::new(|| {
+    ahash::RandomState::with_seeds(
         0x1234_abcd_5678_ef01,
         0xaabb_ccdd_eeff_0011,
         0xfed0_cba9_8765_4321,
         0x0011_2233_4455_6677,
-    );
-    ((s1.hash_one(s) as u128) << 64) | (s2.hash_one(s) as u128)
+    )
+});
+
+/// 128-bit digest of a string key component: two independent AHasher passes
+/// (different seeds), 64 bits each.
+#[inline]
+pub(super) fn digest_str(s: &str) -> u128 {
+    ((DIGEST_STR_S1.hash_one(s) as u128) << 64) | (DIGEST_STR_S2.hash_one(s) as u128)
 }
 
 /// Fold the integer key components into a partial hash (the string components

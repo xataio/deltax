@@ -25,15 +25,24 @@ pub(super) fn new_cd_set_str() -> CdSetStr {
     CdSetStr::with_hasher(BuildHasherDefault::default())
 }
 
+/// Fixed-seed hasher states for `hash128_str`. Built once instead of being
+/// reconstructed from seeds on every call (`with_seeds` does real key-mixing
+/// work; this runs per distinct string). Seeds are unchanged, so the hash
+/// output is byte-identical to the previous per-call construction.
+static CD_HASH_S1: std::sync::LazyLock<ahash::RandomState> = std::sync::LazyLock::new(|| {
+    ahash::RandomState::with_seeds(0xa1b2c3d4, 0xe5f6a7b8, 0x11223344, 0x55667788)
+});
+static CD_HASH_S2: std::sync::LazyLock<ahash::RandomState> = std::sync::LazyLock::new(|| {
+    ahash::RandomState::with_seeds(0x1234abcd, 0x5678ef01, 0xaabbccdd, 0xeeff0011)
+});
+
 /// Compute a 128-bit hash of a byte slice for COUNT(DISTINCT) on strings.
 pub(super) fn hash128_str(data: &[u8]) -> u128 {
     use std::hash::{BuildHasher, Hasher};
-    let s1 = ahash::RandomState::with_seeds(0xa1b2c3d4, 0xe5f6a7b8, 0x11223344, 0x55667788);
-    let mut h1 = s1.build_hasher();
+    let mut h1 = CD_HASH_S1.build_hasher();
     h1.write(data);
     let lo = h1.finish();
-    let s2 = ahash::RandomState::with_seeds(0x1234abcd, 0x5678ef01, 0xaabbccdd, 0xeeff0011);
-    let mut h2 = s2.build_hasher();
+    let mut h2 = CD_HASH_S2.build_hasher();
     h2.write(data);
     let hi = h2.finish();
     (hi as u128) << 64 | lo as u128
