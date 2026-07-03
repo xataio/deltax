@@ -819,6 +819,22 @@ pub(super) fn segment_skippable_by_dict(
         // Parse the compressed column header to get the data portion
         let cc = compression::CompressedColumnRef::from_bytes(blob);
 
+        // Ne can only prune a segment whose dictionary is a single entry
+        // equal to the constant. dict_size lives in the uncompressed header
+        // prefix (same layout for Dictionary and DictionaryLz4), so read it
+        // directly instead of decompressing every segment's dictionary just
+        // to conclude "can't prune" (this decompression on the scan leader
+        // dominated ClickBench Q25's `SearchPhrase <> ''`).
+        if check == DictCheck::Ne {
+            if cc.data.len() < 4 {
+                continue;
+            }
+            let dict_size = u32::from_le_bytes(cc.data[0..4].try_into().unwrap());
+            if dict_size > 1 {
+                continue;
+            }
+        }
+
         // Normalize DictionaryLz4 → Dictionary format for header parsing
         let norm_buf;
         let dict_data = if type_tag == compression::CompressionType::DictionaryLz4 {
