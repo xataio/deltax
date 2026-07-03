@@ -21,7 +21,7 @@ use super::segments::{
 };
 use super::text_col::{
     TextQualInfo, apply_text_eq_filter, apply_text_in_filter, apply_text_like_filter,
-    decompress_text_to_seg_col, strcoll_cmp,
+    decompress_text_to_seg_col,
 };
 use super::{CUSTOM_EXEC_METHODS, DELTAX_APPEND_EXEC_METHODS};
 
@@ -111,6 +111,11 @@ pub(crate) struct DecompressState {
     topn_done: bool,
     /// Whether the Top-N sort column is a text type (uses byte comparison).
     topn_sort_is_text: bool,
+    /// Collation OID for the Top-N text sort — the sort column's own
+    /// collation, resolved once in `exec_topn_text`. `DEFAULT_COLLATION_OID`
+    /// until resolved (and if it can't be resolved), preserving the historical
+    /// default-collation behavior.
+    topn_collation: pg_sys::Oid,
 
     /// DSM-resident shared state when running as a parallel partial scan.
     /// Null in the serial path; non-null after `InitializeDSMCustomScan`
@@ -672,6 +677,7 @@ fn make_worker_stub_state() -> DecompressState {
         topn_cursor: 0,
         topn_done: false,
         topn_sort_is_text: false,
+        topn_collation: pg_sys::DEFAULT_COLLATION_OID,
         pscan: std::ptr::null_mut(),
         wire_base: std::ptr::null(),
         wire_view: None,
@@ -935,6 +941,7 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             topn_cursor: 0,
             topn_done: false,
             topn_sort_is_text,
+            topn_collation: pg_sys::DEFAULT_COLLATION_OID,
             pscan: std::ptr::null_mut(),
             wire_base: std::ptr::null(),
             wire_view: None,
@@ -1130,6 +1137,7 @@ fn load_decompress_state(
         topn_cursor: 0,
         topn_done: false,
         topn_sort_is_text: false,
+        topn_collation: pg_sys::DEFAULT_COLLATION_OID,
         pscan: std::ptr::null_mut(),
         wire_base: std::ptr::null(),
         wire_view: None,
@@ -1149,9 +1157,31 @@ struct TextTopNCandidate {
     phase1_datums: Vec<(usize, pg_sys::Datum, bool)>,
 }
 
-/// Compare two text datums using PG's collation-aware comparison.
+/// Compare two UTF-8 byte strings under `coll_oid` using PG's collation-aware
+/// comparator. `varstr_cmp` dispatches to memcmp (C/POSIX), libc `strcoll`, or
+/// ICU as the collation requires, so passing the sort column's own collation
+/// is what makes non-default collations (e.g. ICU) sort correctly.
 #[inline]
-unsafe fn cmp_text_datums(a: pg_sys::Datum, b: pg_sys::Datum) -> std::cmp::Ordering {
+unsafe fn varstr_cmp_bytes(a: &[u8], b: &[u8], coll_oid: pg_sys::Oid) -> std::cmp::Ordering {
+    unsafe {
+        pg_sys::varstr_cmp(
+            a.as_ptr() as *const std::ffi::c_char,
+            a.len() as i32,
+            b.as_ptr() as *const std::ffi::c_char,
+            b.len() as i32,
+            coll_oid,
+        )
+        .cmp(&0)
+    }
+}
+
+/// Compare two text datums under `coll_oid`.
+#[inline]
+unsafe fn cmp_text_datums(
+    a: pg_sys::Datum,
+    b: pg_sys::Datum,
+    coll_oid: pg_sys::Oid,
+) -> std::cmp::Ordering {
     unsafe {
         let a_vl = a.cast_mut_ptr::<pg_sys::varlena>();
         let b_vl = b.cast_mut_ptr::<pg_sys::varlena>();
@@ -1159,7 +1189,7 @@ unsafe fn cmp_text_datums(a: pg_sys::Datum, b: pg_sys::Datum) -> std::cmp::Order
         let a_len = pgrx::varsize_any_exhdr(a_vl) as i32;
         let b_ptr = pgrx::vardata_any(b_vl) as *const std::ffi::c_char;
         let b_len = pgrx::varsize_any_exhdr(b_vl) as i32;
-        let result = pg_sys::varstr_cmp(a_ptr, a_len, b_ptr, b_len, pg_sys::DEFAULT_COLLATION_OID);
+        let result = pg_sys::varstr_cmp(a_ptr, a_len, b_ptr, b_len, coll_oid);
         result.cmp(&0)
     }
 }
@@ -1171,6 +1201,7 @@ unsafe fn cmp_text_key(
     b_is_null: bool,
     ascending: bool,
     nulls_first: bool,
+    coll_oid: pg_sys::Oid,
 ) -> std::cmp::Ordering {
     unsafe {
         match (a_is_null, b_is_null) {
@@ -1191,9 +1222,9 @@ unsafe fn cmp_text_key(
             }
             (false, false) => {
                 if ascending {
-                    cmp_text_datums(a, b)
+                    cmp_text_datums(a, b, coll_oid)
                 } else {
-                    cmp_text_datums(b, a)
+                    cmp_text_datums(b, a, coll_oid)
                 }
             }
         }
@@ -1205,6 +1236,7 @@ unsafe fn cmp_text_candidate(
     b: &TextTopNCandidate,
     ascending: bool,
     nulls_first: bool,
+    coll_oid: pg_sys::Oid,
 ) -> std::cmp::Ordering {
     unsafe {
         cmp_text_key(
@@ -1214,6 +1246,7 @@ unsafe fn cmp_text_candidate(
             b.sort_is_null,
             ascending,
             nulls_first,
+            coll_oid,
         )
     }
 }
@@ -1362,11 +1395,12 @@ fn cmp_nullable_str_byte(
     }
 }
 
-fn cmp_nullable_str_collation(
+unsafe fn cmp_nullable_str_collation(
     a: Option<&str>,
     b: Option<&str>,
     ascending: bool,
     nulls_first: bool,
+    coll_oid: pg_sys::Oid,
 ) -> std::cmp::Ordering {
     match (a, b) {
         (None, None) => std::cmp::Ordering::Equal,
@@ -1384,13 +1418,13 @@ fn cmp_nullable_str_collation(
                 std::cmp::Ordering::Less
             }
         }
-        (Some(a), Some(b)) => {
+        (Some(a), Some(b)) => unsafe {
             if ascending {
-                strcoll_cmp(a, b)
+                varstr_cmp_bytes(a.as_bytes(), b.as_bytes(), coll_oid)
             } else {
-                strcoll_cmp(b, a)
+                varstr_cmp_bytes(b.as_bytes(), a.as_bytes(), coll_oid)
             }
-        }
+        },
     }
 }
 
@@ -2557,9 +2591,12 @@ unsafe fn exec_topn_text(
         };
         let effective_limit = state.topn_limit;
 
-        // When the sort column's collation is byte-order (C/POSIX/C.UTF-8),
-        // byte comparison IS the final order: per-worker pruning can use the
-        // exact limit and the merge skips strcoll. The attname check guards
+        // Resolve the sort column's collation once. It drives two things: the
+        // byte-order fast path below (C/POSIX/C.UTF-8 → byte comparison is the
+        // final order, so per-worker pruning can use the exact limit and the
+        // merge skips strcoll), and, for every other collation, the OID handed
+        // to `varstr_cmp` so the merge sorts under the column's real collation
+        // (e.g. ICU) instead of the database default. The attname check guards
         // against any attno/col_names misalignment (e.g. dropped columns).
         let byte_order_collation = {
             let rel = (*node).ss.ss_currentRelation;
@@ -2571,8 +2608,14 @@ unsafe fn exec_topn_text(
                     let att = &*super::datum_utils::tupdesc_get_attr(tupdesc, sort_col);
                     let att_name = std::ffi::CStr::from_ptr(att.attname.data.as_ptr())
                         .to_string_lossy();
-                    att_name == state.col_names[sort_col].as_str()
-                        && collation_is_byte_order(att.attcollation)
+                    if att_name == state.col_names[sort_col].as_str() {
+                        if att.attcollation != pg_sys::InvalidOid {
+                            state.topn_collation = att.attcollation;
+                        }
+                        collation_is_byte_order(att.attcollation)
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
@@ -2685,11 +2728,12 @@ unsafe fn exec_topn_text(
             };
             let asc = state.topn_ascending;
             let nf = state.topn_nulls_first;
+            let coll = state.topn_collation;
             let cmp_merge = |a: Option<&str>, b: Option<&str>| {
                 if byte_order_collation {
                     cmp_nullable_str_byte(a, b, asc, nf)
                 } else {
-                    cmp_nullable_str_collation(a, b, asc, nf)
+                    cmp_nullable_str_collation(a, b, asc, nf, coll)
                 }
             };
 
@@ -3216,6 +3260,7 @@ unsafe fn exec_topn_text_sequential(
                         threshold_is_null,
                         state.topn_ascending,
                         state.topn_nulls_first,
+                        state.topn_collation,
                     ) == std::cmp::Ordering::Greater
                 {
                     continue;
@@ -3263,7 +3308,13 @@ unsafe fn exec_topn_text_sequential(
             if candidates.len() >= effective_limit {
                 let n = effective_limit - 1;
                 candidates.select_nth_unstable_by(n, |a, b| {
-                    cmp_text_candidate(a, b, state.topn_ascending, state.topn_nulls_first)
+                    cmp_text_candidate(
+                        a,
+                        b,
+                        state.topn_ascending,
+                        state.topn_nulls_first,
+                        state.topn_collation,
+                    )
                 });
                 threshold_datum = Some((candidates[n].sort_datum, candidates[n].sort_is_null));
             }
@@ -3284,8 +3335,15 @@ unsafe fn exec_topn_text_sequential(
         }
 
         // Sort and truncate to top-N (using collation-aware comparison)
-        candidates
-            .sort_by(|a, b| cmp_text_candidate(a, b, state.topn_ascending, state.topn_nulls_first));
+        candidates.sort_by(|a, b| {
+            cmp_text_candidate(
+                a,
+                b,
+                state.topn_ascending,
+                state.topn_nulls_first,
+                state.topn_collation,
+            )
+        });
         if state.topn_multi_col_sort {
             let threshold_idx = std::cmp::min(effective_limit - 1, candidates.len() - 1);
             let threshold_datum_val = candidates[threshold_idx].sort_datum;
@@ -3298,6 +3356,7 @@ unsafe fn exec_topn_text_sequential(
                     threshold_is_null,
                     state.topn_ascending,
                     state.topn_nulls_first,
+                    state.topn_collation,
                 ) != std::cmp::Ordering::Greater
             });
         } else {
@@ -3474,6 +3533,7 @@ unsafe fn exec_topn_text_sequential(
                     b.sort_is_null,
                     state.topn_ascending,
                     state.topn_nulls_first,
+                    state.topn_collation,
                 )
             });
         }

@@ -16,21 +16,23 @@ encodings — the per-column ``COLLATE`` clause is what the fast path inspects.
 import pytest
 
 from .datasets import create_collation_edges_pair
-from .harness import QueryCase, assert_query_case
+from .harness import assert_query_case
 from .querygen import collation_topn_cases
 
 
 pytestmark = pytest.mark.smoke
 
 
-# Byte-order collations (C, POSIX) plus the database default. The correctness
-# container's default collation is linguistic (en_US.utf8), so a C/POSIX column
-# sorts correctly ONLY if change 3's byte-order fast path engages — otherwise
-# deltax would fall back to the default collation and diverge. That makes these
-# layouts a real test of the fast path, not a tautology.
+# Byte-order collations (C, POSIX), a linguistic ICU collation (unicode), and
+# the database default. The correctness container's default collation is
+# linguistic (en_US.utf8), so a C/POSIX column sorts correctly ONLY if the
+# byte-order fast path engages, and the ICU column sorts correctly ONLY if the
+# Top-N comparison honours the column's own collation (varstr_cmp) rather than
+# the database default — so every layout is a real test, not a tautology.
 COLLATION_LAYOUTS = (
     ("c", "C"),
     ("posix", "POSIX"),
+    ("icu_unicode", "unicode"),
     ("db_default", None),
 )
 
@@ -51,35 +53,6 @@ def test_collation_topn_matches_plain_postgres(collation_edges, db, case):
     assert_query_case(
         db,
         case,
-        plain_table=plain_table,
-        deltax_table=deltax_table,
-    )
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="Pre-existing (not change 3): the Top-N text path sorts via "
-    "cmp_nullable_str_collation, which hardcodes DEFAULT_COLLATION_OID instead "
-    "of the sort column's own collation. An ICU-collated column is therefore "
-    "ordered by the database default collation, giving wrong Top-N rows. "
-    "collation_is_byte_order only rescues C/POSIX/C.UTF-8 columns. When the "
-    "underlying comparison is fixed to honour the column collation, this test "
-    "will XPASS and should be promoted into COLLATION_LAYOUTS.",
-)
-def test_icu_column_collation_topn_matches_plain_postgres(db):
-    plain_table, deltax_table = create_collation_edges_pair(
-        db,
-        deltax_table="collation_edges_icu_unicode",
-        sort_collation="unicode",
-    )
-    # Ascending top-N lands in the leading space/punctuation/digit cluster,
-    # where ICU (ignore-punctuation) and en_US.utf8 disagree deterministically.
-    assert_query_case(
-        db,
-        QueryCase(
-            "icu_sort_text_asc",
-            "SELECT id, sort_text FROM {table} ORDER BY sort_text ASC LIMIT 20",
-        ),
         plain_table=plain_table,
         deltax_table=deltax_table,
     )
