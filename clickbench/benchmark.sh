@@ -85,7 +85,7 @@ fi
 sudo -u postgres psql "$DB" -t -c "SET pg_deltax.mock_now = '2013-07-01 12:00:00'; SELECT deltax.deltax_create_table('hits', 'eventtime', '3 days'::interval, 15)"
 
 # Enable compression before loading (required for direct backfill)
-sudo -u postgres psql "$DB" -t -c "SELECT deltax.deltax_enable_compression('hits', order_by => ARRAY['counterid', 'userid', 'eventtime'], segment_size => 30000)"
+sudo -u postgres psql "$DB" -t -c "SELECT deltax.deltax_enable_compression('hits', order_by => ARRAY['counterid', 'userid', 'eventtime'])"
 
 # Direct backfill: load and compress in a single pass using FORMAT deltax_compress
 LOAD_START=$(date +%s)
