@@ -1543,7 +1543,8 @@ unsafe fn bloom_pruned_segment_ids(
             return bloom_pruned_ids;
         }
 
-        let blooms_rel = pg_sys::table_open(blooms_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let blooms_rel =
+            pg_sys::table_open(blooms_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
         let blooms_tupdesc = (*blooms_rel).rd_att;
         let blooms_natts = (*blooms_tupdesc).natts as usize;
 

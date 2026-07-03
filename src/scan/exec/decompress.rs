@@ -1321,8 +1321,7 @@ unsafe fn collation_is_byte_order(coll_oid: pg_sys::Oid) -> bool {
             (provider, locale)
         } else {
             let cache_id = pg_sys::SysCacheIdentifier::COLLOID;
-            let tup =
-                pg_sys::SearchSysCache1(cache_id as i32, pg_sys::ObjectIdGetDatum(coll_oid));
+            let tup = pg_sys::SearchSysCache1(cache_id as i32, pg_sys::ObjectIdGetDatum(coll_oid));
             if tup.is_null() {
                 return false;
             }
@@ -2606,8 +2605,8 @@ unsafe fn exec_topn_text(
                 let tupdesc = (*rel).rd_att;
                 if sort_col < (*tupdesc).natts as usize {
                     let att = &*super::datum_utils::tupdesc_get_attr(tupdesc, sort_col);
-                    let att_name = std::ffi::CStr::from_ptr(att.attname.data.as_ptr())
-                        .to_string_lossy();
+                    let att_name =
+                        std::ffi::CStr::from_ptr(att.attname.data.as_ptr()).to_string_lossy();
                     if att_name == state.col_names[sort_col].as_str() {
                         if att.attcollation != pg_sys::InvalidOid {
                             state.topn_collation = att.attcollation;
@@ -4543,7 +4542,10 @@ mod tests {
                 .expect("POSIX collation exists");
         unsafe {
             assert!(collation_is_byte_order(c_oid), "C must be byte-order");
-            assert!(collation_is_byte_order(posix_oid), "POSIX must be byte-order");
+            assert!(
+                collation_is_byte_order(posix_oid),
+                "POSIX must be byte-order"
+            );
             // No collation known → never byte-order (must fall back to strcoll).
             assert!(!collation_is_byte_order(pgrx::pg_sys::InvalidOid));
         }
