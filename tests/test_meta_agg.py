@@ -1,15 +1,13 @@
 """Integration tests for the metadata-only aggregate fast path.
 
-v1 scope (2026-04): `MIN / MAX / SUM / COUNT(col) / COUNT(*)` queries
-answer straight from per-segment stats when the WHERE clause is empty
-or contains only segment-by equality predicates.
+`MIN / MAX / SUM / COUNT(col) / COUNT(*)` queries answer straight from
+per-segment stats when the WHERE clause is empty or contains only
+segment-by equality and/or time-column range predicates.
 
-Time-column WHERE clauses are explicitly NOT handled in v1 because a
-segment whose `[min_time, max_time]` straddles a time-range boundary
-contributes all its rows to `row_count` / `col_sums` / `col_minmax`,
-even though some rows fall outside the filter.  Adding partial-
-segment handling (or partition-bound analysis) is a follow-up —
-RTABench Q02 still routes through DeltaXAgg.
+Time-range WHERE clauses no longer need to align with partition (or
+segment) boundaries: segments fully inside the bounds fold from
+metadata, and the segments straddling a bound are decoded and filtered
+row-wise in the executor (`seg_fully_in_bounds` in count_minmax.rs).
 """
 
 import pytest
@@ -167,19 +165,35 @@ def test_time_where_aligned_to_partitions_uses_fast_path(db):
     assert fast == ref
 
 
-def test_time_where_mid_partition_falls_back(db):
-    """WHERE bounds that slice through a partition leave that
-    partition only partially covered — some rows inside it don't
-    satisfy WHERE, so metadata aggregation would overcount.  Must
-    fall back to DeltaXAgg."""
+def test_time_where_mid_partition_uses_fast_path_and_stays_exact(db):
+    """WHERE bounds that slice through a partition leave some segments
+    only partially covered. The fast path still fires: fully-contained
+    segments fold from metadata, straddling segments are decoded and
+    filtered row-wise — so the answer must match the DeltaXAgg result
+    exactly, for every aggregate kind and for both bound directions."""
     from datetime import datetime, timedelta, timezone
     _seed(db)
-    _run_with_fastpath(db, True)
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    # Lower bound is mid-day, so the partition containing it is partial.
+    # Bounds are mid-day, so the partitions containing them are partial.
     lo = (today + timedelta(hours=6)).isoformat()
-    plan = _plan(db, f"SELECT max(val) FROM events WHERE ts >= '{lo}'::timestamptz")
-    assert "DeltaXMinMax" not in plan, plan
+    hi = (today + timedelta(hours=20, minutes=13, seconds=7)).isoformat()
+    for where in (
+        f"ts >= '{lo}'::timestamptz",
+        f"ts > '{lo}'::timestamptz AND ts <= '{hi}'::timestamptz",
+        f"ts < '{hi}'::timestamptz",
+        f"ts >= '{lo}'::timestamptz AND ts < '{hi}'::timestamptz AND device_id = 7",
+    ):
+        sql = (
+            "SELECT count(*), count(val), min(val), max(val), sum(val), max(ts) "
+            f"FROM events WHERE {where}"
+        )
+        _run_with_fastpath(db, True)
+        plan = _plan(db, sql)
+        assert "DeltaXMinMax" in plan, plan
+        fast = db.execute(sql).fetchone()
+        _run_with_fastpath(db, False)
+        slow = db.execute(sql).fetchone()
+        assert fast == slow, f"{where}: fast={fast} slow={slow}"
 
 
 def test_non_key_column_filter_falls_back(db):

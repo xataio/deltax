@@ -72,6 +72,134 @@ unsafe fn rehydrate_segment_filters(
     }
 }
 
+/// True iff every row of the segment satisfies the canonical half-open
+/// time bounds `[lo, hi)` — i.e. its metadata (`row_count`, `col_minmax`,
+/// `col_sums`) is exact for the query's time filter. Segments missing
+/// time metadata are conservatively treated as partial.
+///
+/// This is what lets DeltaXCount/DeltaXMinMax fire on ANY time window:
+/// fully-contained segments fold from metadata, and only the handful of
+/// segments straddling the window's edges get decoded (see
+/// `partial_segment_time_mask`). Before this, the planner required the
+/// window to cover whole partitions — a query like
+/// `WHERE ts >= '2024-04-20' AND ts < '2024-05-20'` silently lost the
+/// fast path whenever its bounds didn't align with the partition grid.
+fn seg_fully_in_bounds(
+    seg: &super::segments::SegmentData,
+    lo: Option<i64>,
+    hi: Option<i64>,
+) -> bool {
+    let lo_ok = match lo {
+        None => true,
+        Some(lo) => seg.min_time.is_some_and(|m| m >= lo),
+    };
+    let hi_ok = match hi {
+        None => true,
+        Some(hi) => seg.max_time.is_some_and(|m| m < hi),
+    };
+    lo_ok && hi_ok
+}
+
+/// Decode one column of a partially-overlapping segment into per-row
+/// `(Datum, is_null)` pairs, fetching its blob on demand (blob-cache
+/// aware). Returns `None` when the column has no blob (segment_by column
+/// or column added after compression).
+unsafe fn decode_partial_col(
+    companion_oid: pg_sys::Oid,
+    seg: &mut super::segments::SegmentData,
+    meta: &super::segments::MetadataInfo,
+    col_idx: usize,
+) -> Option<Vec<(pg_sys::Datum, bool)>> {
+    unsafe {
+        let blob_slot = meta.blob_idx.get(col_idx).copied().flatten()? as usize;
+        let mut needed = vec![false; meta.col_names.len()];
+        needed[col_idx] = true;
+        super::segments::fetch_segment_blobs(
+            companion_oid,
+            seg.segment_id,
+            &meta.col_names,
+            &needed,
+            &meta.blob_idx,
+            seg,
+        );
+        let blob = seg.compressed_blobs.get(blob_slot)?;
+        if blob.is_empty() {
+            return None;
+        }
+        let type_oid = meta.col_types[col_idx];
+        let type_name = super::datum_utils::pg_type_name(type_oid);
+        Some(super::datum_utils::decompress_blob_to_datums(
+            blob,
+            &type_name,
+            type_oid,
+            meta.col_typmods[col_idx],
+        ))
+    }
+}
+
+/// Per-row selection mask for the canonical half-open `[lo, hi)` time
+/// bounds. Rows with a NULL time value are excluded — a NULL comparison
+/// is never TRUE, and partial segments only exist when at least one
+/// bound is present.
+fn time_selection_mask(
+    time_vals: &[(pg_sys::Datum, bool)],
+    lo: Option<i64>,
+    hi: Option<i64>,
+) -> Vec<bool> {
+    time_vals
+        .iter()
+        .map(|(d, is_null)| {
+            if *is_null {
+                return false;
+            }
+            let v = d.value() as i64;
+            lo.is_none_or(|lo| v >= lo) && hi.is_none_or(|hi| v < hi)
+        })
+        .collect()
+}
+
+/// Decode a partially-overlapping segment's time column and return the
+/// `[lo, hi)` row mask. Errors out if the time column has no blob — the
+/// metadata paths must never silently mis-filter.
+unsafe fn partial_segment_time_mask(
+    companion_oid: pg_sys::Oid,
+    seg: &mut super::segments::SegmentData,
+    meta: &super::segments::MetadataInfo,
+    time_col_idx: usize,
+    lo: Option<i64>,
+    hi: Option<i64>,
+) -> Vec<bool> {
+    unsafe {
+        match decode_partial_col(companion_oid, seg, meta, time_col_idx) {
+            Some(vals) => time_selection_mask(&vals, lo, hi),
+            None => pgrx::error!(
+                "pg_deltax: cannot decode time column '{}' for partial segment {}",
+                meta.time_column,
+                seg.segment_id,
+            ),
+        }
+    }
+}
+
+/// Extract an integer sum contribution from a decoded datum. Truncates to
+/// the column's width so the value is correct regardless of how the datum
+/// was extended when packed.
+fn datum_to_i128(d: pg_sys::Datum, col_type_oid: pg_sys::Oid) -> i128 {
+    match col_type_oid {
+        pg_sys::INT2OID => (d.value() as i64) as i16 as i128,
+        pg_sys::INT4OID => (d.value() as i64) as i32 as i128,
+        _ => (d.value() as i64) as i128,
+    }
+}
+
+/// Extract a float sum contribution from a decoded datum.
+fn datum_to_f64(d: pg_sys::Datum, col_type_oid: pg_sys::Oid) -> f64 {
+    match col_type_oid {
+        pg_sys::FLOAT4OID => f32::from_bits(d.value() as u32) as f64,
+        _ => f64::from_bits(d.value() as u64),
+    }
+}
+
 /// State for DeltaXCount (COUNT(*) pushdown).
 pub(crate) struct CountScanState {
     pub(crate) total_count: i64,
@@ -202,12 +330,14 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
                 &meta.time_column,
             );
 
+            let time_col_idx = meta.col_names.iter().position(|n| n == &meta.time_column);
+
             super::segments::reset_scan_buf_stats();
             let t1 = Instant::now();
             let mut total_count: i64 = 0;
             let mut total_segments: u64 = 0;
             for &oid in &companion_oids {
-                let (segs, _, _, _, _, _) = load_segments_heap(
+                let (mut segs, _, _, _, _, _) = load_segments_heap(
                     oid,
                     &meta.col_names,
                     &meta.segment_by,
@@ -226,8 +356,19 @@ pub(super) unsafe extern "C-unwind" fn begin_count_scan(
                     &meta.blob_idx,
                     false,
                 );
-                for seg in &segs {
-                    total_count += seg.row_count as i64;
+                for seg in &mut segs {
+                    seg.companion_oid = oid;
+                    if seg_fully_in_bounds(seg, time_min, time_max) {
+                        total_count += seg.row_count as i64;
+                    } else if let Some(tci) = time_col_idx {
+                        // Segment straddles a bound: decode its time column
+                        // and count only the rows inside [lo, hi).
+                        let mask =
+                            partial_segment_time_mask(oid, seg, &meta, tci, time_min, time_max);
+                        total_count += mask.iter().filter(|&&m| m).count() as i64;
+                    } else {
+                        pgrx::error!("pg_deltax: DeltaXCount partial segment without time column");
+                    }
                 }
                 total_segments += segs.len() as u64;
             }
@@ -517,9 +658,11 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
             })
             .collect();
 
+        let time_col_idx = meta.col_names.iter().position(|n| n == &meta.time_column);
+
         let mut total_segments: u64 = 0;
         for &oid in &companion_oids {
-            let (segs, _, _, _, _, _) = load_segments_heap(
+            let (mut segs, _, _, _, _, _) = load_segments_heap(
                 oid,
                 &meta.col_names,
                 &meta.segment_by,
@@ -538,7 +681,122 @@ pub(super) unsafe extern "C-unwind" fn begin_minmax_scan(
                 &meta.blob_idx,
                 false,
             );
-            for seg in &segs {
+            for seg in &mut segs {
+                seg.companion_oid = oid;
+                if !seg_fully_in_bounds(seg, time_min, time_max) {
+                    // Segment straddles a time bound: its metadata counts
+                    // rows outside [lo, hi), so decode the needed columns
+                    // and fold row-wise over the in-bounds selection.
+                    let tci = match time_col_idx {
+                        Some(i) => i,
+                        None => pgrx::error!(
+                            "pg_deltax: DeltaXMinMax partial segment without time column"
+                        ),
+                    };
+                    let mask = partial_segment_time_mask(oid, seg, &meta, tci, time_min, time_max);
+                    let mut decoded: std::collections::HashMap<
+                        usize,
+                        Option<Vec<(pg_sys::Datum, bool)>>,
+                    > = std::collections::HashMap::new();
+                    for (spec_idx, spec) in agg_specs.iter().enumerate() {
+                        let needs_col =
+                            !matches!(spec.kind, MetaAggKind::CountStar) && spec.varattno > 0;
+                        let vals: Option<&Vec<(pg_sys::Datum, bool)>> = if needs_col {
+                            let col_idx = (spec.varattno - 1) as usize;
+                            decoded
+                                .entry(col_idx)
+                                .or_insert_with(|| decode_partial_col(oid, seg, &meta, col_idx))
+                                .as_ref()
+                        } else {
+                            None
+                        };
+                        match &mut accs[spec_idx] {
+                            Acc::MinMax {
+                                datum,
+                                null,
+                                type_oid,
+                                is_min,
+                            } => {
+                                let Some(vals) = vals else { continue };
+                                for (row, sel) in mask.iter().enumerate() {
+                                    if !sel {
+                                        continue;
+                                    }
+                                    let (d, isnull) = vals[row];
+                                    if isnull {
+                                        continue;
+                                    }
+                                    if *type_oid == pg_sys::InvalidOid {
+                                        *type_oid = spec.col_type_oid;
+                                    }
+                                    if *null {
+                                        *datum = d;
+                                        *null = false;
+                                    } else {
+                                        let cmp = compare_datums(d, *datum, spec.col_type_oid);
+                                        let dominated = if *is_min {
+                                            cmp == std::cmp::Ordering::Less
+                                        } else {
+                                            cmp == std::cmp::Ordering::Greater
+                                        };
+                                        if dominated {
+                                            *datum = d;
+                                        }
+                                    }
+                                }
+                            }
+                            Acc::SumI128 {
+                                acc, nonnull, seen, ..
+                            } => {
+                                let Some(vals) = vals else { continue };
+                                for (row, sel) in mask.iter().enumerate() {
+                                    if !sel {
+                                        continue;
+                                    }
+                                    let (d, isnull) = vals[row];
+                                    if isnull {
+                                        continue;
+                                    }
+                                    *acc = acc.saturating_add(datum_to_i128(d, spec.col_type_oid));
+                                    *nonnull = nonnull.saturating_add(1);
+                                    *seen = true;
+                                }
+                            }
+                            Acc::SumF64 {
+                                acc, nonnull, seen, ..
+                            } => {
+                                let Some(vals) = vals else { continue };
+                                for (row, sel) in mask.iter().enumerate() {
+                                    if !sel {
+                                        continue;
+                                    }
+                                    let (d, isnull) = vals[row];
+                                    if isnull {
+                                        continue;
+                                    }
+                                    *acc += datum_to_f64(d, spec.col_type_oid);
+                                    *nonnull = nonnull.saturating_add(1);
+                                    *seen = true;
+                                }
+                            }
+                            Acc::Count { acc } => match spec.kind {
+                                MetaAggKind::CountStar => {
+                                    *acc += mask.iter().filter(|&&m| m).count() as i64;
+                                }
+                                MetaAggKind::CountCol => {
+                                    let Some(vals) = vals else { continue };
+                                    for (row, sel) in mask.iter().enumerate() {
+                                        if *sel && !vals[row].1 {
+                                            *acc += 1;
+                                        }
+                                    }
+                                }
+                                _ => unreachable!(),
+                            },
+                        }
+                    }
+                    continue;
+                }
                 for (spec_idx, spec) in agg_specs.iter().enumerate() {
                     match &mut accs[spec_idx] {
                         Acc::MinMax {
@@ -886,6 +1144,49 @@ mod tests {
     use crate::compress::{
         PG_EPOCH_OFFSET_DAYS, PG_EPOCH_OFFSET_USEC, encode_f32_to_i64, encode_f64_to_i64,
     };
+
+    #[test]
+    fn time_selection_mask_half_open_bounds() {
+        let ts = |v: i64| (pg_sys::Datum::from(v as usize), false);
+        let vals = vec![ts(10), ts(20), ts(30), (pg_sys::Datum::from(0usize), true)];
+        // [20, 30): only ts=20 matches; NULL is always excluded.
+        assert_eq!(
+            time_selection_mask(&vals, Some(20), Some(30)),
+            vec![false, true, false, false]
+        );
+        // Lower bound only: >= 20.
+        assert_eq!(
+            time_selection_mask(&vals, Some(20), None),
+            vec![false, true, true, false]
+        );
+        // Upper bound only: < 20 (exclusive).
+        assert_eq!(
+            time_selection_mask(&vals, None, Some(20)),
+            vec![true, false, false, false]
+        );
+    }
+
+    #[test]
+    fn datum_to_i128_truncates_to_column_width() {
+        // A negative int2/int4 must extract correctly whether the datum
+        // was stored sign- or zero-extended.
+        let d = pg_sys::Datum::from((-5i16) as u16 as usize); // zero-extended
+        assert_eq!(datum_to_i128(d, pg_sys::INT2OID), -5);
+        let d = pg_sys::Datum::from((-5i64) as usize); // sign-extended
+        assert_eq!(datum_to_i128(d, pg_sys::INT2OID), -5);
+        let d = pg_sys::Datum::from((-100_000i32) as u32 as usize);
+        assert_eq!(datum_to_i128(d, pg_sys::INT4OID), -100_000);
+        let d = pg_sys::Datum::from((-1i64) as usize);
+        assert_eq!(datum_to_i128(d, pg_sys::INT8OID), -1);
+    }
+
+    #[test]
+    fn datum_to_f64_unpacks_float_bits() {
+        let d = pg_sys::Datum::from(1.5f32.to_bits() as usize);
+        assert_eq!(datum_to_f64(d, pg_sys::FLOAT4OID), 1.5);
+        let d = pg_sys::Datum::from((-2.25f64).to_bits() as usize);
+        assert_eq!(datum_to_f64(d, pg_sys::FLOAT8OID), -2.25);
+    }
 
     #[test]
     fn decode_encoded_to_datum_integer_identity() {

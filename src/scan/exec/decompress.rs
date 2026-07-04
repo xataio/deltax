@@ -361,7 +361,8 @@ fn segment_pre_pruned_by_metadata(
         if time_min.is_some_and(|qmin| seg_max < qmin) {
             return true;
         }
-        if time_max.is_some_and(|qmax| seg_min > qmax) {
+        // time_max is exclusive (canonical half-open bounds).
+        if time_max.is_some_and(|qmax| seg_min >= qmax) {
             return true;
         }
     }
@@ -691,9 +692,18 @@ fn make_worker_stub_state() -> DecompressState {
 pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
     node: *mut pg_sys::CustomScanState,
     _estate: *mut pg_sys::EState,
-    _eflags: i32,
+    eflags: i32,
 ) {
     unsafe {
+        // Plain EXPLAIN never calls ExecCustomScan; skip the metadata SPI +
+        // segment heap scan and leave a stub state (same shape the parallel
+        // worker path uses) for EndCustomScan to tear down.
+        if eflags & pg_sys::EXEC_FLAG_EXPLAIN_ONLY as i32 != 0 {
+            let stub = Box::new(make_worker_stub_state());
+            (*node).custom_ps = Box::into_raw(stub) as *mut pg_sys::List;
+            return;
+        }
+
         // Parallel-worker short-circuit (§5.7). The worker's `begin` is called
         // before DSM is attached, so we cannot read metadata here. Install a
         // stub `DecompressState` and defer full hydration to

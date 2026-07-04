@@ -2248,9 +2248,10 @@ pub(super) unsafe fn load_segments_heap(
                 }
             }
 
+            // time_max is exclusive (canonical half-open bounds).
             if let (Some(s_min), Some(s_max)) = (seg_min_time, seg_max_time)
                 && (time_min.is_some_and(|qmin| s_max < qmin)
-                    || time_max.is_some_and(|qmax| s_min > qmax))
+                    || time_max.is_some_and(|qmax| s_min >= qmax))
             {
                 segments_skipped += 1;
                 continue;
@@ -4053,19 +4054,36 @@ pub(super) unsafe fn extract_segment_filters(
                     }
                 };
 
+                // Normalize to canonical half-open [time_min, time_max):
+                // time_min is the smallest value that matches (inclusive),
+                // time_max the smallest value that does NOT match
+                // (exclusive). Exact for the integer-datum time types
+                // (timestamp/timestamptz µs, date days), which lets the
+                // metadata-only agg paths do per-row and full-containment
+                // checks with these bounds, not just conservative pruning.
                 match effective_op {
                     ">=" | ">" => {
+                        let lo = if effective_op == ">" {
+                            ts_val.saturating_add(1)
+                        } else {
+                            ts_val
+                        };
                         // Lower bound: take the maximum of all lower bounds
                         time_min = Some(match time_min {
-                            Some(existing) => existing.max(ts_val),
-                            None => ts_val,
+                            Some(existing) => existing.max(lo),
+                            None => lo,
                         });
                     }
                     "<=" | "<" => {
+                        let hi = if effective_op == "<=" {
+                            ts_val.saturating_add(1)
+                        } else {
+                            ts_val
+                        };
                         // Upper bound: take the minimum of all upper bounds
                         time_max = Some(match time_max {
-                            Some(existing) => existing.min(ts_val),
-                            None => ts_val,
+                            Some(existing) => existing.min(hi),
+                            None => hi,
                         });
                     }
                     _ => {}

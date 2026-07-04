@@ -1035,12 +1035,15 @@ pub(super) fn process_segments_mixed(
             }
         }
 
-        // Time-range pruning
+        // Time-range pruning (time_max is exclusive — canonical half-open bounds)
         if let (Some(seg_min), Some(seg_max)) = (seg.min_time, seg.max_time) {
             if config.time_min.is_some_and(|query_min| seg_max < query_min) {
                 continue;
             }
-            if config.time_max.is_some_and(|query_max| seg_min > query_max) {
+            if config
+                .time_max
+                .is_some_and(|query_max| seg_min >= query_max)
+            {
                 continue;
             }
         }
