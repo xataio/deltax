@@ -585,7 +585,51 @@ fn deltax_set_compression_policy(relation: &str, compress_after: pgrx::datum::In
 /// Compress a single partition.
 #[pg_extern]
 fn deltax_compress_partition(partition: &str) -> String {
-    Spi::connect_mut(|client| compress_partition_impl(client, partition))
+    Spi::connect_mut(|client| {
+        let msg = compress_partition_impl(client, partition);
+        // Refresh the parent-relation merged statistics so a manual
+        // compress leaves the planner-visible stats current (with
+        // pg_deltax.flatten_partitions the planner reads ONLY the parent's
+        // pg_statistic rows — children aren't expanded). Deliberately in
+        // the wrapper, NOT in compress_partition_impl: the maintenance
+        // pass compresses many partitions in one transaction while holding
+        // their AccessExclusive locks, and refreshing the parent's catalog
+        // rows between partition lock acquisitions adds lock edges (and a
+        // wide interleave window) against concurrent DDL like DROP TABLE
+        // CASCADE — a real deadlock seen in CI. The pass refreshes once
+        // per table after auto-compress instead (worker.rs).
+        if msg.starts_with("Compressed") {
+            refresh_parent_stats_for_partition(client, partition);
+        }
+        msg
+    })
+}
+
+/// Best-effort parent-stats refresh for the deltatable owning `partition`.
+/// Failures warn rather than error — the partition is compressed and
+/// queryable either way, just with staler planner estimates.
+fn refresh_parent_stats_for_partition(client: &mut SpiClient, partition: &str) {
+    let (schema, part_table) = crate::partition::resolve_relation(client, partition);
+    let ht = catalog::get_partition_by_name(client, &schema, &part_table)
+        .ok()
+        .flatten()
+        .and_then(|p| {
+            catalog::get_deltatable_by_id(client, p.deltatable_id)
+                .ok()
+                .flatten()
+        });
+    let Some(ht) = ht else { return };
+    if let Err(e) = crate::stats::write_table_stats(client, &ht.schema_name, &ht.table_name) {
+        pgrx::warning!(
+            "pg_deltax: failed to refresh parent stats for {}.{}: {}. \
+             Run deltax_analyze_table('{}.{}') to retry.",
+            ht.schema_name,
+            ht.table_name,
+            e,
+            ht.schema_name,
+            ht.table_name,
+        );
+    }
 }
 
 /// Compress every "sealed" uncompressed partition of a deltax-managed table
@@ -658,6 +702,7 @@ fn deltax_compress_all_partitions(
         }
 
         let mut out: Vec<(String, String)> = Vec::with_capacity(targets.len());
+        let mut any_compressed = false;
         for (sch, name) in targets {
             // `compress_partition_impl` re-resolves the name via
             // `resolve_relation`, which expects an unquoted `schema.table`
@@ -665,7 +710,21 @@ fn deltax_compress_all_partitions(
             // simple identifiers, so this is safe.
             let qualified = format!("{}.{}", sch, name);
             let msg = compress_partition_impl(client, &qualified);
+            any_compressed |= msg.starts_with("Compressed");
             out.push((name, msg));
+        }
+        // One parent-stats refresh for the whole batch — see the
+        // deltax_compress_partition wrapper for why this must not run
+        // per-partition inside compress_partition_impl.
+        if any_compressed
+            && let Err(e) = crate::stats::write_table_stats(client, &ht.schema_name, &ht.table_name)
+        {
+            pgrx::warning!(
+                "pg_deltax: failed to refresh parent stats for {}.{}: {}",
+                ht.schema_name,
+                ht.table_name,
+                e,
+            );
         }
         out
     });
@@ -1117,24 +1176,6 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         None,
         &[],
     );
-
-    // Refresh the parent-relation merged statistics. The background worker
-    // does this after its auto-compress cycles, but manual
-    // deltax_compress_partition calls must not leave the parent stale:
-    // with pg_deltax.flatten_partitions the planner reads ONLY the parent's
-    // pg_statistic rows (children aren't expanded), so per-partition stats
-    // alone no longer feed selectivity.
-    if let Err(e) = crate::stats::write_table_stats(client, &ht.schema_name, &ht.table_name) {
-        pgrx::warning!(
-            "pg_deltax: failed to refresh parent stats for {}.{}: {}. \
-             Run deltax_analyze_table('{}.{}') to retry.",
-            ht.schema_name,
-            ht.table_name,
-            e,
-            ht.schema_name,
-            ht.table_name,
-        );
-    }
 
     crate::scan::invalidate_compressed_cache();
 
