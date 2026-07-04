@@ -50,6 +50,19 @@ pub(crate) static MAX_PARALLEL_WORKERS_PER_SCAN: GucSetting<i32> = GucSetting::<
 /// generic `DeltaXAgg` path for A/B correctness comparisons.
 pub(crate) static DISABLE_META_AGG_FASTPATH: GucSetting<bool> = GucSetting::<bool>::new(false);
 
+/// When true (default), SELECT planning collapses a deltax partitioned
+/// parent whose data lives entirely in compressed companions to a single
+/// un-expanded rel (`rte->inh = false`): PostgreSQL skips building per-child
+/// RelOptInfos/paths for the deliberately-empty partition heaps and the
+/// set_rel_pathlist hook installs DeltaXAppend directly. standard_planner
+/// drops from ~5-8ms to ~1.4ms on a 127-partition table; the eligibility
+/// walk costs ~2-4ms on a cold backend (per-child syscache warming — a
+/// shared-memory verdict cache is the designed follow-up) and ~0.2ms warm.
+/// Tables with uncompressed data (hot partition, non-empty default) are
+/// never flattened — they plan through the regular expansion exactly as
+/// before.
+pub(crate) static FLATTEN_PARTITIONS: GucSetting<bool> = GucSetting::<bool>::new(true);
+
 /// When true, `add_agg_partial_path` returns early and the planner only
 /// sees the complete CustomScan DeltaXAgg path. Escape hatch for the
 /// partial+Gather+FinalAgg model (PARALLEL_AGG.md "C.2 activation
@@ -276,6 +289,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"Disable DeltaXCount/DeltaXMinMax fast paths for queries with WHERE clauses",
         c"When ON, queries that could be answered from per-segment metadata fall through to the generic DeltaXAgg path instead. Used for correctness A/B testing.",
         &DISABLE_META_AGG_FASTPATH,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.flatten_partitions",
+        c"Plan all-compressed deltax tables as a single un-expanded relation",
+        c"When ON (default), SELECT planning skips PostgreSQL's per-partition expansion for deltax parents whose data is entirely in compressed companions and installs DeltaXAppend directly on the parent rel. Tables with uncompressed data are never flattened and plan through the regular expansion.",
+        &FLATTEN_PARTITIONS,
         GucContext::Userset,
         GucFlags::default(),
     );

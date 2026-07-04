@@ -84,7 +84,15 @@ impl AggChainCtx {
                 if rte.is_null() {
                     continue;
                 }
-                if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION || !(*rte).inh {
+                if (*rte).rtekind != pg_sys::RTEKind::RTE_RELATION {
+                    continue;
+                }
+                // Regular expanded parent, or one the flatten walker planned
+                // un-expanded (pg_deltax.flatten_partitions) — the chain
+                // rewrite treats both identically.
+                let flattened = super::hook::is_partitioned_relkind((*rte).relkind)
+                    && super::hook::is_flattened_parent((*rte).relid);
+                if !(*rte).inh && !flattened {
                     continue;
                 }
                 let parent_oid = (*rte).relid;

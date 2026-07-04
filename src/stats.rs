@@ -743,6 +743,7 @@ fn update_reltuples(
 /// selectivity for ordered types) or an MCV list (equality selectivity for
 /// low-cardinality columns — and, crucially, ~0 for values that don't appear,
 /// which `1/ndistinct` gets badly wrong).
+#[derive(Clone)]
 enum Slot1 {
     Histogram {
         type_oid: pg_sys::Oid,
@@ -1525,9 +1526,25 @@ pub fn write_table_stats(client: &mut SpiClient, schema: &str, table: &str) -> s
             stadistinct,
             stanullfrac,
             stawidth,
-            slot,
+            slot.clone(),
             correlation,
             true,
+        )?;
+        // Mirror the same stats to the stainherit=false variant: when
+        // `pg_deltax.flatten_partitions` plans the parent un-expanded
+        // (rte->inh = false), examine_variable() reads the non-inherited
+        // rows — without this mirror, every selectivity there would fall
+        // back to defaults.
+        upsert_pg_statistic_row(
+            client,
+            parent_oid,
+            attr.attnum,
+            stadistinct,
+            stanullfrac,
+            stawidth,
+            slot,
+            correlation,
+            false,
         )?;
     }
 

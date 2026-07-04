@@ -2720,7 +2720,7 @@ thread_local! {
 /// iterates all compressed companion tables.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn add_deltax_append_path(
-    _root: *mut pg_sys::PlannerInfo,
+    root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     companion_oids: &[pg_sys::Oid],
     pathkeys: *mut pg_sys::List,
@@ -2757,7 +2757,7 @@ pub unsafe fn add_deltax_append_path(
         (*rel).pathlist = std::ptr::null_mut();
         (*rel).partial_pathlist = std::ptr::null_mut();
 
-        let cpath = build_deltax_append_path(rel, companion_oids, pathkeys, 0);
+        let cpath = build_deltax_append_path(root, rel, companion_oids, pathkeys, 0);
         pg_sys::add_path(rel, cpath as *mut pg_sys::Path);
 
         // Mark rel as non-partitioned so that apply_scanjoin_target_to_paths()
@@ -2774,7 +2774,7 @@ pub unsafe fn add_deltax_append_path(
 /// `add_deltax_append_path` so the serial wrapper's pathlist/partition
 /// reshaping has already run.
 pub unsafe fn add_partial_deltax_append_path(
-    _root: *mut pg_sys::PlannerInfo,
+    root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     companion_oids: &[pg_sys::Oid],
     pathkeys: *mut pg_sys::List,
@@ -2784,7 +2784,7 @@ pub unsafe fn add_partial_deltax_append_path(
         if workers <= 0 {
             return;
         }
-        let cpath = build_deltax_append_path(rel, companion_oids, pathkeys, workers);
+        let cpath = build_deltax_append_path(root, rel, companion_oids, pathkeys, workers);
         (*cpath).path.parallel_workers = workers;
         (*cpath).path.parallel_aware = true;
         (*cpath).path.parallel_safe = true;
@@ -2792,10 +2792,89 @@ pub unsafe fn add_partial_deltax_append_path(
     }
 }
 
+/// Estimated selectivity of the baserestrict quals that reference ONLY the
+/// table's cluster column (`order_by[0]`, or the time column when
+/// `order_by` is empty). Rows are physically ordered by that column within
+/// each partition, so matching rows occupy a contiguous run of segments and
+/// PG's selectivity estimate for those quals translates directly into
+/// "fraction of segments the executor must decode" after minmax pruning.
+///
+/// Returns 1.0 (no discount) when there is no such qual or on any lookup
+/// failure — costing then degrades to the historical full-scan estimate.
+/// Relies on the parent-level statistics `write_table_stats` maintains
+/// (histogram + HLL n_distinct), which is what makes the estimate reliable
+/// on compressed tables.
+pub(super) unsafe fn minmax_prune_selectivity(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+) -> f64 {
+    unsafe {
+        if root.is_null() || rel.is_null() {
+            return 1.0;
+        }
+        let ris = (*rel).baserestrictinfo;
+        if ris.is_null() || (*ris).length == 0 {
+            return 1.0;
+        }
+        let rti = (*rel).relid;
+        if rti == 0 || (*root).simple_rte_array.is_null() {
+            return 1.0;
+        }
+        let rte = *(*root).simple_rte_array.add(rti as usize);
+        if rte.is_null() {
+            return 1.0;
+        }
+        let Some(cluster_col) = super::hook::table_cluster_column((*rte).relid) else {
+            return 1.0;
+        };
+        let Ok(col_cname) = std::ffi::CString::new(cluster_col) else {
+            return 1.0;
+        };
+        let attno = pg_sys::get_attnum((*rte).relid, col_cname.as_ptr());
+        if attno <= 0 {
+            return 1.0;
+        }
+
+        // Collect the clauses whose Vars are exactly {cluster_col}.
+        // pull_varattnos offsets attnos by -FirstLowInvalidHeapAttributeNumber.
+        let expect = attno as i32 - pg_sys::FirstLowInvalidHeapAttributeNumber;
+        let mut matched: *mut pg_sys::List = std::ptr::null_mut();
+        for i in 0..(*ris).length {
+            let ri = pg_sys::list_nth(ris, i) as *mut pg_sys::RestrictInfo;
+            if ri.is_null() || (*ri).clause.is_null() {
+                continue;
+            }
+            let mut attnos: *mut pg_sys::Bitmapset = std::ptr::null_mut();
+            pg_sys::pull_varattnos((*ri).clause as *mut pg_sys::Node, rti, &mut attnos);
+            if pg_sys::bms_num_members(attnos) == 1
+                && pg_sys::bms_singleton_member(attnos) == expect
+            {
+                matched = pg_sys::lappend(matched, ri as *mut core::ffi::c_void);
+            }
+        }
+        if matched.is_null() {
+            return 1.0;
+        }
+        let sel = pg_sys::clauselist_selectivity(
+            root,
+            matched,
+            rti as i32,
+            pg_sys::JoinType::JOIN_INNER,
+            std::ptr::null_mut(),
+        );
+        if sel.is_finite() {
+            sel.clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+}
+
 /// Shared construction for serial and partial DeltaXAppend paths.
 /// `workers > 0` applies the parallel cost divisor; callers then flip
 /// `parallel_aware`/`parallel_safe`/`parallel_workers` on the returned path.
 unsafe fn build_deltax_append_path(
+    root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     companion_oids: &[pg_sys::Oid],
     pathkeys: *mut pg_sys::List,
@@ -2811,14 +2890,11 @@ unsafe fn build_deltax_append_path(
         (*cpath).path.pathtarget = (*rel).reltarget;
 
         let w = if workers > 0 { workers as usize } else { 0 };
-        let mut total_startup = 0.0f64;
-        let mut total_cost = 0.0f64;
+        let mut total_segs = 0.0f64;
         let mut total_rows = 0.0f64;
         for &oid in companion_oids {
-            let (startup, cost, rows) = cost::estimate_cost_from_pg_class(oid, w, None);
-            total_startup += startup;
-            total_cost += cost;
-            total_rows += rows;
+            total_segs += cost::estimate_companion_segments(oid);
+            total_rows += cost::estimate_companion_rows(oid);
         }
         // Prefer the filter-aware estimate PG already computed for the
         // partitioned parent rel (it sums children's post-filter rows). Only
@@ -2832,16 +2908,19 @@ unsafe fn build_deltax_append_path(
         // parallel (workers > 0), divide by the parallel divisor so
         // per-worker counts stay consistent with the serial path.
         let rel_rows = (*rel).rows;
-        let path_rows = if (*rel).tuples > 0.0 {
-            if workers > 0 {
-                let div = cost::parallel_divisor(workers as usize);
-                rel_rows / div
-            } else {
-                rel_rows
-            }
+        let out_rows = if (*rel).tuples > 0.0 {
+            rel_rows
         } else {
             total_rows
         };
+        let path_rows = if workers > 0 {
+            out_rows / cost::parallel_divisor(workers as usize)
+        } else {
+            out_rows
+        };
+        let prune_sel = minmax_prune_selectivity(root, rel);
+        let (total_startup, total_cost) =
+            cost::deltax_append_cost(total_segs, total_rows, out_rows, prune_sel, w);
         (*cpath).path.rows = path_rows;
         (*cpath).path.startup_cost = total_startup;
         (*cpath).path.total_cost = total_cost;
@@ -2867,7 +2946,7 @@ unsafe fn build_deltax_append_path(
 /// PlanCustomPath callback for DeltaXAppend.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn plan_deltax_append_path(
-    _root: *mut pg_sys::PlannerInfo,
+    root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     best_path: *mut pg_sys::CustomPath,
     tlist: *mut pg_sys::List,
@@ -2876,6 +2955,25 @@ pub unsafe extern "C-unwind" fn plan_deltax_append_path(
 ) -> *mut pg_sys::Plan {
     unsafe {
         let _profile = super::plan_profile::scope("plan_deltax_append_path");
+
+        // Register the companion tables as plan dependencies so cached
+        // plans are invalidated when compress/decompress DDL drops or
+        // recreates them. They are not in the rtable (the scan reads them
+        // directly), and with pg_deltax.flatten_partitions the child
+        // partitions aren't either — without this, a prepared statement
+        // could keep executing against dropped companions.
+        if !root.is_null() && !(*root).glob.is_null() {
+            let oid_list = (*best_path).custom_private;
+            if !oid_list.is_null() {
+                for i in 0..(*oid_list).length {
+                    (*(*root).glob).relationOids = pg_sys::lappend_oid(
+                        (*(*root).glob).relationOids,
+                        pg_sys::list_nth_oid(oid_list, i),
+                    );
+                }
+            }
+        }
+
         let cscan =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScan>()) as *mut pg_sys::CustomScan;
 

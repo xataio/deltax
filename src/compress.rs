@@ -1118,6 +1118,24 @@ fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
         &[],
     );
 
+    // Refresh the parent-relation merged statistics. The background worker
+    // does this after its auto-compress cycles, but manual
+    // deltax_compress_partition calls must not leave the parent stale:
+    // with pg_deltax.flatten_partitions the planner reads ONLY the parent's
+    // pg_statistic rows (children aren't expanded), so per-partition stats
+    // alone no longer feed selectivity.
+    if let Err(e) = crate::stats::write_table_stats(client, &ht.schema_name, &ht.table_name) {
+        pgrx::warning!(
+            "pg_deltax: failed to refresh parent stats for {}.{}: {}. \
+             Run deltax_analyze_table('{}.{}') to retry.",
+            ht.schema_name,
+            ht.table_name,
+            e,
+            ht.schema_name,
+            ht.table_name,
+        );
+    }
+
     crate::scan::invalidate_compressed_cache();
 
     format!(

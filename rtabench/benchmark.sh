@@ -79,6 +79,15 @@ fi
 # Convert order_events to a pg_deltax time-series table.
 # mock_now is set to the start of the dataset's range; 125 partitions of 3 days
 # covers 2024-01-01 → 2025-01-15, comfortably spanning all data.
+#
+# Partition-width note (measured 2026-07-04): 30-day partitions cut planning
+# from ~5-8ms to ~2ms (127 rels → 14) and made the Q7-Q13 point lookups beat
+# TimescaleDB, but regressed Q5 3.5× — segments are order_id-led, so within
+# one partition every segment spans the partition's whole time range and the
+# time-ordered Top-N early-stop degrades with partition width — and Q2 100×
+# (month windows stop aligning with partition boundaries, disabling the
+# whole-partition metadata gate; that part is fixable via segment-granular
+# containment). Net hot total was worse, so 3 days stays.
 sudo -u postgres psql "$DB" -t -c \
     "SET pg_deltax.mock_now = '2024-01-01 00:00:00'; SELECT deltax.deltax_create_table('order_events', 'event_created', '3 days'::interval, 125)"
 
