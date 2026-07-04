@@ -1558,7 +1558,21 @@ pub unsafe fn add_agg_partial_path(
         if !agg_specs_partial_emittable(agg_specs) {
             return;
         }
-        if !group_specs.is_empty() && !super::exec::can_use_compact_keys_path(group_specs, &[]) {
+        // Grouped queries only. The partial+Gather+FinalAgg model is wired
+        // (and benchmarked) for grouped shapes; for UNGROUPED aggregates the
+        // Finalize Agg's setrefs matching against our partial tlist fails —
+        // `sum(col)` errors with "variable not found in subplan target list"
+        // and a bare `count(*)` is worse: the partial Aggref is silently left
+        // in the finalize's transition expression as an EEOP_AGGREF step,
+        // which dereferences NULL `ecxt_aggvalues` at execution — a reliable
+        // leader SEGFAULT (reproduced whenever stats or cost GUCs made this
+        // path win, e.g. `parallel_setup_cost=0`). Ungrouped shapes also gain
+        // nothing here: they emit one row and the complete path already
+        // parallelises internally. See tests/test_parallel_agg.py.
+        if group_specs.is_empty() {
+            return;
+        }
+        if !super::exec::can_use_compact_keys_path(group_specs, &[]) {
             return;
         }
         // Reject WHERE clauses that reference non-numeric columns. See
