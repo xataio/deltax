@@ -114,6 +114,29 @@ pub unsafe fn estimate_cost_from_pg_class(
     (startup, total, rows)
 }
 
+/// Fraction of segments (and stored rows) a scan must decode after
+/// segment-level minmax pruning on the cluster column, given the planner
+/// selectivity of the cluster-column quals. The FUDGE multiplier absorbs
+/// estimate error; the BOUNDARY_SEGS floor pays for partially-matching
+/// segments at the matching run's edges. `prune_sel = 1.0` (no
+/// cluster-column qual) means everything is decoded.
+///
+/// Shared by `deltax_append_cost` and `estimate_agg_cost` — the two paths
+/// decode the SAME pruned segment set, so they must be discounted
+/// identically or a selective qual flips the plan to whichever path got
+/// the discount first (ClickBench Q36-Q42 regressed 6x when only the
+/// append path was selectivity-aware and serial Append+HashAgg started
+/// beating the fused DeltaXAgg).
+pub(super) fn decode_fraction(segs: f64, prune_sel: f64) -> f64 {
+    const FUDGE: f64 = 4.0;
+    const BOUNDARY_SEGS: f64 = 4.0;
+    if prune_sel < 1.0 {
+        (prune_sel * FUDGE + BOUNDARY_SEGS / segs.max(1.0)).min(1.0)
+    } else {
+        1.0
+    }
+}
+
 /// Cost a DeltaXAppend scan of `segs` segments holding `rows` stored rows.
 ///
 /// `prune_sel` is the planner selectivity of the baserestrict quals that
@@ -147,15 +170,9 @@ pub(super) fn deltax_append_cost(
     const PER_SEGMENT: f64 = 100.0; // decode + scan startup of one segment
     const PER_ROW: f64 = 0.1; // decode + batch-eval per stored row
     const PER_OUT_ROW: f64 = 0.01; // matches cpu_tuple_cost for emit
-    const FUDGE: f64 = 4.0; // slack on the selectivity estimate
-    const BOUNDARY_SEGS: f64 = 4.0; // partially-matching segments at run edges
 
     let segs = segs.max(1.0);
-    let decode_frac = if prune_sel < 1.0 {
-        (prune_sel * FUDGE + BOUNDARY_SEGS / segs).min(1.0)
-    } else {
-        1.0
-    };
+    let decode_frac = decode_fraction(segs, prune_sel);
 
     let mut scan_work =
         segs * PER_SEGMENT_META + segs * decode_frac * PER_SEGMENT + rows * decode_frac * PER_ROW;
@@ -341,6 +358,7 @@ pub(super) fn estimate_agg_cost(
     estimated_groups: f64,
     num_having_filters: usize,
     workers: usize,
+    prune_sel: f64,
 ) -> (f64, f64) {
     // Calibrated against RTABench suite (Apr 2026). Adjusting any of these
     // risks regressing planner selection on a subset of queries; re-run
@@ -351,10 +369,19 @@ pub(super) fn estimate_agg_cost(
     const PER_GROUP: f64 = 0.01; // matches cpu_tuple_cost for output
     const PER_HAVING: f64 = 0.00005; // per-group HAVING eval
 
-    let total_rows: f64 = companion_oids
+    let raw_rows: f64 = companion_oids
         .iter()
         .map(|&oid| estimate_companion_rows(oid))
         .sum();
+    let total_segs: f64 = companion_oids
+        .iter()
+        .map(|&oid| estimate_companion_segments(oid))
+        .sum();
+    // Same segment-minmax decode discount as `deltax_append_cost` — the
+    // agg executor prunes the identical segments, and pricing only one of
+    // the two competing paths by selectivity flips plans (see
+    // `decode_fraction`).
+    let total_rows = raw_rows * decode_fraction(total_segs, prune_sel);
 
     let num_partitions = companion_oids.len() as f64;
     let num_aggs = num_agg_exprs.max(1) as f64;

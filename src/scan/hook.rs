@@ -4569,6 +4569,11 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
             std::ptr::null_mut()
         };
 
+        // Cluster-column selectivity discount, shared with the DeltaXAppend
+        // cost so the two paths never diverge on a selectivity change alone
+        // (`input_rel` is the scanned base rel; for join inputs the helper
+        // returns 1.0 and the estimate stays undiscounted).
+        let prune_sel = path::minmax_prune_selectivity(root, input_rel);
         path::add_agg_path(
             root,
             output_rel,
@@ -4578,6 +4583,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
             &having_filters,
             pg_estimated_groups,
             pathkeys,
+            prune_sel,
         );
 
         // Phase C.2 activation — add a partial-mode CustomPath through PG's
@@ -4596,6 +4602,7 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
                 &group_specs,
                 pg_estimated_groups,
                 extra as *mut pg_sys::GroupPathExtraData,
+                prune_sel,
             );
         }
     }

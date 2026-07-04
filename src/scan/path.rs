@@ -1538,6 +1538,7 @@ pub unsafe fn add_agg_partial_path(
     group_specs: &[super::exec::GroupByColSpec],
     pg_estimated_groups: f64,
     extra: *mut pg_sys::GroupPathExtraData,
+    prune_sel: f64,
 ) {
     unsafe {
         let _profile = super::plan_profile::scope("add_agg_partial_path");
@@ -1642,6 +1643,7 @@ pub unsafe fn add_agg_partial_path(
             estimated_rows,
             /* num_having_filters */ 0,
             workers as usize,
+            prune_sel,
         );
         (*cpath).path.startup_cost = startup;
         (*cpath).path.total_cost = total;
@@ -1714,6 +1716,7 @@ pub unsafe fn add_agg_path(
     having_filters: &[super::exec::HavingFilter],
     pg_estimated_groups: f64,
     pathkeys: *mut pg_sys::List,
+    prune_sel: f64,
 ) {
     unsafe {
         let _profile = super::plan_profile::scope("add_agg_path");
@@ -1780,6 +1783,7 @@ pub unsafe fn add_agg_path(
             estimated_rows,
             having_filters.len(),
             workers as usize,
+            prune_sel,
         );
         (*cpath).path.startup_cost = startup;
         (*cpath).path.total_cost = total;
