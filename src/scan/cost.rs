@@ -114,6 +114,75 @@ pub unsafe fn estimate_cost_from_pg_class(
     (startup, total, rows)
 }
 
+/// Fraction of segments (and stored rows) a scan must decode after
+/// segment-level minmax pruning on the cluster column, given the planner
+/// selectivity of the cluster-column quals. The FUDGE multiplier absorbs
+/// estimate error; the BOUNDARY_SEGS floor pays for partially-matching
+/// segments at the matching run's edges. `prune_sel = 1.0` (no
+/// cluster-column qual) means everything is decoded.
+///
+/// Shared by `deltax_append_cost` and `estimate_agg_cost` — the two paths
+/// decode the SAME pruned segment set, so they must be discounted
+/// identically or a selective qual flips the plan to whichever path got
+/// the discount first (ClickBench Q36-Q42 regressed 6x when only the
+/// append path was selectivity-aware and serial Append+HashAgg started
+/// beating the fused DeltaXAgg).
+pub(super) fn decode_fraction(segs: f64, prune_sel: f64) -> f64 {
+    const FUDGE: f64 = 4.0;
+    const BOUNDARY_SEGS: f64 = 4.0;
+    if prune_sel < 1.0 {
+        (prune_sel * FUDGE + BOUNDARY_SEGS / segs.max(1.0)).min(1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Cost a DeltaXAppend scan of `segs` segments holding `rows` stored rows.
+///
+/// `prune_sel` is the planner selectivity of the baserestrict quals that
+/// reference only the table's cluster column (`order_by[0]`, or the time
+/// column when `order_by` is empty). Rows are physically ordered by that
+/// column inside each partition, so matching rows occupy a contiguous run
+/// of segments and the executor's segment-level minmax metadata skips the
+/// rest without decoding — decode cost scales with `prune_sel`, not with
+/// the full table. The `FUDGE` multiplier absorbs estimate error and the
+/// `BOUNDARY_SEGS` floor pays for partially-matching segments at the run's
+/// edges. `prune_sel = 1.0` (no cluster-column qual) reproduces the
+/// historical full-scan estimate.
+///
+/// `out_rows` is the planner's post-filter row estimate (all quals), used
+/// only for the per-emitted-row term.
+///
+/// Getting this fraction right matters beyond plan choice: the historical
+/// full-scan cost (~6.7M on a 181M-row table) pushed trivial point lookups
+/// over `jit_above_cost`, so every fresh backend paid ~10ms of LLVM JIT
+/// load for a 2ms query, and over the Gather threshold, spawning 8 workers
+/// to fetch a handful of rows.
+pub(super) fn deltax_append_cost(
+    segs: f64,
+    rows: f64,
+    out_rows: f64,
+    prune_sel: f64,
+    workers: usize,
+) -> (f64, f64) {
+    const STARTUP: f64 = 10.0;
+    const PER_SEGMENT_META: f64 = 0.05; // minmax check on the segment's meta row
+    const PER_SEGMENT: f64 = 100.0; // decode + scan startup of one segment
+    const PER_ROW: f64 = 0.1; // decode + batch-eval per stored row
+    const PER_OUT_ROW: f64 = 0.01; // matches cpu_tuple_cost for emit
+
+    let segs = segs.max(1.0);
+    let decode_frac = decode_fraction(segs, prune_sel);
+
+    let mut scan_work =
+        segs * PER_SEGMENT_META + segs * decode_frac * PER_SEGMENT + rows * decode_frac * PER_ROW;
+    if workers > 0 {
+        scan_work /= parallel_divisor(workers);
+    }
+    let total = STARTUP + scan_work + out_rows.max(0.0) * PER_OUT_ROW;
+    (STARTUP, total)
+}
+
 /// Planning-only approximate row count from companion-table pg_class stats.
 /// The companion table has one heap row per compressed segment.
 pub(super) fn estimate_companion_rows(companion_oid: pg_sys::Oid) -> f64 {
@@ -289,6 +358,7 @@ pub(super) fn estimate_agg_cost(
     estimated_groups: f64,
     num_having_filters: usize,
     workers: usize,
+    prune_sel: f64,
 ) -> (f64, f64) {
     // Calibrated against RTABench suite (Apr 2026). Adjusting any of these
     // risks regressing planner selection on a subset of queries; re-run
@@ -299,10 +369,19 @@ pub(super) fn estimate_agg_cost(
     const PER_GROUP: f64 = 0.01; // matches cpu_tuple_cost for output
     const PER_HAVING: f64 = 0.00005; // per-group HAVING eval
 
-    let total_rows: f64 = companion_oids
+    let raw_rows: f64 = companion_oids
         .iter()
         .map(|&oid| estimate_companion_rows(oid))
         .sum();
+    let total_segs: f64 = companion_oids
+        .iter()
+        .map(|&oid| estimate_companion_segments(oid))
+        .sum();
+    // Same segment-minmax decode discount as `deltax_append_cost` — the
+    // agg executor prunes the identical segments, and pricing only one of
+    // the two competing paths by selectivity flips plans (see
+    // `decode_fraction`).
+    let total_rows = raw_rows * decode_fraction(total_segs, prune_sel);
 
     let num_partitions = companion_oids.len() as f64;
     let num_aggs = num_agg_exprs.max(1) as f64;
@@ -549,7 +628,7 @@ pub(crate) fn prewarm_partition_column_minmax(oids: &[pg_sys::Oid]) {
 /// Parse a `{"col": [min,max], ...}` JSON map of i64 ranges (as emitted by
 /// `catalog::update_partition_column_minmax`). Returns `None` if the input
 /// isn't shaped like an object — callers treat that as "no info, can't prune".
-fn parse_minmax_json(text: &str) -> Option<HashMap<String, (i64, i64)>> {
+pub(crate) fn parse_minmax_json(text: &str) -> Option<HashMap<String, (i64, i64)>> {
     let bytes = text.as_bytes();
     let mut i = 0;
     while i < bytes.len() && bytes[i].is_ascii_whitespace() {
@@ -738,7 +817,7 @@ fn parse_valmap_json(text: &str, out: &mut std::collections::HashMap<String, Vec
 /// `catalog::update_partition_column_ndistinct`) into the result map.
 /// Trivial hand-rolled parser — values are always integers, keys are
 /// always column names with limited escaping (backslash and quote).
-fn parse_ndistinct_json(text: &str, out: &mut std::collections::HashMap<String, i64>) {
+pub(crate) fn parse_ndistinct_json(text: &str, out: &mut std::collections::HashMap<String, i64>) {
     let bytes = text.as_bytes();
     let mut i = 0;
     // Skip leading whitespace and opening brace
@@ -818,6 +897,65 @@ pub(super) unsafe fn get_reltuples(rel_oid: pg_sys::Oid) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_cost_full_scan_matches_historical_estimate() {
+        // prune_sel = 1.0 must reproduce the historical full-scan shape:
+        // startup + segs*(PER_SEGMENT_META + PER_SEGMENT) + rows*PER_ROW.
+        let (startup, total) = deltax_append_cost(6136.0, 181e6, 181e6, 1.0, 0);
+        assert_eq!(startup, 10.0);
+        let expected = 10.0 + 6136.0 * 0.05 + 6136.0 * 100.0 + 181e6 * 0.1 + 181e6 * 0.01;
+        assert!(
+            (total - expected).abs() / expected < 1e-9,
+            "total={total} expected={expected}"
+        );
+    }
+
+    #[test]
+    fn append_cost_point_lookup_stays_below_jit_threshold() {
+        // A point lookup on the cluster column (sel ~1e-7 on a 181M-row
+        // table) must cost far below PG's default jit_above_cost (100000):
+        // the historical full-scan estimate (~6.7M) made every fresh
+        // backend pay ~10ms of LLVM JIT load for a 2ms query. (Choosing
+        // serial over parallel for such lookups is handled separately, by
+        // the decoded-segment worker gate in deltax_set_rel_pathlist.)
+        let (_, total) = deltax_append_cost(6136.0, 181e6, 756.0, 1e-7, 0);
+        assert!(total < 50_000.0, "point lookup cost too high: {total}");
+        // ...and it must still dwarf a truly trivial scan, so plan
+        // ordering between selective and non-selective shapes is kept.
+        let (_, full) = deltax_append_cost(6136.0, 181e6, 181e6, 1.0, 0);
+        assert!(total < full / 100.0, "point {total} vs full {full}");
+    }
+
+    #[test]
+    fn append_cost_monotonic_in_selectivity() {
+        let costs: Vec<f64> = [1e-7, 1e-4, 1e-2, 0.5, 1.0]
+            .iter()
+            .map(|&sel| deltax_append_cost(6136.0, 181e6, 181e6 * sel, sel, 0).1)
+            .collect();
+        for pair in costs.windows(2) {
+            assert!(
+                pair[0] <= pair[1],
+                "cost must grow with selectivity: {costs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn append_cost_workers_divide_scan_work_only() {
+        let (s0, t0) = deltax_append_cost(1000.0, 30e6, 30e6, 1.0, 0);
+        let (s8, t8) = deltax_append_cost(1000.0, 30e6, 30e6, 1.0, 8);
+        assert_eq!(s0, s8, "startup is not divided");
+        // Scan work should shrink by roughly the parallel divisor.
+        let scan0 = t0 - s0 - 30e6 * 0.01;
+        let scan8 = t8 - s8 - 30e6 * 0.01;
+        let div = parallel_divisor(8);
+        assert!(
+            (scan0 / scan8 - div).abs() < 1e-6,
+            "scan work ratio {} != divisor {div}",
+            scan0 / scan8
+        );
+    }
 
     #[test]
     fn recommend_below_threshold_returns_zero() {

@@ -29,6 +29,14 @@ pg_module_magic!();
 
 pub(crate) static MOCK_NOW: GucSetting<Option<CString>> = GucSetting::<Option<CString>>::new(None);
 
+/// Comma-separated list of databases the maintenance background worker(s)
+/// connect to. SPI binds a background worker to exactly one database for its
+/// lifetime, so one static worker is registered per listed database and each
+/// services only deltatables registered there. Default "postgres" preserves
+/// upstream behaviour (a single worker on the postgres database).
+pub(crate) static TARGET_DATABASE: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(c"postgres"));
+
 pub(crate) static PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(0);
 
 pub(crate) static PARALLEL_REGEX: GucSetting<bool> = GucSetting::<bool>::new(true);
@@ -41,6 +49,19 @@ pub(crate) static MAX_PARALLEL_WORKERS_PER_SCAN: GucSetting<i32> = GucSetting::<
 /// queries with WHERE clauses. Used by tests and operators to force the
 /// generic `DeltaXAgg` path for A/B correctness comparisons.
 pub(crate) static DISABLE_META_AGG_FASTPATH: GucSetting<bool> = GucSetting::<bool>::new(false);
+
+/// When true (default), SELECT planning collapses a deltax partitioned
+/// parent whose data lives entirely in compressed companions to a single
+/// un-expanded rel (`rte->inh = false`): PostgreSQL skips building per-child
+/// RelOptInfos/paths for the deliberately-empty partition heaps and the
+/// set_rel_pathlist hook installs DeltaXAppend directly. standard_planner
+/// drops from ~5-8ms to ~1.4ms on a 127-partition table; the eligibility
+/// walk costs ~2-4ms on a cold backend (per-child syscache warming — a
+/// shared-memory verdict cache is the designed follow-up) and ~0.2ms warm.
+/// Tables with uncompressed data (hot partition, non-empty default) are
+/// never flattened — they plan through the regular expansion exactly as
+/// before.
+pub(crate) static FLATTEN_PARTITIONS: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 /// When true, `add_agg_partial_path` returns early and the planner only
 /// sees the complete CustomScan DeltaXAgg path. Escape hatch for the
@@ -182,11 +203,16 @@ CREATE TABLE IF NOT EXISTS deltax.deltax_partition (
     column_ndistinct JSONB,
     column_valmap   JSONB,
     column_minmax   JSONB,
+    column_valcounts JSONB,
+    column_mcv      JSONB,
     UNIQUE(schema_name, table_name)
 );
 
 ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_valmap JSONB;
 ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_minmax JSONB;
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_hll JSONB;
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_valcounts JSONB;
+ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS column_mcv JSONB;
 ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract JSONB;
 ALTER TABLE deltax.deltax_deltatable ADD COLUMN IF NOT EXISTS json_extract_added_at TIMESTAMPTZ;
 ALTER TABLE deltax.deltax_partition ADD COLUMN IF NOT EXISTS compressed_columns JSONB;
@@ -209,6 +235,11 @@ $$;
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    // NOTE: `PGC_POSTMASTER` GUCs (target_database, blob_cache_mb,
+    // blob_cache_shards) are defined ONLY in the shared-preload branch below —
+    // PostgreSQL FATALs ("cannot create PGC_POSTMASTER variables after startup")
+    // if they are defined in a backend loaded via session_preload / LOAD / fmgr.
+    // Everything here is PGC_USERSET / PGC_SUSET, which is safe in any load mode.
     GucRegistry::define_string_guc(
         c"pg_deltax.mock_now",
         c"Override current time for testing (timestamptz literal, empty = use real time)",
@@ -262,6 +293,14 @@ pub extern "C-unwind" fn _PG_init() {
         GucFlags::default(),
     );
     GucRegistry::define_bool_guc(
+        c"pg_deltax.flatten_partitions",
+        c"Plan all-compressed deltax tables as a single un-expanded relation",
+        c"When ON (default), SELECT planning skips PostgreSQL's per-partition expansion for deltax parents whose data is entirely in compressed companions and installs DeltaXAppend directly on the parent rel. Tables with uncompressed data are never flattened and plan through the regular expansion.",
+        &FLATTEN_PARTITIONS,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
         c"pg_deltax.disable_parallel_agg",
         c"Disable the partial+Gather+FinalAgg path for DeltaXAgg",
         c"When ON, add_agg_partial_path is a no-op and the planner only sees the complete CustomScan DeltaXAgg. Escape hatch for bisecting suspected regressions on the partial path; the complete path's internal-rayon parallelism still runs.",
@@ -275,26 +314,6 @@ pub extern "C-unwind" fn _PG_init() {
         c"none disables extraction; fields uses the path list configured in deltax_enable_compression; all auto-discovers scalar leaves (not yet implemented).",
         &JSON_EXTRACT_MODE,
         GucContext::Userset,
-        GucFlags::default(),
-    );
-    GucRegistry::define_int_guc(
-        c"pg_deltax.blob_cache_mb",
-        c"Size of the process-shared blob cache, in MiB. -1 = auto (25% of physical RAM, clamped to [256, 4096]); 0 = disabled; N > 0 = explicit MiB.",
-        c"The blob cache stores detoasted compressed segment blobs keyed by (companion_oid, segment_id, col_idx). Repeated queries against the same segments skip the pg_detoast_datum path. -1 (default) auto-sizes at postmaster start from /proc/meminfo, falling back to the 256 MB floor if it can't be read. Explicit values override the auto heuristic. See dev/docs/BLOB_CACHE.md. Restart required — the shmem reservation is captured at postmaster start.",
-        &BLOB_CACHE_MB,
-        -1,
-        32768,
-        GucContext::Postmaster,
-        GucFlags::default(),
-    );
-    GucRegistry::define_int_guc(
-        c"pg_deltax.blob_cache_shards",
-        c"Number of shards (power of two) in the blob cache. Restart required.",
-        c"Each shard owns an LWLock and an LRU list. More shards reduce contention under high concurrency; fewer save shmem overhead. Must be a power of two between 1 and 1024.",
-        &BLOB_CACHE_SHARDS,
-        1,
-        1024,
-        GucContext::Postmaster,
         GucFlags::default(),
     );
     GucRegistry::define_bool_guc(
@@ -313,8 +332,11 @@ pub extern "C-unwind" fn _PG_init() {
         GucContext::Userset,
         GucFlags::default(),
     );
-    blob_cache::register_hooks();
-    worker::register_bgworker();
+    // Query hooks are per-backend function pointers — install them in EVERY
+    // load mode (shared_preload, session_preload, LOAD, on-demand fmgr) so query
+    // correctness is identical regardless of how the library was loaded. This
+    // mirrors auto_explain, whose _PG_init installs its executor hooks
+    // unconditionally.
     unsafe {
         scan::register_hook();
     }
@@ -323,6 +345,53 @@ pub extern "C-unwind" fn _PG_init() {
     }
     unsafe {
         copy::register_process_utility_hook();
+    }
+
+    // Postmaster-only setup. The `PGC_POSTMASTER` GUCs, the static maintenance
+    // worker (`RegisterBackgroundWorker`), and the shared blob cache
+    // (`RequestAddinShmemSpace`) all require the postmaster to be processing
+    // `shared_preload_libraries`; `process_shared_preload_libraries_in_progress`
+    // is true exactly then. Defining the GUCs (not just registering the worker /
+    // shmem) MUST be gated here too — PostgreSQL FATALs if a PGC_POSTMASTER GUC
+    // is defined outside postmaster startup, which would crash every
+    // session_preload / LOAD / fmgr backend. When pg_deltax is loaded any other
+    // way these are all skipped: maintenance is driven externally via
+    // `deltax_run_maintenance()`, the blob cache stays off (a performance
+    // feature, not correctness), and the three full-mode-only GUCs are simply
+    // absent. This mirrors pg_stat_statements, which gates its GUC + shmem
+    // machinery on the same flag. Listing pg_deltax in both preload lists is
+    // harmless — Postgres won't re-run `_PG_init` for an already-loaded library.
+    if unsafe { pg_sys::process_shared_preload_libraries_in_progress } {
+        GucRegistry::define_string_guc(
+            c"pg_deltax.target_database",
+            c"Comma-separated database(s) the pg_deltax maintenance worker services",
+            c"One maintenance worker is registered per listed database; each connects to exactly one database and services only deltatables registered there. Each entry consumes a max_worker_processes slot. Changing the list requires a server restart.",
+            &TARGET_DATABASE,
+            GucContext::Postmaster,
+            GucFlags::default(),
+        );
+        GucRegistry::define_int_guc(
+            c"pg_deltax.blob_cache_mb",
+            c"Size of the process-shared blob cache, in MiB. -1 = auto (1/6 of physical RAM, clamped to [256, 16384]); 0 = disabled; N > 0 = explicit MiB.",
+            c"The blob cache stores detoasted compressed segment blobs keyed by (companion_oid, segment_id, col_idx). Repeated queries against the same segments skip the pg_detoast_datum path. -1 (default) auto-sizes at postmaster start from /proc/meminfo, falling back to the 256 MB floor if it can't be read. Explicit values override the auto heuristic. See dev/docs/BLOB_CACHE.md. Restart required — the shmem reservation is captured at postmaster start.",
+            &BLOB_CACHE_MB,
+            -1,
+            32768,
+            GucContext::Postmaster,
+            GucFlags::default(),
+        );
+        GucRegistry::define_int_guc(
+            c"pg_deltax.blob_cache_shards",
+            c"Number of shards (power of two) in the blob cache. Restart required.",
+            c"Each shard owns an LWLock and an LRU list. More shards reduce contention under high concurrency; fewer save shmem overhead. Must be a power of two between 1 and 1024.",
+            &BLOB_CACHE_SHARDS,
+            1,
+            1024,
+            GucContext::Postmaster,
+            GucFlags::default(),
+        );
+        blob_cache::register_hooks();
+        worker::register_bgworker();
     }
 }
 

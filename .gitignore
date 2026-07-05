@@ -15,7 +15,14 @@ tests/__pycache__/
 
 pg_deltax_design_v03.md
 tests/.data/
-tests/.bench_results/
+# Ignore all bench output (per-run results + history) EXCEPT the pinned
+# RTABench wall-clock baseline, which is a deliberate, version-controlled
+# reference for the Phase F regression gate (L5) — without it the gate has
+# nothing to check against and silently skips. (Glob the contents rather than
+# the dir so the negation can re-include the file; git won't descend into a
+# dir ignored with a trailing slash.)
+tests/.bench_results/*
+!tests/.bench_results/rtabench_baseline.json
 clickbench/results/
 clickbench/data.generated.js.new
 clickbench/.env

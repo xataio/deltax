@@ -37,7 +37,11 @@ sudo env "PATH=$PATH" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" "CARGO_HOME=${
     cargo pgrx install --pg-config "$PG_CONFIG" --release
 cd "$SCRIPT_DIR"
 
-# Configure PostgreSQL (idempotent: only add if not already present)
+# Configure PostgreSQL (idempotent: only add if not already present).
+# Stock config except work_mem=64MB — same as ClickBench pg_deltax/install.
+sudo tee /etc/postgresql/18/main/conf.d/clickbench.conf <<EOF
+work_mem=64MB
+EOF
 if ! sudo grep -q "shared_preload_libraries.*pg_deltax" /etc/postgresql/18/main/postgresql.conf; then
     sudo bash -c "echo \"shared_preload_libraries = 'pg_deltax'\" >> /etc/postgresql/18/main/postgresql.conf"
 fi
@@ -48,7 +52,6 @@ sudo -u postgres psql -c "DROP DATABASE IF EXISTS $DB"
 sudo -u postgres psql -c "CREATE DATABASE $DB"
 sudo -u postgres psql "$DB" -c "CREATE EXTENSION pg_deltax"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '1GB'"
-sudo -u postgres psql -c "ALTER DATABASE $DB SET min_parallel_table_scan_size TO '0'"
 
 # Download data
 PARQUET="${PARQUET:-1}"
@@ -82,7 +85,7 @@ fi
 sudo -u postgres psql "$DB" -t -c "SET pg_deltax.mock_now = '2013-07-01 12:00:00'; SELECT deltax.deltax_create_table('hits', 'eventtime', '3 days'::interval, 15)"
 
 # Enable compression before loading (required for direct backfill)
-sudo -u postgres psql "$DB" -t -c "SELECT deltax.deltax_enable_compression('hits', order_by => ARRAY['counterid', 'userid', 'eventtime'], segment_size => 30000)"
+sudo -u postgres psql "$DB" -t -c "SELECT deltax.deltax_enable_compression('hits', order_by => ARRAY['counterid', 'userid', 'eventtime'])"
 
 # Direct backfill: load and compress in a single pass using FORMAT deltax_compress
 LOAD_START=$(date +%s)
@@ -103,8 +106,9 @@ sudo -u postgres psql "$DB" -q -t -c "VACUUM FREEZE ANALYZE hits"
 VACUUM_END=$(date +%s)
 echo "Vacuum time: $((VACUUM_END - VACUUM_START))s"
 
-# Capture data size (bytes)
-DATA_SIZE=$(sudo -u postgres psql "$DB" -t -A -c "SELECT deltax.deltax_table_size('hits')")
+# Capture data size (bytes) — du of base/ (excludes pg_wal), same metric as
+# the ClickBench pg_deltax/data-size script.
+DATA_SIZE=$(sudo du -bcs /var/lib/postgresql/18/main/base | grep total | awk '{print $1}')
 echo "Data size: $DATA_SIZE bytes ($(echo "$DATA_SIZE / 1024 / 1024 / 1024" | bc -l | xargs printf '%.2f') GB)"
 
 # Save load stats for the bench target to pick up later
@@ -115,8 +119,8 @@ DATA_SIZE=$DATA_SIZE
 STATS
 echo "Saved load stats to ~/clickbench/load_stats.env (load_time=${LOAD_TIME}s, data_size=${DATA_SIZE})"
 
-# Lower work_mem and disable JIT for the query phase
-sudo -u postgres psql -c "ALTER DATABASE $DB SET work_mem TO '256MB'"
+# Restore default work_mem and disable JIT for the query phase
+sudo -u postgres psql -c "ALTER DATABASE $DB RESET work_mem"
 sudo -u postgres psql -c "ALTER DATABASE $DB SET jit TO off"
 
 # Report partition and compression info

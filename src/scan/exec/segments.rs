@@ -822,6 +822,22 @@ pub(super) fn segment_skippable_by_dict(
         // Parse the compressed column header to get the data portion
         let cc = compression::CompressedColumnRef::from_bytes(blob);
 
+        // Ne can only prune a segment whose dictionary is a single entry
+        // equal to the constant. dict_size lives in the uncompressed header
+        // prefix (same layout for Dictionary and DictionaryLz4), so read it
+        // directly instead of decompressing every segment's dictionary just
+        // to conclude "can't prune" (this decompression on the scan leader
+        // dominated ClickBench Q25's `SearchPhrase <> ''`).
+        if check == DictCheck::Ne {
+            if cc.data.len() < 4 {
+                continue;
+            }
+            let dict_size = u32::from_le_bytes(cc.data[0..4].try_into().unwrap());
+            if dict_size > 1 {
+                continue;
+            }
+        }
+
         // Normalize DictionaryLz4 → Dictionary format for header parsing
         let norm_buf;
         let dict_data = if type_tag == compression::CompressionType::DictionaryLz4 {
@@ -1520,6 +1536,165 @@ unsafe fn shared_buf_snapshot() -> (i64, i64) {
     }
 }
 
+/// An equality/IN-list bloom probe: the hashes of the constant(s) compared
+/// against column `col_idx` of the companion tables.
+struct BloomCheck {
+    col_idx: u16,
+    hashes: Vec<u64>,
+}
+
+/// Probe the partition's `<partition>_blooms` table for the given checks and
+/// return the ids (subset of `surviving_ids`) of segments whose bloom filter
+/// proves the queried constant(s) absent. Segments without a bloom row are
+/// never returned — their values are not covered (e.g. blooms were disabled
+/// at compress time), so absence of a row says nothing.
+unsafe fn bloom_pruned_segment_ids(
+    meta_oid: pg_sys::Oid,
+    bloom_checks: &[BloomCheck],
+    surviving_ids: &std::collections::HashSet<i32>,
+) -> std::collections::HashSet<i32> {
+    unsafe {
+        let mut bloom_pruned_ids: std::collections::HashSet<i32> = std::collections::HashSet::new();
+        if bloom_checks.is_empty() || surviving_ids.is_empty() {
+            return bloom_pruned_ids;
+        }
+
+        let meta_name_ptr = pg_sys::get_rel_name(meta_oid);
+        if meta_name_ptr.is_null() {
+            return bloom_pruned_ids;
+        }
+        let meta_name_str = std::ffi::CStr::from_ptr(meta_name_ptr)
+            .to_string_lossy()
+            .into_owned();
+        let meta_ns_oid = pg_sys::get_rel_namespace(meta_oid);
+        let partition_name = meta_name_str
+            .strip_suffix("_meta")
+            .unwrap_or(&meta_name_str);
+        let blooms_name = format!("{}_blooms", partition_name);
+        let blooms_cname = std::ffi::CString::new(blooms_name).unwrap();
+        let blooms_oid = pg_sys::get_relname_relid(blooms_cname.as_ptr(), meta_ns_oid);
+        if blooms_oid == pg_sys::InvalidOid {
+            return bloom_pruned_ids;
+        }
+
+        let blooms_rel =
+            pg_sys::table_open(blooms_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        let blooms_tupdesc = (*blooms_rel).rd_att;
+        let blooms_natts = (*blooms_tupdesc).natts as usize;
+
+        // Locate attnos for _segment_id, _num_hashes, _data once from the tupdesc
+        let mut seg_id_att: Option<usize> = None;
+        let mut num_hashes_att: Option<usize> = None;
+        let mut data_att: Option<usize> = None;
+        for i in 0..blooms_natts {
+            let attr = &*tupdesc_get_attr(blooms_tupdesc, i);
+            let name = std::ffi::CStr::from_ptr(attr.attname.data.as_ptr()).to_string_lossy();
+            if name == "_segment_id" {
+                seg_id_att = Some(i);
+            } else if name == "_num_hashes" {
+                num_hashes_att = Some(i);
+            } else if name == "_data" {
+                data_att = Some(i);
+            }
+        }
+
+        let pk_index_oid = primary_key_index_oid(blooms_rel);
+
+        if let (Some(sid_att), Some(nh_att), Some(dat_att), true) = (
+            seg_id_att,
+            num_hashes_att,
+            data_att,
+            pk_index_oid != pg_sys::InvalidOid,
+        ) {
+            let snapshot = pg_sys::GetActiveSnapshot();
+            let idx_rel =
+                pg_sys::index_open(pk_index_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+            for bc in bloom_checks {
+                // Set up scan key: _col_idx = col_idx (SMALLINT equality)
+                let mut skey = [pg_sys::ScanKeyData::default()];
+                pg_sys::ScanKeyInit(
+                    &mut skey[0],
+                    1, // attnum 1 = _col_idx
+                    pg_sys::BTEqualStrategyNumber as u16,
+                    pg_sys::F_INT2EQ.into(),
+                    pg_sys::Datum::from(bc.col_idx as i16),
+                );
+
+                #[cfg(feature = "pg17")]
+                let scan = pg_sys::index_beginscan(blooms_rel, idx_rel, snapshot, 1, 0);
+                #[cfg(feature = "pg18")]
+                let scan = pg_sys::index_beginscan(
+                    blooms_rel,
+                    idx_rel,
+                    snapshot,
+                    std::ptr::null_mut(),
+                    1,
+                    0,
+                );
+                pg_sys::index_rescan(scan, skey.as_mut_ptr(), 1, std::ptr::null_mut(), 0);
+
+                let slot = pg_sys::table_slot_create(blooms_rel, std::ptr::null_mut());
+
+                loop {
+                    if !pg_sys::index_getnext_slot(
+                        scan,
+                        pg_sys::ScanDirection::ForwardScanDirection,
+                        slot,
+                    ) {
+                        break;
+                    }
+
+                    pg_sys::slot_getallattrs(slot);
+                    let tts_values = (*slot).tts_values;
+                    let tts_isnull = (*slot).tts_isnull;
+
+                    if *tts_isnull.add(sid_att)
+                        || *tts_isnull.add(nh_att)
+                        || *tts_isnull.add(dat_att)
+                    {
+                        continue;
+                    }
+                    let seg_id = (*tts_values.add(sid_att)).value() as i32;
+
+                    if !surviving_ids.contains(&seg_id) {
+                        continue;
+                    }
+
+                    let num_hashes = (*tts_values.add(nh_att)).value() as u8;
+
+                    // Detoast bloom data
+                    let varlena_ptr = (*tts_values.add(dat_att)).cast_mut_ptr::<pg_sys::varlena>();
+                    let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                    let data_ptr = pgrx::vardata_any(detoasted);
+                    let data_len = pgrx::varsize_any_exhdr(detoasted);
+                    #[allow(clippy::unnecessary_cast)]
+                    let bloom_bytes = std::slice::from_raw_parts(data_ptr as *const u8, data_len);
+
+                    let bf = crate::bloom::BloomFilter::from_bytes(bloom_bytes, num_hashes);
+                    let any_match = bc.hashes.iter().any(|&h| bf.might_contain(h));
+
+                    if detoasted != varlena_ptr {
+                        pg_sys::pfree(detoasted as *mut _);
+                    }
+
+                    if !any_match {
+                        bloom_pruned_ids.insert(seg_id);
+                    }
+                }
+
+                pg_sys::ExecDropSingleTupleTableSlot(slot);
+                pg_sys::index_endscan(scan);
+            }
+
+            pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        }
+
+        pg_sys::table_close(blooms_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+        bloom_pruned_ids
+    }
+}
+
 /// Load segment data via two-phase scan: meta table (no TOAST) then blob table
 /// (column-major, sequential TOAST I/O per column).
 ///
@@ -1711,15 +1886,47 @@ pub(super) unsafe fn load_segments_heap(
                 let total_segments = reltuples_as_u64(meta_oid).unwrap_or_else(|| {
                     crate::scan::cost::get_segment_count(meta_oid).max(0) as u64
                 });
-                let kept = point_segments.len() as u64;
-                let skipped = total_segments.saturating_sub(kept);
 
                 let (t1_hit, t1_read) = shared_buf_snapshot();
                 buf_stats.meta_hit = t1_hit - t0_hit;
                 buf_stats.meta_read = t1_read - t0_read;
+
+                // Bloom-prune the minmax survivors: for high-cardinality
+                // columns whose per-segment [min, max] spans most of the
+                // domain, the minmax index barely prunes and the blooms do
+                // the real work (e.g. Q19 `WHERE UserID = <const>`).
+                let mut bloom_skipped: u64 = 0;
+                if !point_segments.is_empty() {
+                    let bq = &batch_quals[0];
+                    // Hash the constant exactly as compress-time bloom
+                    // insertion does: raw i64 for ints, bit pattern for
+                    // floats (see `compute_segment_blooms`).
+                    let val_i64 = match bq.type_oid {
+                        pg_sys::FLOAT4OID => (bq.const_datum.value() as u32) as i64,
+                        _ => bq.const_datum.value() as i64,
+                    };
+                    let checks = [BloomCheck {
+                        col_idx: filter_col_idx as u16,
+                        hashes: vec![crate::bloom::hash_datum_i64(val_i64)],
+                    }];
+                    let surviving: std::collections::HashSet<i32> =
+                        point_segments.iter().map(|s| s.segment_id).collect();
+                    let pruned = bloom_pruned_segment_ids(meta_oid, &checks, &surviving);
+                    if !pruned.is_empty() {
+                        bloom_skipped = pruned.len() as u64;
+                        point_segments.retain(|s| !pruned.contains(&s.segment_id));
+                    }
+                    let (tb_hit, tb_read) = shared_buf_snapshot();
+                    buf_stats.bloom_hit = tb_hit - t1_hit;
+                    buf_stats.bloom_read = tb_read - t1_read;
+                }
                 accumulate_scan_buf_stats(&buf_stats);
 
-                return (point_segments, skipped, skipped, 0, 0, 0);
+                let kept = point_segments.len() as u64;
+                let skipped = total_segments.saturating_sub(kept);
+                let minmax_skipped = skipped.saturating_sub(bloom_skipped);
+
+                return (point_segments, skipped, minmax_skipped, bloom_skipped, 0, 0);
             }
         }
 
@@ -1906,20 +2113,18 @@ pub(super) unsafe fn load_segments_heap(
         let mut nulls = vec![true; natts];
 
         // Build bloom filter checks from batch quals (Eq and InList on numeric types)
-        struct BloomCheck {
-            col_idx: u16,
-            hashes: Vec<u64>,
-        }
         // Build valbitmap checks from batch quals (text Eq on low-card columns
         // whose partition-level value list is in `column_valmap`). Each check
         // carries the bit indices the segment must contain at least one of.
-        // `prune_all = true` means the queried constant doesn't appear in
-        // ANY segment of this partition — every segment can be skipped without
-        // even reading the bitmap table.
+        // An empty `wanted_bits` means the queried constant is absent from
+        // the partition-level valmap — every segment that wrote a bitmap row
+        // fails the check and gets pruned. Segments WITHOUT a bitmap row
+        // (they overflowed VALBITMAP_MAX_DISTINCT at compress time, so the
+        // valmap doesn't cover their values) must never be pruned: the
+        // constant may well live only in them.
         struct ValbitmapCheck {
             col_idx: u16,
             wanted_bits: Vec<u8>,
-            prune_all: bool,
         }
         let mut bloom_checks: Vec<BloomCheck> = Vec::new();
         let mut valbitmap_checks: Vec<ValbitmapCheck> = Vec::new();
@@ -1982,25 +2187,20 @@ pub(super) unsafe fn load_segments_heap(
                 && let Some(ref needle) = bq.text_const
                 && let Some(values) = valmap.get(col_name)
             {
-                let bit = values.iter().position(|v| v == needle);
-                match bit {
-                    Some(idx) => {
-                        valbitmap_checks.push(ValbitmapCheck {
-                            col_idx: ci,
-                            wanted_bits: vec![idx as u8],
-                            prune_all: false,
-                        });
-                    }
-                    None => {
-                        // Constant never appeared at compress time → no segment
-                        // can match. Mark the column for "prune everything".
-                        valbitmap_checks.push(ValbitmapCheck {
-                            col_idx: ci,
-                            wanted_bits: vec![],
-                            prune_all: true,
-                        });
-                    }
-                }
+                // A valmap miss leaves `wanted_bits` empty: no segment that
+                // contributed to the valmap can match. Segments that
+                // overflowed the per-segment distinct cap contributed
+                // nothing (and have no bitmap row), so presence is still
+                // re-checked per segment below.
+                let wanted_bits: Vec<u8> = values
+                    .iter()
+                    .position(|v| v == needle)
+                    .map(|idx| vec![idx as u8])
+                    .unwrap_or_default();
+                valbitmap_checks.push(ValbitmapCheck {
+                    col_idx: ci,
+                    wanted_bits,
+                });
             }
         }
         let mut segments_bloom_skipped: u64 = 0;
@@ -2082,9 +2282,10 @@ pub(super) unsafe fn load_segments_heap(
                 }
             }
 
+            // time_max is exclusive (canonical half-open bounds).
             if let (Some(s_min), Some(s_max)) = (seg_min_time, seg_max_time)
                 && (time_min.is_some_and(|qmin| s_max < qmin)
-                    || time_max.is_some_and(|qmax| s_min > qmax))
+                    || time_max.is_some_and(|qmax| s_min >= qmax))
             {
                 segments_skipped += 1;
                 continue;
@@ -2901,167 +3102,28 @@ pub(super) unsafe fn load_segments_heap(
         buf_stats.meta_read += t1b_read - t1_read;
 
         // ================================================================
-        // Bloom phase: PK index scan per bloom-checked column to prune
-        // surviving segments. Mirrors the Phase 2 blob index-scan loop.
+        // Bloom phase: probe per-segment blooms to prune surviving segments.
         // ================================================================
         if !bloom_checks.is_empty() && !segments.is_empty() {
-            let meta_name_ptr = pg_sys::get_rel_name(meta_oid);
-            let meta_name_str = std::ffi::CStr::from_ptr(meta_name_ptr)
-                .to_string_lossy()
-                .into_owned();
-            let meta_ns_oid = pg_sys::get_rel_namespace(meta_oid);
-            let partition_name = meta_name_str
-                .strip_suffix("_meta")
-                .unwrap_or(&meta_name_str);
-            let blooms_name = format!("{}_blooms", partition_name);
-            let blooms_cname = std::ffi::CString::new(blooms_name).unwrap();
-            let blooms_oid = pg_sys::get_relname_relid(blooms_cname.as_ptr(), meta_ns_oid);
+            let surviving: std::collections::HashSet<i32> =
+                surviving_segment_ids.iter().copied().collect();
+            let bloom_pruned_ids = bloom_pruned_segment_ids(meta_oid, &bloom_checks, &surviving);
 
-            if blooms_oid != pg_sys::InvalidOid {
-                // Build surviving segment_id → segment index mapping
-                let mut seg_id_to_idx: HashMap<i32, usize> = HashMap::new();
-                for (idx, &sid) in surviving_segment_ids.iter().enumerate() {
-                    seg_id_to_idx.insert(sid, idx);
-                }
-
-                let blooms_rel =
-                    pg_sys::table_open(blooms_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
-                let blooms_tupdesc = (*blooms_rel).rd_att;
-                let blooms_natts = (*blooms_tupdesc).natts as usize;
-
-                // Locate attnos for _segment_id, _num_hashes, _data once from the tupdesc
-                let mut seg_id_att: Option<usize> = None;
-                let mut num_hashes_att: Option<usize> = None;
-                let mut data_att: Option<usize> = None;
-                for i in 0..blooms_natts {
-                    let attr = &*tupdesc_get_attr(blooms_tupdesc, i);
-                    let name =
-                        std::ffi::CStr::from_ptr(attr.attname.data.as_ptr()).to_string_lossy();
-                    if name == "_segment_id" {
-                        seg_id_att = Some(i);
-                    } else if name == "_num_hashes" {
-                        num_hashes_att = Some(i);
-                    } else if name == "_data" {
-                        data_att = Some(i);
+            // Remove bloom-pruned segments (segments and surviving_segment_ids are parallel)
+            if !bloom_pruned_ids.is_empty() {
+                let before = segments.len();
+                let mut i = 0;
+                while i < segments.len() {
+                    if bloom_pruned_ids.contains(&surviving_segment_ids[i]) {
+                        segments.swap_remove(i);
+                        surviving_segment_ids.swap_remove(i);
+                    } else {
+                        i += 1;
                     }
                 }
-
-                let pk_index_oid = primary_key_index_oid(blooms_rel);
-
-                if let (Some(sid_att), Some(nh_att), Some(dat_att), true) = (
-                    seg_id_att,
-                    num_hashes_att,
-                    data_att,
-                    pk_index_oid != pg_sys::InvalidOid,
-                ) {
-                    let snapshot = pg_sys::GetActiveSnapshot();
-                    let idx_rel = pg_sys::index_open(
-                        pk_index_oid,
-                        pg_sys::AccessShareLock as pg_sys::LOCKMODE,
-                    );
-                    let mut bloom_pruned_ids: std::collections::HashSet<i32> =
-                        std::collections::HashSet::new();
-
-                    for bc in &bloom_checks {
-                        // Set up scan key: _col_idx = col_idx (SMALLINT equality)
-                        let mut skey = [pg_sys::ScanKeyData::default()];
-                        pg_sys::ScanKeyInit(
-                            &mut skey[0],
-                            1, // attnum 1 = _col_idx
-                            pg_sys::BTEqualStrategyNumber as u16,
-                            pg_sys::F_INT2EQ.into(),
-                            pg_sys::Datum::from(bc.col_idx as i16),
-                        );
-
-                        #[cfg(feature = "pg17")]
-                        let scan = pg_sys::index_beginscan(blooms_rel, idx_rel, snapshot, 1, 0);
-                        #[cfg(feature = "pg18")]
-                        let scan = pg_sys::index_beginscan(
-                            blooms_rel,
-                            idx_rel,
-                            snapshot,
-                            std::ptr::null_mut(),
-                            1,
-                            0,
-                        );
-                        pg_sys::index_rescan(scan, skey.as_mut_ptr(), 1, std::ptr::null_mut(), 0);
-
-                        let slot = pg_sys::table_slot_create(blooms_rel, std::ptr::null_mut());
-
-                        loop {
-                            if !pg_sys::index_getnext_slot(
-                                scan,
-                                pg_sys::ScanDirection::ForwardScanDirection,
-                                slot,
-                            ) {
-                                break;
-                            }
-
-                            pg_sys::slot_getallattrs(slot);
-                            let tts_values = (*slot).tts_values;
-                            let tts_isnull = (*slot).tts_isnull;
-
-                            if *tts_isnull.add(sid_att)
-                                || *tts_isnull.add(nh_att)
-                                || *tts_isnull.add(dat_att)
-                            {
-                                continue;
-                            }
-                            let seg_id = (*tts_values.add(sid_att)).value() as i32;
-
-                            if !seg_id_to_idx.contains_key(&seg_id) {
-                                continue;
-                            }
-
-                            let num_hashes = (*tts_values.add(nh_att)).value() as u8;
-
-                            // Detoast bloom data
-                            let varlena_ptr =
-                                (*tts_values.add(dat_att)).cast_mut_ptr::<pg_sys::varlena>();
-                            let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
-                            let data_ptr = pgrx::vardata_any(detoasted);
-                            let data_len = pgrx::varsize_any_exhdr(detoasted);
-                            #[allow(clippy::unnecessary_cast)]
-                            let bloom_bytes =
-                                std::slice::from_raw_parts(data_ptr as *const u8, data_len);
-
-                            let bf = crate::bloom::BloomFilter::from_bytes(bloom_bytes, num_hashes);
-                            let any_match = bc.hashes.iter().any(|&h| bf.might_contain(h));
-
-                            if detoasted != varlena_ptr {
-                                pg_sys::pfree(detoasted as *mut _);
-                            }
-
-                            if !any_match {
-                                bloom_pruned_ids.insert(seg_id);
-                            }
-                        }
-
-                        pg_sys::ExecDropSingleTupleTableSlot(slot);
-                        pg_sys::index_endscan(scan);
-                    }
-
-                    pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
-
-                    // Remove bloom-pruned segments (segments and surviving_segment_ids are parallel)
-                    if !bloom_pruned_ids.is_empty() {
-                        let before = segments.len();
-                        let mut i = 0;
-                        while i < segments.len() {
-                            if bloom_pruned_ids.contains(&surviving_segment_ids[i]) {
-                                segments.swap_remove(i);
-                                surviving_segment_ids.swap_remove(i);
-                            } else {
-                                i += 1;
-                            }
-                        }
-                        let pruned = before - segments.len();
-                        segments_skipped += pruned as u64;
-                        segments_bloom_skipped += pruned as u64;
-                    }
-                }
-
-                pg_sys::table_close(blooms_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                let pruned = before - segments.len();
+                segments_skipped += pruned as u64;
+                segments_bloom_skipped += pruned as u64;
             }
         }
 
@@ -3075,172 +3137,159 @@ pub(super) unsafe fn load_segments_heap(
         // PK on `(_col_idx, _segment_id)`, fetch `_bits`, test the bit
         // recorded in `valmap` for the queried constant. Exact (no false
         // positives), so a clear bit guarantees the segment can be skipped.
+        //
+        // Presence is decided strictly per segment: only segments that wrote
+        // a bitmap row for the column are candidates for pruning. A segment
+        // with no row exceeded VALBITMAP_MAX_DISTINCT at compress time — its
+        // values are not covered by the partition valmap, so neither a clear
+        // bit nor a valmap miss (empty `wanted_bits`) says anything about it.
         // ----------------------------------------------------------------
         if !valbitmap_checks.is_empty() && !segments.is_empty() {
-            // First handle "constant absent from partition entirely" — no
-            // need to even open the bitmap table for those.
-            if valbitmap_checks.iter().any(|c| c.prune_all) {
-                let pruned = segments.len();
-                segments.clear();
-                surviving_segment_ids.clear();
-                segments_skipped += pruned as u64;
-                segments_valbitmap_skipped += pruned as u64;
-            } else {
-                let meta_name_ptr = pg_sys::get_rel_name(meta_oid);
-                let meta_name_str = std::ffi::CStr::from_ptr(meta_name_ptr)
-                    .to_string_lossy()
-                    .into_owned();
-                let meta_ns_oid = pg_sys::get_rel_namespace(meta_oid);
-                let partition_name = meta_name_str
-                    .strip_suffix("_meta")
-                    .unwrap_or(&meta_name_str);
-                let valbitmap_name = format!("{}_valbitmap", partition_name);
-                let valbitmap_cname = std::ffi::CString::new(valbitmap_name).unwrap();
-                let valbitmap_oid =
-                    pg_sys::get_relname_relid(valbitmap_cname.as_ptr(), meta_ns_oid);
+            let meta_name_ptr = pg_sys::get_rel_name(meta_oid);
+            let meta_name_str = std::ffi::CStr::from_ptr(meta_name_ptr)
+                .to_string_lossy()
+                .into_owned();
+            let meta_ns_oid = pg_sys::get_rel_namespace(meta_oid);
+            let partition_name = meta_name_str
+                .strip_suffix("_meta")
+                .unwrap_or(&meta_name_str);
+            let valbitmap_name = format!("{}_valbitmap", partition_name);
+            let valbitmap_cname = std::ffi::CString::new(valbitmap_name).unwrap();
+            let valbitmap_oid = pg_sys::get_relname_relid(valbitmap_cname.as_ptr(), meta_ns_oid);
 
-                if valbitmap_oid != pg_sys::InvalidOid {
-                    let mut seg_id_to_idx: HashMap<i32, usize> = HashMap::new();
-                    for (idx, &sid) in surviving_segment_ids.iter().enumerate() {
-                        seg_id_to_idx.insert(sid, idx);
+            if valbitmap_oid != pg_sys::InvalidOid {
+                let mut seg_id_to_idx: HashMap<i32, usize> = HashMap::new();
+                for (idx, &sid) in surviving_segment_ids.iter().enumerate() {
+                    seg_id_to_idx.insert(sid, idx);
+                }
+
+                let vb_rel =
+                    pg_sys::table_open(valbitmap_oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                let vb_tupdesc = (*vb_rel).rd_att;
+                let vb_natts = (*vb_tupdesc).natts as usize;
+
+                let mut seg_id_att: Option<usize> = None;
+                let mut bits_att: Option<usize> = None;
+                for i in 0..vb_natts {
+                    let attr = &*tupdesc_get_attr(vb_tupdesc, i);
+                    let name =
+                        std::ffi::CStr::from_ptr(attr.attname.data.as_ptr()).to_string_lossy();
+                    if name == "_segment_id" {
+                        seg_id_att = Some(i);
+                    } else if name == "_bits" {
+                        bits_att = Some(i);
                     }
+                }
 
-                    let vb_rel = pg_sys::table_open(
-                        valbitmap_oid,
+                let pk_index_oid = primary_key_index_oid(vb_rel);
+
+                if let (Some(sid_att), Some(bits_a), true) =
+                    (seg_id_att, bits_att, pk_index_oid != pg_sys::InvalidOid)
+                {
+                    let snapshot = pg_sys::GetActiveSnapshot();
+                    let idx_rel = pg_sys::index_open(
+                        pk_index_oid,
                         pg_sys::AccessShareLock as pg_sys::LOCKMODE,
                     );
-                    let vb_tupdesc = (*vb_rel).rd_att;
-                    let vb_natts = (*vb_tupdesc).natts as usize;
+                    let mut vb_pruned_ids: std::collections::HashSet<i32> =
+                        std::collections::HashSet::new();
 
-                    let mut seg_id_att: Option<usize> = None;
-                    let mut bits_att: Option<usize> = None;
-                    for i in 0..vb_natts {
-                        let attr = &*tupdesc_get_attr(vb_tupdesc, i);
-                        let name =
-                            std::ffi::CStr::from_ptr(attr.attname.data.as_ptr()).to_string_lossy();
-                        if name == "_segment_id" {
-                            seg_id_att = Some(i);
-                        } else if name == "_bits" {
-                            bits_att = Some(i);
-                        }
-                    }
-
-                    let pk_index_oid = primary_key_index_oid(vb_rel);
-
-                    if let (Some(sid_att), Some(bits_a), true) =
-                        (seg_id_att, bits_att, pk_index_oid != pg_sys::InvalidOid)
-                    {
-                        let snapshot = pg_sys::GetActiveSnapshot();
-                        let idx_rel = pg_sys::index_open(
-                            pk_index_oid,
-                            pg_sys::AccessShareLock as pg_sys::LOCKMODE,
+                    // Valmap-miss checks carry an empty `wanted_bits`,
+                    // so every segment with a bitmap row fails `passes`
+                    // below and is pruned; segments without a row
+                    // survive.
+                    for vc in &valbitmap_checks {
+                        let mut skey = [pg_sys::ScanKeyData::default()];
+                        pg_sys::ScanKeyInit(
+                            &mut skey[0],
+                            1, // attnum 1 = _col_idx
+                            pg_sys::BTEqualStrategyNumber as u16,
+                            pg_sys::F_INT2EQ.into(),
+                            pg_sys::Datum::from(vc.col_idx as i16),
                         );
-                        let mut vb_pruned_ids: std::collections::HashSet<i32> =
-                            std::collections::HashSet::new();
 
-                        for vc in &valbitmap_checks {
-                            if vc.prune_all {
+                        #[cfg(feature = "pg17")]
+                        let scan = pg_sys::index_beginscan(vb_rel, idx_rel, snapshot, 1, 0);
+                        #[cfg(feature = "pg18")]
+                        let scan = pg_sys::index_beginscan(
+                            vb_rel,
+                            idx_rel,
+                            snapshot,
+                            std::ptr::null_mut(),
+                            1,
+                            0,
+                        );
+                        pg_sys::index_rescan(scan, skey.as_mut_ptr(), 1, std::ptr::null_mut(), 0);
+
+                        let slot = pg_sys::table_slot_create(vb_rel, std::ptr::null_mut());
+
+                        loop {
+                            if !pg_sys::index_getnext_slot(
+                                scan,
+                                pg_sys::ScanDirection::ForwardScanDirection,
+                                slot,
+                            ) {
+                                break;
+                            }
+                            pg_sys::slot_getallattrs(slot);
+                            let tts_values = (*slot).tts_values;
+                            let tts_isnull = (*slot).tts_isnull;
+                            if *tts_isnull.add(sid_att) || *tts_isnull.add(bits_a) {
                                 continue;
                             }
-                            let mut skey = [pg_sys::ScanKeyData::default()];
-                            pg_sys::ScanKeyInit(
-                                &mut skey[0],
-                                1, // attnum 1 = _col_idx
-                                pg_sys::BTEqualStrategyNumber as u16,
-                                pg_sys::F_INT2EQ.into(),
-                                pg_sys::Datum::from(vc.col_idx as i16),
-                            );
-
-                            #[cfg(feature = "pg17")]
-                            let scan = pg_sys::index_beginscan(vb_rel, idx_rel, snapshot, 1, 0);
-                            #[cfg(feature = "pg18")]
-                            let scan = pg_sys::index_beginscan(
-                                vb_rel,
-                                idx_rel,
-                                snapshot,
-                                std::ptr::null_mut(),
-                                1,
-                                0,
-                            );
-                            pg_sys::index_rescan(
-                                scan,
-                                skey.as_mut_ptr(),
-                                1,
-                                std::ptr::null_mut(),
-                                0,
-                            );
-
-                            let slot = pg_sys::table_slot_create(vb_rel, std::ptr::null_mut());
-
-                            loop {
-                                if !pg_sys::index_getnext_slot(
-                                    scan,
-                                    pg_sys::ScanDirection::ForwardScanDirection,
-                                    slot,
-                                ) {
-                                    break;
-                                }
-                                pg_sys::slot_getallattrs(slot);
-                                let tts_values = (*slot).tts_values;
-                                let tts_isnull = (*slot).tts_isnull;
-                                if *tts_isnull.add(sid_att) || *tts_isnull.add(bits_a) {
-                                    continue;
-                                }
-                                let seg_id = (*tts_values.add(sid_att)).value() as i32;
-                                if !seg_id_to_idx.contains_key(&seg_id) {
-                                    continue;
-                                }
-
-                                let varlena_ptr =
-                                    (*tts_values.add(bits_a)).cast_mut_ptr::<pg_sys::varlena>();
-                                let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
-                                let data_ptr = pgrx::vardata_any(detoasted);
-                                let data_len = pgrx::varsize_any_exhdr(detoasted);
-                                #[allow(clippy::unnecessary_cast)]
-                                let bits =
-                                    std::slice::from_raw_parts(data_ptr as *const u8, data_len);
-
-                                // A segment passes if any wanted bit is set.
-                                let passes = vc.wanted_bits.iter().any(|&bi| {
-                                    let byte = (bi / 8) as usize;
-                                    let mask = 1u8 << (bi % 8);
-                                    byte < bits.len() && (bits[byte] & mask) != 0
-                                });
-
-                                if detoasted != varlena_ptr {
-                                    pg_sys::pfree(detoasted as *mut _);
-                                }
-
-                                if !passes {
-                                    vb_pruned_ids.insert(seg_id);
-                                }
+                            let seg_id = (*tts_values.add(sid_att)).value() as i32;
+                            if !seg_id_to_idx.contains_key(&seg_id) {
+                                continue;
                             }
 
-                            pg_sys::ExecDropSingleTupleTableSlot(slot);
-                            pg_sys::index_endscan(scan);
-                        }
+                            let varlena_ptr =
+                                (*tts_values.add(bits_a)).cast_mut_ptr::<pg_sys::varlena>();
+                            let detoasted = pg_sys::pg_detoast_datum(varlena_ptr);
+                            let data_ptr = pgrx::vardata_any(detoasted);
+                            let data_len = pgrx::varsize_any_exhdr(detoasted);
+                            #[allow(clippy::unnecessary_cast)]
+                            let bits = std::slice::from_raw_parts(data_ptr as *const u8, data_len);
 
-                        pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                            // A segment passes if any wanted bit is set.
+                            let passes = vc.wanted_bits.iter().any(|&bi| {
+                                let byte = (bi / 8) as usize;
+                                let mask = 1u8 << (bi % 8);
+                                byte < bits.len() && (bits[byte] & mask) != 0
+                            });
 
-                        if !vb_pruned_ids.is_empty() {
-                            let before = segments.len();
-                            let mut i = 0;
-                            while i < segments.len() {
-                                if vb_pruned_ids.contains(&surviving_segment_ids[i]) {
-                                    segments.swap_remove(i);
-                                    surviving_segment_ids.swap_remove(i);
-                                } else {
-                                    i += 1;
-                                }
+                            if detoasted != varlena_ptr {
+                                pg_sys::pfree(detoasted as *mut _);
                             }
-                            let pruned = before - segments.len();
-                            segments_skipped += pruned as u64;
-                            segments_valbitmap_skipped += pruned as u64;
+
+                            if !passes {
+                                vb_pruned_ids.insert(seg_id);
+                            }
                         }
+
+                        pg_sys::ExecDropSingleTupleTableSlot(slot);
+                        pg_sys::index_endscan(scan);
                     }
 
-                    pg_sys::table_close(vb_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+                    pg_sys::index_close(idx_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+
+                    if !vb_pruned_ids.is_empty() {
+                        let before = segments.len();
+                        let mut i = 0;
+                        while i < segments.len() {
+                            if vb_pruned_ids.contains(&surviving_segment_ids[i]) {
+                                segments.swap_remove(i);
+                                surviving_segment_ids.swap_remove(i);
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        let pruned = before - segments.len();
+                        segments_skipped += pruned as u64;
+                        segments_valbitmap_skipped += pruned as u64;
+                    }
                 }
+
+                pg_sys::table_close(vb_rel, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
             }
         }
 
@@ -4039,19 +4088,36 @@ pub(super) unsafe fn extract_segment_filters(
                     }
                 };
 
+                // Normalize to canonical half-open [time_min, time_max):
+                // time_min is the smallest value that matches (inclusive),
+                // time_max the smallest value that does NOT match
+                // (exclusive). Exact for the integer-datum time types
+                // (timestamp/timestamptz µs, date days), which lets the
+                // metadata-only agg paths do per-row and full-containment
+                // checks with these bounds, not just conservative pruning.
                 match effective_op {
                     ">=" | ">" => {
+                        let lo = if effective_op == ">" {
+                            ts_val.saturating_add(1)
+                        } else {
+                            ts_val
+                        };
                         // Lower bound: take the maximum of all lower bounds
                         time_min = Some(match time_min {
-                            Some(existing) => existing.max(ts_val),
-                            None => ts_val,
+                            Some(existing) => existing.max(lo),
+                            None => lo,
                         });
                     }
                     "<=" | "<" => {
+                        let hi = if effective_op == "<=" {
+                            ts_val.saturating_add(1)
+                        } else {
+                            ts_val
+                        };
                         // Upper bound: take the minimum of all upper bounds
                         time_max = Some(match time_max {
-                            Some(existing) => existing.min(ts_val),
-                            None => ts_val,
+                            Some(existing) => existing.min(hi),
+                            None => hi,
                         });
                     }
                     _ => {}

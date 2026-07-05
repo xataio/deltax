@@ -1,6 +1,6 @@
 [package]
 name = "pg_deltax"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 resolver = "3"
 license = "Apache-2.0"
@@ -27,7 +27,7 @@ lz4_flex = "0.11"
 memchr = "2"
 hashbrown = "0.15"
 ahash = "0.8"
-cardinality-estimator = "1.0"
+cardinality-estimator = { version = "1.0", features = ["with_serde"] }
 num_cpus = "1"
 regex = "1"
 parquet = { version = "55", default-features = false, features = ["zstd", "snap"] }

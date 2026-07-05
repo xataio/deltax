@@ -10,7 +10,11 @@ use std::hash::{BuildHasher, Hasher};
 const BITS_PER_ELEMENT: usize = 10;
 /// Minimum bloom filter size in bytes.
 const MIN_BLOOM_BYTES: usize = 64;
-/// Maximum bloom filter size in bytes.
+/// Maximum bloom filter size in bytes. Segments at the cap (ndistinct above
+/// ~6.5K) get fewer than the designed 10 bits/element, but the measured FPR
+/// on high-cardinality real data (ClickBench UserID) is still only ~3.5%,
+/// and a larger cap makes the per-survivor bloom detoast during the scan's
+/// bloom phase proportionally more expensive.
 const MAX_BLOOM_BYTES: usize = 8192;
 
 /// Fixed seeds for deterministic hashing across compression and query time.

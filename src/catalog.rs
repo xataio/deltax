@@ -1,5 +1,6 @@
 use pgrx::prelude::*;
 use pgrx::spi::SpiClient;
+use std::ffi::CStr;
 
 /// Metadata for a deltax-managed deltatable.
 #[derive(Debug, Clone)]
@@ -39,6 +40,31 @@ pub struct PartitionInfo {
     /// back to positional `pg_attribute` mapping in that case. See
     /// `dev/docs/SCHEMA_CHANGES.md`.
     pub compressed_columns: Option<serde_json::Value>,
+}
+
+/// True if the extension's catalog exists in the *current* database.
+///
+/// When `pg_deltax` is in `shared_preload_libraries`, its ProcessUtility /
+/// planner / executor hooks fire in every database in the cluster — including
+/// databases where `CREATE EXTENSION pg_deltax` was never run. In those
+/// databases the `deltax.*` catalog tables don't exist, so any hook that
+/// queries them hard-fails. Callers must bail
+/// out of all deltax-specific processing when this returns `false`.
+///
+/// Implemented as two syscache lookups (`get_namespace_oid` with
+/// `missing_ok = true`, then `get_relname_relid`) rather than SPI: it runs on
+/// every intercepted utility statement, raises nothing when the schema/table
+/// is absent, and is cheap enough to call unconditionally.
+pub fn catalog_present() -> bool {
+    const SCHEMA: &CStr = c"deltax";
+    const RELATION: &CStr = c"deltax_deltatable";
+    unsafe {
+        let ns_oid = pg_sys::get_namespace_oid(SCHEMA.as_ptr(), true);
+        if ns_oid == pg_sys::InvalidOid {
+            return false;
+        }
+        pg_sys::get_relname_relid(RELATION.as_ptr(), ns_oid) != pg_sys::InvalidOid
+    }
 }
 
 /// Register a new deltatable in the catalog. Returns the new deltatable id.
@@ -406,6 +432,24 @@ pub fn update_partition_column_ndistinct_from_map(
     Ok(())
 }
 
+/// Persist the serialized per-column HLL sketches for a partition into the
+/// `deltax.deltax_partition.column_hll` JSONB column. `json` is the
+/// `{col_name: <sketch>}` object produced by `compress::serialize_partition_hll`.
+/// `stats::write_table_stats` merges these across partitions for an accurate
+/// table-wide distinct count.
+pub fn update_partition_column_hll(
+    client: &mut SpiClient,
+    partition_id: i32,
+    json: &str,
+) -> spi::SpiResult<()> {
+    client.update(
+        "UPDATE deltax.deltax_partition SET column_hll = $1::jsonb WHERE id = $2",
+        None,
+        &[json.into(), partition_id.into()],
+    )?;
+    Ok(())
+}
+
 /// Persist the per-column value lists used by the segment value-presence
 /// bitmap (see `compress::compute_segment_valbitmaps` and the read-side
 /// pruner in `scan::exec::segments`). Shape on disk is
@@ -436,6 +480,77 @@ pub fn update_partition_column_valmap(
 
     client.update(
         "UPDATE deltax.deltax_partition SET column_valmap = $1::jsonb WHERE id = $2",
+        None,
+        &[json.into(), partition_id.into()],
+    )?;
+    Ok(())
+}
+
+/// Persist the summed per-value occurrence counts for low-cardinality columns
+/// on `deltax.deltax_partition.column_valcounts`. Shape on disk is
+/// `{"col_name": {"val0": count0, "val1": count1, ...}}`. Read by `stats.rs`
+/// to write real `pg_statistic.most_common_freqs` (count / row_count) instead
+/// of a uniform `1/ndistinct`. Same column set as `column_valmap` (≤ 32
+/// distinct values).
+pub fn update_partition_column_valcounts(
+    client: &mut SpiClient,
+    partition_id: i32,
+    col_valcounts: &crate::compress::ColumnValcounts,
+) -> spi::SpiResult<()> {
+    let mut parts: Vec<String> = Vec::with_capacity(col_valcounts.len());
+    let mut names: Vec<&String> = col_valcounts.keys().collect();
+    names.sort();
+    for name in names {
+        let counts = &col_valcounts[name];
+        let obj_body: Vec<String> = counts
+            .iter()
+            .map(|(v, c)| format!("\"{}\":{}", json_escape(v), c))
+            .collect();
+        parts.push(format!(
+            "\"{}\":{{{}}}",
+            json_escape(name),
+            obj_body.join(",")
+        ));
+    }
+    let json = format!("{{{}}}", parts.join(","));
+
+    client.update(
+        "UPDATE deltax.deltax_partition SET column_valcounts = $1::jsonb WHERE id = $2",
+        None,
+        &[json.into(), partition_id.into()],
+    )?;
+    Ok(())
+}
+
+/// Persist the partial MCV (heavy hitters) for high-cardinality text columns on
+/// `deltax.deltax_partition.column_mcv`. Same `{"col": {"val": count}}` shape as
+/// `column_valcounts`, but for columns the `<=32` valmap doesn't cover: `stats.rs`
+/// writes these as an MCV while keeping the real HLL `stadistinct`, so the long
+/// tail is still estimated (see `select_partial_mcv`).
+pub fn update_partition_column_mcv(
+    client: &mut SpiClient,
+    partition_id: i32,
+    col_mcv: &crate::compress::ColumnValcounts,
+) -> spi::SpiResult<()> {
+    let mut parts: Vec<String> = Vec::with_capacity(col_mcv.len());
+    let mut names: Vec<&String> = col_mcv.keys().collect();
+    names.sort();
+    for name in names {
+        let counts = &col_mcv[name];
+        let obj_body: Vec<String> = counts
+            .iter()
+            .map(|(v, c)| format!("\"{}\":{}", json_escape(v), c))
+            .collect();
+        parts.push(format!(
+            "\"{}\":{{{}}}",
+            json_escape(name),
+            obj_body.join(",")
+        ));
+    }
+    let json = format!("{{{}}}", parts.join(","));
+
+    client.update(
+        "UPDATE deltax.deltax_partition SET column_mcv = $1::jsonb WHERE id = $2",
         None,
         &[json.into(), partition_id.into()],
     )?;
@@ -615,8 +730,8 @@ pub fn rename_column_in_deltatable(
         &[deltatable_id.into(), old.into(), new.into()],
     )?;
 
-    // Rewrite the keys of column_ndistinct and column_valmap JSONB
-    // objects in every child partition. Use a CTE that re-keys with
+    // Rewrite the keys of column_ndistinct / column_valmap / column_valcounts
+    // JSONB objects in every child partition. Use a CTE that re-keys with
     // jsonb_object_agg.
     client.update(
         "UPDATE deltax.deltax_partition
@@ -635,6 +750,22 @@ pub fn rename_column_in_deltatable(
                      value
                  ) FROM jsonb_each(column_valmap))
              ELSE column_valmap
+         END,
+         column_valcounts = CASE
+             WHEN column_valcounts ? $2 THEN
+                 (SELECT jsonb_object_agg(
+                     CASE WHEN key = $2 THEN $3 ELSE key END,
+                     value
+                 ) FROM jsonb_each(column_valcounts))
+             ELSE column_valcounts
+         END,
+         column_mcv = CASE
+             WHEN column_mcv ? $2 THEN
+                 (SELECT jsonb_object_agg(
+                     CASE WHEN key = $2 THEN $3 ELSE key END,
+                     value
+                 ) FROM jsonb_each(column_mcv))
+             ELSE column_mcv
          END
          WHERE deltatable_id = $1",
         None,

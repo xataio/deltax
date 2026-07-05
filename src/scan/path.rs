@@ -1325,6 +1325,128 @@ fn agg_specs_partial_emittable(agg_specs: &[AggSpec]) -> bool {
     })
 }
 
+/// True iff a scalar (no GROUP BY) aggregate's WHERE clause is fully
+/// answerable from per-segment colstats metadata — i.e. the serial
+/// metadata fast path (`try_metadata_fast_path`) resolves the whole query
+/// without decompressing any blob. Two shapes qualify:
+///
+///   * No WHERE clause at all — COUNT / SUM / AVG / MIN / MAX over every
+///     row come straight from the stored per-segment sums / counts / minmax.
+///   * A single `col = 0` / `col <> 0` predicate on a numeric column — the
+///     `nonzero_count` colstat (populated for every sum-supporting column at
+///     compression time) answers it per segment with zero decompression.
+///
+/// For these, parallel DeltaXAgg is a pessimisation: the leader's parallel
+/// branch skips the metadata fast path and every worker decompresses the
+/// filter column, on top of ~150 ms of worker-fork overhead that dwarfs the
+/// ~20 ms metadata scan. ClickBench Q1 (`COUNT(*) WHERE AdvEngineID <> 0`)
+/// goes 219 ms → 21 ms by staying serial. GROUP BY aggregates are never
+/// affected — the caller gates on `group_specs.is_empty()`.
+///
+/// Conservative by construction: anything else (ranges, non-zero equality,
+/// multi-qual ANDs, text predicates) returns false and keeps the parallel
+/// path, which genuinely wins when real decompression is required.
+unsafe fn scalar_where_is_metadata_resolvable(root: *mut pg_sys::PlannerInfo) -> bool {
+    unsafe {
+        let parse = (*root).parse;
+        if parse.is_null() {
+            return false;
+        }
+        let jointree = (*parse).jointree;
+        if jointree.is_null() {
+            return true;
+        }
+        let mut quals = (*jointree).quals;
+        if quals.is_null() {
+            // No WHERE clause: scalar aggregate over all rows is pure metadata.
+            return true;
+        }
+        // `jointree->quals` is an implicit-AND `List` of qual expressions.
+        // A single predicate is a 1-element list; unwrap it to the bare
+        // expression. Multiple AND'd quals (length > 1) are conservatively
+        // treated as not metadata-resolvable — keep the parallel path.
+        if (*quals).type_ == pg_sys::NodeTag::T_List {
+            let list = quals as *mut pg_sys::List;
+            if (*list).length != 1 {
+                return false;
+            }
+            quals = (*(*list).elements.add(0)).ptr_value as *mut pg_sys::Node;
+            if quals.is_null() {
+                return false;
+            }
+        }
+        is_zero_comparison_opexpr(quals as *const pg_sys::Node)
+    }
+}
+
+/// True iff `node` is a single `Var = Const(0)` / `Var <> Const(0)`
+/// comparison (in either argument order, RelabelType-unwrapped). Mirrors the
+/// `OpExpr` parsing in `extract_batch_quals`.
+unsafe fn is_zero_comparison_opexpr(node: *const pg_sys::Node) -> bool {
+    unsafe {
+        if node.is_null() || (*node).type_ != pg_sys::NodeTag::T_OpExpr {
+            return false;
+        }
+        let opexpr = node as *const pg_sys::OpExpr;
+        let args = (*opexpr).args;
+        if args.is_null() || (*args).length != 2 {
+            return false;
+        }
+        let opname_ptr = pg_sys::get_opname((*opexpr).opno);
+        if opname_ptr.is_null() {
+            return false;
+        }
+        let opname = std::ffi::CStr::from_ptr(opname_ptr).to_str().unwrap_or("");
+        if opname != "=" && opname != "<>" && opname != "!=" {
+            return false;
+        }
+
+        let raw0 = (*(*args).elements.add(0)).ptr_value as *const pg_sys::Node;
+        let raw1 = (*(*args).elements.add(1)).ptr_value as *const pg_sys::Node;
+        if raw0.is_null() || raw1.is_null() {
+            return false;
+        }
+        // PG inserts RelabelType for width-coercing casts (int2→int4 etc.).
+        let unwrap = |n: *const pg_sys::Node| -> *const pg_sys::Node {
+            if !n.is_null() && (*n).type_ == pg_sys::NodeTag::T_RelabelType {
+                (*(n as *const pg_sys::RelabelType)).arg as *const pg_sys::Node
+            } else {
+                n
+            }
+        };
+        let a0 = unwrap(raw0);
+        let a1 = unwrap(raw1);
+
+        let const_node = if (*a0).type_ == pg_sys::NodeTag::T_Var
+            && (*a1).type_ == pg_sys::NodeTag::T_Const
+        {
+            a1 as *const pg_sys::Const
+        } else if (*a0).type_ == pg_sys::NodeTag::T_Const && (*a1).type_ == pg_sys::NodeTag::T_Var {
+            a0 as *const pg_sys::Const
+        } else {
+            return false;
+        };
+        if (*const_node).constisnull {
+            return false;
+        }
+        is_zero_const_datum((*const_node).constvalue, (*const_node).consttype)
+    }
+}
+
+/// Local copy of the numeric zero-test (mirrors `segments::is_zero_const`,
+/// which is private to `scan::exec`). Only the types that carry a
+/// `nonzero_count` colstat need handling.
+fn is_zero_const_datum(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> bool {
+    match type_oid {
+        pg_sys::INT2OID => datum.value() as i16 == 0,
+        pg_sys::INT4OID => datum.value() as i32 == 0,
+        pg_sys::INT8OID => datum.value() as i64 == 0,
+        pg_sys::FLOAT4OID => f32::from_bits(datum.value() as u32) == 0.0,
+        pg_sys::FLOAT8OID => f64::from_bits(datum.value() as u64) == 0.0,
+        _ => false,
+    }
+}
+
 /// Phase C.2 activation — true iff every `Var` reachable from `qual_list`
 /// has a numeric `vartype` (int / float / timestamp / date / bool). Used
 /// to gate the partial-mode CustomPath: `process_segments_compact` only
@@ -1416,6 +1538,7 @@ pub unsafe fn add_agg_partial_path(
     group_specs: &[super::exec::GroupByColSpec],
     pg_estimated_groups: f64,
     extra: *mut pg_sys::GroupPathExtraData,
+    prune_sel: f64,
 ) {
     unsafe {
         let _profile = super::plan_profile::scope("add_agg_partial_path");
@@ -1436,7 +1559,21 @@ pub unsafe fn add_agg_partial_path(
         if !agg_specs_partial_emittable(agg_specs) {
             return;
         }
-        if !group_specs.is_empty() && !super::exec::can_use_compact_keys_path(group_specs, &[]) {
+        // Grouped queries only. The partial+Gather+FinalAgg model is wired
+        // (and benchmarked) for grouped shapes; for UNGROUPED aggregates the
+        // Finalize Agg's setrefs matching against our partial tlist fails —
+        // `sum(col)` errors with "variable not found in subplan target list"
+        // and a bare `count(*)` is worse: the partial Aggref is silently left
+        // in the finalize's transition expression as an EEOP_AGGREF step,
+        // which dereferences NULL `ecxt_aggvalues` at execution — a reliable
+        // leader SEGFAULT (reproduced whenever stats or cost GUCs made this
+        // path win, e.g. `parallel_setup_cost=0`). Ungrouped shapes also gain
+        // nothing here: they emit one row and the complete path already
+        // parallelises internally. See tests/test_parallel_agg.py.
+        if group_specs.is_empty() {
+            return;
+        }
+        if !super::exec::can_use_compact_keys_path(group_specs, &[]) {
             return;
         }
         // Reject WHERE clauses that reference non-numeric columns. See
@@ -1453,6 +1590,18 @@ pub unsafe fn add_agg_partial_path(
                 }
             }
         }
+        // Scalar aggregates that the serial metadata fast path resolves with
+        // zero decompression (no filter, or a single `col = 0` / `col <> 0`
+        // predicate answered from colstats) are an order of magnitude faster
+        // serially — the parallel leader bypasses the metadata fast path and
+        // every worker decompresses the filter column, plus ~150 ms of
+        // worker-fork overhead. Keep them serial; GROUP BY aggregates and
+        // anything needing real decompression still parallelise. See
+        // `scalar_where_is_metadata_resolvable`.
+        if group_specs.is_empty() && scalar_where_is_metadata_resolvable(root) {
+            return;
+        }
+
         let workers = cost::recommend_agg_workers(companion_oids);
         if workers <= 0 {
             return;
@@ -1494,6 +1643,7 @@ pub unsafe fn add_agg_partial_path(
             estimated_rows,
             /* num_having_filters */ 0,
             workers as usize,
+            prune_sel,
         );
         (*cpath).path.startup_cost = startup;
         (*cpath).path.total_cost = total;
@@ -1566,6 +1716,7 @@ pub unsafe fn add_agg_path(
     having_filters: &[super::exec::HavingFilter],
     pg_estimated_groups: f64,
     pathkeys: *mut pg_sys::List,
+    prune_sel: f64,
 ) {
     unsafe {
         let _profile = super::plan_profile::scope("add_agg_path");
@@ -1632,6 +1783,7 @@ pub unsafe fn add_agg_path(
             estimated_rows,
             having_filters.len(),
             workers as usize,
+            prune_sel,
         );
         (*cpath).path.startup_cost = startup;
         (*cpath).path.total_cost = total;
@@ -2586,7 +2738,7 @@ thread_local! {
 /// iterates all compressed companion tables.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn add_deltax_append_path(
-    _root: *mut pg_sys::PlannerInfo,
+    root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     companion_oids: &[pg_sys::Oid],
     pathkeys: *mut pg_sys::List,
@@ -2623,7 +2775,7 @@ pub unsafe fn add_deltax_append_path(
         (*rel).pathlist = std::ptr::null_mut();
         (*rel).partial_pathlist = std::ptr::null_mut();
 
-        let cpath = build_deltax_append_path(rel, companion_oids, pathkeys, 0);
+        let cpath = build_deltax_append_path(root, rel, companion_oids, pathkeys, 0);
         pg_sys::add_path(rel, cpath as *mut pg_sys::Path);
 
         // Mark rel as non-partitioned so that apply_scanjoin_target_to_paths()
@@ -2640,7 +2792,7 @@ pub unsafe fn add_deltax_append_path(
 /// `add_deltax_append_path` so the serial wrapper's pathlist/partition
 /// reshaping has already run.
 pub unsafe fn add_partial_deltax_append_path(
-    _root: *mut pg_sys::PlannerInfo,
+    root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     companion_oids: &[pg_sys::Oid],
     pathkeys: *mut pg_sys::List,
@@ -2650,7 +2802,7 @@ pub unsafe fn add_partial_deltax_append_path(
         if workers <= 0 {
             return;
         }
-        let cpath = build_deltax_append_path(rel, companion_oids, pathkeys, workers);
+        let cpath = build_deltax_append_path(root, rel, companion_oids, pathkeys, workers);
         (*cpath).path.parallel_workers = workers;
         (*cpath).path.parallel_aware = true;
         (*cpath).path.parallel_safe = true;
@@ -2658,10 +2810,89 @@ pub unsafe fn add_partial_deltax_append_path(
     }
 }
 
+/// Estimated selectivity of the baserestrict quals that reference ONLY the
+/// table's cluster column (`order_by[0]`, or the time column when
+/// `order_by` is empty). Rows are physically ordered by that column within
+/// each partition, so matching rows occupy a contiguous run of segments and
+/// PG's selectivity estimate for those quals translates directly into
+/// "fraction of segments the executor must decode" after minmax pruning.
+///
+/// Returns 1.0 (no discount) when there is no such qual or on any lookup
+/// failure — costing then degrades to the historical full-scan estimate.
+/// Relies on the parent-level statistics `write_table_stats` maintains
+/// (histogram + HLL n_distinct), which is what makes the estimate reliable
+/// on compressed tables.
+pub(super) unsafe fn minmax_prune_selectivity(
+    root: *mut pg_sys::PlannerInfo,
+    rel: *mut pg_sys::RelOptInfo,
+) -> f64 {
+    unsafe {
+        if root.is_null() || rel.is_null() {
+            return 1.0;
+        }
+        let ris = (*rel).baserestrictinfo;
+        if ris.is_null() || (*ris).length == 0 {
+            return 1.0;
+        }
+        let rti = (*rel).relid;
+        if rti == 0 || (*root).simple_rte_array.is_null() {
+            return 1.0;
+        }
+        let rte = *(*root).simple_rte_array.add(rti as usize);
+        if rte.is_null() {
+            return 1.0;
+        }
+        let Some(cluster_col) = super::hook::table_cluster_column((*rte).relid) else {
+            return 1.0;
+        };
+        let Ok(col_cname) = std::ffi::CString::new(cluster_col) else {
+            return 1.0;
+        };
+        let attno = pg_sys::get_attnum((*rte).relid, col_cname.as_ptr());
+        if attno <= 0 {
+            return 1.0;
+        }
+
+        // Collect the clauses whose Vars are exactly {cluster_col}.
+        // pull_varattnos offsets attnos by -FirstLowInvalidHeapAttributeNumber.
+        let expect = attno as i32 - pg_sys::FirstLowInvalidHeapAttributeNumber;
+        let mut matched: *mut pg_sys::List = std::ptr::null_mut();
+        for i in 0..(*ris).length {
+            let ri = pg_sys::list_nth(ris, i) as *mut pg_sys::RestrictInfo;
+            if ri.is_null() || (*ri).clause.is_null() {
+                continue;
+            }
+            let mut attnos: *mut pg_sys::Bitmapset = std::ptr::null_mut();
+            pg_sys::pull_varattnos((*ri).clause as *mut pg_sys::Node, rti, &mut attnos);
+            if pg_sys::bms_num_members(attnos) == 1
+                && pg_sys::bms_singleton_member(attnos) == expect
+            {
+                matched = pg_sys::lappend(matched, ri as *mut core::ffi::c_void);
+            }
+        }
+        if matched.is_null() {
+            return 1.0;
+        }
+        let sel = pg_sys::clauselist_selectivity(
+            root,
+            matched,
+            rti as i32,
+            pg_sys::JoinType::JOIN_INNER,
+            std::ptr::null_mut(),
+        );
+        if sel.is_finite() {
+            sel.clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+}
+
 /// Shared construction for serial and partial DeltaXAppend paths.
 /// `workers > 0` applies the parallel cost divisor; callers then flip
 /// `parallel_aware`/`parallel_safe`/`parallel_workers` on the returned path.
 unsafe fn build_deltax_append_path(
+    root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     companion_oids: &[pg_sys::Oid],
     pathkeys: *mut pg_sys::List,
@@ -2677,33 +2908,37 @@ unsafe fn build_deltax_append_path(
         (*cpath).path.pathtarget = (*rel).reltarget;
 
         let w = if workers > 0 { workers as usize } else { 0 };
-        let mut total_startup = 0.0f64;
-        let mut total_cost = 0.0f64;
+        let mut total_segs = 0.0f64;
         let mut total_rows = 0.0f64;
         for &oid in companion_oids {
-            let (startup, cost, rows) = cost::estimate_cost_from_pg_class(oid, w, None);
-            total_startup += startup;
-            total_cost += cost;
-            total_rows += rows;
+            total_segs += cost::estimate_companion_segments(oid);
+            total_rows += cost::estimate_companion_rows(oid);
         }
         // Prefer the filter-aware estimate PG already computed for the
-        // partitioned parent rel (it sums children's post-filter rows).
-        // `rel->rows = 1.0` is PG's fallback when nothing populated
-        // `pg_class.reltuples`; if we see that, trust our companion sum
-        // instead. When parallel (workers > 0), divide the PG estimate
-        // by the parallel divisor so per-worker row counts stay
-        // consistent with the serial path.
+        // partitioned parent rel (it sums children's post-filter rows). Only
+        // fall back to the unfiltered companion sum when PG never sized the
+        // parent — gate on `rel->tuples > 0`, NOT on `rel->rows > 1`. A
+        // highly selective predicate legitimately drives `rel->rows` down to
+        // ≤1 (PG's floor), and the old `rows > 1` guard mistook that for the
+        // "unpopulated reltuples" default and threw the good estimate away,
+        // replacing it with the *full* unfiltered row count — i.e. a
+        // conjunction estimated higher than either conjunct alone. When
+        // parallel (workers > 0), divide by the parallel divisor so
+        // per-worker counts stay consistent with the serial path.
         let rel_rows = (*rel).rows;
-        let path_rows = if rel_rows > 1.0 {
-            if workers > 0 {
-                let div = cost::parallel_divisor(workers as usize);
-                rel_rows / div
-            } else {
-                rel_rows
-            }
+        let out_rows = if (*rel).tuples > 0.0 {
+            rel_rows
         } else {
             total_rows
         };
+        let path_rows = if workers > 0 {
+            out_rows / cost::parallel_divisor(workers as usize)
+        } else {
+            out_rows
+        };
+        let prune_sel = minmax_prune_selectivity(root, rel);
+        let (total_startup, total_cost) =
+            cost::deltax_append_cost(total_segs, total_rows, out_rows, prune_sel, w);
         (*cpath).path.rows = path_rows;
         (*cpath).path.startup_cost = total_startup;
         (*cpath).path.total_cost = total_cost;
@@ -2729,7 +2964,7 @@ unsafe fn build_deltax_append_path(
 /// PlanCustomPath callback for DeltaXAppend.
 #[pg_guard]
 pub unsafe extern "C-unwind" fn plan_deltax_append_path(
-    _root: *mut pg_sys::PlannerInfo,
+    root: *mut pg_sys::PlannerInfo,
     rel: *mut pg_sys::RelOptInfo,
     best_path: *mut pg_sys::CustomPath,
     tlist: *mut pg_sys::List,
@@ -2738,6 +2973,25 @@ pub unsafe extern "C-unwind" fn plan_deltax_append_path(
 ) -> *mut pg_sys::Plan {
     unsafe {
         let _profile = super::plan_profile::scope("plan_deltax_append_path");
+
+        // Register the companion tables as plan dependencies so cached
+        // plans are invalidated when compress/decompress DDL drops or
+        // recreates them. They are not in the rtable (the scan reads them
+        // directly), and with pg_deltax.flatten_partitions the child
+        // partitions aren't either — without this, a prepared statement
+        // could keep executing against dropped companions.
+        if !root.is_null() && !(*root).glob.is_null() {
+            let oid_list = (*best_path).custom_private;
+            if !oid_list.is_null() {
+                for i in 0..(*oid_list).length {
+                    (*(*root).glob).relationOids = pg_sys::lappend_oid(
+                        (*(*root).glob).relationOids,
+                        pg_sys::list_nth_oid(oid_list, i),
+                    );
+                }
+            }
+        }
+
         let cscan =
             pg_sys::palloc0(std::mem::size_of::<pg_sys::CustomScan>()) as *mut pg_sys::CustomScan;
 
@@ -2842,6 +3096,42 @@ mod tests {
         // the -1 list-sentinel used elsewhere in the wire format.
         const _: () = assert!(TOPN_SORT_COL_DERIVED < 0);
         const _: () = assert!(TOPN_SORT_COL_DERIVED != -1);
+    }
+
+    #[test]
+    fn is_zero_const_datum_matches_each_numeric_type() {
+        // Gates the serial metadata fast path for `col = 0` / `col <> 0`
+        // (ClickBench Q1). A misfire here would wrongly route a non-zero
+        // predicate to the no-decompress path — only zero must match.
+        assert!(is_zero_const_datum(
+            pg_sys::Datum::from(0i32 as usize),
+            pg_sys::INT4OID
+        ));
+        assert!(!is_zero_const_datum(
+            pg_sys::Datum::from(1i32 as usize),
+            pg_sys::INT4OID
+        ));
+        assert!(is_zero_const_datum(
+            pg_sys::Datum::from(0i16 as usize),
+            pg_sys::INT2OID
+        ));
+        assert!(is_zero_const_datum(
+            pg_sys::Datum::from(0i64 as usize),
+            pg_sys::INT8OID
+        ));
+        assert!(is_zero_const_datum(
+            pg_sys::Datum::from(0.0f32.to_bits() as usize),
+            pg_sys::FLOAT4OID
+        ));
+        assert!(!is_zero_const_datum(
+            pg_sys::Datum::from(1.5f64.to_bits() as usize),
+            pg_sys::FLOAT8OID
+        ));
+        // Non-numeric / unsupported const types never match.
+        assert!(!is_zero_const_datum(
+            pg_sys::Datum::from(0usize),
+            pg_sys::TEXTOID
+        ));
     }
 
     #[test]

@@ -2,7 +2,7 @@ mod agg;
 mod agg_wire;
 mod append_wire;
 mod batch_qual;
-mod count_minmax;
+pub(crate) mod count_minmax;
 pub(in crate::scan) mod datum_utils;
 mod decompress;
 pub(in crate::scan) mod segments;
@@ -11,6 +11,19 @@ mod text_col;
 use pgrx::pg_sys;
 
 use super::SyncStatic;
+
+/// Drop a large owned structure on a detached background thread.
+/// Freeing tens of millions of hash-map entries and arena blocks takes
+/// hundreds of milliseconds and would otherwise land on the query's
+/// critical path (it runs before the executor returns). The value must
+/// not touch PostgreSQL state on drop — plain Rust-heap data only. If
+/// the spawn fails the closure (and the value it owns) is dropped
+/// inline, so the value is always freed.
+pub(crate) fn background_drop<T: Send + 'static>(v: T) {
+    let _ = std::thread::Builder::new()
+        .name("deltax-bgdrop".into())
+        .spawn(move || drop(v));
+}
 
 // Re-exports for explain.rs
 pub(crate) use agg::AggScanState;

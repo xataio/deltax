@@ -180,6 +180,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "53a7bc4e9a7ab9239a4a46df35d75101cee57defc8e4255a1b2b6f8eab8de87e"
 dependencies = [
  "enum_dispatch",
+ "serde",
  "wyhash",
 ]
 
@@ -1214,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "pg_deltax"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ahash",
  "cardinality-estimator",

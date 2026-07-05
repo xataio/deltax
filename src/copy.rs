@@ -6,6 +6,7 @@ use std::ffi::{CStr, CString, c_char};
 use std::io::{BufRead, BufReader};
 use std::sync::atomic::{AtomicPtr, Ordering};
 
+use cardinality_estimator::CardinalityEstimator;
 use pgrx::pg_sys;
 use pgrx::pg_sys::ffi::pg_guard_ffi_boundary;
 use pgrx::prelude::*;
@@ -242,6 +243,27 @@ unsafe extern "C-unwind" fn deltax_process_utility(
     qc: *mut pg_sys::QueryCompletion,
 ) {
     let utility_stmt = unsafe { (*pstmt).utilityStmt };
+
+    // When pg_deltax is in shared_preload_libraries, this hook fires in every
+    // database in the cluster — including ones where the extension was never
+    // `CREATE EXTENSION`'d. There the `deltax.*` catalog doesn't exist, so any
+    // of the interception paths below would hard-fail. Bail to the
+    // standard executor; with no catalog there are no deltatables to manage.
+    if !crate::catalog::catalog_present() {
+        unsafe {
+            chain_to_prev(
+                pstmt,
+                query_string,
+                read_only_tree,
+                context,
+                params,
+                query_env,
+                dest,
+                qc,
+            );
+        }
+        return;
+    }
 
     // Intercept `ANALYZE <compressed_partition>` (and `VACUUM ANALYZE`)
     // before the standard executor samples our empty heap and overwrites
@@ -638,15 +660,21 @@ struct PartitionBuffer {
     typed_cols: Vec<TypedColumn>,
     row_count: usize,
     next_segment_id: i32,
+    /// Partition-level HLL sketches (one per non-segment-by column), unioned
+    /// from each segment's sketches; serialized to `column_hll` at finalize.
+    partition_hll: Vec<CardinalityEstimator<u64>>,
+    /// Partition-level top-value summary (one map per non-segment-by column,
+    /// text only) feeding the partial MCV for high-cardinality text columns.
+    partition_topvals: crate::compress::TopVals,
     blob_buffer: Vec<(u16, i32, Vec<u8>)>,
     blob_buffer_size: usize,
     bloom_buffer: Vec<(u16, i32, u8, Vec<u8>)>,
     /// Accumulated text-length sidecar blobs (col_idx, segment_id, length_blob).
     text_length_buffer: Vec<(u16, i32, Vec<u8>)>,
-    /// Per-segment distinct-value sets for low-cardinality text columns.
+    /// Per-segment (value, count) lists for low-cardinality text columns.
     /// Encoded into bitmaps in `finalize_partition` once the partition-level
-    /// value→bit_idx map is known.
-    valbitmap_value_buffer: Vec<(u16, i32, Vec<String>)>,
+    /// value→bit_idx map is known; the counts are summed into `column_valcounts`.
+    valbitmap_value_buffer: Vec<(u16, i32, crate::compress::SegValueCounts)>,
     total_compressed_size: i64,
     total_rows: i64,
     meta_table_created: bool,
@@ -936,6 +964,8 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_
             typed_cols: init_typed_columns(&columns, &kinds),
             row_count: 0,
             next_segment_id: 1,
+            partition_hll: Vec::new(),
+            partition_topvals: Vec::new(),
             blob_buffer: Vec::new(),
             blob_buffer_size: 0,
             bloom_buffer: Vec::new(),
@@ -1056,6 +1086,23 @@ fn handle_copy_from_inner(copy_stmt: *mut pg_sys::CopyStmt, format_idx: i32, is_
         // ANALYZE companion tables and update catalog
         finalize_partition(buf, &state.columns);
     }
+
+    // Populate planner statistics (per-partition histograms / MCV lists +
+    // parent-relation merged stats) now that every partition is compressed.
+    // The direct-backfill path doesn't write pg_statistic incrementally, so do
+    // it once here — otherwise the planner has no stats until someone runs
+    // deltax_analyze_table.
+    Spi::connect_mut(|client| {
+        let result = crate::compress::analyze_table_impl(client, &format!("{}.{}", schema, table));
+        if result.starts_with("Failed") || result.starts_with("No compressed") {
+            pgrx::warning!(
+                "pg_deltax: post-backfill analyze for {}.{}: {}",
+                schema,
+                table,
+                result
+            );
+        }
+    });
 
     crate::scan::invalidate_compressed_cache();
 
@@ -2165,13 +2212,19 @@ struct CompressedSegment {
     bloom_entries: Vec<(u16, u8, Vec<u8>)>, // (col_idx, num_hashes, bytes); empty if blooms disabled
     /// Per-text-column length sidecars (col_idx, length_blob).
     text_length_blobs: Vec<(u16, Vec<u8>)>,
-    /// Per-text-column distinct-value sets for low-cardinality (≤32) columns.
+    /// Per-text-column (value, count) lists for low-cardinality (≤32) columns.
     /// Encoded into bitmaps in `finalize_partition` once the partition-level
-    /// value list is finalized.
-    valbitmap_value_sets: Vec<(u16, Vec<String>)>,
+    /// value list is finalized; counts feed `column_valcounts`.
+    valbitmap_value_sets: Vec<(u16, crate::compress::SegValueCounts)>,
     meta_values_csv: String, // pre-formatted VALUES clause for thin meta
     colstats_rows_csv: Vec<String>, // pre-formatted VALUES tuples, one per non-segment-by column
     total_compressed_size: i64,
+    /// Per-non-segment-by-column HLL sketches for this segment, unioned into
+    /// the partition-level sketch on the main thread.
+    hll_sketches: Vec<CardinalityEstimator<u64>>,
+    /// Per-non-segment-by-column top-value summary for this segment (text only),
+    /// merged into the partition-level summary on the main thread → partial MCV.
+    topvals: crate::compress::TopVals,
 }
 
 /// Sort, compress, and prepare metadata for a segment (pure Rust, no PG calls).
@@ -2191,7 +2244,10 @@ fn compress_segment(
     sort_typed_columns(&mut typed_cols, order_col_indices, row_count);
 
     // Ndistinct
-    let (ndistinct, _hll_sketches) = compute_segment_ndistinct(&typed_cols, columns);
+    let (ndistinct, hll_sketches) = compute_segment_ndistinct(&typed_cols, columns);
+    // Per-segment top-value summary (text columns) for the partial MCV.
+    let mut topvals: crate::compress::TopVals = Vec::new();
+    crate::compress::merge_segment_topvals(&typed_cols, columns, &mut topvals);
 
     // Segment_by values
     let seg_values: Vec<Option<String>> = columns
@@ -2339,6 +2395,8 @@ fn compress_segment(
         meta_values_csv: meta_vals.join(", "),
         colstats_rows_csv,
         total_compressed_size: total_size,
+        hll_sketches,
+        topvals,
     }
 }
 
@@ -2367,7 +2425,13 @@ fn flush_segment(buf: &mut PartitionBuffer, state: &BackfillState) {
     let sort_ms = t_sort_start.elapsed().as_millis();
 
     // Compute ndistinct
-    let (ndistinct, _hll_sketches) = compute_segment_ndistinct(&buf.typed_cols, &state.columns);
+    let (ndistinct, hll_sketches) = compute_segment_ndistinct(&buf.typed_cols, &state.columns);
+    crate::compress::accumulate_partition_hll(&mut buf.partition_hll, &hll_sketches);
+    crate::compress::merge_segment_topvals(
+        &buf.typed_cols,
+        &state.columns,
+        &mut buf.partition_topvals,
+    );
 
     // Segment_by values from the buffered data (extract from first row if present)
     let seg_values: Vec<Option<String>> = state
@@ -2795,6 +2859,11 @@ fn write_compressed_segment(
     buf.total_compressed_size += cs.total_compressed_size;
     buf.total_rows += cs.row_count as i64;
 
+    // Union this segment's HLL sketches + top-value summary into the
+    // partition-level accumulators.
+    crate::compress::accumulate_partition_hll(&mut buf.partition_hll, &cs.hll_sketches);
+    crate::compress::merge_topvals_into(&mut buf.partition_topvals, cs.topvals);
+
     // Track segment_id for next allocation
     if cs.seg_id >= buf.next_segment_id {
         buf.next_segment_id = cs.seg_id + 1;
@@ -2865,7 +2934,8 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
     // map, drop columns that overflowed VALBITMAP_MAX_DISTINCT, encode each
     // segment's bitmap, bulk-insert. Returns the column→values map for the
     // catalog write below.
-    let column_valmap = finalize_and_insert_valbitmap(buf, columns, &ddl);
+    let (mut column_valmap, mut column_valcounts) =
+        finalize_and_insert_valbitmap(buf, columns, &ddl);
 
     spi_exec(&format!("ANALYZE {}", ddl.meta_fqn));
     spi_exec(&format!("ANALYZE {}", ddl.colstats_fqn));
@@ -2902,15 +2972,81 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
             &buf.partition_table,
         )
         .expect("failed to install compressed partition DML trigger");
-        catalog::update_partition_column_ndistinct(
+        // Per-column distinct counts: prefer the value-based HLL estimate
+        // (one sketch per non-segment column, unioned across segments). The
+        // colstats-derived fallback merges per-segment `_ndistinct` by a
+        // range-overlap heuristic, which collapses to a single segment's
+        // count (MAX, not SUM) when segments share overlapping ranges of the
+        // sort key — e.g. `order_id` ordered physically by time, where all
+        // ~154 segments span the full order_id range. That undercounts
+        // `n_distinct(order_id)` ~150x (1.7K vs 250K), making per-partition
+        // equality selectivity (and thus the child `stadistinct`) wildly
+        // wrong while the parent — which already uses the HLL — stays right.
+        // The in-memory compress path computes this map the same way.
+        // Fold segment-by columns into the catalog stat maps from the meta
+        // table's exact (segment value, _row_count) — see
+        // compress::augment_segment_by_stats. Populates valmap/valcounts
+        // (persisted below) and a segment-key ndistinct map merged into the
+        // HLL-based map.
+        let mut seg_ndistinct: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        crate::compress::augment_segment_by_stats(
             client,
-            partition_id,
-            &ddl.colstats_fqn,
-            &nd_col_names,
-        )
-        .expect("failed to update partition column_ndistinct");
+            &ddl.meta_fqn,
+            columns,
+            &mut seg_ndistinct,
+            &mut column_valmap,
+            &mut column_valcounts,
+        );
+        // Partial MCV for high-cardinality text columns (built in the HLL
+        // branch, where the per-column ndistinct estimate is available).
+        let mut column_mcv: crate::compress::ColumnValcounts = std::collections::HashMap::new();
+        if !buf.partition_hll.is_empty() && buf.partition_hll.len() == nd_col_names.len() {
+            let mut col_ndistinct: std::collections::HashMap<String, i64> = nd_col_names
+                .iter()
+                .zip(buf.partition_hll.iter())
+                .map(|(name, hll)| (name.clone(), hll.estimate() as i64))
+                .collect();
+            col_ndistinct.extend(seg_ndistinct);
+            let nd_refs: Vec<&str> = nd_col_names.iter().map(|s| s.as_str()).collect();
+            column_mcv = crate::compress::select_partial_mcv(
+                &buf.partition_topvals,
+                &nd_refs,
+                &col_ndistinct,
+                &column_valmap,
+                buf.total_rows,
+            );
+            catalog::update_partition_column_ndistinct_from_map(
+                client,
+                partition_id,
+                &col_ndistinct,
+            )
+            .expect("failed to update partition column_ndistinct");
+        } else {
+            catalog::update_partition_column_ndistinct(
+                client,
+                partition_id,
+                &ddl.colstats_fqn,
+                &nd_col_names,
+            )
+            .expect("failed to update partition column_ndistinct");
+        }
+        // Persist the partition-level HLL sketches (unioned across segments)
+        // so write_table_stats can merge them across partitions for an
+        // accurate table-wide distinct count.
+        let nd_col_refs: Vec<&str> = nd_col_names.iter().map(|s| s.as_str()).collect();
+        if let Some(hll_json) =
+            crate::compress::serialize_partition_hll(&nd_col_refs, &buf.partition_hll)
+        {
+            catalog::update_partition_column_hll(client, partition_id, &hll_json)
+                .expect("failed to update partition column_hll");
+        }
         catalog::update_partition_column_valmap(client, partition_id, &column_valmap)
             .expect("failed to update partition column_valmap");
+        catalog::update_partition_column_valcounts(client, partition_id, &column_valcounts)
+            .expect("failed to update partition column_valcounts");
+        catalog::update_partition_column_mcv(client, partition_id, &column_mcv)
+            .expect("failed to update partition column_mcv");
         catalog::update_partition_column_minmax(client, partition_id, &ddl.colstats_fqn, columns)
             .expect("failed to update partition column_minmax");
 
@@ -2938,8 +3074,9 @@ fn finalize_partition(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
 
 /// Build partition-level value→bit_idx maps from per-segment value sets,
 /// encode each segment's bitmap, bulk-insert into the valbitmap table.
-/// Returns the partition-level value list keyed by user column name (for
-/// the catalog write).
+/// Returns the partition-level value list (for `column_valmap`) plus the summed
+/// per-value occurrence counts (for `column_valcounts`), both keyed by user
+/// column name.
 ///
 /// Mirrors `compress::finalize_and_insert_valbitmaps` but uses `spi_exec`
 /// for inserts (the direct-backfill path doesn't have a long-lived
@@ -2948,45 +3085,50 @@ fn finalize_and_insert_valbitmap(
     buf: &mut PartitionBuffer,
     columns: &[ColumnMeta],
     ddl: &crate::compress::CompanionDdl,
-) -> std::collections::HashMap<String, Vec<String>> {
-    use std::collections::{BTreeSet, HashMap};
+) -> (
+    std::collections::HashMap<String, Vec<String>>,
+    crate::compress::ColumnValcounts,
+) {
+    use std::collections::{BTreeMap, HashMap};
 
     let value_buffer = std::mem::take(&mut buf.valbitmap_value_buffer);
     if value_buffer.is_empty() {
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     }
 
-    // Aggregate per-col_idx union, dropping columns that overflow.
-    let mut union_by_col: HashMap<u16, BTreeSet<String>> = HashMap::new();
+    // Aggregate per-col_idx distinct values + summed counts, dropping columns
+    // that overflow VALBITMAP_MAX_DISTINCT.
+    let mut count_by_col: HashMap<u16, BTreeMap<String, i64>> = HashMap::new();
     let mut overflow_cols: std::collections::HashSet<u16> = std::collections::HashSet::new();
     for (col_idx, _seg_id, vals) in &value_buffer {
         if overflow_cols.contains(col_idx) {
             continue;
         }
-        let entry = union_by_col.entry(*col_idx).or_default();
-        for v in vals {
-            if entry.len() >= crate::compress::VALBITMAP_MAX_DISTINCT && !entry.contains(v) {
+        let entry = count_by_col.entry(*col_idx).or_default();
+        for (v, c) in vals {
+            if entry.len() >= crate::compress::VALBITMAP_MAX_DISTINCT && !entry.contains_key(v) {
                 overflow_cols.insert(*col_idx);
-                union_by_col.remove(col_idx);
+                count_by_col.remove(col_idx);
                 break;
             }
-            entry.insert(v.clone());
+            *entry.entry(v.clone()).or_insert(0) += *c as i64;
         }
     }
 
-    if union_by_col.is_empty() {
-        return HashMap::new();
+    if count_by_col.is_empty() {
+        return (HashMap::new(), HashMap::new());
     }
 
-    // Finalize per-column sorted value list + value→bit_idx index.
+    // Finalize per-column sorted value list + value→bit_idx index (BTreeMap
+    // keys are already sorted).
     let mut finalized: HashMap<u16, (Vec<String>, HashMap<String, u8>)> = HashMap::new();
-    for (col_idx, set) in union_by_col {
-        let sorted: Vec<String> = set.into_iter().collect();
+    for (col_idx, counts) in &count_by_col {
+        let sorted: Vec<String> = counts.keys().cloned().collect();
         let mut idx: HashMap<String, u8> = HashMap::new();
         for (i, v) in sorted.iter().enumerate() {
             idx.insert(v.clone(), i as u8);
         }
-        finalized.insert(col_idx, (sorted, idx));
+        finalized.insert(*col_idx, (sorted, idx));
     }
 
     // Map non-segment-by col_idx → user column name for the catalog payload.
@@ -3016,7 +3158,7 @@ fn finalize_and_insert_valbitmap(
         let n_bits = idx_map.len();
         let n_bytes = n_bits.div_ceil(8);
         let mut bits: Vec<u8> = vec![0; n_bytes];
-        for v in &vals {
+        for (v, _c) in &vals {
             if let Some(&bit_idx) = idx_map.get(v) {
                 bits[(bit_idx / 8) as usize] |= 1u8 << (bit_idx % 8);
             }
@@ -3047,14 +3189,21 @@ fn finalize_and_insert_valbitmap(
     // those use isn't worth it here).
     spi_exec(&format!("ANALYZE {}", ddl.valbitmap_fqn));
 
-    // Build the catalog payload: column name → sorted value list.
-    let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
+    // Build the catalog payloads: column name → sorted value list (valmap) and
+    // column name → summed per-value counts (valcounts).
+    let mut valmap: HashMap<String, Vec<String>> = HashMap::new();
     for (col_idx, (vals, _)) in finalized {
         if let Some(name) = col_idx_to_name.get(&col_idx) {
-            by_name.insert(name.clone(), vals);
+            valmap.insert(name.clone(), vals);
         }
     }
-    by_name
+    let mut valcounts: crate::compress::ColumnValcounts = HashMap::new();
+    for (col_idx, counts) in count_by_col {
+        if let Some(name) = col_idx_to_name.get(&col_idx) {
+            valcounts.insert(name.clone(), counts.into_iter().collect());
+        }
+    }
+    (valmap, valcounts)
 }
 
 /// Binary search for partition by time value.

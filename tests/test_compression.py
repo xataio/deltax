@@ -4500,3 +4500,187 @@ class TestCompressAllPartitions:
         assert results == [], (
             f"expected zero eligible partitions, got {results}"
         )
+
+
+class TestJsonbCompressionFidelity:
+    """The post-INSERT compression path reads jsonb back via SPI. It must store
+    the jsonb container verbatim — NOT round-trip through serde_json, which
+    would silently round numbers outside i64/u64/f64 range.
+
+    Comparisons use server-side `::text` (jsonb_out is full-precision) rather
+    than letting psycopg parse jsonb into Python floats, which would itself lose
+    precision and mask a regression.
+    """
+
+    def _setup(self, db, table="jfidelity"):
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute(f"""
+            CREATE TABLE {table} (
+                ts TIMESTAMPTZ NOT NULL,
+                device_id TEXT NOT NULL,
+                data JSONB
+            )
+        """)
+        db.execute(
+            f"SELECT deltax.deltax_create_table('{table}', 'ts', '1 day'::interval)"
+        )
+        db.commit()
+
+    def test_high_precision_numbers_survive_compression(self, db):
+        table = "jfidelity"
+        self._setup(db, table)
+
+        # Values chosen to break a serde_json (no arbitrary_precision) round-trip:
+        # - a 29-significant-digit decimal (f64 keeps ~17)
+        # - a 30-digit integer, well beyond u64::MAX (~1.8e19)
+        # - a plain nested object as a control
+        payloads = [
+            '{"amount": 0.12345678901234567890123456789}',
+            '{"big": 123456789012345678901234567890}',
+            '{"nested": {"k": 1, "arr": [1, 2, 3]}, "s": "hello"}',
+        ]
+        for i, p in enumerate(payloads):
+            db.execute(
+                f"INSERT INTO {table} VALUES ("
+                f"'{BASE_TS}'::timestamptz + interval '{i} minutes', "
+                f"'dev-{i}', '{p}'::jsonb)"
+            )
+        db.commit()
+
+        # Canonical, full-precision text straight from PG, before compression.
+        before = db.execute(
+            f"SELECT data::text FROM {table} ORDER BY ts"
+        ).fetchall()
+        assert len(before) == len(payloads)
+
+        db.execute(
+            f"SELECT deltax.deltax_enable_compression('{table}', "
+            f"segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, table)
+
+        after = db.execute(
+            f"SELECT data::text FROM {table} ORDER BY ts"
+        ).fetchall()
+
+        assert after == before, (
+            "jsonb changed across compression — the SPI compress path is "
+            f"corrupting values.\nbefore={before}\nafter={after}"
+        )
+
+    def test_null_jsonb_survives_compression(self, db):
+        table = "jfidelity_null"
+        self._setup(db, table)
+        db.execute(
+            f"INSERT INTO {table} VALUES "
+            f"('{BASE_TS}'::timestamptz, 'dev-0', NULL), "
+            f"('{BASE_TS}'::timestamptz + interval '1 minute', 'dev-0', '{{\"a\": 1}}'::jsonb)"
+        )
+        db.commit()
+        before = db.execute(
+            f"SELECT data::text FROM {table} ORDER BY ts"
+        ).fetchall()
+
+        db.execute(
+            f"SELECT deltax.deltax_enable_compression('{table}', "
+            f"segment_by => ARRAY['device_id'], order_by => ARRAY['ts'])"
+        )
+        db.commit()
+        _compress_all_partitions(db, table)
+
+        after = db.execute(
+            f"SELECT data::text FROM {table} ORDER BY ts"
+        ).fetchall()
+        assert after == before
+        assert before[0][0] is None  # NULL preserved as NULL, not '{}'
+
+
+# ---------------------------------------------------------------------------
+# Cross-schema companion disambiguation
+# ---------------------------------------------------------------------------
+
+def test_same_named_partition_in_other_schema_not_hijacked(db):
+    """Two deltax tables with the same name in different schemas produce
+    identically-named partitions. Companion tables live in the single shared
+    `_deltax_compressed` namespace and embed only the partition NAME, so the
+    scan hook's companion lookup must verify via the catalog that the
+    (schema-qualified) partition it is planning is actually the compressed
+    one. Regression: compressing s1's partition made the hook treat s2's
+    same-named, UNCOMPRESSED partition as compressed and serve s1's data."""
+    db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+    for s in ("s1", "s2"):
+        db.execute(f"CREATE SCHEMA {s}")
+        db.execute(f"""
+            CREATE TABLE {s}.events (
+                ts  TIMESTAMPTZ NOT NULL,
+                val INT NOT NULL
+            )
+        """)
+        db.execute(
+            f"SELECT deltax.deltax_create_table('{s}.events', 'ts', "
+            "'1 day'::interval)"
+        )
+    db.commit()
+
+    # Distinct payloads per schema so any cross-wiring is visible.
+    for s, base in (("s1", 1000), ("s2", 2000)):
+        values = ", ".join(
+            f"('{BASE_TS}'::timestamptz + interval '{i} minutes', {base + i})"
+            for i in range(50)
+        )
+        db.execute(f"INSERT INTO {s}.events (ts, val) VALUES {values}")
+    db.commit()
+
+    # Sanity: the partition names collide across the two schemas.
+    parts1 = {
+        r[0]
+        for r in db.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('s1.events')"
+        ).fetchall()
+    }
+    parts2 = {
+        r[0]
+        for r in db.execute(
+            "SELECT partition_name FROM deltax.deltax_partition_info('s2.events')"
+        ).fetchall()
+    }
+    assert parts1 == parts2, f"expected colliding names, got {parts1} vs {parts2}"
+
+    # Compress only s1's data-bearing partition.
+    db.execute(
+        "SELECT deltax.deltax_enable_compression('s1.events', "
+        "order_by => ARRAY['ts'])"
+    )
+    db.commit()
+    target = None
+    for p in sorted(parts1):
+        if "default" in p:
+            continue
+        if db.execute(f'SELECT count(*) FROM s1."{p}"').fetchone()[0]:
+            target = p
+            break
+    assert target is not None
+    db.execute(f"SELECT deltax.deltax_compress_partition('s1.{target}')")
+    db.commit()
+
+    # s1 reads its data through the companion.
+    vals1 = [
+        r[0]
+        for r in db.execute("SELECT val FROM s1.events ORDER BY val").fetchall()
+    ]
+    assert vals1 == list(range(1000, 1050))
+
+    # s2 is NOT compressed — it must read its own heap, not s1's companion.
+    vals2 = [
+        r[0]
+        for r in db.execute("SELECT val FROM s2.events ORDER BY val").fetchall()
+    ]
+    assert vals2 == list(range(2000, 2050)), (
+        f"s2.events returned wrong rows — its partition was hijacked by "
+        f"s1's same-named compressed partition: {vals2[:5]}..."
+    )
+
+    # Scanning s2's partition directly must hit its heap too.
+    n = db.execute(f'SELECT count(*) FROM s2."{target}"').fetchone()[0]
+    assert n == 50, f"direct scan of s2 partition returned {n} rows"

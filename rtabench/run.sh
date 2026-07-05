@@ -18,17 +18,11 @@ for file in "$DIR/queries"/*.sql; do
 
     query="$(cat "$file")"
     for i in $(seq 1 $TRIES); do
-        # `enable_nestloop=off` is a benchmark tuning: Q17-style queries
-        # hit a NestLoop-over-Materialize plan with a 105M-row inner that
-        # runs for 30+ minutes; disabling NL forces a pair of hash joins
-        # and drops it to ~25 s. Point-lookup queries (Q07/Q10/Q11) still
-        # finish in single-digit ms on hash paths.
-        # `work_mem=8GB` keeps the 105M-row hash in a single batch (would
-        # otherwise spill to disk at 2 GB, doubling runtime).
+        # `work_mem=50MB` matches the TimescaleDB RTABench harness for an
+        # apples-to-apples comparison.
         sudo -u postgres psql test --no-psqlrc --tuples-only \
             --command "\timing on" \
-            --command "SET enable_nestloop = off" \
-            --command "SET work_mem = '8GB'" \
+            --command "SET work_mem = '50MB'" \
             --command "$query" 2>&1 | grep -P 'Time|psql: error' | tail -n1
     done
 done

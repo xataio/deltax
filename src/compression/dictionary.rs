@@ -315,6 +315,70 @@ pub fn encode_lz4(values: &[&str]) -> Vec<u8> {
     buf
 }
 
+/// Flat-decoded dictionary: all entry bytes in one owned buffer plus
+/// per-entry (offset, len) ranges into it. Avoids one `String` allocation
+/// per entry and per-entry UTF-8 validation (entries were written by our
+/// own encoder from valid PG text).
+pub struct FlatDict {
+    pub buf: Vec<u8>,
+    pub entry_ranges: Vec<(u32, u32)>,
+}
+
+/// Walk a `[4B len][bytes]…` entries blob, returning per-entry ranges into it
+/// (ranges skip the 4-byte length prefixes).
+fn entry_ranges_in(blob: &[u8], dict_size: usize) -> Vec<(u32, u32)> {
+    let mut ranges = Vec::with_capacity(dict_size);
+    let mut off = 0usize;
+    for _ in 0..dict_size {
+        let len = u32::from_le_bytes(blob[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        ranges.push((off as u32, len as u32));
+        off += len;
+    }
+    ranges
+}
+
+/// Decode a plain-`Dictionary` blob into a `FlatDict` plus per-row indices
+/// (`count` = number of non-null rows). One bulk copy of the entries region,
+/// no per-entry allocations, no UTF-8 validation.
+pub fn decode_flat(data: &[u8], count: usize) -> (FlatDict, Vec<u16>) {
+    let dict_size = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let index_width = data[4];
+    // Entries region starts right after [4B dict_size][1B width][2B empty_idx].
+    let entry_ranges = entry_ranges_in(&data[7..], dict_size);
+    let entries_len = entry_ranges.last().map_or(0, |&(o, l)| (o + l) as usize);
+    let buf = data[7..7 + entries_len].to_vec();
+    let indices_start = 7 + entries_len;
+    let mut indices = Vec::with_capacity(count);
+    for i in 0..count {
+        indices.push(read_index(data, indices_start, index_width, i));
+    }
+    (FlatDict { buf, entry_ranges }, indices)
+}
+
+/// Decode a `DictionaryLz4` blob into a `FlatDict` plus per-row indices.
+/// Decompresses only the entries blob and reads indices directly from
+/// `data` — avoids `normalize_lz4`'s full-buffer reassembly (which copies
+/// the indices array a second time).
+pub fn decode_flat_lz4(data: &[u8], count: usize) -> (FlatDict, Vec<u16>) {
+    let dict_size = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+    let index_width = data[4];
+    let lz4_blob_len = u32::from_le_bytes(data[7..11].try_into().unwrap()) as usize;
+    let buf = if lz4_blob_len > 0 {
+        lz4_flex::decompress_size_prepended(&data[11..11 + lz4_blob_len])
+            .expect("LZ4 decompression failed in DictionaryLz4")
+    } else {
+        Vec::new()
+    };
+    let entry_ranges = entry_ranges_in(&buf, dict_size);
+    let indices_start = 11 + lz4_blob_len;
+    let mut indices = Vec::with_capacity(count);
+    for i in 0..count {
+        indices.push(read_index(data, indices_start, index_width, i));
+    }
+    (FlatDict { buf, entry_ranges }, indices)
+}
+
 /// Decompress DictionaryLz4 data back to plain Dictionary wire format.
 ///
 /// Reads the LZ4-compressed dictionary entries, decompresses them, and returns

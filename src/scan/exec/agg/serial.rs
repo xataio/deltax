@@ -28,7 +28,7 @@ use super::super::datum_utils::{
 use super::super::segments::{
     MetadataInfo, SegmentData, detoast_lazy_blobs, segment_skippable_by_dict, take_scan_buf_stats,
 };
-use super::super::text_col::SegTextColumn;
+use super::super::text_col::{SegTextColumn, decompress_text_to_seg_col};
 use super::cd_set::hash128_str;
 use super::extract::{constant_extract_key_for_segment, eval_extract};
 use super::keys::{CompactGroupMap, pack_int_key_1, pack_int_keys_2, unpack_int_keys};
@@ -788,94 +788,7 @@ pub(super) unsafe fn dispatch_serial_path(
                     };
                     if needed_cols[col_idx] && text_group_cols[col_idx] {
                         let blob = &seg.compressed_blobs[blob_idx2];
-                        if !blob.is_empty() {
-                            let cc_ref = compression::CompressedColumnRef::from_bytes(blob);
-                            let total = cc_ref.row_count as usize;
-                            let nn_count = count_non_null(cc_ref.null_bitmap, total);
-
-                            let seg_col = match cc_ref.type_tag {
-                                compression::CompressionType::Dictionary
-                                | compression::CompressionType::DictionaryLz4 => {
-                                    let norm_buf;
-                                    let dict_data = if cc_ref.type_tag
-                                        == compression::CompressionType::DictionaryLz4
-                                    {
-                                        norm_buf =
-                                            compression::dictionary::normalize_lz4(cc_ref.data);
-                                        &norm_buf[..]
-                                    } else {
-                                        cc_ref.data
-                                    };
-                                    let (dict_entries, nn_indices) =
-                                        compression::dictionary::decode_dict_and_indices(
-                                            dict_data, nn_count,
-                                        );
-                                    let entries: Vec<String> =
-                                        dict_entries.iter().map(|&s| s.to_string()).collect();
-
-                                    // Expand nn_indices to full-row indices (u32::MAX for nulls)
-                                    let row_to_entry = if cc_ref.null_bitmap.is_empty() {
-                                        nn_indices.iter().map(|&idx| idx as u32).collect()
-                                    } else {
-                                        let mut re = Vec::with_capacity(total);
-                                        let mut vi = 0;
-                                        for i in 0..total {
-                                            let is_null =
-                                                (cc_ref.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
-                                            if is_null {
-                                                re.push(u32::MAX);
-                                            } else {
-                                                re.push(nn_indices[vi] as u32);
-                                                vi += 1;
-                                            }
-                                        }
-                                        re
-                                    };
-                                    SegTextColumn::Dict {
-                                        entries,
-                                        row_to_entry,
-                                    }
-                                }
-                                compression::CompressionType::Lz4
-                                | compression::CompressionType::Lz4Blocked => {
-                                    let (buf, ranges) = if cc_ref.type_tag
-                                        == compression::CompressionType::Lz4
-                                    {
-                                        compression::lz4::decode_to_ranges(cc_ref.data, nn_count)
-                                    } else {
-                                        compression::lz4::decode_to_ranges_blocked(
-                                            cc_ref.data,
-                                            nn_count,
-                                            None,
-                                        )
-                                    };
-
-                                    // Expand ranges to full-row ranges (u32::MAX for nulls)
-                                    let row_to_range = if cc_ref.null_bitmap.is_empty() {
-                                        ranges
-                                            .iter()
-                                            .map(|&(off, len)| (off as u32, len as u16))
-                                            .collect()
-                                    } else {
-                                        let mut rr = Vec::with_capacity(total);
-                                        let mut vi = 0;
-                                        for i in 0..total {
-                                            let is_null =
-                                                (cc_ref.null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
-                                            if is_null {
-                                                rr.push((u32::MAX, 0u16));
-                                            } else {
-                                                let (off, len) = ranges[vi];
-                                                rr.push((off as u32, len as u16));
-                                                vi += 1;
-                                            }
-                                        }
-                                        rr
-                                    };
-                                    SegTextColumn::Lz4 { buf, row_to_range }
-                                }
-                                _ => continue,
-                            };
+                        if let Some(seg_col) = decompress_text_to_seg_col(blob, false) {
                             seg_text_columns[col_idx] = Some(seg_col);
                         }
                     }

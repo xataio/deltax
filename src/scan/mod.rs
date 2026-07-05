@@ -2,7 +2,7 @@
 ///
 /// Installs a `set_rel_pathlist_hook` that detects compressed partitions
 /// and injects a `DeltaXDecompress` custom path/scan node.
-mod cost;
+pub(crate) mod cost;
 pub(crate) mod exec;
 mod explain;
 mod hook;

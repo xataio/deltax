@@ -235,6 +235,100 @@ unsafe fn current_agg_worker_slot() -> usize {
     }
 }
 
+/// Lower bound on the GROUP BY cardinality for the count-floor two-pass
+/// top-N gate: catalog HLL ndistinct of the most distinct single group
+/// column, summed across the scanned partitions. The group count is >=
+/// any one (bijective) key component's ndistinct. Planner estimates
+/// won't do here — `plan_rows` is clamped to the input-row estimate,
+/// which runs ~3x low. Cheap: the planner already populated the
+/// per-backend ndistinct cache for this query's partitions.
+fn compute_group_nd_hint(
+    group_specs: &[GroupByColSpec],
+    meta: &crate::scan::exec::segments::MetadataInfo,
+    companion_oids: &[pg_sys::Oid],
+    topn_limit: i64,
+    where_quals: *mut pg_sys::List,
+) -> usize {
+    if topn_limit <= 0 || !where_quals.is_null() {
+        return 0;
+    }
+    group_specs
+        .iter()
+        .filter(|gs| {
+            matches!(gs.expr, GroupByExpr::Column | GroupByExpr::AddConst { .. })
+                && (gs.col_idx as usize) < meta.col_names.len()
+        })
+        .map(|gs| {
+            let col_name = &meta.col_names[gs.col_idx as usize];
+            companion_oids
+                .iter()
+                .map(|&oid| {
+                    crate::scan::cost::get_column_ndistinct(oid)
+                        .get(col_name)
+                        .copied()
+                        .unwrap_or(0)
+                        .max(0) as usize
+                })
+                .sum()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Upper bound on the GROUP BY cardinality from catalog HLL ndistinct:
+/// the product of per-column distinct counts over the DISTINCT columns the
+/// group keys reference, saturating. Every supported `GroupByExpr` is a
+/// function of a single column, so the joint cardinality of any number of
+/// keys derived from one column is bounded by that column's ndistinct
+/// (bijections like `col - 1` preserve it, date_trunc/CASE reduce it).
+/// Per-partition counts are summed, which over-counts values shared across
+/// partitions — fine for an upper bound.
+///
+/// Returns `usize::MAX` (no cap) when any referenced column lacks a
+/// catalog count.
+///
+/// Why this exists: the planner's own group estimate degrades to "clamp at
+/// input rows" when expressions defeat its statistics (ClickBench Q35
+/// groups by `ClientIP, ClientIP-1, ClientIP-2, ClientIP-3` → estimate =
+/// full table row count), and `plan_rows` then oversizes every worker's
+/// pre-allocated group map. The catalog knows ClientIP has ~10M distinct
+/// values; use it.
+fn compute_group_nd_cap(
+    group_specs: &[GroupByColSpec],
+    meta: &crate::scan::exec::segments::MetadataInfo,
+    companion_oids: &[pg_sys::Oid],
+) -> usize {
+    let mut cols: Vec<usize> = group_specs
+        .iter()
+        .map(|gs| gs.col_idx as usize)
+        .filter(|&ci| ci < meta.col_names.len())
+        .collect();
+    if cols.len() != group_specs.len() {
+        return usize::MAX;
+    }
+    cols.sort_unstable();
+    cols.dedup();
+    let mut cap: usize = 1;
+    for ci in cols {
+        let col_name = &meta.col_names[ci];
+        let nd: usize = companion_oids
+            .iter()
+            .map(|&oid| {
+                crate::scan::cost::get_column_ndistinct(oid)
+                    .get(col_name)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0) as usize
+            })
+            .sum();
+        if nd == 0 {
+            return usize::MAX;
+        }
+        cap = cap.saturating_mul(nd);
+    }
+    cap.max(1)
+}
+
 /// Static CustomExecMethods struct for DeltaXAgg.
 pub(crate) static DELTAX_AGG_EXEC_METHODS: SyncStatic<pg_sys::CustomExecMethods> =
     SyncStatic(pg_sys::CustomExecMethods {
@@ -686,6 +780,10 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
         let sidecar_only_cols: Vec<bool> = if sidecar_candidate.iter().any(|&s| s)
             && crate::get_parallel_workers() > 1
             && estimated_rows >= SIDECAR_MIN_ROWS
+            // Mirror the no-GROUP-BY clause of can_parallel_mixed_flag below;
+            // a no-group query without batch quals won't reach the mixed
+            // dispatch, so sidecar-only loading must stay off for it.
+            && (!group_specs.is_empty() || !batch_quals.is_empty())
             && can_parallel_mixed(
                 &group_specs,
                 &needed_cols,
@@ -723,6 +821,13 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
         // Load segments from all companion tables (with lazy pruning)
         let n_workers = crate::get_parallel_workers();
         let use_lazy = n_workers > 1;
+        // Planner group-count estimate for this agg, capped by the catalog
+        // HLL ndistinct bound. `plan_rows` degrades to the full input row
+        // count when grouping expressions defeat PG's statistics (see
+        // `compute_group_nd_cap`), and it only pre-sizes worker hash maps —
+        // an over-estimate directly costs allocation and zeroing time.
+        let est_groups = ((*(*node).ss.ps.plan).plan_rows.max(0.0) as usize)
+            .min(compute_group_nd_cap(&group_specs, &meta, &companion_oids));
         let lazy_cols: Vec<bool> = needed_cols_main.clone();
         let mut all_segments: Vec<SegmentData> = Vec::new();
         let mut total_detoast_us: u64 = 0;
@@ -834,6 +939,13 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
             &meta.col_types,
             &batch_quals,
         ) {
+            let nd_hint = compute_group_nd_hint(
+                &group_specs,
+                &meta,
+                &companion_oids,
+                topn_limit,
+                where_quals,
+            );
             let state = dispatch_parallel_compact_path(
                 agg_specs,
                 group_specs,
@@ -852,116 +964,13 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 time_min,
                 time_max,
                 n_workers,
+                est_groups,
+                nd_hint,
                 use_lazy,
                 num_result_cols,
                 metadata_us,
                 heap_scan_us,
                 t_wall,
-                compact_storage.take(),
-                total_detoast_us,
-                total_cache_hits,
-                total_cache_misses,
-                total_cache_bytes_served,
-            );
-            let state_ptr = Box::into_raw(Box::new(state));
-            (*node).custom_ps = state_ptr as *mut pg_sys::List;
-            return;
-        }
-
-        // ============================================================
-        // PARALLEL MIXED PATH: multi-threaded with string GROUP BY
-        // ============================================================
-        // Try to compile regexp patterns with Rust regex for thread-safe parallel execution
-        let mut rust_regex_infos: Vec<RustRegexInfo> = Vec::new();
-        if has_regexp_group {
-            let regexp_count = group_specs
-                .iter()
-                .filter(|gs| matches!(gs.expr, GroupByExpr::RegexpReplace { .. }))
-                .count();
-            for gs in group_specs.iter() {
-                if let GroupByExpr::RegexpReplace {
-                    ref pattern,
-                    ref replacement,
-                    ..
-                } = gs.expr
-                    && let Some(compiled) = try_compile_rust_regex(pattern)
-                {
-                    let rust_replacement = convert_pg_replacement(replacement);
-                    rust_regex_infos.push(RustRegexInfo {
-                        regex: compiled,
-                        replacement: rust_replacement,
-                        col_idx: gs.col_idx as usize,
-                    });
-                }
-            }
-            if rust_regex_infos.len() != regexp_count {
-                rust_regex_infos.clear(); // all-or-nothing: if any failed, fall back entirely
-            }
-        }
-        let all_regexp_compiled = !has_regexp_group || !rust_regex_infos.is_empty();
-
-        let mut mixed_col_not_null = meta.col_not_null.clone();
-        mixed_col_not_null.resize(meta.col_names.len(), false);
-        for gs in &group_specs {
-            if !matches!(gs.expr, GroupByExpr::Extract { .. })
-                || gs.col_idx < 0
-                || (gs.col_idx as usize) >= meta.col_names.len()
-            {
-                continue;
-            }
-            let col_idx = gs.col_idx as usize;
-            let col_name = &meta.col_names[col_idx];
-            if all_segments.iter().all(|seg| {
-                seg.col_sums
-                    .get(col_name)
-                    .is_some_and(|cs| cs.nonnull_count == seg.row_count as i64)
-            }) {
-                mixed_col_not_null[col_idx] = true;
-            }
-        }
-
-        // The parallel-compact dispatch above runs and returns when its
-        // gate passes, so reaching this point means compact was ineligible.
-        let can_parallel_mixed_flag = has_group_by
-            && (n_workers > 1 || derived_minmax_topn.is_some())
-            && all_segments.len() > 1
-            && all_regexp_compiled
-            && can_parallel_mixed(
-                &group_specs,
-                &needed_cols,
-                &meta.col_types,
-                &mixed_col_not_null,
-                &batch_quals,
-                &agg_specs,
-            );
-
-        if can_parallel_mixed_flag {
-            let state = dispatch_parallel_mixed_path(
-                agg_specs,
-                group_specs,
-                &output_map,
-                &having_filters,
-                where_quals,
-                topn_limit,
-                topn_sort_col,
-                topn_ascending,
-                bare_limit,
-                derived_minmax_topn,
-                &meta,
-                &mut all_segments,
-                &needed_cols,
-                &batch_quals,
-                &seg_filters,
-                &sidecar_only_cols,
-                time_min,
-                time_max,
-                n_workers,
-                use_lazy,
-                num_result_cols,
-                metadata_us,
-                heap_scan_us,
-                t_wall,
-                rust_regex_infos,
                 compact_storage.take(),
                 total_detoast_us,
                 total_cache_hits,
@@ -977,6 +986,11 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
         // PARALLEL COUNT(DISTINCT) PATH: no GROUP BY, all aggs are
         // CountDistinct — parallelize by splitting segments across
         // threads, each builds local HashSets, then merge.
+        //
+        // Must run before the mixed path: with the no-GROUP-BY mixed
+        // relaxation, an unfiltered COUNT(DISTINCT text_col) would
+        // otherwise be claimed by mixed, losing the CD-specific
+        // partitioned merge.
         // ============================================================
         if parallel_count_distinct_eligible(
             &agg_specs,
@@ -1009,6 +1023,127 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 &mut total_cache_hits,
                 &mut total_cache_misses,
                 &mut total_cache_bytes_served,
+            );
+            let state_ptr = Box::into_raw(Box::new(state));
+            (*node).custom_ps = state_ptr as *mut pg_sys::List;
+            return;
+        }
+
+        // ============================================================
+        // PARALLEL MIXED PATH: multi-threaded with string GROUP BY
+        // (or no GROUP BY at all — single constant-key group — when
+        // there are batch quals involving a text column)
+        // ============================================================
+        // Try to compile regexp patterns with Rust regex for thread-safe parallel execution
+        let mut rust_regex_infos: Vec<RustRegexInfo> = Vec::new();
+        if has_regexp_group {
+            let regexp_count = group_specs
+                .iter()
+                .filter(|gs| matches!(gs.expr, GroupByExpr::RegexpReplace { .. }))
+                .count();
+            for gs in group_specs.iter() {
+                if let GroupByExpr::RegexpReplace {
+                    ref pattern,
+                    ref replacement,
+                    ..
+                } = gs.expr
+                    && let Some(compiled) = try_compile_rust_regex(pattern)
+                {
+                    let rust_replacement = convert_pg_replacement(replacement);
+                    rust_regex_infos.push(RustRegexInfo {
+                        regex: compiled,
+                        replacement: rust_replacement,
+                        simple: super::regex::SimplePattern::try_parse(pattern, replacement),
+                        col_idx: gs.col_idx as usize,
+                    });
+                }
+            }
+            if rust_regex_infos.len() != regexp_count {
+                rust_regex_infos.clear(); // all-or-nothing: if any failed, fall back entirely
+            }
+        }
+        let all_regexp_compiled = !has_regexp_group || !rust_regex_infos.is_empty();
+
+        let mut mixed_col_not_null = meta.col_not_null.clone();
+        mixed_col_not_null.resize(meta.col_names.len(), false);
+        for gs in &group_specs {
+            if !matches!(gs.expr, GroupByExpr::Extract { .. })
+                || gs.col_idx < 0
+                || (gs.col_idx as usize) >= meta.col_names.len()
+            {
+                continue;
+            }
+            let col_idx = gs.col_idx as usize;
+            let col_name = &meta.col_names[col_idx];
+            if all_segments.iter().all(|seg| {
+                seg.col_sums
+                    .get(col_name)
+                    .is_some_and(|cs| cs.nonnull_count == seg.row_count as i64)
+            }) {
+                mixed_col_not_null[col_idx] = true;
+            }
+        }
+
+        // The parallel-compact dispatch above runs and returns when its
+        // gate passes, so reaching this point means compact was ineligible.
+        // No-GROUP-BY shapes are admitted only when there are batch quals:
+        // unfiltered aggregates are already covered by the metadata fast
+        // path / parallel-CD path, and `can_parallel_mixed` requires the
+        // quals to involve a text column.
+        let can_parallel_mixed_flag = (has_group_by || !batch_quals.is_empty())
+            && (n_workers > 1 || derived_minmax_topn.is_some())
+            && all_segments.len() > 1
+            && all_regexp_compiled
+            && can_parallel_mixed(
+                &group_specs,
+                &needed_cols,
+                &meta.col_types,
+                &mixed_col_not_null,
+                &batch_quals,
+                &agg_specs,
+            );
+
+        if can_parallel_mixed_flag {
+            let nd_hint = compute_group_nd_hint(
+                &group_specs,
+                &meta,
+                &companion_oids,
+                topn_limit,
+                where_quals,
+            );
+            let state = dispatch_parallel_mixed_path(
+                agg_specs,
+                group_specs,
+                &output_map,
+                &having_filters,
+                where_quals,
+                topn_limit,
+                topn_sort_col,
+                topn_ascending,
+                bare_limit,
+                derived_minmax_topn,
+                &meta,
+                &mut all_segments,
+                &needed_cols,
+                &batch_quals,
+                &seg_filters,
+                &sidecar_only_cols,
+                time_min,
+                time_max,
+                n_workers,
+                est_groups,
+                nd_hint,
+                use_lazy,
+                num_result_cols,
+                metadata_us,
+                heap_scan_us,
+                t_wall,
+                rust_regex_infos,
+                compact_storage.take(),
+                total_detoast_us,
+                total_cache_hits,
+                total_cache_misses,
+                total_cache_bytes_served,
             );
             let state_ptr = Box::into_raw(Box::new(state));
             (*node).custom_ps = state_ptr as *mut pg_sys::List;
@@ -1201,6 +1336,7 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
                 time_min: ctx.time_min,
                 time_max: ctx.time_max,
                 topn_spec: ctx.topn_spec,
+                reserve_groups: 0,
             };
 
             const CHUNK: u64 = 4;
@@ -1213,7 +1349,8 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
                 }
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
-                let chunk_result = process_segments_compact(slice, &cfg);
+                let seq = std::sync::atomic::AtomicUsize::new(0);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg);
                 merge_compact_results(
                     &mut global.compact_map,
                     &mut global.compact_storage,
@@ -1420,6 +1557,7 @@ unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
                 time_min: ctx.time_min,
                 time_max: ctx.time_max,
                 topn_spec: None,
+                reserve_groups: 0,
             };
             const CHUNK: u64 = 4;
             loop {
@@ -1431,7 +1569,8 @@ unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
                 }
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
-                let chunk_result = process_segments_compact(slice, &cfg);
+                let seq = std::sync::atomic::AtomicUsize::new(0);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg);
                 merge_compact_results(
                     &mut local.compact_map,
                     &mut local.compact_storage,
@@ -1530,6 +1669,7 @@ unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
                 time_min: ctx.time_min,
                 time_max: ctx.time_max,
                 topn_spec: ctx.topn_spec,
+                reserve_groups: 0,
             };
 
             loop {
@@ -1539,7 +1679,8 @@ unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
                 }
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
-                let chunk_result = process_segments_compact(slice, &cfg);
+                let seq = std::sync::atomic::AtomicUsize::new(0);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg);
 
                 merge_compact_results(
                     &mut local.compact_map,

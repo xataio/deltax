@@ -15,6 +15,18 @@ ideas.
 
 ## What changed since the last analysis
 
+**2026-06-10:** blob-cache auto-size retuned (cap 4 → 16 GiB,
+fraction RAM/4 → RAM/6; `PERF_IMPROVEMENTS.md` #50) + dedup-aware
+partitioned merge (#51). The c6a.4xlarge now resolves to ~5.2 GiB
+of blob cache and each query's working set stays resident under the
+bench protocol — warm detoast ≈ 0 everywhere. Q20 2.00 → 1.12 s,
+Q22 4.16 → 2.80 s, Q28 8.17 → 7.80 s; the merge change adds Q32
+9.50 → 8.59 s (and −4.3 GB peak RSS, fixing an OOM at-the-edge
+condition in no-restart sessions) and Q15 −0.16 s. Bench hot total
+**58.8 → 53.4 s (−9.1%)**. The F3 "detoast dominates" finding below
+is largely obsolete for warm runs, and F4's merge numbers predate
+#51; per-query breakdowns in this doc predate both changes.
+
 Landed in the interval: CountDistinct acceleration via hashbrown +
 parallel partitioned CD merge (`PERF_IMPROVEMENTS.md` #43 fixes (a)(b)(c)).
 
@@ -97,15 +109,17 @@ noise. The follow-up (partition `CompactAccStorage` and
 cost — touches every accumulator accessor in hot code. Currently not
 prioritized.
 
-### F5. Q20/Q21/Q22 URL LIKE on LZ4 columns (unchanged)
+### F5. Q20/Q21/Q22 URL LIKE on LZ4 columns — largely fixed by #49
 
-Still the worst outliers in the benchmark. Q20 6.73 s (~22× CH), Q22
-3.62 s (5.2× CH). URL is LZ4-encoded (high cardinality), so
-dictionary-accelerated LIKE (#40) doesn't apply. Trigram bloom (#33)
-tried — ineffective on common patterns. The only remaining levers are
-pipelined detoast (already active, ~10 % help) or heavier inverted-index
-style approaches (per-(column, segment) trigram→row-set postings —
-storage-prohibitive at 100 M scale).
+**Update 2026-06-10:** Q20 was running single-threaded — no GROUP BY
+meant every parallel dispatch rejected it (see
+`PERF_IMPROVEMENTS.md` #49). With the no-GROUP-BY parallel-mixed
+relaxation plus a single-sweep memmem LIKE for LZ4 columns, Q20 went
+**4.63 s → 1.02 s** warm (the earlier 6.73 s figure predates the blob
+cache). Q22 3.46 → 3.11 s from the sweep alone. Remaining Q20 cost is
+~⅓ detoast / ⅓ LZ4 decompress / ⅓ sweep+row-loop. The older notes
+below on inverted-index approaches still apply to whatever gap
+remains vs ClickHouse, but the "22× CH" outlier status is gone.
 
 ### F6. `COUNT(DISTINCT)` on blob-backed columns (narrowed, deprioritized)
 

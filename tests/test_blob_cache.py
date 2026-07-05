@@ -102,9 +102,9 @@ def test_blob_cache_enabled_with_auto_default(db):
     """The auto-sized default (-1) resolves to a non-zero cap at
     postmaster start. bytes_max is the resolved value, not the GUC."""
     s = _stats(db)
-    # 256 MiB floor at minimum; cap at 4 GiB. Either way > 0.
+    # 256 MiB floor at minimum; cap at 16 GiB. Either way > 0.
     assert s["bytes_max"] >= 256 * 1024 * 1024
-    assert s["bytes_max"] <= 4096 * 1024 * 1024
+    assert s["bytes_max"] <= 16384 * 1024 * 1024
 
 
 def test_blob_cache_first_scan_populates_misses(db):

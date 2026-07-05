@@ -15,8 +15,8 @@ VENV         = .venv
        integration-test \
        correctness-smoke correctness correctness-fuzz correctness-clean \
        bench-clickbench bench-clickbench-keep bench-clickbench-full bench-clean \
-       bench-rtabench bench-rtabench-keep bench-rtabench-full bench-rtabench-clean \
-       bench-rtabench-distclean \
+       bench-rtabench bench-rtabench-bless bench-rtabench-keep bench-rtabench-full \
+       bench-rtabench-clean bench-rtabench-distclean \
        bench-timescaledb bench-compare bench-all \
        run-sql run-sql-file logs logs-all logs-follow release
 
@@ -243,6 +243,12 @@ bench-clean:
 # sub-GB slice of the real dataset, with per-query correctness checks.
 bench-rtabench: $(VENV)/.stamp image
 	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) $(VENV)/bin/pytest tests/bench_rtabench.py -v -s
+
+# Record the current warm times as the pinned wall-clock baseline (L5). Run
+# this deliberately after a known-good change so the regression gate (Phase F)
+# checks against an intentional reference, not a drifting previous run.
+bench-rtabench-bless: $(VENV)/.stamp image
+	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) RTABENCH_BLESS=1 $(VENV)/bin/pytest tests/bench_rtabench.py -v -s
 
 bench-rtabench-full: $(VENV)/.stamp image
 	PG_DELTAX_IMAGE=pg_deltax:pg$(PG_MAJOR) RTABENCH_ORDERS=10010342 $(VENV)/bin/pytest tests/bench_rtabench.py -v -s
