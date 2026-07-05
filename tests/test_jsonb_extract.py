@@ -914,3 +914,198 @@ class TestJsonBenchQ2AggPushdown:
             f"and mode='fields':\n  none={none}\n  fields={fields}"
         )
         assert len(fields) > 0, "no hour groups; fixture or pushdown broken"
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: jsonb sub-object / array extraction (`type: "jsonb"`).
+#
+# Extracts a whole sub-value (object or array) into a narrow jsonb companion
+# column so containment / other jsonb ops run against the small extracted value
+# instead of decompressing+reparsing the full row. Mirrors RTABench Q04/Q08,
+# which filter on `event_payload -> 'status' @> '[...]'` (status is an array).
+# ---------------------------------------------------------------------------
+
+# Low-cardinality status combinations mirroring the real RTABench distribution
+# (see memory project_rtabench_status_cardinality): mostly length-1, one
+# length-2 combo `[Delayed, Priority]`.
+_STATUS_COMBOS = [
+    ["Pending"], ["Processing"], ["Departed"], ["Delayed", "Priority"],
+    ["Priority"], ["Delivered"], ["Cancelled"],
+]
+_TERMINALS = ["Berlin", "London", "Athens"]
+
+
+def _setup_arr(conn, table_name="oe"):
+    conn.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+    conn.execute(f"""
+        CREATE TABLE {table_name} (
+            ts TIMESTAMPTZ NOT NULL,
+            event_payload JSONB NOT NULL
+        )
+    """)
+    conn.execute(
+        f"SELECT deltax.deltax_create_table('{table_name}', 'ts', '1 day'::interval, 5)"
+    )
+    conn.commit()
+
+
+def _enable_arr(conn, table_name="oe", segment_size=50):
+    extract = json.dumps([
+        {"src": "event_payload", "path": ["status"], "name": "x_status", "type": "jsonb"},
+        {"src": "event_payload", "path": ["delivery"], "name": "x_delivery", "type": "jsonb"},
+        {"src": "event_payload", "path": ["terminal"], "name": "x_terminal", "type": "text"},
+    ])
+    conn.execute(f"""
+        SELECT deltax.deltax_enable_compression(
+            '{table_name}',
+            order_by => ARRAY['ts'],
+            segment_size => {segment_size},
+            json_extract => %s::jsonb
+        )
+    """, (extract,))
+    conn.execute("SET pg_deltax.json_extract_mode = 'fields'")
+    conn.commit()
+
+
+def _backfill_arr(conn, table_name="oe", n=400, seed=7):
+    """Direct-backfill (COPY FORMAT deltax_compress) so rows are compressed and
+    the synthetic jsonb columns are actually populated at COPY time."""
+    rng = random.Random(seed)
+    rows = []
+    for i in range(n):
+        ts = f"2025-01-15 {(i // 100):02d}:{(i % 60):02d}:00+00"
+        payload = {
+            "status": rng.choice(_STATUS_COMBOS),
+            "terminal": rng.choice(_TERMINALS),
+            "delivery": {"carrier": rng.choice(["dhl", "ups", "fedex"]), "express": bool(i % 2)},
+        }
+        rows.append((ts, json.dumps(payload)))
+    text = "\n".join(f"{ts}\t{payload}" for ts, payload in rows) + "\n"
+    with conn.cursor() as cur:
+        with cur.copy(f"COPY {table_name} FROM STDIN WITH (FORMAT deltax_compress)") as cp:
+            cp.write(text)
+    conn.commit()
+
+
+class TestJsonbSubObjectExtract:
+    # Queries mirror RTABench Q04/Q08 shape: `... GROUP BY <day> ... WHERE
+    # status @> '[...]'` — a grouped aggregate with output columns, which is
+    # what the feature actually targets. (The pure `count(*)`-filter-only shape
+    # hits a separate, pre-existing DeltaXDecompress limitation — see
+    # TestJsonbContainmentCountStar below.)
+
+    def test_array_containment_single(self, db):
+        _setup_arr(db); _enable_arr(db); _backfill_arr(db)
+        none, fields = _ab(
+            db,
+            "SELECT date_trunc('day', ts) AS d, count(*) FROM oe "
+            "WHERE event_payload -> 'status' @> '[\"Delayed\"]' GROUP BY 1 ORDER BY 1",
+        )
+        assert none == fields
+        assert sum(r[1] for r in fields) > 0, "no rows matched; fixture or extraction broken"
+
+    def test_array_containment_multi(self, db):
+        _setup_arr(db); _enable_arr(db); _backfill_arr(db)
+        none, fields = _ab(
+            db,
+            "SELECT date_trunc('day', ts) AS d, count(*) FROM oe "
+            "WHERE event_payload -> 'status' @> '[\"Delayed\", \"Priority\"]' "
+            "GROUP BY 1 ORDER BY 1",
+        )
+        assert none == fields
+        assert sum(r[1] for r in fields) > 0
+
+    def test_array_containment_absent_label(self, db):
+        # A label that never appears: must return the same (empty) result.
+        _setup_arr(db); _enable_arr(db); _backfill_arr(db)
+        none, fields = _ab(
+            db,
+            "SELECT date_trunc('day', ts) AS d, count(*) FROM oe "
+            "WHERE event_payload -> 'status' @> '[\"Nonexistent\"]' GROUP BY 1 ORDER BY 1",
+        )
+        assert none == fields
+        assert fields == []
+
+    def test_subobject_containment(self, db):
+        # Extract a whole nested object as jsonb; `@>` runs against it.
+        _setup_arr(db); _enable_arr(db); _backfill_arr(db)
+        none, fields = _ab(
+            db,
+            "SELECT date_trunc('day', ts) AS d, count(*) FROM oe "
+            "WHERE event_payload -> 'delivery' @> '{\"carrier\":\"dhl\"}' GROUP BY 1 ORDER BY 1",
+        )
+        assert none == fields
+        assert sum(r[1] for r in fields) > 0
+
+    def test_extracted_jsonb_roundtrip(self, db):
+        # Select the extracted array back out; group by its text rendering.
+        _setup_arr(db); _enable_arr(db); _backfill_arr(db)
+        none, fields = _ab(
+            db,
+            "SELECT (event_payload -> 'status')::text AS s, count(*) FROM oe "
+            "GROUP BY 1 ORDER BY 1",
+        )
+        assert none == fields
+        assert len(fields) == len(_STATUS_COMBOS)
+
+    def test_mixed_with_scalar_extract(self, db):
+        # jsonb sub-object extract alongside the existing text `terminal` extract.
+        _setup_arr(db); _enable_arr(db); _backfill_arr(db)
+        none, fields = _ab(
+            db,
+            "SELECT event_payload ->> 'terminal' AS t, count(*) FROM oe "
+            "WHERE event_payload -> 'status' @> '[\"Priority\"]' "
+            "GROUP BY 1 ORDER BY 1",
+        )
+        assert none == fields
+        assert len(fields) > 0
+
+    def test_whole_payload_containment(self, db):
+        # `@>` directly on the physical jsonb column (no extraction involved).
+        # Exercises the batch-qual per-row fallback on non-dict blobs: with
+        # the qual batch-folded, ExecQual is skipped and the fold IS the
+        # filter — results must still match plain evaluation.
+        _setup_arr(db); _enable_arr(db); _backfill_arr(db)
+        none, fields = _ab(
+            db,
+            "SELECT date_trunc('day', ts) AS d, count(*) FROM oe "
+            "WHERE event_payload @> '{\"terminal\":\"Berlin\"}' GROUP BY 1 ORDER BY 1",
+        )
+        assert none == fields
+        assert sum(r[1] for r in fields) > 0
+
+    def test_containment_with_order_by_limit(self, db):
+        # ORDER BY + LIMIT + `@>`: the Top-N scan path cannot evaluate jsonb
+        # containment on its worker threads and must fall back to the normal
+        # scan path (not silently drop the filter).
+        _setup_arr(db); _enable_arr(db); _backfill_arr(db)
+        none, fields = _ab(
+            db,
+            "SELECT ts, event_payload ->> 'terminal' FROM oe "
+            "WHERE event_payload -> 'status' @> '[\"Delayed\"]' "
+            "ORDER BY ts DESC, 2 LIMIT 7",
+        )
+        assert none == fields
+        assert len(fields) == 7
+
+
+class TestJsonbContainmentCountStar:
+    """Pre-existing DeltaXDecompress limitation, surfaced (not caused) by jsonb
+    extraction. A query with ZERO output columns whose only reference to a
+    synthetic column is in the scan qual (e.g. `SELECT count(*) ... WHERE
+    <synthetic> ...`) crashes with `invalid attribute number 1`: the scan slot
+    is built 0-wide but the rewritten `Var(INDEX_VAR, k)` qual needs slot k.
+
+    This also reproduces with a TEXT synthetic when aggregate pushdown is
+    defeated (e.g. `count(*) WHERE upper(data->>'x') = '...'`); jsonb `@>` just
+    hits it readily because `@>` never gets pushdown. Tracked for a separate
+    executor fix (widen the scan slot to cover qual-referenced synthetics)."""
+
+    @pytest.mark.xfail(reason="pre-existing: 0-output + synthetic-only-in-qual scan slot", strict=True)
+    def test_count_star_filter_only(self, db):
+        _setup_arr(db); _enable_arr(db); _backfill_arr(db)
+        none, fields = _ab(
+            db,
+            "SELECT count(*) FROM oe WHERE event_payload -> 'status' @> '[\"Delayed\"]'",
+        )
+        assert none == fields
