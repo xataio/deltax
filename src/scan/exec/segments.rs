@@ -586,7 +586,10 @@ pub(super) fn segment_all_rows_pass(
                 None
             }
         }
-        BatchCompareOp::InList | BatchCompareOp::Like | BatchCompareOp::NotLike => None,
+        BatchCompareOp::InList
+        | BatchCompareOp::Like
+        | BatchCompareOp::NotLike
+        | BatchCompareOp::JsonbContains => None,
     }
 }
 
@@ -870,6 +873,35 @@ pub(super) fn segment_skippable_by_dict(
         }
     }
 
+    false
+}
+
+/// jsonb twin of `segment_skippable_by_dict`: for each `JsonbContains` batch
+/// qual on a dict-encoded jsonb column, skip the segment when no dictionary
+/// entry contains the template — no row can match.
+///
+/// Kept separate from `segment_skippable_by_dict` because the containment
+/// check calls PG's `jsonb_contains` (palloc/fmgr), and that function is also
+/// invoked from internal-thread agg paths that must stay free of PG calls.
+/// Call this only from backend-thread scan loops.
+pub(super) unsafe fn segment_skippable_by_jsonb_dict(
+    batch_quals: &[BatchQual],
+    blob_idx_map: &[Option<u16>],
+    compressed_blobs: &[BlobBytes],
+) -> bool {
+    for bq in batch_quals {
+        if bq.op != BatchCompareOp::JsonbContains {
+            continue;
+        }
+        let Some(blob_idx) = blob_idx_map.get(bq.col_idx).copied().flatten() else {
+            continue;
+        };
+        let blob = &compressed_blobs[blob_idx as usize];
+        match unsafe { super::datum_utils::jsonb_dict_any_entry_contains(blob, bq.const_datum) } {
+            Some(false) => return true, // no dict entry contains the template
+            _ => continue,              // matches, or not dict-encoded
+        }
+    }
     false
 }
 

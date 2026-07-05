@@ -11,13 +11,15 @@ use super::batch_qual::{
 };
 use super::datum_utils::{
     decompress_blob_to_datums, decompress_blob_to_datums_truncated,
-    decompress_jsonb_blob_with_selection, decompress_text_blob_with_eq_filter,
-    decompress_text_blob_with_in_filter, decompress_text_blob_with_like_filter,
-    decompress_text_blob_with_selection, exec_project, exec_qual, pg_type_name, string_to_datum,
+    decompress_jsonb_blob_with_contains_filter, decompress_jsonb_blob_with_selection,
+    decompress_text_blob_with_eq_filter, decompress_text_blob_with_in_filter,
+    decompress_text_blob_with_like_filter, decompress_text_blob_with_selection, exec_project,
+    exec_qual, pg_type_name, string_to_datum,
 };
 use super::segments::{
     SegmentData, detoast_lazy_blobs, detoast_lazy_blobs_selective, extract_segment_filters,
     fetch_segment_blobs, load_segments_heap, segment_skippable_by_dict,
+    segment_skippable_by_jsonb_dict,
 };
 use super::text_col::{
     TextQualInfo, apply_text_eq_filter, apply_text_in_filter, apply_text_like_filter,
@@ -754,8 +756,14 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
 
         // Extract batch quals early — we need to know which extra columns to load
         let plan_qual = (*(*node).ss.ps.plan).qual;
-        let (batch_quals, handled_count) =
+        let (mut batch_quals, mut handled_count) =
             extract_batch_quals(plan_qual, &meta.col_names, &meta.col_types);
+        super::batch_qual::drop_segmentby_jsonb_contains_quals(
+            &mut batch_quals,
+            &mut handled_count,
+            &meta.col_names,
+            &meta.segment_by,
+        );
         let nquals = if plan_qual.is_null() {
             0
         } else {
@@ -998,8 +1006,14 @@ fn load_decompress_state(
     let metadata_us = t0.elapsed().as_micros() as u64;
 
     // Extract batch quals early — we need to know which extra columns to load
-    let (batch_quals, handled_count) =
+    let (mut batch_quals, mut handled_count) =
         unsafe { extract_batch_quals(plan_qual, &meta.col_names, &meta.col_types) };
+    super::batch_qual::drop_segmentby_jsonb_contains_quals(
+        &mut batch_quals,
+        &mut handled_count,
+        &meta.col_names,
+        &meta.segment_by,
+    );
     let nquals = if plan_qual.is_null() {
         0
     } else {
@@ -1833,6 +1847,10 @@ unsafe fn exec_topn_two_pass(
                             && bq.in_list_text.is_some()
                             && bq.op == BatchCompareOp::InList
                     });
+                    let jsonb_contains_qual = state
+                        .batch_quals
+                        .iter()
+                        .find(|bq| bq.col_idx == col_idx && bq.op == BatchCompareOp::JsonbContains);
                     let has_any_batch_qual =
                         state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
 
@@ -1856,6 +1874,16 @@ unsafe fn exec_topn_two_pass(
                         let strs = bq.in_list_text.as_ref().unwrap();
                         let (datums, sel) = decompress_text_blob_with_in_filter(
                             blob, type_oid, typmod, strs, /* is_not_in */ false, cutoff_row,
+                        );
+                        decompressed.push(datums);
+                        merge_and_selection(&mut pre_selection, sel);
+                    } else if let Some(bq) = jsonb_contains_qual {
+                        // jsonb `@>` folded into decompression: dict-encoded
+                        // segments evaluate containment once per dict entry.
+                        let (datums, sel) = decompress_jsonb_blob_with_contains_filter(
+                            blob,
+                            bq.const_datum,
+                            cutoff_row,
                         );
                         decompressed.push(datums);
                         merge_and_selection(&mut pre_selection, sel);
@@ -3659,6 +3687,24 @@ unsafe fn exec_topn(
         // Two-pass execution (first call only): sort all qualifying rows, then
         // re-enter exec_custom_scan to start emitting from the buffer.
         if state.topn_limit > 0 && !state.topn_done && state.topn_sort_col.is_some() {
+            // jsonb `@>` quals can't run on the Top-N internal worker threads
+            // (jsonb_contains is a PG call, backend-thread only) and the
+            // Top-N candidate collectors would silently skip them — wrong
+            // results. Fall back to the normal scan path.
+            if state
+                .batch_quals
+                .iter()
+                .any(|bq| bq.op == BatchCompareOp::JsonbContains)
+            {
+                for seg in state.segments_data.iter_mut() {
+                    let dl = detoast_lazy_blobs(seg);
+                    state.timing.fold_detoast_stats(dl);
+                }
+                state.topn_limit = 0;
+                state.segment_index = 0;
+                state.topn_done = true;
+                return None;
+            }
             let plan_qual_list = (*(*node).ss.ps.plan).qual;
             if state.topn_sort_is_text {
                 exec_topn_text(node, state, instrument, plan_qual_list);
@@ -3857,6 +3903,21 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
                 continue;
             }
 
+            // Dictionary-based jsonb `@>` pruning: if no distinct value in a
+            // dict-encoded jsonb column contains the template, no row can.
+            // Separate from segment_skippable_by_dict because jsonb_contains
+            // is a PG call — this loop runs on the backend thread, but
+            // segment_skippable_by_dict is shared with the internal-thread
+            // agg paths and must stay free of PG calls.
+            if segment_skippable_by_jsonb_dict(
+                &state.batch_quals,
+                &state.blob_idx,
+                &seg.compressed_blobs,
+            ) {
+                state.timing.segments_skipped += 1;
+                continue;
+            }
+
             let t_decompress = if instrument {
                 Some(Instant::now())
             } else {
@@ -3946,6 +4007,10 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
                             && bq.in_list_text.is_some()
                             && bq.op == BatchCompareOp::InList
                     });
+                    let jsonb_contains_qual = state
+                        .batch_quals
+                        .iter()
+                        .find(|bq| bq.col_idx == col_idx && bq.op == BatchCompareOp::JsonbContains);
                     let has_any_batch_qual =
                         state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
 
@@ -3970,6 +4035,13 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
                         let (datums, sel) = decompress_text_blob_with_in_filter(
                             blob, type_oid, typmod, strs, /* is_not_in */ false, None,
                         );
+                        decompressed.push(datums);
+                        merge_and_selection(&mut pre_selection, sel);
+                    } else if let Some(bq) = jsonb_contains_qual {
+                        // jsonb `@>` folded into decompression: dict-encoded
+                        // segments evaluate containment once per dict entry.
+                        let (datums, sel) =
+                            decompress_jsonb_blob_with_contains_filter(blob, bq.const_datum, None);
                         decompressed.push(datums);
                         merge_and_selection(&mut pre_selection, sel);
                     } else if has_any_batch_qual {
@@ -4384,8 +4456,14 @@ pub(super) unsafe extern "C-unwind" fn init_worker_deltax_append(
         // Now that col_names / col_types are live, rebuild qual-driven state
         // that the leader built in `begin_deltax_append`.
         let plan_qual = (*(*node).ss.ps.plan).qual;
-        let (batch_quals, handled_count) =
+        let (mut batch_quals, mut handled_count) =
             extract_batch_quals(plan_qual, &state.col_names, &state.col_types);
+        super::batch_qual::drop_segmentby_jsonb_contains_quals(
+            &mut batch_quals,
+            &mut handled_count,
+            &state.col_names,
+            &state.segment_by,
+        );
         let nquals = if plan_qual.is_null() {
             0
         } else {

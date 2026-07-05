@@ -1531,6 +1531,217 @@ pub(super) unsafe fn decompress_jsonb_blob_with_selection(
     }
 }
 
+unsafe extern "C-unwind" {
+    /// PG's `jsonb_contains(fcinfo)` C symbol. `pg_sys::jsonb_contains` wraps
+    /// it in a Rust-ABI `pg_guard` shim, which can't be passed to
+    /// `DirectFunctionCall2Coll` (it expects a raw C-unwind fn pointer).
+    #[link_name = "jsonb_contains"]
+    fn jsonb_contains_raw(fcinfo: pg_sys::FunctionCallInfo) -> pg_sys::Datum;
+}
+
+/// Evaluate `entry @> tmpl_datum` where `entry` is the header-less binary
+/// jsonb payload as stored in the companion blob and `tmpl_datum` is a jsonb
+/// Const datum from the plan tree. Builds a temporary varlena around the
+/// entry bytes and calls PG's `jsonb_contains`.
+///
+/// Backend-thread only: `jsonb_contains` is a PG function (palloc, fmgr).
+/// Callers are the Phase-1 blob fold and dict-based segment skipping, both of
+/// which run on the leader / PG parallel-worker backends — never on the
+/// internal `std::thread::scope` workers.
+unsafe fn jsonb_bytes_contains(entry: &[u8], tmpl_datum: pg_sys::Datum) -> bool {
+    unsafe {
+        let total_len = pg_sys::VARHDRSZ + entry.len();
+        let ptr = pg_sys::palloc(total_len) as *mut pg_sys::varlena;
+        pgrx::set_varsize_4b(ptr, total_len as i32);
+        std::ptr::copy_nonoverlapping(
+            entry.as_ptr(),
+            (ptr as *mut u8).add(pg_sys::VARHDRSZ),
+            entry.len(),
+        );
+        let result = pg_sys::DirectFunctionCall2Coll(
+            Some(jsonb_contains_raw),
+            pg_sys::InvalidOid,
+            pg_sys::Datum::from(ptr),
+            tmpl_datum,
+        );
+        pg_sys::pfree(ptr as *mut _);
+        result.value() != 0
+    }
+}
+
+/// Decompress a jsonb column blob with `@>` containment filtering pushed into
+/// decompression. Mirrors `decompress_text_blob_with_eq_filter`: for
+/// dictionary-compressed data the containment predicate runs **once per dict
+/// entry** (O(dict_size) `jsonb_contains` calls instead of O(row_count)), and
+/// jsonb varlenas are arena-allocated only for matching rows.
+///
+/// Returns `(datums, selection)` — full-length datum array with nulls
+/// reinserted (placeholder `Datum(0)` at non-matching positions) plus the
+/// per-row match vector. NULL rows never match (`@>` is strict).
+pub(super) unsafe fn decompress_jsonb_blob_with_contains_filter(
+    blob: &[u8],
+    tmpl_datum: pg_sys::Datum,
+    max_rows: Option<usize>,
+) -> (Vec<(pg_sys::Datum, bool)>, Vec<bool>) {
+    if blob.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let cc = CompressedColumnRef::from_bytes(blob);
+    let total_count = match max_rows {
+        Some(mr) => mr.min(cc.row_count as usize),
+        None => cc.row_count as usize,
+    };
+    let non_null_count = count_non_null(cc.null_bitmap, total_count);
+
+    let (nn_datums, nn_sel): (Vec<pg_sys::Datum>, Vec<bool>) = match cc.type_tag {
+        CompressionType::Dictionary | CompressionType::DictionaryLz4 => {
+            let norm_buf;
+            let dict_data = if cc.type_tag == CompressionType::DictionaryLz4 {
+                norm_buf = compression::dictionary::normalize_lz4(cc.data);
+                &norm_buf
+            } else {
+                cc.data
+            };
+            let (dict_entries, indices_start, index_width) =
+                compression::dictionary::parse_header_bytes(dict_data);
+
+            // The whole point: containment verdict once per distinct value.
+            let dict_matches: Vec<bool> = dict_entries
+                .iter()
+                .map(|e| unsafe { jsonb_bytes_contains(e, tmpl_datum) })
+                .collect();
+
+            let mut sel = Vec::with_capacity(non_null_count);
+            let mut matched_slices: Vec<&[u8]> = Vec::new();
+            for i in 0..non_null_count {
+                let idx =
+                    compression::dictionary::read_index(dict_data, indices_start, index_width, i)
+                        as usize;
+                let pass = dict_matches[idx];
+                sel.push(pass);
+                if pass {
+                    matched_slices.push(dict_entries[idx]);
+                }
+            }
+            let matched_datums = unsafe { byte_slices_to_jsonb_datums_arena(&matched_slices) };
+            let datums = merge_with_placeholder(&matched_datums, &sel);
+            (datums, sel)
+        }
+        CompressionType::Lz4 | CompressionType::Lz4Blocked => {
+            // High-cardinality fallback: per-row evaluation. No worse than the
+            // per-row ExecQual this replaces, and it still short-circuits slot
+            // fills for non-matching rows.
+            let (buf, ranges) = if cc.type_tag == CompressionType::Lz4 {
+                compression::lz4::decode_to_ranges(cc.data, non_null_count)
+            } else {
+                compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None)
+            };
+
+            let slices: Vec<&[u8]> = ranges
+                .iter()
+                .map(|&(off, len)| &buf[off..off + len])
+                .collect();
+            let sel: Vec<bool> = slices
+                .iter()
+                .map(|b| unsafe { jsonb_bytes_contains(b, tmpl_datum) })
+                .collect();
+
+            let matched_slices: Vec<&[u8]> = slices
+                .iter()
+                .zip(sel.iter())
+                .filter(|&(_, &pass)| pass)
+                .map(|(&b, _)| b)
+                .collect();
+            let matched_datums = unsafe { byte_slices_to_jsonb_datums_arena(&matched_slices) };
+            let datums = merge_with_placeholder(&matched_datums, &sel);
+            (datums, sel)
+        }
+        _ => {
+            // Unexpected compression type: decompress fully, then evaluate the
+            // predicate per row on the materialized datums. Unlike the text
+            // filters' fallback we must NOT return an all-true selection —
+            // when all_quals_batch_handled skipped ExecQual, this selection is
+            // the only filter.
+            let full = unsafe { decompress_blob_to_datums(blob, "jsonb", pg_sys::JSONBOID, -1) };
+            let sel: Vec<bool> = full
+                .iter()
+                .map(|&(d, is_null)| {
+                    if is_null {
+                        false
+                    } else {
+                        unsafe {
+                            pg_sys::DirectFunctionCall2Coll(
+                                Some(jsonb_contains_raw),
+                                pg_sys::InvalidOid,
+                                d,
+                                tmpl_datum,
+                            )
+                            .value()
+                                != 0
+                        }
+                    }
+                })
+                .collect();
+            return (full, sel);
+        }
+    };
+
+    // Reinsert nulls into both datums and selection vectors.
+    let null_bitmap = cc.null_bitmap;
+    if null_bitmap.is_empty() {
+        let datums: Vec<(pg_sys::Datum, bool)> =
+            nn_datums.into_iter().map(|d| (d, false)).collect();
+        (datums, nn_sel)
+    } else {
+        let mut datums = Vec::with_capacity(total_count);
+        let mut sel = Vec::with_capacity(total_count);
+        let mut val_idx = 0;
+        for i in 0..total_count {
+            let is_null = is_null_at(null_bitmap, i);
+            if is_null {
+                datums.push((pg_sys::Datum::from(0), true));
+                sel.push(false); // NULL @> anything is not true
+            } else {
+                datums.push((nn_datums[val_idx], false));
+                sel.push(nn_sel[val_idx]);
+                val_idx += 1;
+            }
+        }
+        (datums, sel)
+    }
+}
+
+/// Check whether any dictionary entry of a dict-encoded jsonb blob satisfies
+/// `entry @> tmpl_datum`. Used for segment-level skipping: if no distinct
+/// value in the segment contains the template, no row can. Returns `None`
+/// when the blob isn't dictionary-encoded (caller can't conclude anything).
+/// Backend-thread only (see `jsonb_bytes_contains`).
+pub(super) unsafe fn jsonb_dict_any_entry_contains(
+    blob: &[u8],
+    tmpl_datum: pg_sys::Datum,
+) -> Option<bool> {
+    if blob.is_empty() {
+        return None;
+    }
+    let cc = CompressedColumnRef::from_bytes(blob);
+    let norm_buf;
+    let dict_data = match cc.type_tag {
+        CompressionType::Dictionary => cc.data,
+        CompressionType::DictionaryLz4 => {
+            norm_buf = compression::dictionary::normalize_lz4(cc.data);
+            &norm_buf
+        }
+        _ => return None,
+    };
+    let (dict_entries, _, _) = compression::dictionary::parse_header_bytes(dict_data);
+    Some(
+        dict_entries
+            .iter()
+            .any(|e| unsafe { jsonb_bytes_contains(e, tmpl_datum) }),
+    )
+}
+
 /// Create a text/varchar/bpchar datum from a Rust string.
 /// Allocates in the current memory context.
 /// Compare two strings using PG's collation-aware comparison.

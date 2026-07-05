@@ -305,14 +305,29 @@ unsafe fn walk_chain_shape(node: *mut pg_sys::Node) -> Option<ChainShape> {
             return None;
         }
         // Peel outer cast wrappers to learn the effective result type.
-        let (chain_root, leaf_kind) = strip_outer_cast(node);
+        let (chain_root, leaf_kind_from_cast) = strip_outer_cast(node);
+        let had_cast = !std::ptr::eq(chain_root, node);
 
-        // Outermost step is `->>` (text result); inner steps are `->` until
-        // a Var. `match_op_step` returns `deeper` already unwrap_relabel'd,
-        // so we don't need to peel again between iterations.
+        // Two recognized leaf shapes:
+        //   - text leaf:  outermost op is `->>`  → leaf type is `->>`'s text
+        //                 (or the outer cast's type, e.g. `(... ->> 'k')::bigint`).
+        //   - jsonb leaf: outermost op is `->`   → the whole sub-value (object,
+        //                 array, scalar) is extracted as jsonb. Only when there's
+        //                 no outer cast — `(... -> 'k')::T` is a different beast.
+        // Inner steps are always `->` until a Var. `match_op_step` returns
+        // `deeper` already unwrap_relabel'd, so no re-peel between iterations.
         let mut keys: Vec<String> = Vec::new();
-        let (k, mut cursor) = match_op_step(chain_root, JSONB_OBJECT_FIELD_TEXT_OPNO)?;
-        keys.push(k);
+        let (leaf_kind, mut cursor) =
+            if let Some((k, deeper)) = match_op_step(chain_root, JSONB_OBJECT_FIELD_TEXT_OPNO) {
+                keys.push(k);
+                (leaf_kind_from_cast, deeper)
+            } else if !had_cast {
+                let (k, deeper) = match_op_step(chain_root, JSONB_OBJECT_FIELD_OPNO)?;
+                keys.push(k);
+                (ColumnKind::Jsonb, deeper)
+            } else {
+                return None;
+            };
         while let Some((k, deeper)) = match_op_step(cursor, JSONB_OBJECT_FIELD_OPNO) {
             keys.push(k);
             cursor = deeper;
@@ -1392,7 +1407,27 @@ unsafe fn subplan_tlist_from_deltax_decompress(
         // slot-position math in HashJoin / NestLoop reads from the wider
         // scan tuple slot — the join's probe value comes from the wrong
         // physical slot position and matches nothing.
-        let needs_chain_rewrite = check_cscan_has_relevant_synthetics(cscan, rtable, needed);
+        // The phase-0 pre-walk stops at the cscan boundary, so `needed` only
+        // carries upper-plan chain sigs. A chain whose only reference is the
+        // scan-level qual (e.g. `WHERE payload -> 'status' @> '[...]'` with
+        // no chain in any tlist above) must still trigger the rewrite — that
+        // is the entire point of `rewrite_scan_qual_chains`. Union the scan
+        // qual's own sigs into the fire/no-fire decision, but keep passing
+        // the narrower `needed` to `extend_scan_targetlist_with_forwarders`
+        // so qual-only synthetics don't grow per-row forwarder copies.
+        //
+        // Exception: when the scan projects zero columns (e.g. `SELECT
+        // count(*) ... WHERE <chain qual>`), the executor does not yet fill
+        // synthetic slot positions that only the qual references — the
+        // rewritten qual would evaluate against empty values and silently
+        // drop every row. Leave those plans on the (correct, slower)
+        // chain-Expr path until the executor handles qual-only synthetics.
+        let mut gate_sigs = needed.clone();
+        let scan_tlist = (*cscan).scan.plan.targetlist;
+        if !scan_tlist.is_null() && (*scan_tlist).length > 0 {
+            collect_chain_signatures_in_list((*cscan).scan.plan.qual, &mut gate_sigs);
+        }
+        let needs_chain_rewrite = check_cscan_has_relevant_synthetics(cscan, rtable, &gate_sigs);
         if !needs_chain_rewrite {
             return None;
         }
@@ -2702,12 +2737,46 @@ mod tests {
     }
 
     #[pg_test]
-    fn walk_chain_shape_rejects_no_terminal_text_arrow() {
-        // `var -> 'k'` alone (no terminal `->>`) is not a recognized chain.
+    fn walk_chain_shape_jsonb_leaf_single_step() {
+        // `var -> 'k'` (no terminal `->>`) is a jsonb-leaf chain: the whole
+        // sub-value is extracted as jsonb.
         unsafe {
             let var = make_jsonb_var() as *mut pg_sys::Node;
             let only_obj_field = make_op_expr(var, "k", JSONB_OBJECT_FIELD_OPNO, pg_sys::JSONBOID);
-            assert!(walk_chain_shape(only_obj_field).is_none());
+            let shape = walk_chain_shape(only_obj_field).expect("recognized");
+            assert_eq!(shape.keys, vec!["k".to_string()]);
+            assert_eq!(shape.leaf_kind, ColumnKind::Jsonb);
+            assert_eq!((*shape.inner_var).varattno, 1);
+        }
+    }
+
+    #[pg_test]
+    fn walk_chain_shape_jsonb_leaf_nested() {
+        // `(var -> 'a') -> 'b'` is a jsonb-leaf chain with path [a, b].
+        unsafe {
+            let var = make_jsonb_var() as *mut pg_sys::Node;
+            let step_a = make_op_expr(var, "a", JSONB_OBJECT_FIELD_OPNO, pg_sys::JSONBOID);
+            let step_b = make_op_expr(step_a, "b", JSONB_OBJECT_FIELD_OPNO, pg_sys::JSONBOID);
+            let shape = walk_chain_shape(step_b).expect("recognized");
+            assert_eq!(shape.keys, vec!["a".to_string(), "b".to_string()]);
+            assert_eq!(shape.leaf_kind, ColumnKind::Jsonb);
+        }
+    }
+
+    #[pg_test]
+    fn walk_chain_shape_rejects_cast_over_jsonb_leaf() {
+        // `(var -> 'k')::text` has an outer cast over a `->` chain — not a
+        // recognized jsonb-leaf chain (only the naked `->` form is).
+        unsafe {
+            let var = make_jsonb_var() as *mut pg_sys::Node;
+            let inner = make_op_expr(var, "k", JSONB_OBJECT_FIELD_OPNO, pg_sys::JSONBOID);
+            let coerce = pg_sys::palloc0(std::mem::size_of::<pg_sys::CoerceViaIO>())
+                as *mut pg_sys::CoerceViaIO;
+            (*coerce).xpr.type_ = pg_sys::NodeTag::T_CoerceViaIO;
+            (*coerce).arg = inner as *mut pg_sys::Expr;
+            (*coerce).resulttype = pg_sys::TEXTOID;
+            (*coerce).location = -1;
+            assert!(walk_chain_shape(coerce as *mut pg_sys::Node).is_none());
         }
     }
 

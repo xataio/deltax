@@ -131,13 +131,9 @@ pub(crate) fn parse_extract_specs(value: &serde_json::Value) -> Vec<ExtractSpec>
             .unwrap_or_else(|| pgrx::error!("pg_deltax: json_extract[{}].type must be a string", i))
             .to_string();
         let target_kind = classify_column(&target_type, false);
-        if matches!(target_kind, ColumnKind::Jsonb) {
-            // jsonb-extracted-as-jsonb adds no value; reject for clarity.
-            pgrx::error!(
-                "pg_deltax: json_extract[{}].type=jsonb is not supported (use the source jsonb column directly)",
-                i
-            );
-        }
+        // `jsonb` extracts a whole sub-object/array into a narrow jsonb companion
+        // column (so containment/other jsonb ops run against the small extracted
+        // value instead of decompressing+reparsing the full row).
         // Unknown type names fall through to `Text` in classify_column. Keep
         // the user's spelling in `target_type` but warn on obvious typos by
         // requiring the recognized ones explicitly.
@@ -350,6 +346,16 @@ fn push_extracted_leaf(
             let parsed = std::panic::catch_unwind(|| crate::timeparse::parse_timestamp_to_usec(s));
             vec.push(parsed.ok());
         }
+        // Jsonb: extract the whole sub-value (object, array, or scalar). The
+        // worker path accumulates as JSON text (jsonb_in is not thread-safe);
+        // the merge phase converts Text -> binary jsonb varlena. The main-thread
+        // path (sequential COPY) accumulates as Bytes and converts inline.
+        (ColumnKind::Jsonb, TypedColumn::Text(vec), v) => {
+            vec.push(Some(v.to_string()));
+        }
+        (ColumnKind::Jsonb, TypedColumn::Bytes(vec), v) => {
+            vec.push(Some(unsafe { jsonb_text_to_binary(&v.to_string()) }));
+        }
         // Anything else: type mismatch -> NULL.
         (_, typed_col, _) => {
             push_typed_null(typed_col);
@@ -390,6 +396,7 @@ fn is_recognized_extract_type(t: &str) -> bool {
             | "timestamp with time zone"
             | "timestamptz"
             | "date"
+            | "jsonb"
     )
 }
 
@@ -4910,6 +4917,7 @@ mod tests {
             "timestamp with time zone",
             "timestamptz",
             "date",
+            "jsonb",
         ] {
             assert!(
                 is_recognized_extract_type(ok),
@@ -4917,8 +4925,7 @@ mod tests {
                 ok
             );
         }
-        // Jsonb is intentionally rejected at parse time (see parse_extract_specs).
-        for bad in ["jsonb", "uuid", "numeric", "interval", "money"] {
+        for bad in ["uuid", "numeric", "interval", "money"] {
             assert!(
                 !is_recognized_extract_type(bad),
                 "{} should NOT be recognized",

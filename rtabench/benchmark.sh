@@ -97,13 +97,16 @@ sudo -u postgres psql "$DB" -t -c \
 # SEGMENT_SIZE is overridable to allow sweeping (e.g. 1000, 10000, 30000).
 SEGMENT_SIZE="${SEGMENT_SIZE:-30000}"
 echo "Using segment_size=$SEGMENT_SIZE"
-# `event_payload->>'terminal'` is the only chain RTABench queries touch
+# `event_payload->>'terminal'` is the only text chain RTABench queries touch
 # (Q0/Q1/Q3/Q4/Q8/Q23). Pre-extract it so the planner_hook walker can
 # rewrite chains to synthetic-Var refs and DeltaXAgg picks the queries
-# up directly.
+# up directly. `event_payload->'status'` is a low-cardinality array used in
+# containment filters (Q4/Q8); extract it whole as jsonb so `@>` runs against
+# the narrow companion column instead of the full payload.
 sudo -u postgres psql "$DB" -t -c \
     "SELECT deltax.deltax_enable_compression('order_events', order_by => ARRAY['order_id','event_created'], segment_size => $SEGMENT_SIZE, \
-        json_extract => '[{\"src\":\"event_payload\",\"path\":[\"terminal\"],\"name\":\"x_terminal\",\"type\":\"text\"}]'::jsonb)"
+        json_extract => '[{\"src\":\"event_payload\",\"path\":[\"terminal\"],\"name\":\"x_terminal\",\"type\":\"text\"}, \
+                          {\"src\":\"event_payload\",\"path\":[\"status\"],\"name\":\"x_status\",\"type\":\"jsonb\"}]'::jsonb)"
 
 # Activate the planner_hook walker by default so chain Exprs use the
 # pre-extracted synthetic column.

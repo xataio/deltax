@@ -25,23 +25,43 @@ def _unique_table():
 
 
 def _cleanup(db, table_name):
-    """Drop test table and its catalog entries."""
-    # Reset the worker's clock
-    _alter_system("ALTER SYSTEM RESET pg_deltax.mock_now")
+    """Drop test table and its catalog entries.
 
+    Order matters: the table must be gone BEFORE the worker's clock is
+    reset. `ALTER SYSTEM RESET pg_deltax.mock_now` + reload SIGHUPs the
+    worker awake on the real clock (far in the future relative to the
+    test's mock time), and its next pass immediately starts partition
+    DDL on this table — deadlocking against our DROP CASCADE while this
+    transaction holds uncommitted catalog-row DELETEs. Dropping first
+    leaves the woken worker nothing to collide with; a short deadlock
+    retry covers the residual race with a pass already in flight from
+    the worker's own timer."""
     # The connection may be in an error state; roll back first
     db.rollback()
     db.execute("RESET pg_deltax.mock_now")
-    db.execute(
-        "DELETE FROM deltax.deltax_partition WHERE deltatable_id IN "
-        "(SELECT id FROM deltax.deltax_deltatable WHERE table_name = %s)",
-        (table_name,),
-    )
-    db.execute(
-        "DELETE FROM deltax.deltax_deltatable WHERE table_name = %s", (table_name,)
-    )
-    db.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
     db.commit()
+    for attempt in range(3):
+        try:
+            db.execute(
+                "DELETE FROM deltax.deltax_partition WHERE deltatable_id IN "
+                "(SELECT id FROM deltax.deltax_deltatable WHERE table_name = %s)",
+                (table_name,),
+            )
+            db.execute(
+                "DELETE FROM deltax.deltax_deltatable WHERE table_name = %s",
+                (table_name,),
+            )
+            db.execute(f'DROP TABLE IF EXISTS "{table_name}" CASCADE')
+            db.commit()
+            break
+        except psycopg.errors.DeadlockDetected:
+            db.rollback()
+            if attempt == 2:
+                raise
+            time.sleep(0.5)
+
+    # Reset the worker's clock only after the table is gone.
+    _alter_system("ALTER SYSTEM RESET pg_deltax.mock_now")
 
 
 def test_worker_creates_future_partitions(postgres_db):

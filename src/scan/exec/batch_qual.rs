@@ -11,6 +11,13 @@ pub(super) enum BatchCompareOp {
     Like,
     NotLike,
     InList,
+    /// jsonb `@>` containment (`Var @> Const`). Folded into Phase-1 blob
+    /// decompression like the text ops: for dictionary-encoded jsonb the
+    /// predicate runs once per dict entry (via `jsonb_contains`), not per
+    /// row. Backend-thread only — never evaluated on internal worker
+    /// threads (the Top-N paths disable themselves when one is present,
+    /// and DeltaXAgg's planner gate never accepts `@>`).
+    JsonbContains,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +102,10 @@ pub(super) fn flip_compare_op(op: BatchCompareOp) -> BatchCompareOp {
         BatchCompareOp::Like => BatchCompareOp::Like,
         BatchCompareOp::NotLike => BatchCompareOp::NotLike,
         BatchCompareOp::InList => BatchCompareOp::InList,
+        // Not actually flippable (`Const @> Var` means "contained by") —
+        // extract_batch_quals only accepts the Var-on-left form, so this
+        // arm is unreachable; identity keeps the match total.
+        BatchCompareOp::JsonbContains => BatchCompareOp::JsonbContains,
     }
 }
 
@@ -144,7 +155,10 @@ fn apply_batch_filter_typed<T, F>(
             BatchCompareOp::Le => v <= constant,
             BatchCompareOp::Gt => v > constant,
             BatchCompareOp::Ge => v >= constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => {
+            BatchCompareOp::Like
+            | BatchCompareOp::NotLike
+            | BatchCompareOp::InList
+            | BatchCompareOp::JsonbContains => {
                 unreachable!()
             }
         };
@@ -215,7 +229,10 @@ pub(super) fn apply_batch_filter_bool(
         let v = datum.value() != 0;
         sel[i] = match op {
             BatchCompareOp::Ne => v != constant,
-            BatchCompareOp::Like | BatchCompareOp::NotLike | BatchCompareOp::InList => {
+            BatchCompareOp::Like
+            | BatchCompareOp::NotLike
+            | BatchCompareOp::InList
+            | BatchCompareOp::JsonbContains => {
                 unreachable!()
             }
             _ => v == constant, // Eq, Lt, Le, Gt, Ge all degrade to equality
@@ -430,11 +447,41 @@ pub(super) fn evaluate_batch_quals(
                 // decompress_text_blob_with_eq_filter) and their results are
                 // folded into pre_selection. Skip to avoid redundant evaluation.
             }
+            pg_sys::JSONBOID => {
+                // jsonb `@>` is folded during Phase 1 decompression
+                // (decompress_jsonb_blob_with_contains_filter) into
+                // pre_selection, same as the text ops above.
+            }
             _ => {} // unsupported type, skip
         }
     }
 
     sel
+}
+
+/// Drop `JsonbContains` quals that target segment_by columns, decrementing
+/// `handled_count` for each. The segment_by fill path materializes one
+/// repeated datum per segment and only folds text Eq/Ne — a jsonb containment
+/// qual there would be silently skipped by `evaluate_batch_quals` (its
+/// JSONBOID arm assumes Phase-1 folding), dropping the filter. Handing the
+/// qual back to PG's ExecQual keeps it correct; jsonb segment_by is a
+/// pathological config, so no fast path is owed.
+pub(super) fn drop_segmentby_jsonb_contains_quals(
+    batch_quals: &mut Vec<BatchQual>,
+    handled_count: &mut usize,
+    col_names: &[String],
+    segment_by: &[String],
+) {
+    batch_quals.retain(|bq| {
+        let on_segment_by = bq.op == BatchCompareOp::JsonbContains
+            && col_names
+                .get(bq.col_idx)
+                .is_some_and(|n| segment_by.contains(n));
+        if on_segment_by {
+            *handled_count = handled_count.saturating_sub(1);
+        }
+        !on_segment_by
+    });
 }
 
 /// Extract batch quals from the plan qual list.
@@ -675,11 +722,14 @@ pub(super) unsafe fn extract_batch_quals(
             // Recognize LIKE/NOT LIKE operators before comparison ops
             let is_like = opname == "~~";
             let is_not_like = opname == "!~~";
+            let is_contains = opname == "@>";
 
             let cmp_op = if is_like {
                 BatchCompareOp::Like
             } else if is_not_like {
                 BatchCompareOp::NotLike
+            } else if is_contains {
+                BatchCompareOp::JsonbContains
             } else {
                 match parse_compare_op(opname) {
                     Some(op) => op,
@@ -739,7 +789,24 @@ pub(super) unsafe fn extract_batch_quals(
             let col_idx = (varattno - 1) as usize;
             let type_oid = col_types[col_idx];
 
-            if is_like || is_not_like {
+            if is_contains {
+                // jsonb containment: `Var @> Const` only. `Const @> Var` is a
+                // different predicate ("const contains column") and `@>` also
+                // exists for arrays/ranges — require jsonb on both sides.
+                if !var_on_left
+                    || type_oid != pg_sys::JSONBOID
+                    || (*const_node).consttype != pg_sys::JSONBOID
+                {
+                    continue;
+                }
+                batch_quals.push(BatchQual {
+                    col_idx,
+                    op: BatchCompareOp::JsonbContains,
+                    const_datum: (*const_node).constvalue,
+                    type_oid,
+                    ..Default::default()
+                });
+            } else if is_like || is_not_like {
                 // LIKE is not symmetric: column must be on the left
                 if !var_on_left {
                     continue;

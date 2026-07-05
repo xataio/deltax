@@ -935,6 +935,119 @@ mod tests {
         assert!(datums[3].0.value() != 0);
     }
 
+    /// Helper: header-less binary jsonb → palloc'd jsonb varlena datum.
+    unsafe fn jsonb_bin_to_datum(bin: &[u8]) -> pg_sys::Datum {
+        unsafe {
+            let len = pg_sys::VARHDRSZ + bin.len();
+            let p = pg_sys::palloc(len) as *mut pg_sys::varlena;
+            pgrx::set_varsize_4b(p, len as i32);
+            std::ptr::copy_nonoverlapping(
+                bin.as_ptr(),
+                (p as *mut u8).add(pg_sys::VARHDRSZ),
+                bin.len(),
+            );
+            pg_sys::Datum::from(p)
+        }
+    }
+
+    #[pg_test]
+    fn test_decompress_jsonb_contains_filter_dict() {
+        use super::datum_utils::decompress_jsonb_blob_with_contains_filter;
+        use crate::compression::{CompressionType, dictionary};
+
+        // 6 rows, 3 distinct status arrays, dictionary-encoded the same way
+        // compress_byte_values does it (binary jsonb masquerading as &str).
+        let texts = [
+            r#"["Delayed"]"#,
+            r#"["Pending"]"#,
+            r#"["Delayed", "Priority"]"#,
+        ];
+        let bins: Vec<Vec<u8>> = texts
+            .iter()
+            .map(|t| unsafe { crate::compress::jsonb_text_to_binary(t) })
+            .collect();
+        let row_vals: Vec<&str> = [0usize, 1, 2, 0, 1, 2]
+            .iter()
+            .map(|&i| unsafe { std::str::from_utf8_unchecked(&bins[i]) })
+            .collect();
+        let data = dictionary::encode(&row_vals);
+        let blob = make_blob(CompressionType::Dictionary, 6, data);
+
+        let tmpl_bin = unsafe { crate::compress::jsonb_text_to_binary(r#"["Delayed"]"#) };
+        let tmpl = unsafe { jsonb_bin_to_datum(&tmpl_bin) };
+
+        let (datums, sel) =
+            unsafe { decompress_jsonb_blob_with_contains_filter(&blob, tmpl, None) };
+        // ["Delayed"] and ["Delayed","Priority"] contain ["Delayed"].
+        assert_eq!(sel, vec![true, false, true, true, false, true]);
+        assert_eq!(datums.len(), 6);
+        assert!(datums[0].0.value() != 0);
+        assert_eq!(datums[1].0.value(), 0); // placeholder at non-match
+        assert!(datums[2].0.value() != 0);
+    }
+
+    #[pg_test]
+    fn test_decompress_jsonb_contains_filter_lz4() {
+        use super::datum_utils::decompress_jsonb_blob_with_contains_filter;
+        use crate::compression::{CompressionType, lz4};
+
+        // Non-dict (per-row fallback) path: object containment.
+        let texts = [
+            r#"{"carrier": "dhl", "express": true}"#,
+            r#"{"carrier": "ups", "express": false}"#,
+            r#"{"carrier": "dhl", "express": false}"#,
+        ];
+        let bins: Vec<Vec<u8>> = texts
+            .iter()
+            .map(|t| unsafe { crate::compress::jsonb_text_to_binary(t) })
+            .collect();
+        let row_vals: Vec<&str> = bins
+            .iter()
+            .map(|b| unsafe { std::str::from_utf8_unchecked(b) })
+            .collect();
+        let data = lz4::encode(&row_vals);
+        let blob = make_blob(CompressionType::Lz4, 3, data);
+
+        let tmpl_bin = unsafe { crate::compress::jsonb_text_to_binary(r#"{"carrier": "dhl"}"#) };
+        let tmpl = unsafe { jsonb_bin_to_datum(&tmpl_bin) };
+
+        let (datums, sel) =
+            unsafe { decompress_jsonb_blob_with_contains_filter(&blob, tmpl, None) };
+        assert_eq!(sel, vec![true, false, true]);
+        assert_eq!(datums.len(), 3);
+    }
+
+    #[pg_test]
+    fn test_jsonb_dict_any_entry_contains() {
+        use super::datum_utils::jsonb_dict_any_entry_contains;
+        use crate::compression::{CompressionType, dictionary};
+
+        let texts = [r#"["Pending"]"#, r#"["Processing"]"#];
+        let bins: Vec<Vec<u8>> = texts
+            .iter()
+            .map(|t| unsafe { crate::compress::jsonb_text_to_binary(t) })
+            .collect();
+        let row_vals: Vec<&str> = bins
+            .iter()
+            .map(|b| unsafe { std::str::from_utf8_unchecked(b) })
+            .collect();
+        let data = dictionary::encode(&row_vals);
+        let blob = make_blob(CompressionType::Dictionary, 2, data);
+
+        let hit = unsafe { crate::compress::jsonb_text_to_binary(r#"["Pending"]"#) };
+        let miss = unsafe { crate::compress::jsonb_text_to_binary(r#"["Delayed"]"#) };
+        unsafe {
+            assert_eq!(
+                jsonb_dict_any_entry_contains(&blob, jsonb_bin_to_datum(&hit)),
+                Some(true)
+            );
+            assert_eq!(
+                jsonb_dict_any_entry_contains(&blob, jsonb_bin_to_datum(&miss)),
+                Some(false)
+            );
+        }
+    }
+
     #[pg_test]
     fn test_decompress_text_like_contains_lz4() {
         use super::batch_qual::LikeStrategy;
