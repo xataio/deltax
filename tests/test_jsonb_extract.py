@@ -1090,18 +1090,21 @@ class TestJsonbSubObjectExtract:
 
 
 class TestJsonbContainmentCountStar:
-    """Pre-existing DeltaXDecompress limitation, surfaced (not caused) by jsonb
-    extraction. A query with ZERO output columns whose only reference to a
-    synthetic column is in the scan qual (e.g. `SELECT count(*) ... WHERE
-    <synthetic> ...`) crashes with `invalid attribute number 1`: the scan slot
-    is built 0-wide but the rewritten `Var(INDEX_VAR, k)` qual needs slot k.
+    """Zero-output-column shape: `SELECT count(*) ... WHERE <synthetic qual>`.
 
-    This also reproduces with a TEXT synthetic when aggregate pushdown is
-    defeated (e.g. `count(*) WHERE upper(data->>'x') = '...'`); jsonb `@>` just
-    hits it readily because `@>` never gets pushdown. Tracked for a separate
-    executor fix (widen the scan slot to cover qual-referenced synthetics)."""
+    This used to crash on the DeltaXDecompress path (`invalid attribute
+    number 1`: scan slot built 0-wide, but the rewritten `Var(INDEX_VAR, k)`
+    qual needed slot k via ExecQual). The batch `@>` containment fold fixed
+    it as a side effect: the rewritten qual is recognized as a batch qual,
+    ExecQual is skipped entirely, and the filter runs during Phase-1 blob
+    decompression — no slot access, correct results.
 
-    @pytest.mark.xfail(reason="pre-existing: 0-output + synthetic-only-in-qual scan slot", strict=True)
+    The underlying executor gap (qual-referenced synthetics aren't filled in
+    the scan slot when no output column needs them) still exists for shapes
+    that are NOT batch-foldable — e.g. a TEXT synthetic under an expression
+    ExecQual must evaluate (`count(*) WHERE upper(data->>'x') = '...'`).
+    The DeltaXAppend walker keeps its non-empty-tlist guard for that reason."""
+
     def test_count_star_filter_only(self, db):
         _setup_arr(db); _enable_arr(db); _backfill_arr(db)
         none, fields = _ab(

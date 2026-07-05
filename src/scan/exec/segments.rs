@@ -897,9 +897,7 @@ pub(super) unsafe fn segment_skippable_by_jsonb_dict(
             continue;
         };
         let blob = &compressed_blobs[blob_idx as usize];
-        match unsafe {
-            super::datum_utils::jsonb_dict_any_entry_contains(blob, bq.const_datum)
-        } {
+        match unsafe { super::datum_utils::jsonb_dict_any_entry_contains(blob, bq.const_datum) } {
             Some(false) => return true, // no dict entry contains the template
             _ => continue,              // matches, or not dict-encoded
         }

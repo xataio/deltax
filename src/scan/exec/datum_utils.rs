@@ -1615,12 +1615,9 @@ pub(super) unsafe fn decompress_jsonb_blob_with_contains_filter(
             let mut sel = Vec::with_capacity(non_null_count);
             let mut matched_slices: Vec<&[u8]> = Vec::new();
             for i in 0..non_null_count {
-                let idx = compression::dictionary::read_index(
-                    dict_data,
-                    indices_start,
-                    index_width,
-                    i,
-                ) as usize;
+                let idx =
+                    compression::dictionary::read_index(dict_data, indices_start, index_width, i)
+                        as usize;
                 let pass = dict_matches[idx];
                 sel.push(pass);
                 if pass {
@@ -1666,8 +1663,7 @@ pub(super) unsafe fn decompress_jsonb_blob_with_contains_filter(
             // filters' fallback we must NOT return an all-true selection —
             // when all_quals_batch_handled skipped ExecQual, this selection is
             // the only filter.
-            let full =
-                unsafe { decompress_blob_to_datums(blob, "jsonb", pg_sys::JSONBOID, -1) };
+            let full = unsafe { decompress_blob_to_datums(blob, "jsonb", pg_sys::JSONBOID, -1) };
             let sel: Vec<bool> = full
                 .iter()
                 .map(|&(d, is_null)| {

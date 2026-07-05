@@ -13,8 +13,8 @@ use super::datum_utils::{
     decompress_blob_to_datums, decompress_blob_to_datums_truncated,
     decompress_jsonb_blob_with_contains_filter, decompress_jsonb_blob_with_selection,
     decompress_text_blob_with_eq_filter, decompress_text_blob_with_in_filter,
-    decompress_text_blob_with_like_filter,
-    decompress_text_blob_with_selection, exec_project, exec_qual, pg_type_name, string_to_datum,
+    decompress_text_blob_with_like_filter, decompress_text_blob_with_selection, exec_project,
+    exec_qual, pg_type_name, string_to_datum,
 };
 use super::segments::{
     SegmentData, detoast_lazy_blobs, detoast_lazy_blobs_selective, extract_segment_filters,
@@ -1847,9 +1847,10 @@ unsafe fn exec_topn_two_pass(
                             && bq.in_list_text.is_some()
                             && bq.op == BatchCompareOp::InList
                     });
-                    let jsonb_contains_qual = state.batch_quals.iter().find(|bq| {
-                        bq.col_idx == col_idx && bq.op == BatchCompareOp::JsonbContains
-                    });
+                    let jsonb_contains_qual = state
+                        .batch_quals
+                        .iter()
+                        .find(|bq| bq.col_idx == col_idx && bq.op == BatchCompareOp::JsonbContains);
                     let has_any_batch_qual =
                         state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
 
@@ -4006,9 +4007,10 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
                             && bq.in_list_text.is_some()
                             && bq.op == BatchCompareOp::InList
                     });
-                    let jsonb_contains_qual = state.batch_quals.iter().find(|bq| {
-                        bq.col_idx == col_idx && bq.op == BatchCompareOp::JsonbContains
-                    });
+                    let jsonb_contains_qual = state
+                        .batch_quals
+                        .iter()
+                        .find(|bq| bq.col_idx == col_idx && bq.op == BatchCompareOp::JsonbContains);
                     let has_any_batch_qual =
                         state.batch_quals.iter().any(|bq| bq.col_idx == col_idx);
 
@@ -4038,11 +4040,8 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
                     } else if let Some(bq) = jsonb_contains_qual {
                         // jsonb `@>` folded into decompression: dict-encoded
                         // segments evaluate containment once per dict entry.
-                        let (datums, sel) = decompress_jsonb_blob_with_contains_filter(
-                            blob,
-                            bq.const_datum,
-                            None,
-                        );
+                        let (datums, sel) =
+                            decompress_jsonb_blob_with_contains_filter(blob, bq.const_datum, None);
                         decompressed.push(datums);
                         merge_and_selection(&mut pre_selection, sel);
                     } else if has_any_batch_qual {
