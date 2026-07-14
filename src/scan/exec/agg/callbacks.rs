@@ -16,15 +16,18 @@ use super::super::SyncStatic;
 use super::super::agg_wire;
 use super::super::batch_qual::{BatchCompareOp, BatchQual, extract_batch_quals};
 use super::super::segments::{
-    SegmentData, extract_segment_filters, load_segments_heap, load_text_length_sidecars,
-    reset_scan_buf_stats,
+    SegmentData, extract_segment_filters, load_groupcol_valcounts, load_segments_heap,
+    load_text_length_sidecars, reset_scan_buf_stats,
 };
 use super::compact::{
     CompactAccLayout, CompactAccStorage, can_use_compact_accs, compact_emit_partial,
     compact_finalize, i128_to_numeric_datum,
 };
 use super::keys::{CompactGroupMap, can_use_compact_keys, unpack_int_keys};
-use super::metadata::{load_agg_metadata_from_plan, try_catalog_shortcut, try_metadata_fast_path};
+use super::metadata::{
+    groupby_count_shape, load_agg_metadata_from_plan, try_catalog_shortcut,
+    try_groupby_count_fast_path, try_metadata_fast_path,
+};
 use super::parallel_cd::{dispatch_parallel_count_distinct_path, parallel_count_distinct_eligible};
 use super::parallel_compact::{
     ParallelCompactConfig, ParallelCompactResult, dispatch_parallel_compact_path,
@@ -577,6 +580,130 @@ pub(crate) unsafe extern "C-unwind" fn begin_agg_scan(
                 let state_ptr = Box::into_raw(Box::new(state));
                 (*node).custom_ps = state_ptr as *mut pg_sys::List;
                 return;
+            }
+        }
+
+        // Fast path 3: GROUP BY <low-cardinality int col> [+ COUNT(*)]
+        // answered entirely from the per-(segment, value) COUNT sidecar on
+        // the `_valbitmap` companion table — no blobs touched. Bails to the
+        // normal path on any shape/coverage mismatch (see
+        // `try_groupby_count_fast_path` for the exactness rules).
+        let t_fp3 = Instant::now();
+        if let Some(group_col_idx) = groupby_count_shape(&plan, &meta) {
+            let group_col_name = meta.col_names[group_col_idx].clone();
+
+            // The sidecar only exists for non-segment-by columns persisted in
+            // the blob path; `blob_idx = None` (segment_by or column added
+            // after compression) can't be served.
+            if let Some(sidecar_ci) = meta.blob_idx[group_col_idx] {
+                // Every companion partition must cover the column in its
+                // partition-level valmap (value list = bit_idx decode table).
+                // Values must parse as i64 — they were written by the int
+                // sidecar path, so a parse failure means "not our sidecar".
+                let mut per_oid_values: Vec<Vec<i64>> =
+                    Vec::with_capacity(plan.companion_oids.len());
+                let mut all_covered = true;
+                for &oid in &plan.companion_oids {
+                    let vm = crate::scan::cost::get_column_valmap(oid);
+                    let parsed: Option<Vec<i64>> = vm
+                        .get(&group_col_name)
+                        .map(|vals| vals.iter().map(|v| v.parse::<i64>().ok()).collect())
+                        .unwrap_or(None);
+                    match parsed {
+                        Some(p) if !p.is_empty() => per_oid_values.push(p),
+                        _ => {
+                            all_covered = false;
+                            break;
+                        }
+                    }
+                }
+
+                // Extract batch quals; the fast path requires full coverage.
+                let fast_batch_quals = if !plan.where_quals.is_null() {
+                    let (bqs, handled) =
+                        extract_batch_quals(plan.where_quals, &meta.col_names, &meta.col_types);
+                    if handled as i32 == (*plan.where_quals).length {
+                        bqs
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                };
+                let quals_ok = plan.where_quals.is_null() || !fast_batch_quals.is_empty();
+
+                if all_covered && quals_ok {
+                    // Segment-by / time filters for exact segment pruning.
+                    let (seg_filters, time_min, time_max) = if !plan.where_quals.is_null() {
+                        extract_segment_filters(
+                            plan.where_quals,
+                            &meta.col_names,
+                            &meta.segment_by,
+                            &meta.time_column,
+                        )
+                    } else {
+                        (vec![], None, None)
+                    };
+
+                    // classify_segment_quals needs col_sums (NULL checks) for
+                    // every non-group qual column.
+                    let mut needed_stats_set: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for bq in &fast_batch_quals {
+                        needed_stats_set.insert(meta.col_names[bq.col_idx].clone());
+                    }
+                    let needed_stats_cols: Vec<String> = needed_stats_set.into_iter().collect();
+                    let load_minmax = !fast_batch_quals.is_empty();
+
+                    crate::scan::cost::prewarm_partition_column_minmax(&plan.companion_oids);
+
+                    let no_blobs = vec![false; meta.col_names.len()];
+                    let mut all_segments: Vec<SegmentData> = Vec::new();
+                    for (pi, &oid) in plan.companion_oids.iter().enumerate() {
+                        let (mut segs, _, _, _, _, _) = load_segments_heap(
+                            oid,
+                            &meta.col_names,
+                            &meta.segment_by,
+                            &no_blobs,
+                            &meta.time_column,
+                            load_minmax,
+                            &seg_filters,
+                            time_min,
+                            time_max,
+                            None,
+                            &fast_batch_quals,
+                            &needed_stats_cols,
+                            &meta.col_types,
+                            &meta.col_not_null,
+                            &[],
+                            &meta.blob_idx,
+                            false,
+                        );
+                        if !segs.is_empty() {
+                            load_groupcol_valcounts(
+                                oid,
+                                sidecar_ci,
+                                &per_oid_values[pi],
+                                &mut segs,
+                            );
+                        }
+                        all_segments.extend(segs);
+                    }
+                    let fp3_heap_scan_us = t_fp3.elapsed().as_micros() as u64;
+
+                    if let Some(state) = try_groupby_count_fast_path(
+                        &plan,
+                        &meta,
+                        &all_segments,
+                        &fast_batch_quals,
+                        metadata_us,
+                        fp3_heap_scan_us,
+                    ) {
+                        let state_ptr = Box::into_raw(Box::new(state));
+                        (*node).custom_ps = state_ptr as *mut pg_sys::List;
+                        return;
+                    }
+                }
             }
         }
 

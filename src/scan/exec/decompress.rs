@@ -4376,6 +4376,7 @@ pub(super) unsafe extern "C-unwind" fn init_worker_deltax_append(
                 col_sums: std::collections::HashMap::new(),
                 toast_pointers: vec![Vec::new(); num_blob_cols],
                 cached_blob_pins: Vec::new(),
+                valcounts: None,
             });
         }
         state.segments_data = segments_data;
@@ -4767,6 +4768,7 @@ mod tests {
             col_sums: std::collections::HashMap::new(),
             toast_pointers: Vec::new(),
             cached_blob_pins: Vec::new(),
+            valcounts: None,
         };
         // No filters, no time range — never pruned.
         assert!(!segment_pre_pruned_by_metadata(&seg, &[], None, None));
@@ -4787,6 +4789,7 @@ mod tests {
             col_sums: std::collections::HashMap::new(),
             toast_pointers: Vec::new(),
             cached_blob_pins: Vec::new(),
+            valcounts: None,
         };
         // svi=0, filter "host-a" matches
         assert!(!segment_pre_pruned_by_metadata(
@@ -4833,6 +4836,7 @@ mod tests {
             col_sums: std::collections::HashMap::new(),
             toast_pointers: Vec::new(),
             cached_blob_pins: Vec::new(),
+            valcounts: None,
         };
         // Query range [3_000, ..) → seg.max_time (2_000) < 3_000, prune
         assert!(segment_pre_pruned_by_metadata(&seg, &[], Some(3_000), None));

@@ -1936,7 +1936,7 @@ unsafe fn push_attr_array(out: &mut PosSet, arr: *mut pg_sys::AttrNumber, n: i32
 const PVC_RECURSE_AGGREGATES: i32 = 0x0002;
 const PVC_RECURSE_WINDOWFUNCS: i32 = 0x0008;
 const PVC_RECURSE_PLACEHOLDERS: i32 = 0x0020;
-const PVC_FLAGS_FULL: i32 =
+pub(super) const PVC_FLAGS_FULL: i32 =
     PVC_RECURSE_AGGREGATES | PVC_RECURSE_WINDOWFUNCS | PVC_RECURSE_PLACEHOLDERS;
 
 /// Collect attnos of every `Var(OUTER_VAR, k)` reachable from `node`.
