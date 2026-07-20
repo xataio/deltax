@@ -1666,7 +1666,6 @@ impl TypeInputFn {
     }
 }
 
-
 /// Build datums from string slices.
 ///
 /// For text/varchar: a single contiguous arena allocation — instead of N
@@ -1750,7 +1749,11 @@ pub(super) unsafe fn make_numeric_datum(mantissa: i64, dscale: u8) -> pg_sys::Da
         let total_len = pg_sys::VARHDRSZ + 2 + 2 + 2 * digits.len();
         let ptr = pg_sys::palloc(total_len) as *mut u8;
         pgrx::set_varsize_4b(ptr as *mut pg_sys::varlena, total_len as i32);
-        let sign: u16 = if neg && !digits.is_empty() { NUMERIC_NEG } else { 0 };
+        let sign: u16 = if neg && !digits.is_empty() {
+            NUMERIC_NEG
+        } else {
+            0
+        };
         let n_sign_dscale: u16 = sign | (dscale as u16 & 0x3FFF);
         (ptr.add(pg_sys::VARHDRSZ) as *mut u16).write_unaligned(n_sign_dscale);
         (ptr.add(pg_sys::VARHDRSZ + 2) as *mut i16).write_unaligned(weight);

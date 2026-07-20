@@ -776,8 +776,7 @@ pub(crate) fn parse_uuid_bytes(s: &str) -> Result<[u8; 16], String> {
             _ => {
                 let d = (c as char)
                     .to_digit(16)
-                    .ok_or_else(|| format!("invalid uuid: {}", s))?
-                    as u8;
+                    .ok_or_else(|| format!("invalid uuid: {}", s))? as u8;
                 if nibbles >= 32 {
                     return Err(format!("invalid uuid: {}", s));
                 }

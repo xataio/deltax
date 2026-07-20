@@ -200,7 +200,10 @@ fn read_column(
                 ColumnKind::Inet => {
                     let bytes: Result<Vec<Option<Vec<u8>>>, String> = unpacked
                         .into_iter()
-                        .map(|opt| opt.map(|s| crate::copyparse::parse_inet_bytes(&s)).transpose())
+                        .map(|opt| {
+                            opt.map(|s| crate::copyparse::parse_inet_bytes(&s))
+                                .transpose()
+                        })
                         .collect();
                     Ok(TypedColumn::Bytes(bytes?))
                 }
@@ -208,7 +211,8 @@ fn read_column(
                     let usecs: Result<Vec<Option<i64>>, String> = unpacked
                         .into_iter()
                         .map(|opt| {
-                            opt.map(|s| crate::timeparse::parse_time_to_usec(&s)).transpose()
+                            opt.map(|s| crate::timeparse::parse_time_to_usec(&s))
+                                .transpose()
                         })
                         .collect();
                     Ok(TypedColumn::Int64(usecs?))
@@ -224,8 +228,12 @@ fn read_column(
                 .map_err(|e| format!("pg_deltax: parquet read error: {}", e))?;
             if matches!(kind, ColumnKind::Uuid) {
                 // Parquet UUID logical type: FIXED_LEN_BYTE_ARRAY(16), raw bytes.
-                let bytes =
-                    unpack_nullable_fixed_byte_array_raw(&values, &def_levels, num_rows, num_values);
+                let bytes = unpack_nullable_fixed_byte_array_raw(
+                    &values,
+                    &def_levels,
+                    num_rows,
+                    num_values,
+                );
                 return Ok(TypedColumn::Bytes(bytes));
             }
             let unpacked =

@@ -1400,13 +1400,10 @@ pub(crate) fn new_typed_column(kind: ColumnKind) -> TypedColumn {
         ColumnKind::Float32 => TypedColumn::Float32(Vec::new()),
         ColumnKind::Float64 => TypedColumn::Float64(Vec::new()),
         ColumnKind::Bool => TypedColumn::Bool(Vec::new()),
-        ColumnKind::Timestamp
-        | ColumnKind::TimestampTz
-        | ColumnKind::Date
-        | ColumnKind::Time => TypedColumn::Int64(Vec::new()),
-        ColumnKind::Uuid | ColumnKind::Bytea | ColumnKind::Inet => {
-            TypedColumn::Bytes(Vec::new())
+        ColumnKind::Timestamp | ColumnKind::TimestampTz | ColumnKind::Date | ColumnKind::Time => {
+            TypedColumn::Int64(Vec::new())
         }
+        ColumnKind::Uuid | ColumnKind::Bytea | ColumnKind::Inet => TypedColumn::Bytes(Vec::new()),
     }
 }
 
@@ -4141,7 +4138,9 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
         let inner_tag = CompressionType::from_u8(cc.data[1]);
         let payload = &cc.data[2..];
         let ints: Vec<i64> = match inner_tag {
-            CompressionType::DeltaVarint => compression::integer::decode_i64(payload, non_null_count),
+            CompressionType::DeltaVarint => {
+                compression::integer::decode_i64(payload, non_null_count)
+            }
             CompressionType::Constant => {
                 compression::bitpacked::decode_constant_i64(payload, non_null_count)
             }
@@ -4167,7 +4166,9 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
     if (dt == "time" || dt == "time without time zone")
         && matches!(
             cc.type_tag,
-            CompressionType::DeltaVarint | CompressionType::Constant | CompressionType::ForBitpacked
+            CompressionType::DeltaVarint
+                | CompressionType::Constant
+                | CompressionType::ForBitpacked
         )
     {
         let non_null_count = count_non_null(&cc.null_bitmap, total_count);
@@ -5446,10 +5447,7 @@ mod tests {
             classify_column("interval", false),
             ColumnKind::Text
         ));
-        assert!(matches!(
-            classify_column("timetz", false),
-            ColumnKind::Text
-        ));
+        assert!(matches!(classify_column("timetz", false), ColumnKind::Text));
         // segment_by columns are always read as text for SQL literals.
         assert!(matches!(classify_column("uuid", true), ColumnKind::Text));
     }

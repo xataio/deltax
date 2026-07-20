@@ -73,7 +73,10 @@ pub fn format_numeric_scaled(mantissa: i64, dscale: u8) -> String {
     let abs = mantissa.unsigned_abs().to_string();
     let s = dscale as usize;
     let (int_part, frac_part) = if abs.len() > s {
-        (abs[..abs.len() - s].to_string(), abs[abs.len() - s..].to_string())
+        (
+            abs[..abs.len() - s].to_string(),
+            abs[abs.len() - s..].to_string(),
+        )
     } else {
         ("0".to_string(), format!("{:0>width$}", abs, width = s))
     };
@@ -115,12 +118,23 @@ mod tests {
     #[test]
     fn parse_format_roundtrip() {
         for s in [
-            "0", "1", "-1", "123", "-123", "0.5", "-0.5", "1.20", "-1.20",
-            "123.4500", "0.000001", "-0.000001", "9223372036854775807",
-            "92233720368547758.07", "0.00",
+            "0",
+            "1",
+            "-1",
+            "123",
+            "-123",
+            "0.5",
+            "-0.5",
+            "1.20",
+            "-1.20",
+            "123.4500",
+            "0.000001",
+            "-0.000001",
+            "9223372036854775807",
+            "92233720368547758.07",
+            "0.00",
         ] {
-            let (m, d) = parse_numeric_scaled(s)
-                .unwrap_or_else(|| panic!("failed to parse {}", s));
+            let (m, d) = parse_numeric_scaled(s).unwrap_or_else(|| panic!("failed to parse {}", s));
             assert_eq!(format_numeric_scaled(m, d), s, "roundtrip of {}", s);
         }
     }
@@ -128,10 +142,18 @@ mod tests {
     #[test]
     fn parse_rejects_specials_and_overflow() {
         for s in [
-            "NaN", "Infinity", "-Infinity", "1e5", "1.5e-3", "", "-", ".",
-            "9223372036854775808",          // > i64::MAX
-            "1.0000000000000000001",        // dscale 19 > MAX_DSCALE
-            "12,5", " 1",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            "1e5",
+            "1.5e-3",
+            "",
+            "-",
+            ".",
+            "9223372036854775808",   // > i64::MAX
+            "1.0000000000000000001", // dscale 19 > MAX_DSCALE
+            "12,5",
+            " 1",
         ] {
             assert!(parse_numeric_scaled(s).is_none(), "should reject {:?}", s);
         }
@@ -147,11 +169,7 @@ mod tests {
 
     #[test]
     fn uniform_scaled_gate() {
-        let ok = vec![
-            Some("1.20".to_string()),
-            None,
-            Some("-3.05".to_string()),
-        ];
+        let ok = vec![Some("1.20".to_string()), None, Some("-3.05".to_string())];
         let (v, d) = to_uniform_scaled(&ok).unwrap();
         assert_eq!(d, 2);
         assert_eq!(v, vec![Some(120), None, Some(-305)]);

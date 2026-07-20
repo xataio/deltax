@@ -115,7 +115,9 @@ pub fn parse_time_to_usec(s: &str) -> Result<i64, String> {
                 let mut usec: i64 = 0;
                 let mut digits = 0;
                 for c in frac.chars() {
-                    let d = c.to_digit(10).ok_or_else(|| format!("invalid time: {}", s))?;
+                    let d = c
+                        .to_digit(10)
+                        .ok_or_else(|| format!("invalid time: {}", s))?;
                     if digits < 6 {
                         usec = usec * 10 + d as i64;
                         digits += 1;
