@@ -278,3 +278,175 @@ class TestNonTextColumns:
         assert db.execute(
             "SELECT sum(geo_lat)::text FROM pingbacks"
         ).fetchone()[0] == pre["sum"]
+
+
+class TestGucPinnedRenderings:
+    def test_hostile_writer_gucs_roundtrip(self, db):
+        """Compression pins IntervalStyle / DateStyle / extra_float_digits
+        (RenderGucGuard in src/compress.rs) while rendering fallback columns
+        to text. A writer session with hostile settings must still produce
+        renderings that read back exactly:
+
+        - IntervalStyle=sql_standard renders mixed-sign intervals like
+          '-1-2 +3 -4:05:06', which other styles re-interpret differently
+          (the pg_dump caveat);
+        - extra_float_digits=-3 renders float8[] elements lossily — without
+          the pin that is permanent data loss, not just a read-side bug.
+        """
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE guc_pin (
+                ts TIMESTAMPTZ NOT NULL,
+                n INTEGER NOT NULL,
+                iv INTERVAL,
+                fvals FLOAT8[]
+            )
+        """)
+        db.execute(
+            "SELECT deltax.deltax_create_table('guc_pin', 'ts', '1 day'::interval)"
+        )
+        db.execute(
+            "SELECT deltax.deltax_enable_compression('guc_pin', "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+
+        intervals = [
+            "'1 year 2 mons 3 days 04:05:06'",
+            "'-1 years -2 mons +3 days -04:05:06'",  # mixed signs: the ambiguous case
+            "'00:00:00.000001'",
+            "'-178000000 years'",
+            "NULL",
+        ]
+        floats = [
+            "ARRAY[0.1, 0.30000000000000004, 1.7976931348623157e308]",
+            "ARRAY[2.2250738585072014e-308, -0.1234567890123456789]",
+            "ARRAY[]::float8[]",
+            "NULL",
+        ]
+        values = []
+        for i in range(120):
+            ts = f"'{BASE_TS}'::timestamptz + interval '{i} minutes'"
+            iv = intervals[i % len(intervals)]
+            fv = floats[i % len(floats)]
+            iv = iv if iv == "NULL" else f"{iv}::interval"
+            values.append(f"({ts}, {i}, {iv}, {fv})")
+        db.execute(
+            "INSERT INTO guc_pin (ts, n, iv, fvals) VALUES " + ", ".join(values)
+        )
+        db.commit()
+
+        # Snapshot under neutral reader GUCs before compression.
+        def snapshot():
+            db.execute("SET IntervalStyle = 'postgres'")
+            db.execute("SET extra_float_digits = 1")
+            return db.execute(
+                "SELECT n, iv::text, extract(epoch FROM iv)::text, fvals::text "
+                "FROM guc_pin ORDER BY n"
+            ).fetchall()
+
+        before = snapshot()
+        assert len(before) == 120
+
+        # Compress with HOSTILE writer GUCs — the guard must override them
+        # for the ::text rendering.
+        db.execute("SET IntervalStyle = 'sql_standard'")
+        db.execute("SET DateStyle = 'SQL, DMY'")
+        db.execute("SET extra_float_digits = -3")
+        part_name = find_partition(db, "guc_pin")
+        compress_partition(db, part_name, "guc_pin")
+
+        # The guard must restore the session's own GUCs after the pass.
+        assert db.execute("SHOW IntervalStyle").fetchone()[0] == "sql_standard"
+        assert db.execute("SHOW extra_float_digits").fetchone()[0] == "-3"
+
+        assert snapshot() == before, (
+            "fallback renderings changed under hostile writer GUCs — "
+            "RenderGucGuard is not pinning the rendering settings"
+        )
+
+        # Reads must also be exact under a hostile READER session: the pinned
+        # 'postgres'-style / ISO / shortest-precise renderings parse the same
+        # under every input GUC combination.
+        db.execute("SET IntervalStyle = 'sql_standard'")
+        db.execute("SET DateStyle = 'SQL, DMY'")
+        hostile_reader = db.execute(
+            "SELECT n, extract(epoch FROM iv)::text, fvals::text "
+            "FROM guc_pin ORDER BY n"
+        ).fetchall()
+        assert hostile_reader == [(n, ep, fv) for (n, _, ep, fv) in before]
+
+        # Decompress and verify once more end-to-end.
+        result = db.execute(
+            f"SELECT deltax.deltax_decompress_partition('{part_name}')"
+        ).fetchone()[0]
+        db.commit()
+        assert "Decompressed" in result
+        assert snapshot() == before
+
+
+class TestFallbackTypedSegmentBy:
+    def test_uuid_segment_by_roundtrip(self, db):
+        """A fallback-typed (uuid) segment_by column: segment values are
+        stored as text in the meta table and rebuilt via string_to_datum.
+        Roundtrip equality plus typed equality filtering on the segment key."""
+        db.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
+        db.execute("""
+            CREATE TABLE seg_uuid (
+                ts TIMESTAMPTZ NOT NULL,
+                n INTEGER NOT NULL,
+                tenant UUID NOT NULL,
+                payload TEXT
+            )
+        """)
+        db.execute(
+            "SELECT deltax.deltax_create_table('seg_uuid', 'ts', '1 day'::interval)"
+        )
+        db.execute(
+            "SELECT deltax.deltax_enable_compression('seg_uuid', "
+            "segment_by => ARRAY['tenant'], "
+            "order_by => ARRAY['ts'])"
+        )
+        db.commit()
+
+        tenants = [
+            "0e37df36-f698-11e6-8dd4-cb9ced3df976",
+            "6ecd8c99-4036-403d-bf84-cf8400f67836",
+            "3f333df6-90a4-4fda-8dd3-9485d27cee36",
+        ]
+        values = []
+        for i in range(150):
+            ts = f"'{BASE_TS}'::timestamptz + interval '{i} minutes'"
+            values.append(
+                f"({ts}, {i}, '{tenants[i % 3]}'::uuid, 'p-{i}')"
+            )
+        db.execute(
+            "INSERT INTO seg_uuid (ts, n, tenant, payload) VALUES "
+            + ", ".join(values)
+        )
+        db.commit()
+
+        snapshot_sql = "SELECT n, tenant::text, payload FROM seg_uuid ORDER BY n"
+        before = db.execute(snapshot_sql).fetchall()
+        per_tenant = db.execute(
+            "SELECT tenant::text, count(*) FROM seg_uuid GROUP BY 1 ORDER BY 1"
+        ).fetchall()
+
+        part_name = find_partition(db, "seg_uuid")
+        compress_partition(db, part_name, "seg_uuid")
+
+        assert db.execute(snapshot_sql).fetchall() == before
+        assert db.execute(
+            "SELECT tenant::text, count(*) FROM seg_uuid GROUP BY 1 ORDER BY 1"
+        ).fetchall() == per_tenant
+        # Typed equality on the segment key must hit exactly one tenant's rows.
+        assert db.execute(
+            f"SELECT count(*) FROM seg_uuid WHERE tenant = '{tenants[0]}'::uuid"
+        ).fetchone()[0] == 50
+
+        result = db.execute(
+            f"SELECT deltax.deltax_decompress_partition('{part_name}')"
+        ).fetchone()[0]
+        db.commit()
+        assert "Decompressed" in result
+        assert db.execute(snapshot_sql).fetchall() == before

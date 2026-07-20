@@ -887,7 +887,72 @@ fn deltax_table_size(relation: &str) -> i64 {
 // Internal implementation
 // ============================================================================
 
+/// Scoped pin of the GUCs that affect the `::text` renderings compression
+/// stores for fallback-typed columns (`classify_column` → `ColumnKind::Text`
+/// with a non-text attribute type: interval, date/timestamp inside arrays or
+/// composites, float arrays, ...). The stored text must parse back to the
+/// same value under ANY reader session GUCs, so rendering pins:
+///
+/// - `IntervalStyle = postgres`: unit-labeled output that `interval_in`
+///   parses identically under every IntervalStyle (sql_standard renderings
+///   like '1-2' are re-interpreted differently per style — the pg_dump
+///   caveat, which pins the same value);
+/// - `DateStyle = ISO, MDY`: ISO date/timestamp text is unambiguous under
+///   every DateStyle (a 'DMY'-rendered '02/03/2025' inside e.g. a
+///   timestamptz[] would silently swap day/month for an 'MDY' reader);
+/// - `extra_float_digits = 1`: shortest-precise float rendering; a session
+///   with a negative setting would render floats inside arrays/composites
+///   lossily — permanent data loss, not just a read-side issue.
+///
+/// Uses the standard PG nest-level save/restore idiom (`NewGUCNestLevel` +
+/// `GUC_ACTION_SAVE` + `AtEOXact_GUC`), so the previous values come back at
+/// scope exit instead of leaking a `SET LOCAL` into the caller's transaction.
+/// On error, the transaction abort path restores them.
+struct RenderGucGuard {
+    nest_level: std::ffi::c_int,
+}
+
+impl RenderGucGuard {
+    fn pin() -> Self {
+        let nest_level = unsafe { pgrx::pg_sys::NewGUCNestLevel() };
+        for (name, value) in [
+            ("intervalstyle", "postgres"),
+            ("datestyle", "ISO, MDY"),
+            ("extra_float_digits", "1"),
+        ] {
+            let name_c = std::ffi::CString::new(name).unwrap();
+            let value_c = std::ffi::CString::new(value).unwrap();
+            unsafe {
+                pgrx::pg_sys::set_config_option(
+                    name_c.as_ptr(),
+                    value_c.as_ptr(),
+                    pgrx::pg_sys::GucContext::PGC_USERSET,
+                    pgrx::pg_sys::GucSource::PGC_S_SESSION,
+                    pgrx::pg_sys::GucAction::GUC_ACTION_SAVE,
+                    true,
+                    pgrx::pg_sys::PGERROR as std::ffi::c_int,
+                    false,
+                );
+            }
+        }
+        Self { nest_level }
+    }
+}
+
+impl Drop for RenderGucGuard {
+    fn drop(&mut self) {
+        // On panic/error the transaction abort path runs AtEOXact_GUC itself;
+        // calling it here with isCommit=true would be wrong mid-abort.
+        if !std::thread::panicking() {
+            unsafe { pgrx::pg_sys::AtEOXact_GUC(true, self.nest_level) };
+        }
+    }
+}
+
 fn compress_partition_impl(client: &mut SpiClient, partition: &str) -> String {
+    // Pin rendering GUCs for the whole pass: covers the streaming `::text`
+    // SELECT and the segment-by stats/valcounts queries.
+    let _render_gucs = RenderGucGuard::pin();
     // 1. Look up partition in catalog
     let (schema, part_table) = crate::partition::resolve_relation(client, partition);
     let part_info = catalog::get_partition_by_name(client, &schema, &part_table)
@@ -1613,35 +1678,56 @@ pub(crate) unsafe fn jsonb_text_to_binary(text: &str) -> Vec<u8> {
     }
 }
 
-/// Convert a binary jsonb varlena payload (everything after the varlena
-/// header, as produced by `jsonb_text_to_binary` / `JsonbRaw`) back to its
-/// canonical JSON text by wrapping it in a fresh varlena header and calling
-/// PG's jsonb output function. Exact inverse of `jsonb_text_to_binary`.
-/// Must only be called from the main backend thread.
-pub(crate) unsafe fn jsonb_binary_to_text(payload: &[u8]) -> String {
-    unsafe {
-        let total_len = pgrx::pg_sys::VARHDRSZ + payload.len();
-        let varlena = pgrx::pg_sys::palloc(total_len) as *mut pgrx::pg_sys::varlena;
-        pgrx::set_varsize_4b(varlena, total_len as i32);
-        std::ptr::copy_nonoverlapping(
-            payload.as_ptr(),
-            (varlena as *mut u8).add(pgrx::pg_sys::VARHDRSZ),
-            payload.len(),
-        );
-        let mut typoutput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
-        let mut typisvarlena: bool = false;
-        pgrx::pg_sys::getTypeOutputInfo(pgrx::pg_sys::JSONBOID, &mut typoutput, &mut typisvarlena);
-        let cstr = pgrx::pg_sys::OidOutputFunctionCall(
-            typoutput,
-            pgrx::pg_sys::Datum::from(varlena as usize),
-        );
-        let text = std::ffi::CStr::from_ptr(cstr)
-            .to_str()
-            .expect("jsonb_out produced invalid UTF-8")
-            .to_string();
-        pgrx::pg_sys::pfree(cstr.cast());
-        pgrx::pg_sys::pfree(varlena.cast());
-        text
+/// PG's jsonb output function resolved once, for converting binary jsonb
+/// varlena payloads (as produced by `jsonb_text_to_binary` / `JsonbRaw`) back
+/// to canonical JSON text inside per-value loops. Hoists the
+/// `getTypeOutputInfo` syscache lookup and the `fmgr_info` resolution out of
+/// the loop. Must only be used on the main backend thread.
+pub(crate) struct JsonbOutFn {
+    finfo: pgrx::pg_sys::FmgrInfo,
+}
+
+impl JsonbOutFn {
+    pub(crate) unsafe fn resolve() -> Self {
+        unsafe {
+            let mut typoutput: pgrx::pg_sys::Oid = pgrx::pg_sys::InvalidOid;
+            let mut typisvarlena: bool = false;
+            pgrx::pg_sys::getTypeOutputInfo(
+                pgrx::pg_sys::JSONBOID,
+                &mut typoutput,
+                &mut typisvarlena,
+            );
+            let mut finfo = pgrx::pg_sys::FmgrInfo::default();
+            pgrx::pg_sys::fmgr_info(typoutput, &mut finfo);
+            Self { finfo }
+        }
+    }
+
+    /// Wrap `payload` (the bytes after the varlena header) in a fresh varlena
+    /// header and call jsonb's output function. Exact inverse of
+    /// `jsonb_text_to_binary`.
+    pub(crate) unsafe fn render(&mut self, payload: &[u8]) -> String {
+        unsafe {
+            let total_len = pgrx::pg_sys::VARHDRSZ + payload.len();
+            let varlena = pgrx::pg_sys::palloc(total_len) as *mut pgrx::pg_sys::varlena;
+            pgrx::set_varsize_4b(varlena, total_len as i32);
+            std::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                (varlena as *mut u8).add(pgrx::pg_sys::VARHDRSZ),
+                payload.len(),
+            );
+            let cstr = pgrx::pg_sys::OutputFunctionCall(
+                &mut self.finfo,
+                pgrx::pg_sys::Datum::from(varlena as usize),
+            );
+            let text = std::ffi::CStr::from_ptr(cstr)
+                .to_str()
+                .expect("jsonb_out produced invalid UTF-8")
+                .to_string();
+            pgrx::pg_sys::pfree(cstr.cast());
+            pgrx::pg_sys::pfree(varlena.cast());
+            text
+        }
     }
 }
 
@@ -2851,7 +2937,7 @@ fn compress_partition_streaming(
             use pgrx::datum::DatumWithOid;
             let insert_sql = format!(
                 "INSERT INTO {} (_col_idx, _segment_id, _data) VALUES ($1, $2, $3)",
-                &ddl.blobs_fqn
+                ddl.blobs_fqn
             );
             let args: Vec<DatumWithOid> = vec![
                 (col_idx as i16).into(),
@@ -2876,7 +2962,7 @@ fn compress_partition_streaming(
                 use pgrx::datum::DatumWithOid;
                 let insert_sql = format!(
                     "INSERT INTO {} (_col_idx, _segment_id, _num_hashes, _data) VALUES ($1, $2, $3, $4)",
-                    &ddl.blooms_fqn
+                    ddl.blooms_fqn
                 );
                 let args: Vec<DatumWithOid> = vec![
                     (col_idx as i16).into(),
@@ -2906,7 +2992,7 @@ fn compress_partition_streaming(
                 use pgrx::datum::DatumWithOid;
                 let insert_sql = format!(
                     "INSERT INTO {} (_col_idx, _segment_id, _data) VALUES ($1, $2, $3)",
-                    &ddl.text_lengths_fqn
+                    ddl.text_lengths_fqn
                 );
                 let args: Vec<DatumWithOid> = vec![
                     (col_idx as i16).into(),
@@ -3069,7 +3155,7 @@ fn finalize_and_insert_valbitmaps(
         use pgrx::datum::DatumWithOid;
         let insert_sql = format!(
             "INSERT INTO {} (_col_idx, _segment_id, _bits) VALUES ($1, $2, $3)",
-            &ddl.valbitmap_fqn
+            ddl.valbitmap_fqn
         );
         let args: Vec<DatumWithOid> = vec![
             (col_idx as i16).into(),
@@ -3785,25 +3871,26 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
     // "invalid UTF-8 in LZ4 data".
     if dt == "jsonb" {
         let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+        let mut jsonb_out = unsafe { JsonbOutFn::resolve() };
         let strings: Vec<String> = match cc.type_tag {
             CompressionType::Dictionary => {
                 compression::dictionary::decode_to_byte_slices(&cc.data, non_null_count)
                     .iter()
-                    .map(|b| unsafe { jsonb_binary_to_text(b) })
+                    .map(|b| unsafe { jsonb_out.render(b) })
                     .collect()
             }
             CompressionType::DictionaryLz4 => {
                 let normalized = compression::dictionary::normalize_lz4(&cc.data);
                 compression::dictionary::decode_to_byte_slices(&normalized, non_null_count)
                     .iter()
-                    .map(|b| unsafe { jsonb_binary_to_text(b) })
+                    .map(|b| unsafe { jsonb_out.render(b) })
                     .collect()
             }
             CompressionType::Lz4 => {
                 let (buf, ranges) = compression::lz4::decode_to_ranges(&cc.data, non_null_count);
                 ranges
                     .iter()
-                    .map(|&(off, len)| unsafe { jsonb_binary_to_text(&buf[off..off + len]) })
+                    .map(|&(off, len)| unsafe { jsonb_out.render(&buf[off..off + len]) })
                     .collect()
             }
             CompressionType::Lz4Blocked => {
@@ -3811,7 +3898,7 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
                     compression::lz4::decode_to_ranges_blocked(&cc.data, non_null_count, None);
                 ranges
                     .iter()
-                    .map(|&(off, len)| unsafe { jsonb_binary_to_text(&buf[off..off + len]) })
+                    .map(|&(off, len)| unsafe { jsonb_out.render(&buf[off..off + len]) })
                     .collect()
             }
             other => pgrx::error!(

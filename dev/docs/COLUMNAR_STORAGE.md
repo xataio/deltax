@@ -364,6 +364,24 @@ so the main thread can saturate the storage bandwidth.
 
 ## Write Path
 
+### Fallback-Typed Columns: Text Renderings and Pinned GUCs
+
+Columns whose type has no native codec (`classify_column` falls through to
+`ColumnKind::Text` for anything that isn't int/float/bool/timestamp/date/jsonb
+or text/varchar/bpchar — e.g. `numeric`, `uuid`, `bytea`, `inet`, `interval`,
+arrays, enums, composites) are stored as their lossless `::text` rendering.
+The read path reconstructs real typed datums via the type's input function
+(`TypeInputFn` in the scan exec code), the exact inverse of the rendering.
+
+Some output functions are GUC-sensitive, so compression pins the rendering
+GUCs for the duration of a pass (`RenderGucGuard` in src/compress.rs):
+`IntervalStyle = postgres`, `DateStyle = ISO, MDY`, `extra_float_digits = 1`.
+This guarantees the stored text parses back to the same value under any
+reader session's settings (the same reasoning as pg_dump, which pins the
+same GUCs). Without the pin, an `IntervalStyle = sql_standard` writer or an
+`extra_float_digits = -3` writer would store renderings that are respectively
+ambiguous or lossy.
+
 ### During Compression
 
 Compression processes one segment at a time (all columns for segment 1, then
