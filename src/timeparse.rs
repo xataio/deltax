@@ -86,6 +86,77 @@ pub fn usec_to_timestamp_string(usec: i64) -> String {
     }
 }
 
+/// Parse a PostgreSQL text-format `time` value (`"HH:MM:SS[.ffffff]"`, also
+/// accepting `"HH:MM"`) to microseconds since midnight. PG renders `time`
+/// in this fixed 24-hour form regardless of DateStyle.
+pub fn parse_time_to_usec(s: &str) -> Result<i64, String> {
+    let s = s.trim();
+    let mut parts = s.splitn(3, ':');
+    let hours: i64 = parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| format!("invalid time: {}", s))?;
+    let minutes: i64 = parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| format!("invalid time: {}", s))?;
+    let (seconds, frac_usec): (i64, i64) = match parts.next() {
+        None => (0, 0),
+        Some(sec_part) => match sec_part.split_once('.') {
+            None => (
+                sec_part
+                    .parse()
+                    .map_err(|_| format!("invalid time: {}", s))?,
+                0,
+            ),
+            Some((sec, frac)) => {
+                let sec: i64 = sec.parse().map_err(|_| format!("invalid time: {}", s))?;
+                // Right-pad the fractional digits to microseconds.
+                let mut usec: i64 = 0;
+                let mut digits = 0;
+                for c in frac.chars() {
+                    let d = c.to_digit(10).ok_or_else(|| format!("invalid time: {}", s))?;
+                    if digits < 6 {
+                        usec = usec * 10 + d as i64;
+                        digits += 1;
+                    }
+                }
+                while digits < 6 {
+                    usec *= 10;
+                    digits += 1;
+                }
+                (sec, usec)
+            }
+        },
+    };
+    // 24:00:00 is a valid PG time value.
+    if !(0..=24).contains(&hours)
+        || !(0..60).contains(&minutes)
+        || !(0..61).contains(&seconds)
+        || (hours == 24 && (minutes != 0 || seconds != 0 || frac_usec != 0))
+    {
+        return Err(format!("time out of range: {}", s));
+    }
+    Ok(((hours * 3600 + minutes * 60 + seconds) * 1_000_000) + frac_usec)
+}
+
+/// Format microseconds since midnight as `"HH:MM:SS[.ffffff]"` (PG's `time`
+/// text rendering, trailing fractional zeros trimmed).
+pub fn usec_to_time_string(usec: i64) -> String {
+    let total_secs = usec / 1_000_000;
+    let frac_usec = usec % 1_000_000;
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if frac_usec > 0 {
+        let frac_str = format!("{:06}", frac_usec);
+        let trimmed = frac_str.trim_end_matches('0');
+        format!("{:02}:{:02}:{:02}.{}", hours, minutes, seconds, trimmed)
+    } else {
+        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+    }
+}
+
 /// Format Unix epoch microseconds as `"YYYY-MM-DD"`.
 pub fn usec_to_date_string(usec: i64) -> String {
     // For dates we just need the day portion

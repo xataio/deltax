@@ -502,6 +502,11 @@ fn encode_datum_to_i64(datum: pg_sys::Datum, type_oid: pg_sys::Oid) -> Option<i6
             let pg_epoch_days = datum.value() as i32 as i64;
             Some((pg_epoch_days + crate::compress::PG_EPOCH_OFFSET_DAYS) * 86_400_000_000)
         }
+        pg_sys::TIMEOID => {
+            // TimeADT is microseconds since midnight; colstats stores the same
+            // (no epoch offset), so identity encoding.
+            Some(datum.value() as i64)
+        }
         pg_sys::FLOAT4OID => {
             let v = f32::from_bits(datum.value() as u32);
             Some(encode_f32_to_i64(v))

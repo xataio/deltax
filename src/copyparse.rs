@@ -520,6 +520,17 @@ fn parse_str_and_append(
             }
             Ok(())
         }
+        ColumnKind::Time => {
+            let usec = timeparse::parse_time_to_usec(s).map_err(|e| ParseError {
+                message: e,
+                column: col_idx,
+                line: line_number,
+            })?;
+            if let TypedColumn::Int64(vec) = typed_col {
+                vec.push(Some(usec));
+            }
+            Ok(())
+        }
         ColumnKind::Date => {
             let usec = timeparse::parse_timestamp_to_usec(s);
             if let TypedColumn::Int64(vec) = typed_col {
@@ -654,6 +665,17 @@ pub fn parse_and_append(
             }
             ColumnKind::Date => {
                 let usec = timeparse::parse_timestamp_to_usec(s);
+                if let TypedColumn::Int64(vec) = typed_col {
+                    vec.push(Some(usec));
+                }
+                Ok(())
+            }
+            ColumnKind::Time => {
+                let usec = timeparse::parse_time_to_usec(s).map_err(|e| ParseError {
+                    message: e,
+                    column: col_idx,
+                    line: line_number,
+                })?;
                 if let TypedColumn::Int64(vec) = typed_col {
                     vec.push(Some(usec));
                 }

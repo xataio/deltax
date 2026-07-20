@@ -40,6 +40,7 @@ pub(crate) fn kind_to_type_oid(kind: ColumnKind) -> pg_sys::Oid {
         ColumnKind::Timestamp => pg_sys::TIMESTAMPOID,
         ColumnKind::TimestampTz => pg_sys::TIMESTAMPTZOID,
         ColumnKind::Date => pg_sys::DATEOID,
+        ColumnKind::Time => pg_sys::TIMEOID,
         ColumnKind::Jsonb => pg_sys::JSONBOID,
     }
 }

@@ -1274,6 +1274,7 @@ pub(crate) enum ColumnKind {
     Timestamp,   // timestamp without time zone — read as pgrx::Timestamp → i64 usec
     TimestampTz, // timestamp with time zone — read as pgrx::TimestampWithTimeZone → i64 usec
     Date,        // date — read as pgrx::Date → i64 usec
+    Time,        // time without time zone — read as pgrx::Time → i64 usec since midnight
     Jsonb,       // jsonb — stored as the binary varlena form produced by jsonb_in
 }
 
@@ -1366,6 +1367,9 @@ pub(crate) fn classify_column(data_type: &str, is_segment_by: bool) -> ColumnKin
         ColumnKind::Timestamp
     } else if dt == "date" {
         ColumnKind::Date
+    } else if dt == "time" || dt == "time without time zone" {
+        // timetz stays on the text fallback (carries a zone offset).
+        ColumnKind::Time
     } else if dt == "jsonb" {
         ColumnKind::Jsonb
     } else {
@@ -1383,9 +1387,10 @@ pub(crate) fn new_typed_column(kind: ColumnKind) -> TypedColumn {
         ColumnKind::Float32 => TypedColumn::Float32(Vec::new()),
         ColumnKind::Float64 => TypedColumn::Float64(Vec::new()),
         ColumnKind::Bool => TypedColumn::Bool(Vec::new()),
-        ColumnKind::Timestamp | ColumnKind::TimestampTz | ColumnKind::Date => {
-            TypedColumn::Int64(Vec::new())
-        }
+        ColumnKind::Timestamp
+        | ColumnKind::TimestampTz
+        | ColumnKind::Date
+        | ColumnKind::Time => TypedColumn::Int64(Vec::new()),
     }
 }
 
@@ -1540,6 +1545,17 @@ fn append_row_to_columns(
                     vec.push(v.map(|d| {
                         ((d.into_inner() as i64) + PG_EPOCH_OFFSET_DAYS) * 86_400_000_000
                     }));
+                }
+            }
+            ColumnKind::Time => {
+                let v = row
+                    .get_datum_by_ordinal(ordinal)
+                    .unwrap()
+                    .value::<pgrx::datum::Time>()
+                    .unwrap();
+                if let TypedColumn::Int64(vec) = &mut typed_cols[i] {
+                    // TimeADT is already microseconds since midnight
+                    vec.push(v.map(|t| t.into_inner()));
                 }
             }
             ColumnKind::Text => {
@@ -3909,6 +3925,36 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
         return compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count);
     }
 
+    // time columns: integer-tag blobs (native codec) hold microseconds since
+    // midnight and must be rendered as 'HH:MM:SS[.ffffff]' for the re-INSERT.
+    // Legacy text-tag blobs hold the time's text rendering already and fall
+    // through to the generic dictionary/LZ4 arms below.
+    if (dt == "time" || dt == "time without time zone")
+        && matches!(
+            cc.type_tag,
+            CompressionType::DeltaVarint | CompressionType::Constant | CompressionType::ForBitpacked
+        )
+    {
+        let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+        let usecs: Vec<i64> = match cc.type_tag {
+            CompressionType::DeltaVarint => {
+                compression::integer::decode_i64(&cc.data, non_null_count)
+            }
+            CompressionType::Constant => {
+                compression::bitpacked::decode_constant_i64(&cc.data, non_null_count)
+            }
+            CompressionType::ForBitpacked => {
+                compression::bitpacked::decode_for_i64(&cc.data, non_null_count)
+            }
+            _ => unreachable!(),
+        };
+        let strings: Vec<String> = usecs
+            .iter()
+            .map(|&u| crate::timeparse::usec_to_time_string(u))
+            .collect();
+        return compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count);
+    }
+
     match cc.type_tag {
         CompressionType::Gorilla => {
             if dt.contains("timestamp") || dt == "date" {
@@ -4091,6 +4137,8 @@ pub(crate) fn supports_minmax(data_type: &str) -> bool {
     let dt = data_type.to_lowercase();
     dt.contains("timestamp")
         || dt == "date"
+        || dt == "time"
+        || dt == "time without time zone"
         || dt == "integer"
         || dt == "int4"
         || dt == "bigint"
