@@ -32,6 +32,17 @@ def _cleanup(db, table_name):
     # The connection may be in an error state; roll back first
     db.rollback()
     db.execute("RESET pg_deltax.mock_now")
+    # Serialize against the background worker: take the same per-database
+    # advisory xact lock its maintenance pass acquires (maintenance_lock_key in
+    # src/worker.rs: "pdlt" tag in the high 32 bits, database OID in the low
+    # 32). This blocks until any in-flight pass commits, and a pass starting
+    # after us try-locks, loses, and skips — so the catalog deletes and the
+    # DROP CASCADE below can't deadlock with the worker's partition DDL.
+    db.execute(
+        "SELECT pg_advisory_xact_lock("
+        "(x'70646C74'::bigint << 32) | "
+        "(SELECT oid::bigint FROM pg_database WHERE datname = current_database()))"
+    )
     db.execute(
         "DELETE FROM deltax.deltax_partition WHERE deltatable_id IN "
         "(SELECT id FROM deltax.deltax_deltatable WHERE table_name = %s)",
