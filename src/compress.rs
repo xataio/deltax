@@ -3380,6 +3380,14 @@ pub(crate) fn compress_typed_column(data: &TypedColumn, data_type: &str) -> Vec<
             .to_bytes()
         }
         TypedColumn::Text(values) => {
+            let dt = data_type.to_lowercase();
+            if dt.starts_with("numeric") || dt.starts_with("decimal") {
+                // Try the scaled-i64 numeric codec; per-blob text fallback for
+                // NaN/Infinity, mixed dscale, or mantissas beyond i64.
+                if let Some(blob) = compress_numeric_scaled(values) {
+                    return blob;
+                }
+            }
             // Delegate to existing string-based compression
             compress_column_values(values, data_type, "")
         }
@@ -3609,6 +3617,29 @@ fn compress_byte_values(values: &[Option<Vec<u8>>]) -> Vec<u8> {
 /// otherwise identical — only the tag byte differs, marking the payloads as
 /// raw bytes so the read side never routes them through the UTF-8 text or
 /// input-function paths.
+/// Encode a segment of `numeric_out` renderings as scaled-i64 mantissas
+/// (`CompressionType::NumericScaled`): data = [dscale][inner integer tag]
+/// [inner encoding]. Returns `None` when the segment doesn't qualify
+/// (see `compression::numeric_scaled::to_uniform_scaled`).
+fn compress_numeric_scaled(values: &[Option<String>]) -> Option<Vec<u8>> {
+    let (scaled, dscale) = compression::numeric_scaled::to_uniform_scaled(values)?;
+    let (non_null, null_bitmap) = compression::extract_nulls(&scaled);
+    let (inner_tag, encoded) = compression::bitpacked::best_encoding_i64(&non_null);
+    let mut data = Vec::with_capacity(2 + encoded.len());
+    data.push(dscale);
+    data.push(inner_tag as u8);
+    data.extend_from_slice(&encoded);
+    Some(
+        CompressedColumn {
+            type_tag: CompressionType::NumericScaled,
+            row_count: values.len() as u32,
+            null_bitmap,
+            data,
+        }
+        .to_bytes(),
+    )
+}
+
 fn compress_binary_values(values: &[Option<Vec<u8>>]) -> Vec<u8> {
     let mut blob = compress_byte_values(values);
     if let Some(tag) = blob.first_mut() {
@@ -4096,6 +4127,33 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
         return compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count);
     }
 
+    // NumericScaled blobs: decode the scaled-i64 mantissas and render the
+    // exact numeric_out text back (pure Rust inverse of the write side).
+    if cc.type_tag == CompressionType::NumericScaled {
+        let non_null_count = count_non_null(&cc.null_bitmap, total_count);
+        let dscale = cc.data[0];
+        let inner_tag = CompressionType::from_u8(cc.data[1]);
+        let payload = &cc.data[2..];
+        let ints: Vec<i64> = match inner_tag {
+            CompressionType::DeltaVarint => compression::integer::decode_i64(payload, non_null_count),
+            CompressionType::Constant => {
+                compression::bitpacked::decode_constant_i64(payload, non_null_count)
+            }
+            CompressionType::ForBitpacked => {
+                compression::bitpacked::decode_for_i64(payload, non_null_count)
+            }
+            other => pgrx::error!(
+                "pg_deltax: unexpected inner tag {:?} in NumericScaled blob",
+                other
+            ),
+        };
+        let strings: Vec<String> = ints
+            .iter()
+            .map(|&m| compression::numeric_scaled::format_numeric_scaled(m, dscale))
+            .collect();
+        return compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count);
+    }
+
     // time columns: integer-tag blobs (native codec) hold microseconds since
     // midnight and must be rendered as 'HH:MM:SS[.ffffff]' for the re-INSERT.
     // Legacy text-tag blobs hold the time's text rendering already and fall
@@ -4224,12 +4282,14 @@ fn decompress_column_values(blob: &[u8], data_type: &str) -> Vec<Option<String>>
                 .collect();
             compression::reinsert_nulls(&strings, &cc.null_bitmap, total_count)
         }
-        // Handled by the early-return binary branch above for the types that
-        // write these tags (uuid/bytea/inet/cidr); anything else is corrupt.
+        // Handled by the early-return branches above for the types that
+        // write these tags; anything else is corrupt.
         CompressionType::BinaryDictionary
         | CompressionType::BinaryDictionaryLz4
-        | CompressionType::BinaryLz4Blocked => pgrx::error!(
-            "pg_deltax: unexpected binary-tag blob for column type {}",
+        | CompressionType::BinaryLz4Blocked
+        | CompressionType::NumericScaled => pgrx::error!(
+            "pg_deltax: unexpected {:?} blob for column type {}",
+            cc.type_tag,
             dt
         ),
         CompressionType::Constant => {

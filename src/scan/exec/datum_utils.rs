@@ -297,6 +297,29 @@ unsafe fn decode_compressed_datums(
                 unsafe { ranges_to_varlena_datums(&buf, &ranges) }
             }
         }
+        CompressionType::NumericScaled => {
+            let dscale = cc.data[0];
+            let inner_tag = CompressionType::from_u8(cc.data[1]);
+            let payload = &cc.data[2..];
+            let ints: Vec<i64> = match inner_tag {
+                CompressionType::DeltaVarint => {
+                    compression::integer::decode_i64(payload, non_null_count)
+                }
+                CompressionType::Constant => {
+                    compression::bitpacked::decode_constant_i64(payload, non_null_count)
+                }
+                CompressionType::ForBitpacked => {
+                    compression::bitpacked::decode_for_i64(payload, non_null_count)
+                }
+                other => pgrx::error!(
+                    "pg_deltax: unexpected inner tag {:?} in NumericScaled blob",
+                    other
+                ),
+            };
+            ints.iter()
+                .map(|&m| unsafe { make_numeric_datum(m, dscale) })
+                .collect()
+        }
         CompressionType::BooleanBitmap => {
             let bools = compression::boolean::decode(cc.data, non_null_count);
             bools
@@ -514,7 +537,8 @@ fn decode_numeric_blob_pairs(
         | CompressionType::Lz4Blocked
         | CompressionType::BinaryDictionary
         | CompressionType::BinaryDictionaryLz4
-        | CompressionType::BinaryLz4Blocked => return None,
+        | CompressionType::BinaryLz4Blocked
+        | CompressionType::NumericScaled => return None,
     };
     Some(pairs)
 }
@@ -1686,6 +1710,56 @@ pub(super) unsafe fn str_slices_to_text_datums_arena(
 /// per-row `jsonb_in` parse — parsing happened once at ingest.
 pub(super) unsafe fn byte_slices_to_jsonb_datums_arena(slices: &[&[u8]]) -> Vec<pg_sys::Datum> {
     unsafe { varlena_arena_alloc(slices) }
+}
+
+/// Build a PG `numeric` datum from a scaled-i64 mantissa (`value = mantissa /
+/// 10^dscale`), constructing the long-format NumericData varlena directly:
+/// `[vl_len][n_sign_dscale u16][n_weight i16][base-10000 digits i16...]`.
+/// Trailing zero base-10000 digits are stripped (PG's normal form — required
+/// for hashing/equality consistency); `dscale` still drives the rendering, so
+/// `numeric_out` reproduces the original text exactly.
+pub(super) unsafe fn make_numeric_datum(mantissa: i64, dscale: u8) -> pg_sys::Datum {
+    const NBASE: i128 = 10_000;
+    const NUMERIC_NEG: u16 = 0x4000;
+    let neg = mantissa < 0;
+    let abs = mantissa.unsigned_abs() as i128;
+    // Pad the fractional part to a whole number of base-10000 digits.
+    let fpad = (4 - (dscale as usize % 4)) % 4;
+    let scaled = abs * 10i128.pow(fpad as u32);
+    let frac_ndigits = (dscale as usize + fpad) / 4;
+
+    let mut digits: Vec<i16> = Vec::new();
+    let mut v = scaled;
+    while v > 0 {
+        digits.push((v % NBASE) as i16);
+        v /= NBASE;
+    }
+    digits.reverse();
+    let weight: i16 = if scaled == 0 {
+        0
+    } else {
+        (digits.len() as i32 - frac_ndigits as i32 - 1) as i16
+    };
+    while let Some(&0) = digits.last() {
+        digits.pop();
+    }
+    // Leading zero digits can't occur: the most significant base-10000 digit
+    // of a non-zero `scaled` is non-zero by construction.
+
+    unsafe {
+        let total_len = pg_sys::VARHDRSZ + 2 + 2 + 2 * digits.len();
+        let ptr = pg_sys::palloc(total_len) as *mut u8;
+        pgrx::set_varsize_4b(ptr as *mut pg_sys::varlena, total_len as i32);
+        let sign: u16 = if neg && !digits.is_empty() { NUMERIC_NEG } else { 0 };
+        let n_sign_dscale: u16 = sign | (dscale as u16 & 0x3FFF);
+        (ptr.add(pg_sys::VARHDRSZ) as *mut u16).write_unaligned(n_sign_dscale);
+        (ptr.add(pg_sys::VARHDRSZ + 2) as *mut i16).write_unaligned(weight);
+        let digit_base = ptr.add(pg_sys::VARHDRSZ + 4) as *mut i16;
+        for (i, &d) in digits.iter().enumerate() {
+            digit_base.add(i).write_unaligned(d);
+        }
+        pg_sys::Datum::from(ptr as usize)
+    }
 }
 
 /// Arena-allocate fixed-length pass-by-reference datums (uuid: 16 bytes) —

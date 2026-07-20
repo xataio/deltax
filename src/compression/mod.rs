@@ -4,6 +4,7 @@ pub mod dictionary;
 pub mod gorilla;
 pub mod integer;
 pub mod lz4;
+pub mod numeric_scaled;
 
 /// Tag byte identifying the compression codec used.
 #[repr(u8)]
@@ -26,6 +27,12 @@ pub enum CompressionType {
     BinaryDictionary = 10,
     BinaryDictionaryLz4 = 11,
     BinaryLz4Blocked = 12,
+    /// numeric stored as scaled i64 mantissas: data = [dscale u8][inner
+    /// integer tag u8][inner encoding]. Written only when every non-null
+    /// value in the segment has the same dscale and its mantissa fits i64
+    /// (the typical `numeric(p,s)` column); otherwise the segment falls back
+    /// to the text codecs — dispatch is per blob.
+    NumericScaled = 13,
 }
 
 impl CompressionType {
@@ -43,6 +50,7 @@ impl CompressionType {
             10 => Self::BinaryDictionary,
             11 => Self::BinaryDictionaryLz4,
             12 => Self::BinaryLz4Blocked,
+            13 => Self::NumericScaled,
             _ => panic!("unknown compression type tag: {}", v),
         }
     }
