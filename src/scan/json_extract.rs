@@ -42,6 +42,9 @@ pub(crate) fn kind_to_type_oid(kind: ColumnKind) -> pg_sys::Oid {
         ColumnKind::Date => pg_sys::DATEOID,
         ColumnKind::Time => pg_sys::TIMEOID,
         ColumnKind::Jsonb => pg_sys::JSONBOID,
+        ColumnKind::Uuid => pg_sys::UUIDOID,
+        ColumnKind::Bytea => pg_sys::BYTEAOID,
+        ColumnKind::Inet => pg_sys::INETOID,
     }
 }
 

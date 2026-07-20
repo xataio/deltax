@@ -531,6 +531,39 @@ fn parse_str_and_append(
             }
             Ok(())
         }
+        ColumnKind::Uuid => {
+            let bytes = parse_uuid_bytes(s).map_err(|e| ParseError {
+                message: e,
+                column: col_idx,
+                line: line_number,
+            })?;
+            if let TypedColumn::Bytes(vec) = typed_col {
+                vec.push(Some(bytes.to_vec()));
+            }
+            Ok(())
+        }
+        ColumnKind::Bytea => {
+            let bytes = parse_bytea_bytes(s).map_err(|e| ParseError {
+                message: e,
+                column: col_idx,
+                line: line_number,
+            })?;
+            if let TypedColumn::Bytes(vec) = typed_col {
+                vec.push(Some(bytes));
+            }
+            Ok(())
+        }
+        ColumnKind::Inet => {
+            let bytes = parse_inet_bytes(s).map_err(|e| ParseError {
+                message: e,
+                column: col_idx,
+                line: line_number,
+            })?;
+            if let TypedColumn::Bytes(vec) = typed_col {
+                vec.push(Some(bytes));
+            }
+            Ok(())
+        }
         ColumnKind::Date => {
             let usec = timeparse::parse_timestamp_to_usec(s);
             if let TypedColumn::Int64(vec) = typed_col {
@@ -694,7 +727,167 @@ pub fn parse_and_append(
                 }
                 Ok(())
             }
+            ColumnKind::Uuid => {
+                let bytes = parse_uuid_bytes(s).map_err(|e| ParseError {
+                    message: e,
+                    column: col_idx,
+                    line: line_number,
+                })?;
+                if let TypedColumn::Bytes(vec) = typed_col {
+                    vec.push(Some(bytes.to_vec()));
+                }
+                Ok(())
+            }
+            ColumnKind::Bytea => {
+                let bytes = parse_bytea_bytes(s).map_err(|e| ParseError {
+                    message: e,
+                    column: col_idx,
+                    line: line_number,
+                })?;
+                if let TypedColumn::Bytes(vec) = typed_col {
+                    vec.push(Some(bytes));
+                }
+                Ok(())
+            }
+            ColumnKind::Inet => {
+                let bytes = parse_inet_bytes(s).map_err(|e| ParseError {
+                    message: e,
+                    column: col_idx,
+                    line: line_number,
+                })?;
+                if let TypedColumn::Bytes(vec) = typed_col {
+                    vec.push(Some(bytes));
+                }
+                Ok(())
+            }
         },
+    }
+}
+
+/// Parse a uuid text rendering to its 16 raw bytes. Accepts the canonical
+/// 8-4-4-4-12 form plus PG's other accepted variants (braces, missing
+/// hyphens), matching `uuid_in`'s tolerance. Pure Rust — thread-safe.
+pub(crate) fn parse_uuid_bytes(s: &str) -> Result<[u8; 16], String> {
+    let mut out = [0u8; 16];
+    let mut nibbles = 0usize;
+    for c in s.bytes() {
+        match c {
+            b'-' | b'{' | b'}' => continue,
+            _ => {
+                let d = (c as char)
+                    .to_digit(16)
+                    .ok_or_else(|| format!("invalid uuid: {}", s))?
+                    as u8;
+                if nibbles >= 32 {
+                    return Err(format!("invalid uuid: {}", s));
+                }
+                out[nibbles / 2] = (out[nibbles / 2] << 4) | d;
+                nibbles += 1;
+            }
+        }
+    }
+    if nibbles != 32 {
+        return Err(format!("invalid uuid: {}", s));
+    }
+    Ok(out)
+}
+
+/// Parse a bytea text rendering to raw bytes: `\x<hex>` (hex format) or the
+/// legacy escape format (`\\` for backslash, `\nnn` octal). Pure Rust.
+pub(crate) fn parse_bytea_bytes(s: &str) -> Result<Vec<u8>, String> {
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[0] == b'\\' && (b[1] == b'x' || b[1] == b'X') {
+        let hex = &b[2..];
+        if hex.len() % 2 != 0 {
+            return Err(format!("invalid bytea hex: {}", s));
+        }
+        let mut out = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.chunks_exact(2) {
+            let hi = (pair[0] as char)
+                .to_digit(16)
+                .ok_or_else(|| format!("invalid bytea hex: {}", s))?;
+            let lo = (pair[1] as char)
+                .to_digit(16)
+                .ok_or_else(|| format!("invalid bytea hex: {}", s))?;
+            out.push(((hi << 4) | lo) as u8);
+        }
+        return Ok(out);
+    }
+    // Escape format
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] == b'\\' {
+            if i + 1 < b.len() && b[i + 1] == b'\\' {
+                out.push(b'\\');
+                i += 2;
+            } else if i + 3 < b.len()
+                && b[i + 1].is_ascii_digit()
+                && b[i + 2].is_ascii_digit()
+                && b[i + 3].is_ascii_digit()
+            {
+                let v = (b[i + 1] - b'0') as u16 * 64
+                    + (b[i + 2] - b'0') as u16 * 8
+                    + (b[i + 3] - b'0') as u16;
+                if v > 255 {
+                    return Err(format!("invalid bytea escape: {}", s));
+                }
+                out.push(v as u8);
+                i += 4;
+            } else {
+                return Err(format!("invalid bytea escape: {}", s));
+            }
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// PG's address family tags for the inet/cidr binary payload
+/// (`PGSQL_AF_INET` / `PGSQL_AF_INET6` in utils/inet.h).
+const PGSQL_AF_INET: u8 = 2;
+const PGSQL_AF_INET6: u8 = 3;
+
+/// Parse an inet/cidr text rendering to PG's varlena payload bytes:
+/// `[family, bits, addr...]` (`inet_struct`, addr trimmed to the family's
+/// size). Pure Rust — thread-safe.
+pub(crate) fn parse_inet_bytes(s: &str) -> Result<Vec<u8>, String> {
+    let (addr_part, prefix) = match s.split_once('/') {
+        Some((a, p)) => (
+            a,
+            Some(
+                p.parse::<u16>()
+                    .map_err(|_| format!("invalid inet prefix: {}", s))?,
+            ),
+        ),
+        None => (s, None),
+    };
+    match addr_part.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            let bits = prefix.unwrap_or(32);
+            if bits > 32 {
+                return Err(format!("invalid inet prefix: {}", s));
+            }
+            let mut out = Vec::with_capacity(6);
+            out.push(PGSQL_AF_INET);
+            out.push(bits as u8);
+            out.extend_from_slice(&v4.octets());
+            Ok(out)
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let bits = prefix.unwrap_or(128);
+            if bits > 128 {
+                return Err(format!("invalid inet prefix: {}", s));
+            }
+            let mut out = Vec::with_capacity(18);
+            out.push(PGSQL_AF_INET6);
+            out.push(bits as u8);
+            out.extend_from_slice(&v6.octets());
+            Ok(out)
+        }
+        Err(_) => Err(format!("invalid inet: {}", s)),
     }
 }
 

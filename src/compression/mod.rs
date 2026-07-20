@@ -18,6 +18,14 @@ pub enum CompressionType {
     Constant = 7,
     ForBitpacked = 8,
     DictionaryLz4 = 9,
+    // Binary variants of the string codecs: the payloads are raw bytes (a
+    // type's binary representation), NOT UTF-8 text renderings. Emitted for
+    // natively-coded fixed/varlena types (uuid, bytea, inet); the tag is what
+    // distinguishes a new binary blob from a legacy text-rendering blob on
+    // the same column, so mixed-generation partitions decode correctly.
+    BinaryDictionary = 10,
+    BinaryDictionaryLz4 = 11,
+    BinaryLz4Blocked = 12,
 }
 
 impl CompressionType {
@@ -32,7 +40,23 @@ impl CompressionType {
             7 => Self::Constant,
             8 => Self::ForBitpacked,
             9 => Self::DictionaryLz4,
+            10 => Self::BinaryDictionary,
+            11 => Self::BinaryDictionaryLz4,
+            12 => Self::BinaryLz4Blocked,
             _ => panic!("unknown compression type tag: {}", v),
+        }
+    }
+
+    /// Remap a string-codec tag to its binary-payload variant. Used by
+    /// `compress_binary_values`, which reuses the string codec pipeline
+    /// byte-for-byte and only changes the tag so readers know the payloads
+    /// are raw bytes rather than UTF-8 text.
+    pub fn to_binary_variant(self) -> Self {
+        match self {
+            Self::Dictionary => Self::BinaryDictionary,
+            Self::DictionaryLz4 => Self::BinaryDictionaryLz4,
+            Self::Lz4Blocked => Self::BinaryLz4Blocked,
+            other => other,
         }
     }
 }

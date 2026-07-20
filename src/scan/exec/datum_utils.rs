@@ -265,6 +265,38 @@ unsafe fn decode_compressed_datums(
                 compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
             unsafe { text_ranges_to_datums(&buf, &ranges, type_oid, typmod) }
         }
+        CompressionType::BinaryDictionary | CompressionType::BinaryDictionaryLz4 => {
+            // Binary payloads (uuid/bytea/inet native codecs): the stored
+            // bytes ARE the attribute's binary representation — wrap them in
+            // datums directly, no text or input-function round-trip.
+            let norm_buf;
+            let dict_data = if cc.type_tag == CompressionType::BinaryDictionaryLz4 {
+                norm_buf = compression::dictionary::normalize_lz4(cc.data);
+                &norm_buf
+            } else {
+                cc.data
+            };
+            let byte_slices =
+                compression::dictionary::decode_to_byte_slices(dict_data, non_null_count);
+            if type_oid == pg_sys::UUIDOID {
+                unsafe { byte_slices_to_fixed_datums_arena(&byte_slices) }
+            } else {
+                unsafe { varlena_arena_alloc(&byte_slices) }
+            }
+        }
+        CompressionType::BinaryLz4Blocked => {
+            let (buf, ranges) =
+                compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
+            if type_oid == pg_sys::UUIDOID {
+                let byte_slices: Vec<&[u8]> = ranges
+                    .iter()
+                    .map(|&(off, len)| &buf[off..off + len])
+                    .collect();
+                unsafe { byte_slices_to_fixed_datums_arena(&byte_slices) }
+            } else {
+                unsafe { ranges_to_varlena_datums(&buf, &ranges) }
+            }
+        }
         CompressionType::BooleanBitmap => {
             let bools = compression::boolean::decode(cc.data, non_null_count);
             bools
@@ -479,7 +511,10 @@ fn decode_numeric_blob_pairs(
         CompressionType::Dictionary
         | CompressionType::DictionaryLz4
         | CompressionType::Lz4
-        | CompressionType::Lz4Blocked => return None,
+        | CompressionType::Lz4Blocked
+        | CompressionType::BinaryDictionary
+        | CompressionType::BinaryDictionaryLz4
+        | CompressionType::BinaryLz4Blocked => return None,
     };
     Some(pairs)
 }
@@ -1651,6 +1686,32 @@ pub(super) unsafe fn str_slices_to_text_datums_arena(
 /// per-row `jsonb_in` parse — parsing happened once at ingest.
 pub(super) unsafe fn byte_slices_to_jsonb_datums_arena(slices: &[&[u8]]) -> Vec<pg_sys::Datum> {
     unsafe { varlena_arena_alloc(slices) }
+}
+
+/// Arena-allocate fixed-length pass-by-reference datums (uuid: 16 bytes) —
+/// each datum is a bare pointer to the copied bytes, no varlena header.
+/// Single contiguous palloc for cache locality, entries padded to MAXALIGN.
+pub(super) unsafe fn byte_slices_to_fixed_datums_arena(slices: &[&[u8]]) -> Vec<pg_sys::Datum> {
+    if slices.is_empty() {
+        return Vec::new();
+    }
+    unsafe {
+        const MAXALIGN: usize = 8;
+        let total_size: usize = slices
+            .iter()
+            .map(|b| (b.len() + MAXALIGN - 1) & !(MAXALIGN - 1))
+            .sum();
+        let arena = pg_sys::palloc(total_size) as *mut u8;
+        let mut datums = Vec::with_capacity(slices.len());
+        let mut offset = 0usize;
+        for b in slices {
+            let dst = arena.add(offset);
+            std::ptr::copy_nonoverlapping(b.as_ptr(), dst, b.len());
+            datums.push(pg_sys::Datum::from(dst as usize));
+            offset += (b.len() + MAXALIGN - 1) & !(MAXALIGN - 1);
+        }
+        datums
+    }
 }
 
 /// Arena-allocate a contiguous palloc block holding one varlena per input
