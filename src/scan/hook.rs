@@ -2357,7 +2357,16 @@ pub unsafe extern "C-unwind" fn deltax_create_upper_paths(
         //   and prune at segment level inside the executor. Otherwise
         //   fall through to DeltaXAgg which decompresses and filters.
         // =====================================================================
-        if aggrefs.len() == 1 && (*aggrefs[0]).aggstar && !has_group_by && !has_having {
+        // A FILTER clause disqualifies the fast path: the catalog/meta row
+        // counts can't apply the per-row filter expression. (The DeltaXAgg
+        // classifier below also rejects FILTER, so those queries fall back to
+        // a plain scan + PG Aggregate, which evaluates FILTER correctly.)
+        if aggrefs.len() == 1
+            && (*aggrefs[0]).aggstar
+            && (*aggrefs[0]).aggfilter.is_null()
+            && !has_group_by
+            && !has_having
+        {
             if !has_where {
                 path::add_count_star_path(root, output_rel, &companion_oids, std::ptr::null_mut());
                 return;
