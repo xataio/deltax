@@ -1,7 +1,32 @@
 # Type Support Improvement Plan
 
-Status: draft (2026-07-20). Follows community PR #51 / issue #50 (non-text
-fallthrough columns read back wrong or crashed the backend).
+Status: Phases 0-2 implemented (2026-07-20, PR #53). Follows community PR #51
+/ issue #50 (non-text fallthrough columns read back wrong or crashed the
+backend).
+
+Implementation notes vs. the original plan below:
+
+- time uses the existing integer tags (no new tag needed — legacy time blobs
+  have text-family tags, so the tag disambiguates generations naturally).
+- uuid/bytea/inet/cidr use three new tags (BinaryDictionary=10,
+  BinaryDictionaryLz4=11, BinaryLz4Blocked=12) that remap the byte-pipeline
+  output; jsonb keeps the legacy tags (disambiguated by oid) for on-disk
+  compatibility.
+- numeric kept `ColumnKind::Text` entirely: only `compress_typed_column`
+  gained a gate that tries `CompressionType::NumericScaled` (=13, scaled-i64
+  mantissas + uniform dscale) per blob, with text fallback for
+  NaN/Infinity/mixed-dscale/>i64 segments. Reads build long-format
+  NumericData varlenas directly (`make_numeric_datum`).
+- Mixed-generation testing runs with current code via the
+  `pg_deltax.force_text_fallback` GUC (tests/test_native_type_codecs.py),
+  which forces legacy text-era blobs at compression time.
+- Found and fixed along the way: the single-`count(*)` fast path ignored
+  FILTER clauses (returned total row count for `count(*) FILTER (...)` on
+  any compressed table).
+
+Remaining: macaddr (would ride the fixed-length path like uuid), numeric
+minmax pruning (needs a cross-segment order-preserving encoding), bloom
+probes for time/uuid equality, and the Phase 3 benchmark validation runs.
 
 ## Background
 

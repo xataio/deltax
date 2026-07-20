@@ -42,6 +42,10 @@ pub(crate) static PARALLEL_WORKERS: GucSetting<i32> = GucSetting::<i32>::new(0);
 pub(crate) static PARALLEL_REGEX: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 pub(crate) static BLOOM_FILTERS: GucSetting<bool> = GucSetting::<bool>::new(true);
+/// Testing-only: force natively-coded fallback types (time, uuid, bytea,
+/// inet/cidr, numeric) back onto the legacy ::text codecs at compression
+/// time, to produce legacy-format blobs for mixed-generation read tests.
+pub(crate) static FORCE_TEXT_FALLBACK: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 pub(crate) static MAX_PARALLEL_WORKERS_PER_SCAN: GucSetting<i32> = GucSetting::<i32>::new(-1);
 
@@ -263,6 +267,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"Use Rust regex for parallel REGEXP_REPLACE in GROUP BY",
         c"When ON, compatible regex patterns use the Rust regex crate for thread-safe parallel execution",
         &PARALLEL_REGEX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.force_text_fallback",
+        c"TESTING: compress natively-coded fallback types via the legacy text codecs",
+        c"When ON, time/uuid/bytea/inet/cidr/numeric columns compress through the legacy ::text rendering codecs instead of their native binary codecs. Produces legacy-format blobs for mixed-generation read testing; never needed in production.",
+        &FORCE_TEXT_FALLBACK,
         GucContext::Userset,
         GucFlags::default(),
     );

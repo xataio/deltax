@@ -102,6 +102,15 @@ fn read_column(
                             .collect(),
                     )
                 }
+                ColumnKind::Time => {
+                    // Parquet TIME as INT32 is millis since midnight → usec
+                    TypedColumn::Int64(
+                        unpacked
+                            .into_iter()
+                            .map(|v| v.map(|ms| (ms as i64) * 1_000))
+                            .collect(),
+                    )
+                }
                 _ => {
                     TypedColumn::Int64(unpacked.into_iter().map(|v| v.map(|x| x as i64)).collect())
                 }
@@ -161,15 +170,50 @@ fn read_column(
             let (_records, num_values, _levels) = r
                 .read_records(num_rows, Some(&mut def_levels), None, &mut values)
                 .map_err(|e| format!("pg_deltax: parquet read error: {}", e))?;
+            if matches!(kind, ColumnKind::Bytea) {
+                // BYTE_ARRAY for a bytea column is raw binary — keep the bytes.
+                let bytes =
+                    unpack_nullable_byte_array_raw(&values, &def_levels, num_rows, num_values);
+                return Ok(TypedColumn::Bytes(bytes));
+            }
             let unpacked = unpack_nullable_byte_array(&values, &def_levels, num_rows, num_values)?;
-            if matches!(kind, ColumnKind::Jsonb) {
-                let bytes: Vec<Option<Vec<u8>>> = unpacked
-                    .into_iter()
-                    .map(|opt| opt.map(|s| unsafe { crate::compress::jsonb_text_to_binary(&s) }))
-                    .collect();
-                Ok(TypedColumn::Bytes(bytes))
-            } else {
-                Ok(TypedColumn::Text(unpacked))
+            match kind {
+                ColumnKind::Jsonb => {
+                    let bytes: Vec<Option<Vec<u8>>> = unpacked
+                        .into_iter()
+                        .map(|opt| {
+                            opt.map(|s| unsafe { crate::compress::jsonb_text_to_binary(&s) })
+                        })
+                        .collect();
+                    Ok(TypedColumn::Bytes(bytes))
+                }
+                ColumnKind::Uuid => {
+                    let bytes: Result<Vec<Option<Vec<u8>>>, String> = unpacked
+                        .into_iter()
+                        .map(|opt| {
+                            opt.map(|s| crate::copyparse::parse_uuid_bytes(&s).map(|b| b.to_vec()))
+                                .transpose()
+                        })
+                        .collect();
+                    Ok(TypedColumn::Bytes(bytes?))
+                }
+                ColumnKind::Inet => {
+                    let bytes: Result<Vec<Option<Vec<u8>>>, String> = unpacked
+                        .into_iter()
+                        .map(|opt| opt.map(|s| crate::copyparse::parse_inet_bytes(&s)).transpose())
+                        .collect();
+                    Ok(TypedColumn::Bytes(bytes?))
+                }
+                ColumnKind::Time => {
+                    let usecs: Result<Vec<Option<i64>>, String> = unpacked
+                        .into_iter()
+                        .map(|opt| {
+                            opt.map(|s| crate::timeparse::parse_time_to_usec(&s)).transpose()
+                        })
+                        .collect();
+                    Ok(TypedColumn::Int64(usecs?))
+                }
+                _ => Ok(TypedColumn::Text(unpacked)),
             }
         }
         ColumnReader::FixedLenByteArrayColumnReader(r) => {
@@ -178,6 +222,12 @@ fn read_column(
             let (_records, num_values, _levels) = r
                 .read_records(num_rows, Some(&mut def_levels), None, &mut values)
                 .map_err(|e| format!("pg_deltax: parquet read error: {}", e))?;
+            if matches!(kind, ColumnKind::Uuid) {
+                // Parquet UUID logical type: FIXED_LEN_BYTE_ARRAY(16), raw bytes.
+                let bytes =
+                    unpack_nullable_fixed_byte_array_raw(&values, &def_levels, num_rows, num_values);
+                return Ok(TypedColumn::Bytes(bytes));
+            }
             let unpacked =
                 unpack_nullable_fixed_byte_array(&values, &def_levels, num_rows, num_values)?;
             Ok(TypedColumn::Text(unpacked))
@@ -251,6 +301,53 @@ fn unpack_nullable_byte_array(
         }
     }
     Ok(result)
+}
+
+/// Raw-bytes variant of `unpack_nullable_byte_array` — no UTF-8 validation,
+/// for binary columns (bytea).
+fn unpack_nullable_byte_array_raw(
+    values: &[parquet::data_type::ByteArray],
+    def_levels: &[i16],
+    num_rows: usize,
+    num_values: usize,
+) -> Vec<Option<Vec<u8>>> {
+    if num_values == num_rows {
+        return values.iter().map(|v| Some(v.data().to_vec())).collect();
+    }
+    let mut result = Vec::with_capacity(num_rows);
+    let mut val_idx = 0;
+    for &dl in def_levels.iter().take(num_rows) {
+        if dl > 0 {
+            result.push(Some(values[val_idx].data().to_vec()));
+            val_idx += 1;
+        } else {
+            result.push(None);
+        }
+    }
+    result
+}
+
+/// Raw-bytes variant of `unpack_nullable_fixed_byte_array` (uuid: 16 bytes).
+fn unpack_nullable_fixed_byte_array_raw(
+    values: &[parquet::data_type::FixedLenByteArray],
+    def_levels: &[i16],
+    num_rows: usize,
+    num_values: usize,
+) -> Vec<Option<Vec<u8>>> {
+    if num_values == num_rows {
+        return values.iter().map(|v| Some(v.data().to_vec())).collect();
+    }
+    let mut result = Vec::with_capacity(num_rows);
+    let mut val_idx = 0;
+    for &dl in def_levels.iter().take(num_rows) {
+        if dl > 0 {
+            result.push(Some(values[val_idx].data().to_vec()));
+            val_idx += 1;
+        } else {
+            result.push(None);
+        }
+    }
+    result
 }
 
 /// Unpack nullable FixedLenByteArray values into Option<String>.

@@ -1370,11 +1370,15 @@ pub(crate) fn classify_column(data_type: &str, is_segment_by: bool) -> ColumnKin
         ColumnKind::Timestamp
     } else if dt == "date" {
         ColumnKind::Date
+    } else if dt == "jsonb" {
+        ColumnKind::Jsonb
+    } else if crate::FORCE_TEXT_FALLBACK.get() {
+        // TESTING: force the graduated types back onto the legacy ::text
+        // codecs so mixed-generation reads can be exercised with current code.
+        ColumnKind::Text
     } else if dt == "time" || dt == "time without time zone" {
         // timetz stays on the text fallback (carries a zone offset).
         ColumnKind::Time
-    } else if dt == "jsonb" {
-        ColumnKind::Jsonb
     } else if dt == "uuid" {
         ColumnKind::Uuid
     } else if dt == "bytea" {
@@ -3381,7 +3385,9 @@ pub(crate) fn compress_typed_column(data: &TypedColumn, data_type: &str) -> Vec<
         }
         TypedColumn::Text(values) => {
             let dt = data_type.to_lowercase();
-            if dt.starts_with("numeric") || dt.starts_with("decimal") {
+            if (dt.starts_with("numeric") || dt.starts_with("decimal"))
+                && !crate::FORCE_TEXT_FALLBACK.get()
+            {
                 // Try the scaled-i64 numeric codec; per-blob text fallback for
                 // NaN/Infinity, mixed dscale, or mantissas beyond i64.
                 if let Some(blob) = compress_numeric_scaled(values) {
@@ -5427,8 +5433,25 @@ mod tests {
         ));
         assert!(matches!(classify_column("date", false), ColumnKind::Date));
         assert!(matches!(classify_column("jsonb", false), ColumnKind::Jsonb));
+        assert!(matches!(
+            classify_column("time without time zone", false),
+            ColumnKind::Time
+        ));
+        assert!(matches!(classify_column("uuid", false), ColumnKind::Uuid));
+        assert!(matches!(classify_column("bytea", false), ColumnKind::Bytea));
+        assert!(matches!(classify_column("inet", false), ColumnKind::Inet));
+        assert!(matches!(classify_column("cidr", false), ColumnKind::Inet));
         // Unknown types default to Text (no error — caller doesn't see this).
-        assert!(matches!(classify_column("uuid", false), ColumnKind::Text));
+        assert!(matches!(
+            classify_column("interval", false),
+            ColumnKind::Text
+        ));
+        assert!(matches!(
+            classify_column("timetz", false),
+            ColumnKind::Text
+        ));
+        // segment_by columns are always read as text for SQL literals.
+        assert!(matches!(classify_column("uuid", true), ColumnKind::Text));
     }
 
     #[test]

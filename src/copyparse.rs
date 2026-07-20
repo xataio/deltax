@@ -798,7 +798,7 @@ pub(crate) fn parse_bytea_bytes(s: &str) -> Result<Vec<u8>, String> {
     let b = s.as_bytes();
     if b.len() >= 2 && b[0] == b'\\' && (b[1] == b'x' || b[1] == b'X') {
         let hex = &b[2..];
-        if hex.len() % 2 != 0 {
+        if !hex.len().is_multiple_of(2) {
             return Err(format!("invalid bytea hex: {}", s));
         }
         let mut out = Vec::with_capacity(hex.len() / 2);

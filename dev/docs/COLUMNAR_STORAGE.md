@@ -367,9 +367,15 @@ so the main thread can saturate the storage bandwidth.
 ### Fallback-Typed Columns: Text Renderings and Pinned GUCs
 
 Columns whose type has no native codec (`classify_column` falls through to
-`ColumnKind::Text` for anything that isn't int/float/bool/timestamp/date/jsonb
-or text/varchar/bpchar — e.g. `numeric`, `uuid`, `bytea`, `inet`, `interval`,
-arrays, enums, composites) are stored as their lossless `::text` rendering.
+`ColumnKind::Text` — after the Phase 2 type graduation that means e.g.
+`interval`, `timetz`, arrays, enums, composites, extension types) are stored
+as their lossless `::text` rendering. Natively-coded since Phase 2
+(dev/docs/TYPE_SUPPORT_PLAN.md): `time` (i64 usec through the integer
+codecs), `uuid`/`bytea`/`inet`/`cidr` (raw binary payloads via the
+BinaryDictionary/BinaryDictionaryLz4/BinaryLz4Blocked tags), and `numeric`
+(scaled-i64 mantissas via the NumericScaled tag, with per-blob text fallback).
+Legacy partitions compressed before graduation keep reading through the text
+path — the compression type tag on each blob picks the decode route.
 The read path reconstructs real typed datums via the type's input function
 (`TypeInputFn` in the scan exec code), the exact inverse of the rendering.
 
