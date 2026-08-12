@@ -27,6 +27,7 @@ There are two ways to get the library loaded into your backends:
 | Transparent reads of compressed data | ✅ every backend | ✅ in backends that load the library |
 | Automatic background maintenance | ✅ built-in worker | ❌ you schedule `deltax_run_maintenance()` (e.g. with pg_cron) |
 | Shared blob cache (cold-read speedup) | ✅ | ❌ off (performance only, not correctness) |
+| Condition cache (repeated filtered queries) | ✅ | ❌ off (rides the blob cache's shared memory) |
 | Safe if a client connects without the library | ✅ can't happen | ⚠️ that backend silently returns **zero rows** from compressed partitions — see [Caveats](#caveats) |
 | Per-connection cost | None | A tiny `dlopen` at connect (negligible, especially behind a pooler) |
 
@@ -139,8 +140,10 @@ against this; avoid it by configuration:
 
 **No shared blob cache.** The process-shared blob cache (a cold-read latency
 optimization) is only set up at postmaster start, so it is off in session mode.
-Correctness and warm-cache performance are unaffected; only cold reads of
-compressed segments are a little slower. This is subject for improvement in the
+The condition cache (which reuses the blob cache's shared memory to accelerate
+repeated filtered queries) is off with it. Correctness and warm-cache
+performance are unaffected; only cold reads of compressed segments and repeated
+filtered queries are a little slower. This is subject for improvement in the
 future.
 
 **Postmaster-only GUCs are unavailable.** `pg_deltax.target_database`,

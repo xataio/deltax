@@ -207,6 +207,15 @@ pub(super) unsafe fn dispatch_serial_path(
         let mut total_rows_processed: u64 = 0;
         let mut decompress_us: u64 = 0;
 
+        // Condition cache: every selection writer in this loop derives from
+        // `batch_quals` (ne-empty dict checks, length sidecars, like/eq/in
+        // decode filters), so the fingerprint covers the applied set.
+        let cond_fp = if super::super::cond_cache::enabled() {
+            super::super::cond_cache::fingerprint_quals(batch_quals, &[])
+        } else {
+            None
+        };
+
         for seg in all_segments.iter() {
             if seg.row_count == 0 {
                 continue;
@@ -242,6 +251,26 @@ pub(super) unsafe fn dispatch_serial_path(
             // Dictionary-based LIKE pruning: skip segment if no dict entry matches
             if segment_skippable_by_dict(batch_quals, &meta.blob_idx, &seg.compressed_blobs) {
                 continue;
+            }
+
+            // Condition cache lookup. Segments proven empty under these
+            // quals skip all decode; AllPass/Bitmap hits skip evaluation.
+            let mut cond_hit: Option<super::super::cond_cache::CachedSelection> = None;
+            if let Some(fp) = cond_fp
+                && seg.tombstones.is_none()
+            {
+                cond_hit = super::super::cond_cache::lookup(
+                    seg.companion_oid,
+                    seg.segment_id,
+                    fp,
+                    seg.row_count as usize,
+                );
+                if matches!(
+                    cond_hit,
+                    Some(super::super::cond_cache::CachedSelection::NonePass)
+                ) {
+                    continue;
+                }
             }
 
             total_segments += 1;
@@ -799,8 +828,28 @@ pub(super) unsafe fn dispatch_serial_path(
             // pre_selection seeds the selection vector so that rows already
             // filtered by LIKE during decompression are skipped (their dummy
             // datums are never dereferenced).
-            let selection =
-                evaluate_batch_quals(&decompressed, row_count, batch_quals, pre_selection);
+            let selection = match cond_hit {
+                Some(super::super::cond_cache::CachedSelection::AllPass) => Vec::new(),
+                Some(super::super::cond_cache::CachedSelection::Bitmap(v)) => v,
+                // NonePass segments were skipped before decode.
+                Some(super::super::cond_cache::CachedSelection::NonePass) => unreachable!(),
+                None => {
+                    let sel =
+                        evaluate_batch_quals(&decompressed, row_count, batch_quals, pre_selection);
+                    if let Some(fp) = cond_fp
+                        && seg.tombstones.is_none()
+                    {
+                        super::super::cond_cache::store(
+                            seg.companion_oid,
+                            seg.segment_id,
+                            fp,
+                            row_count,
+                            &sel,
+                        );
+                    }
+                    sel
+                }
+            };
 
             // Pre-compute CaseWhen GROUP BY columns into SegTextColumn
             let case_when_seg_cols: Vec<Option<SegTextColumn>> = group_specs

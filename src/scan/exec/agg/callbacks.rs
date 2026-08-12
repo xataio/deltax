@@ -1377,6 +1377,15 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
                 reserve_groups: 0,
             };
 
+            // Condition cache: fingerprint the numeric filter set and
+            // prefetch cached selections (this is a backend thread).
+            let mut cond = super::super::cond_cache::CondBatch::disabled(ctx.meta.col_names.len());
+            if super::super::cond_cache::enabled()
+                && let Some(fp) = super::super::cond_cache::fingerprint_quals(&ctx.batch_quals, &[])
+            {
+                cond.prefetch(fp, &ctx.all_segments);
+            }
+
             const CHUNK: u64 = 4;
             loop {
                 let start = (*state.pscan)
@@ -1388,7 +1397,17 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
                 let seq = std::sync::atomic::AtomicUsize::new(0);
-                let chunk_result = process_segments_compact(slice, &seq, &cfg);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg, &cond);
+                if let Some(fp) = cond.fp {
+                    for (companion, segment_id, payload) in &chunk_result.cond_store {
+                        super::super::cond_cache::store_encoded_raw(
+                            *companion,
+                            *segment_id,
+                            fp,
+                            payload,
+                        );
+                    }
+                }
                 merge_compact_results(
                     &mut global.compact_map,
                     &mut global.compact_storage,
@@ -1598,6 +1617,15 @@ unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
                 topn_spec: None,
                 reserve_groups: 0,
             };
+            // Condition cache: fingerprint the numeric filter set and
+            // prefetch cached selections (this is a backend thread).
+            let mut cond = super::super::cond_cache::CondBatch::disabled(ctx.meta.col_names.len());
+            if super::super::cond_cache::enabled()
+                && let Some(fp) = super::super::cond_cache::fingerprint_quals(&ctx.batch_quals, &[])
+            {
+                cond.prefetch(fp, &ctx.all_segments);
+            }
+
             const CHUNK: u64 = 4;
             loop {
                 let start = (*state.pscan)
@@ -1609,7 +1637,17 @@ unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
                 let seq = std::sync::atomic::AtomicUsize::new(0);
-                let chunk_result = process_segments_compact(slice, &seq, &cfg);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg, &cond);
+                if let Some(fp) = cond.fp {
+                    for (companion, segment_id, payload) in &chunk_result.cond_store {
+                        super::super::cond_cache::store_encoded_raw(
+                            *companion,
+                            *segment_id,
+                            fp,
+                            payload,
+                        );
+                    }
+                }
                 merge_compact_results(
                     &mut local.compact_map,
                     &mut local.compact_storage,
@@ -1712,6 +1750,15 @@ unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
                 reserve_groups: 0,
             };
 
+            // Condition cache: fingerprint the numeric filter set and
+            // prefetch cached selections (this is a backend thread).
+            let mut cond = super::super::cond_cache::CondBatch::disabled(ctx.meta.col_names.len());
+            if super::super::cond_cache::enabled()
+                && let Some(fp) = super::super::cond_cache::fingerprint_quals(&ctx.batch_quals, &[])
+            {
+                cond.prefetch(fp, &ctx.all_segments);
+            }
+
             loop {
                 let start = ps.next_segment.fetch_add(CHUNK, Ordering::Relaxed);
                 if start >= total_segments {
@@ -1720,7 +1767,17 @@ unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
                 let end = (start + CHUNK).min(total_segments);
                 let slice = &ctx.all_segments[start as usize..end as usize];
                 let seq = std::sync::atomic::AtomicUsize::new(0);
-                let chunk_result = process_segments_compact(slice, &seq, &cfg);
+                let chunk_result = process_segments_compact(slice, &seq, &cfg, &cond);
+                if let Some(fp) = cond.fp {
+                    for (companion, segment_id, payload) in &chunk_result.cond_store {
+                        super::super::cond_cache::store_encoded_raw(
+                            *companion,
+                            *segment_id,
+                            fp,
+                            payload,
+                        );
+                    }
+                }
 
                 merge_compact_results(
                     &mut local.compact_map,

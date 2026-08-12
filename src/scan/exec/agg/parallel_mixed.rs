@@ -29,6 +29,7 @@ use std::time::Instant;
 use pgrx::pg_sys;
 
 use super::super::batch_qual::{BatchCompareOp, BatchQual, evaluate_batch_quals};
+use super::super::cond_cache::{self, CachedSelection, CondBatch};
 use super::super::datum_utils::{collation_strcmp, string_to_datum};
 use super::super::segments::{
     MetadataInfo, SegmentData, SegmentQualResult, classify_segment_quals_numeric,
@@ -393,6 +394,10 @@ pub(super) struct ParallelMixedResult {
     pub(super) rows_processed: u64,
     pub(super) decompress_us: u64,
     pub(super) topk: Option<(Vec<u128>, i64)>,
+    /// Condition-cache payloads computed by this worker, keyed by
+    /// `(companion_oid, segment_id)`. The leader inserts them after the
+    /// scope joins (scope threads can't take LWLocks).
+    pub(super) cond_store: Vec<(u32, i32, Vec<u8>)>,
 }
 
 // decompress_text_to_seg_col is now in text_col.rs
@@ -948,7 +953,9 @@ pub(super) fn process_segments_mixed(
     chunk_offset: usize,
     claim: &std::sync::atomic::AtomicUsize,
     config: &ParallelMixedConfig,
+    cond: &CondBatch,
 ) -> ParallelMixedResult {
+    let mut cond_store: Vec<(u32, i32, Vec<u8>)> = Vec::new();
     let mut compact_map = DigestGroupMap::with_capacity_and_hasher(
         config.reserve_groups,
         BuildHasherDefault::default(),
@@ -1053,6 +1060,14 @@ pub(super) fn process_segments_mixed(
             continue;
         }
 
+        // Condition cache: a cached selection replaces both the numeric
+        // eval and the text-qual application below; NonePass skips the
+        // segment before any decode.
+        let cond_hit: Option<CachedSelection> = cond.hit(seg);
+        if matches!(cond_hit, Some(CachedSelection::NonePass)) {
+            continue;
+        }
+
         // C.3 per-segment fast path: classify against the **numeric subset**
         // of batch_quals using col_minmax / nonzero_count. NonePass on any
         // numeric qual rules out the segment (text quals can only narrow
@@ -1060,7 +1075,7 @@ pub(super) fn process_segments_mixed(
         // while still applying text quals on top of an empty selection.
         // No-op when batch_quals has no numeric entries (helper returns
         // Ambiguous in that case).
-        let numeric_quals_all_pass = if config.batch_quals.is_empty() {
+        let numeric_quals_all_pass = if config.batch_quals.is_empty() || cond_hit.is_some() {
             true
         } else {
             match classify_segment_quals_numeric(seg, config.batch_quals, config.col_names) {
@@ -1146,6 +1161,14 @@ pub(super) fn process_segments_mixed(
                 seg_val_idx += 1;
             } else if let Some(slot) = config.blob_idx[col_idx] {
                 let slot = slot as usize;
+                if cond_hit.is_some() && cond.filter_only_cols[col_idx] {
+                    // The cached selection already accounts for every filter
+                    // on this column, and nothing else reads it — skip its
+                    // decode entirely.
+                    numeric_cols.push(Vec::new());
+                    text_seg_cols.push(None);
+                    continue;
+                }
                 if config
                     .sidecar_only_cols
                     .get(col_idx)
@@ -1213,50 +1236,74 @@ pub(super) fn process_segments_mixed(
 
         let row_count = seg.row_count as usize;
 
-        // Build selection vector from quals
-        // First: numeric batch quals — skip the per-row eval when C.3
-        // metadata classification already proved every row passes the
-        // numeric subset.
-        let mut selection = if numeric_quals_all_pass {
-            Vec::new()
+        // Build selection vector from quals. A condition-cache hit restores
+        // the final selection verbatim (numeric + text quals included).
+        let selection = if let Some(hit) = &cond_hit {
+            match hit {
+                CachedSelection::AllPass => Vec::new(),
+                CachedSelection::Bitmap(v) => v.clone(),
+                // NonePass segments were skipped before decode.
+                CachedSelection::NonePass => unreachable!(),
+            }
         } else {
-            evaluate_batch_quals(&numeric_cols, row_count, config.batch_quals, Vec::new())
-        };
+            // First: numeric batch quals — skip the per-row eval when C.3
+            // metadata classification already proved every row passes the
+            // numeric subset.
+            let mut selection = if numeric_quals_all_pass {
+                Vec::new()
+            } else {
+                evaluate_batch_quals(&numeric_cols, row_count, config.batch_quals, Vec::new())
+            };
 
-        // Then: text quals (applied on SegTextColumn, short-circuiting via selection)
-        for tqi in config.text_qual_infos {
-            match tqi {
-                TextQualInfo::EqNe {
-                    col_idx,
-                    const_str,
-                    is_ne,
-                } => {
-                    if let Some(ref seg_col) = text_seg_cols[*col_idx] {
-                        apply_text_eq_filter(seg_col, const_str, *is_ne, row_count, &mut selection);
+            // Then: text quals (applied on SegTextColumn, short-circuiting via selection)
+            for tqi in config.text_qual_infos {
+                match tqi {
+                    TextQualInfo::EqNe {
+                        col_idx,
+                        const_str,
+                        is_ne,
+                    } => {
+                        if let Some(ref seg_col) = text_seg_cols[*col_idx] {
+                            apply_text_eq_filter(
+                                seg_col,
+                                const_str,
+                                *is_ne,
+                                row_count,
+                                &mut selection,
+                            );
+                        }
                     }
-                }
-                TextQualInfo::Like {
-                    col_idx,
-                    strategy,
-                    negate,
-                } => {
-                    if let Some(ref seg_col) = text_seg_cols[*col_idx] {
-                        apply_text_like_filter(
-                            seg_col,
-                            strategy,
-                            *negate,
-                            row_count,
-                            &mut selection,
-                        );
+                    TextQualInfo::Like {
+                        col_idx,
+                        strategy,
+                        negate,
+                    } => {
+                        if let Some(ref seg_col) = text_seg_cols[*col_idx] {
+                            apply_text_like_filter(
+                                seg_col,
+                                strategy,
+                                *negate,
+                                row_count,
+                                &mut selection,
+                            );
+                        }
                     }
-                }
-                TextQualInfo::InList { col_idx, values } => {
-                    if let Some(ref seg_col) = text_seg_cols[*col_idx] {
-                        apply_text_in_filter(seg_col, values, row_count, &mut selection);
+                    TextQualInfo::InList { col_idx, values } => {
+                        if let Some(ref seg_col) = text_seg_cols[*col_idx] {
+                            apply_text_in_filter(seg_col, values, row_count, &mut selection);
+                        }
                     }
                 }
             }
-        }
+            // Hand the computed selection to the leader for insertion.
+            if cond.fp.is_some()
+                && seg.tombstones.is_none()
+                && let Some(payload) = cond_cache::encode_selection_payload(&selection, row_count)
+            {
+                cond_store.push((seg.companion_oid.to_u32(), seg.segment_id, payload));
+            }
+            selection
+        };
         // Early skip: if all rows are filtered out, skip aggregation for this segment
         if !selection.is_empty() && !selection.iter().any(|&b| b) {
             continue;
@@ -1811,6 +1858,7 @@ pub(super) fn process_segments_mixed(
         rows_processed,
         decompress_us,
         topk,
+        cond_store,
     }
 }
 
@@ -3885,6 +3933,58 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             TextQualInfo::Like { negate: true, .. } => 3,  // NOT LIKE
         });
 
+        // Condition cache: fingerprint the applied filter set (numeric
+        // batch quals + text quals, post-sort so the order is canonical)
+        // and prefetch every segment's cached selection on this backend
+        // thread — scope workers cannot touch LWLocks. On a hit, columns
+        // referenced only by filters stay undecoded; that set is poisoned
+        // (all false) when residual quals need row values or a CaseWhen
+        // group key may read arbitrary columns. See CONDITION_CACHE.md.
+        let mut cond = super::super::cond_cache::CondBatch::disabled(meta.col_names.len());
+        if super::super::cond_cache::enabled()
+            && let Some(fp) =
+                super::super::cond_cache::fingerprint_quals(batch_quals, &text_qual_infos)
+        {
+            cond.prefetch(fp, all_segments);
+            let cond_case_when = group_specs
+                .iter()
+                .any(|gs| matches!(gs.expr, GroupByExpr::CaseWhen(_)));
+            if where_quals.is_null() && !cond_case_when {
+                let mut used = vec![false; meta.col_names.len()];
+                for gs in &group_specs {
+                    if let Some(u) = used.get_mut(gs.col_idx as usize) {
+                        *u = true;
+                    }
+                }
+                for sp in &agg_specs {
+                    if let Some(u) = used.get_mut(sp.col_idx as usize) {
+                        *u = true;
+                    }
+                }
+                let mut in_quals = vec![false; meta.col_names.len()];
+                for bq in batch_quals {
+                    if let Some(q) = in_quals.get_mut(bq.col_idx) {
+                        *q = true;
+                    }
+                }
+                for tqi in &text_qual_infos {
+                    let ci = match tqi {
+                        TextQualInfo::EqNe { col_idx, .. }
+                        | TextQualInfo::Like { col_idx, .. }
+                        | TextQualInfo::InList { col_idx, .. } => *col_idx,
+                    };
+                    if let Some(q) = in_quals.get_mut(ci) {
+                        *q = true;
+                    }
+                }
+                cond.filter_only_cols = (0..meta.col_names.len())
+                    .map(|c| {
+                        in_quals[c] && !used[c] && !meta.segment_by.contains(&meta.col_names[c])
+                    })
+                    .collect();
+            }
+        }
+
         // Pipeline detoast with parallel processing when enough segments.
         // Use fewer batches than the compact path (2 vs n_workers*2) because
         // the mixed path processes text columns which have high per-segment
@@ -4175,8 +4275,15 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
                             // current_batch[0] in the leader's all_segments
                             // view, used to index
                             // dict_distinct_remaps.per_segment.
+                            let cond_ref = &cond;
                             s.spawn(move || {
-                                process_segments_mixed(current_batch, batch_start, claim, cfg)
+                                process_segments_mixed(
+                                    current_batch,
+                                    batch_start,
+                                    claim,
+                                    cfg,
+                                    cond_ref,
+                                )
                             })
                         })
                         .collect();
@@ -4209,12 +4316,23 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
                     .map(|_| {
                         let cfg = &config;
                         let claim = &claim;
-                        s.spawn(move || process_segments_mixed(segs, 0, claim, cfg))
+                        let cond_ref = &cond;
+                        s.spawn(move || process_segments_mixed(segs, 0, claim, cfg, cond_ref))
                     })
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
             })
         };
+
+        // Condition cache: insert the selections the scope workers computed
+        // (this is the backend thread — LWLocks are legal again).
+        if let Some(fp) = cond.fp {
+            for r in &mut partial_results {
+                for (companion, segment_id, payload) in r.cond_store.drain(..) {
+                    cond_cache::store_encoded_raw(companion, segment_id, fp, &payload);
+                }
+            }
+        }
 
         // The counting filter (up to 1 GiB) is dead after pass 2 — free it
         // off the query critical path.

@@ -148,6 +148,7 @@ Current features include:
 - Top-N fast path: `ORDER BY ts LIMIT N` uses a two-pass scan that decodes only the sort column for most segments, then the remaining columns for the ~N winning rows.
 - Parallel aggregation: parallel-aware `Partial → Gather → FinalAgg` for `SUM` / `AVG` / `COUNT` with numeric `WHERE`.
 - Shared-memory blob cache: cross-backend DSA-backed cache of detoasted compressed blobs, so hot-cache scans don't pay TOAST cost.
+- Condition cache: per-segment `WHERE`-filter survivor bitmaps cached in shared memory, so repeated filtered queries skip predicate evaluation and filter-only column decompression (2–4× faster warm on text `LIKE` filters).
 - Text-length sidecar fast path: `length(col)` / `col = ''` / `col <> ''` queries read a few-KB sidecar instead of detoasting the multi-MB text blob.
 
 **JSON field extraction**

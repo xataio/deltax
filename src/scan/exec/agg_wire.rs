@@ -455,6 +455,7 @@ pub(super) unsafe fn deserialize_partial(
             rows_processed: hdr.rows_processed,
             decompress_us: hdr.decompress_us,
             topk,
+            cond_store: Vec::new(),
         })
     }
 }

@@ -2,6 +2,7 @@ mod agg;
 mod agg_wire;
 mod append_wire;
 mod batch_qual;
+mod cond_cache;
 pub(crate) mod count_minmax;
 pub(in crate::scan) mod datum_utils;
 mod decompress;

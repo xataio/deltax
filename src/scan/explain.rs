@@ -310,6 +310,8 @@ unsafe fn explain_timing(node: *mut pg_sys::CustomScanState, es: *mut pg_sys::Ex
         let mut blob_cache_hits = t.blob_cache_hits;
         let mut blob_cache_misses = t.blob_cache_misses;
         let mut blob_cache_bytes_served = t.blob_cache_bytes_served;
+        let mut cond_cache_hits = t.cond_cache_hits;
+        let mut cond_cache_misses = t.cond_cache_misses;
         for (slot_idx, s) in state.cached_worker_timings.iter().enumerate() {
             if slot_idx == 0 || s.populated == 0 {
                 continue;
@@ -332,6 +334,8 @@ unsafe fn explain_timing(node: *mut pg_sys::CustomScanState, es: *mut pg_sys::Ex
             blob_cache_hits += s.blob_cache_hits;
             blob_cache_misses += s.blob_cache_misses;
             blob_cache_bytes_served += s.blob_cache_bytes_served;
+            cond_cache_hits += s.cond_cache_hits;
+            cond_cache_misses += s.cond_cache_misses;
         }
 
         let total_ms =
@@ -385,6 +389,14 @@ unsafe fn explain_timing(node: *mut pg_sys::CustomScanState, es: *mut pg_sys::Ex
                     "hits={} misses={} bytes_served={}",
                     blob_cache_hits, blob_cache_misses, blob_cache_bytes_served,
                 ),
+            );
+        }
+
+        if cond_cache_hits + cond_cache_misses > 0 {
+            emit_text(
+                es,
+                c"DeltaX Condition Cache",
+                &format!("hits={cond_cache_hits} misses={cond_cache_misses}"),
             );
         }
 

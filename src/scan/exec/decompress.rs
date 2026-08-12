@@ -91,6 +91,11 @@ pub(crate) struct DecompressState {
     all_quals_batch_handled: bool,
     /// Selection vector: true = row passes batch quals. Empty = all pass.
     selection_vector: Vec<bool>,
+    /// Condition-cache fingerprint of `batch_quals` (None = uncacheable),
+    /// memoised on first segment load. See `cond_cache`.
+    cond_fp: Option<u64>,
+    /// Whether `cond_fp` has been computed yet.
+    cond_fp_computed: bool,
 
     /// Top-N optimization: effective LIMIT count (0 = disabled).
     topn_limit: usize,
@@ -265,6 +270,10 @@ pub(crate) struct ScanTiming {
     pub(crate) blob_cache_misses: u64,
     /// Bytes served from the blob cache (sum across hits).
     pub(crate) blob_cache_bytes_served: u64,
+    /// Condition-cache hits (segments whose qual selection came from cache).
+    pub(crate) cond_cache_hits: u64,
+    /// Condition-cache misses (selection computed, then best-effort stored).
+    pub(crate) cond_cache_misses: u64,
     /// Rows emitted from the Phase 3 heap tail (loose rows inserted into
     /// compressed partitions after compression).
     pub(crate) heap_tail_rows: u64,
@@ -301,6 +310,8 @@ pub(crate) struct ScanTimingShmem {
     pub(crate) blob_cache_hits: u64,
     pub(crate) blob_cache_misses: u64,
     pub(crate) blob_cache_bytes_served: u64,
+    pub(crate) cond_cache_hits: u64,
+    pub(crate) cond_cache_misses: u64,
 }
 
 /// Leader + up to 32 workers. PG typically uses much less; we hard-error
@@ -578,6 +589,8 @@ unsafe fn flush_timing_to_shmem(state: &DecompressState) {
         slot.blob_cache_hits = t.blob_cache_hits;
         slot.blob_cache_misses = t.blob_cache_misses;
         slot.blob_cache_bytes_served = t.blob_cache_bytes_served;
+        slot.cond_cache_hits = t.cond_cache_hits;
+        slot.cond_cache_misses = t.cond_cache_misses;
         // populated must be written last so the leader can treat slots
         // missing this flag (e.g. a worker that crashed) as absent.
         slot.populated = 1;
@@ -795,6 +808,8 @@ fn make_worker_stub_state() -> DecompressState {
         batch_quals: Vec::new(),
         all_quals_batch_handled: false,
         selection_vector: Vec::new(),
+        cond_fp: None,
+        cond_fp_computed: false,
         topn_limit: 0,
         topn_ascending: true,
         topn_nulls_first: false,
@@ -1116,6 +1131,8 @@ pub(super) unsafe extern "C-unwind" fn begin_deltax_append(
             batch_quals,
             all_quals_batch_handled,
             selection_vector: Vec::new(),
+            cond_fp: None,
+            cond_fp_computed: false,
             topn_limit: if topn_limit > 0 {
                 topn_limit as usize
             } else {
@@ -1321,6 +1338,8 @@ fn load_decompress_state(
         batch_quals,
         all_quals_batch_handled,
         selection_vector: Vec::new(),
+        cond_fp: None,
+        cond_fp_computed: false,
         topn_limit: 0,
         topn_ascending: true,
         topn_nulls_first: false,
@@ -4192,6 +4211,44 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
                 continue;
             }
 
+            // Condition cache: this site's row-level filters are exactly
+            // `batch_quals` (text filters fold in during Phase 1 decode),
+            // so the fingerprint covers them alone. Segments with
+            // tombstones bypass the cache (see CONDITION_CACHE.md).
+            if !state.cond_fp_computed {
+                state.cond_fp = if super::cond_cache::enabled() {
+                    super::cond_cache::fingerprint_quals(&state.batch_quals, &[])
+                } else {
+                    None
+                };
+                state.cond_fp_computed = true;
+            }
+            let cond_cacheable = state.cond_fp.is_some() && seg.tombstones.is_none();
+            let mut cached_sel: Option<super::cond_cache::CachedSelection> = None;
+            if cond_cacheable {
+                cached_sel = super::cond_cache::lookup(
+                    seg.companion_oid,
+                    seg.segment_id,
+                    state.cond_fp.unwrap(),
+                    seg.row_count as usize,
+                );
+                if cached_sel.is_some() {
+                    state.timing.cond_cache_hits += 1;
+                } else {
+                    state.timing.cond_cache_misses += 1;
+                }
+            }
+            if matches!(
+                cached_sel,
+                Some(super::cond_cache::CachedSelection::NonePass)
+            ) {
+                // No row in this segment passes the quals — skip it
+                // without decoding anything.
+                state.timing.segments_skipped += 1;
+                continue;
+            }
+            let cached_hit = cached_sel.is_some();
+
             let t_decompress = if instrument {
                 Some(Instant::now())
             } else {
@@ -4266,6 +4323,13 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
                     let repeated: Vec<(pg_sys::Datum, bool)> =
                         (0..seg.row_count).map(|_| (datum, is_null)).collect();
                     decompressed.push(repeated);
+                } else if cached_hit {
+                    // Condition-cache hit: the selection is already known,
+                    // so every blob column defers to Phase 2, which decodes
+                    // text/JSONB selection-aware and runs no filters.
+                    phase2_cols.push((col_idx, blob_idx));
+                    decompressed.push(Vec::new());
+                    blob_idx += 1;
                 } else {
                     let blob = &seg.compressed_blobs[blob_idx];
                     let typmod = state.col_typmods[col_idx];
@@ -4348,7 +4412,16 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
             // Evaluate batch quals on the decompressed segment.
             // pre_selection seeds the selection vector so that rows already
             // filtered by LIKE during decompression are skipped.
-            if !state.batch_quals.is_empty() || !pre_selection.is_empty() {
+            if let Some(cs) = cached_sel {
+                // Condition-cache hit: the selection is restored verbatim;
+                // no filter evaluation runs for this segment.
+                state.selection_vector = match cs {
+                    super::cond_cache::CachedSelection::AllPass => Vec::new(),
+                    super::cond_cache::CachedSelection::Bitmap(v) => v,
+                    // NonePass segments were skipped before Phase 1.
+                    super::cond_cache::CachedSelection::NonePass => unreachable!(),
+                };
+            } else if !state.batch_quals.is_empty() || !pre_selection.is_empty() {
                 let t_batch = if instrument {
                     Some(Instant::now())
                 } else {
@@ -4362,6 +4435,17 @@ unsafe fn load_next_segment(state: &mut DecompressState, instrument: bool) -> bo
                 );
                 if let Some(t) = t_batch {
                     state.timing.batch_eval_us += t.elapsed().as_micros() as u64;
+                }
+                // Best-effort store so later queries (and this query's
+                // other workers) can skip the evaluation.
+                if cond_cacheable {
+                    super::cond_cache::store(
+                        state.segments_data[seg_idx].companion_oid,
+                        state.segments_data[seg_idx].segment_id,
+                        state.cond_fp.unwrap(),
+                        state.current_row_count,
+                        &state.selection_vector,
+                    );
                 }
             } else {
                 state.selection_vector.clear();

@@ -102,6 +102,13 @@ pub(crate) static BLOB_CACHE_MB: GucSetting<i32> = GucSetting::<i32>::new(-1);
 /// fit for typical OLAP workloads. Restart required to change.
 pub(crate) static BLOB_CACHE_SHARDS: GucSetting<i32> = GucSetting::<i32>::new(64);
 
+/// When ON, per-segment qual-selection bitmaps are cached in the blob
+/// cache's shared memory and reused by later queries with the same
+/// filters (see `dev/docs/CONDITION_CACHE.md`). Requires the blob cache
+/// to be available (full preload mode, `blob_cache_mb != 0`); inert
+/// otherwise. Userset so A/B runs can toggle it per session.
+pub(crate) static CONDITION_CACHE: GucSetting<bool> = GucSetting::<bool>::new(true);
+
 /// When ON, internal columnar-blob companion tables (`_blobs`, `_blooms`,
 /// `_text_lengths`, `_valbitmap`) are declared with `BYTEA COMPRESSION lz4`.
 /// The actual columnar compression happens in Rust regardless; this flag
@@ -338,6 +345,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"TESTING: compress natively-coded fallback types via the legacy text codecs",
         c"When ON, time/uuid/bytea/inet/cidr/numeric columns compress through the legacy ::text rendering codecs instead of their native binary codecs. Produces legacy-format blobs for mixed-generation read testing; never needed in production.",
         &FORCE_TEXT_FALLBACK,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.condition_cache",
+        c"Cache per-segment qual-selection bitmaps in shared memory",
+        c"When ON (and the shared blob cache is available), the survivor bitmap of a segment under a given set of WHERE filters is cached and reused by later queries with identical filters, skipping predicate evaluation and filter-only column decompression.",
+        &CONDITION_CACHE,
         GucContext::Userset,
         GucFlags::default(),
     );

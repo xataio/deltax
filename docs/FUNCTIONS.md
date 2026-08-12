@@ -52,5 +52,5 @@ SELECT deltax.time_bucket('1 hour', ts), avg(value) FROM metrics GROUP BY 1;
 
 | Function | Description |
 |---|---|
-| `pg_deltax_blob_cache_stats()` | Process-wide blob-cache counters: hits, misses, evictions, current bytes / entries, configured size. |
+| `pg_deltax_blob_cache_stats()` | Process-wide blob-cache counters: hits, misses, evictions, current bytes / entries, configured size — plus condition-cache counters (`cond_hits_total`, `cond_misses_total`, `cond_inserts_total`). |
 | `pg_deltax_blob_cache_shard_stats()` | Same as above but broken down per shard. Used to diagnose hot-shard contention. |

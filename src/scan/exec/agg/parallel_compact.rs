@@ -23,6 +23,7 @@ use std::time::Instant;
 use pgrx::pg_sys;
 
 use super::super::batch_qual::{BatchQual, evaluate_batch_quals};
+use super::super::cond_cache::{self, CachedSelection, CondBatch};
 use super::super::datum_utils::{collation_strcmp, count_non_null};
 use super::super::segments::{
     MetadataInfo, SegmentData, SegmentQualResult, classify_segment_quals, detoast_lazy_blobs,
@@ -432,6 +433,10 @@ pub(crate) struct ParallelCompactResult {
     /// Pre-computed top-K candidates: (keys, floor_value).
     /// Present when `config.topn_spec` is set.
     pub(crate) topk: Option<(Vec<u128>, i64)>,
+    /// Condition-cache payloads computed by this worker, keyed by
+    /// `(companion_oid, segment_id)`. Inserted by the calling backend
+    /// thread (scope threads can't take LWLocks).
+    pub(crate) cond_store: Vec<(u32, i32, Vec<u8>)>,
 }
 
 impl ParallelCompactResult {
@@ -447,6 +452,7 @@ impl ParallelCompactResult {
             rows_processed: 0,
             decompress_us: 0,
             topk: None,
+            cond_store: Vec::new(),
         }
     }
 }
@@ -739,8 +745,9 @@ pub(super) fn process_segments_compact(
     segments: &[SegmentData],
     claim: &std::sync::atomic::AtomicUsize,
     config: &ParallelCompactConfig,
+    cond: &CondBatch,
 ) -> ParallelCompactResult {
-    process_segments_compact_filtered(segments, claim, config, None)
+    process_segments_compact_filtered(segments, claim, config, None, cond)
 }
 
 /// `process_segments_compact` with an optional singleton filter from the
@@ -754,7 +761,9 @@ pub(super) fn process_segments_compact_filtered(
     claim: &std::sync::atomic::AtomicUsize,
     config: &ParallelCompactConfig,
     singleton: Option<(&CountingFilter, usize)>,
+    cond: &CondBatch,
 ) -> ParallelCompactResult {
+    let mut cond_store: Vec<(u32, i32, Vec<u8>)> = Vec::new();
     let mut compact_map = CompactGroupMap::with_capacity_and_hasher(
         config.reserve_groups,
         BuildHasherDefault::default(),
@@ -817,7 +826,14 @@ pub(super) fn process_segments_compact_filtered(
         // is numeric (`is_batch_comparable_type`), so classify_segment_quals
         // always has the metadata it needs — no Ambiguous-from-mixed-types
         // edge case here (that's only relevant in `process_segments_mixed`).
-        let seg_qual_result = if config.batch_quals.is_empty() {
+        // Condition cache: a cached selection replaces the per-row eval;
+        // NonePass skips the segment before any decompression.
+        let cond_hit: Option<CachedSelection> = cond.hit(seg);
+        if matches!(cond_hit, Some(CachedSelection::NonePass)) {
+            continue;
+        }
+
+        let seg_qual_result = if config.batch_quals.is_empty() || cond_hit.is_some() {
             SegmentQualResult::AllPass
         } else {
             classify_segment_quals(
@@ -852,10 +868,27 @@ pub(super) fn process_segments_compact_filtered(
         // Evaluate batch quals — but only if metadata couldn't already
         // prove all rows pass. AllPass means we can use an empty selection
         // (every row included) and skip the per-row qual evaluation loop.
-        let selection = if quals_all_pass {
-            Vec::new()
-        } else {
-            evaluate_batch_quals(&decompressed, row_count, config.batch_quals, Vec::new())
+        let selection = match &cond_hit {
+            Some(CachedSelection::AllPass) => Vec::new(),
+            Some(CachedSelection::Bitmap(v)) => v.clone(),
+            // NonePass segments were skipped before decode.
+            Some(CachedSelection::NonePass) => unreachable!(),
+            None => {
+                let sel = if quals_all_pass {
+                    Vec::new()
+                } else {
+                    evaluate_batch_quals(&decompressed, row_count, config.batch_quals, Vec::new())
+                };
+                // Hand the computed selection to the calling backend
+                // thread for insertion.
+                if cond.fp.is_some()
+                    && seg.tombstones.is_none()
+                    && let Some(payload) = cond_cache::encode_selection_payload(&sel, row_count)
+                {
+                    cond_store.push((seg.companion_oid.to_u32(), seg.segment_id, payload));
+                }
+                sel
+            }
         };
 
         // Compact aggregation loop (identical to single-threaded path)
@@ -1063,6 +1096,7 @@ pub(super) fn process_segments_compact_filtered(
         rows_processed,
         decompress_us,
         topk,
+        cond_store,
     }
 }
 
@@ -3159,96 +3193,122 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
             None
         };
 
-        let partial_results: Vec<ParallelCompactResult> = if let Some(filter) = &singleton_filter {
-            // Count-floor pass 2: aggregate keys that may reach the floor.
-            // Only the singleton floor needs fillers — higher floors are
-            // sample-proven to leave >= limit groups in the map.
-            let claim = std::sync::atomic::AtomicUsize::new(0);
-            let segs: &[SegmentData] = all_segments;
-            let filler_limit = if filter.threshold() == 2 {
-                topn_limit as usize
-            } else {
-                0
-            };
-            std::thread::scope(|s| {
-                let n_threads = n_workers.min(segs.len()).max(1);
-                let handles: Vec<_> = (0..n_threads)
-                    .map(|_| {
-                        let cfg = &config;
-                        let claim = &claim;
-                        s.spawn(move || {
-                            process_segments_compact_filtered(
-                                segs,
-                                claim,
-                                cfg,
-                                Some((filter, filler_limit)),
-                            )
-                        })
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            })
-        } else if use_pipeline {
-            let n_batches = (n_workers * 2).max(2).min(all_segments.len());
-            let batch_size = all_segments.len().div_ceil(n_batches);
-            let mut results: Vec<ParallelCompactResult> = Vec::new();
-            let mut batch_start = 0;
-            let total_segs = all_segments.len();
+        // Condition cache: fingerprint the numeric filter set and prefetch
+        // cached selections on this backend thread (see CONDITION_CACHE.md).
+        let mut cond = cond_cache::CondBatch::disabled(config.col_names.len());
+        if cond_cache::enabled()
+            && let Some(fp) = cond_cache::fingerprint_quals(config.batch_quals, &[])
+        {
+            cond.prefetch(fp, all_segments);
+        }
 
-            while batch_start < total_segs {
-                let batch_end = (batch_start + batch_size).min(total_segs);
-                let next_end = (batch_end + batch_size).min(total_segs);
-
-                let (done, pending) = all_segments.split_at_mut(batch_end);
-                let current_batch = &done[batch_start..];
-
+        let mut partial_results: Vec<ParallelCompactResult> =
+            if let Some(filter) = &singleton_filter {
+                // Count-floor pass 2: aggregate keys that may reach the floor.
+                // Only the singleton floor needs fillers — higher floors are
+                // sample-proven to leave >= limit groups in the map.
                 let claim = std::sync::atomic::AtomicUsize::new(0);
+                let segs: &[SegmentData] = all_segments;
+                let filler_limit = if filter.threshold() == 2 {
+                    topn_limit as usize
+                } else {
+                    0
+                };
                 std::thread::scope(|s| {
-                    let n_threads = n_workers.min(current_batch.len()).max(1);
+                    let n_threads = n_workers.min(segs.len()).max(1);
                     let handles: Vec<_> = (0..n_threads)
                         .map(|_| {
                             let cfg = &config;
                             let claim = &claim;
-                            s.spawn(move || process_segments_compact(current_batch, claim, cfg))
+                            let cond_ref = &cond;
+                            s.spawn(move || {
+                                process_segments_compact_filtered(
+                                    segs,
+                                    claim,
+                                    cfg,
+                                    Some((filter, filler_limit)),
+                                    cond_ref,
+                                )
+                            })
                         })
                         .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            } else if use_pipeline {
+                let n_batches = (n_workers * 2).max(2).min(all_segments.len());
+                let batch_size = all_segments.len().div_ceil(n_batches);
+                let mut results: Vec<ParallelCompactResult> = Vec::new();
+                let mut batch_start = 0;
+                let total_segs = all_segments.len();
 
-                    // Main thread detoasts next batch while workers run
-                    if batch_end < total_segs {
-                        let t_pd = Instant::now();
-                        for seg in &mut pending[..next_end - batch_end] {
-                            let dl = detoast_lazy_blobs(seg);
-                            total_cache_hits += dl.cache_hits;
-                            total_cache_misses += dl.cache_misses;
-                            total_cache_bytes_served += dl.cache_bytes_served;
+                while batch_start < total_segs {
+                    let batch_end = (batch_start + batch_size).min(total_segs);
+                    let next_end = (batch_end + batch_size).min(total_segs);
+
+                    let (done, pending) = all_segments.split_at_mut(batch_end);
+                    let current_batch = &done[batch_start..];
+
+                    let claim = std::sync::atomic::AtomicUsize::new(0);
+                    std::thread::scope(|s| {
+                        let n_threads = n_workers.min(current_batch.len()).max(1);
+                        let handles: Vec<_> = (0..n_threads)
+                            .map(|_| {
+                                let cfg = &config;
+                                let claim = &claim;
+                                let cond_ref = &cond;
+                                s.spawn(move || {
+                                    process_segments_compact(current_batch, claim, cfg, cond_ref)
+                                })
+                            })
+                            .collect();
+
+                        // Main thread detoasts next batch while workers run
+                        if batch_end < total_segs {
+                            let t_pd = Instant::now();
+                            for seg in &mut pending[..next_end - batch_end] {
+                                let dl = detoast_lazy_blobs(seg);
+                                total_cache_hits += dl.cache_hits;
+                                total_cache_misses += dl.cache_misses;
+                                total_cache_bytes_served += dl.cache_bytes_served;
+                            }
+                            pipeline_detoast_us += t_pd.elapsed().as_micros() as u64;
                         }
-                        pipeline_detoast_us += t_pd.elapsed().as_micros() as u64;
-                    }
 
-                    for h in handles {
-                        results.push(h.join().unwrap());
-                    }
-                });
+                        for h in handles {
+                            results.push(h.join().unwrap());
+                        }
+                    });
 
-                batch_start = batch_end;
+                    batch_start = batch_end;
+                }
+                results
+            } else {
+                // Single scope — original path (or lazy already detoasted above)
+                let claim = std::sync::atomic::AtomicUsize::new(0);
+                let segs: &[SegmentData] = all_segments;
+                std::thread::scope(|s| {
+                    let n_threads = n_workers.min(segs.len()).max(1);
+                    let handles: Vec<_> = (0..n_threads)
+                        .map(|_| {
+                            let cfg = &config;
+                            let claim = &claim;
+                            let cond_ref = &cond;
+                            s.spawn(move || process_segments_compact(segs, claim, cfg, cond_ref))
+                        })
+                        .collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })
+            };
+
+        // Condition cache: insert the selections the scope workers computed
+        // (this is the backend thread — LWLocks are legal again).
+        if let Some(fp) = cond.fp {
+            for r in &mut partial_results {
+                for (companion, segment_id, payload) in r.cond_store.drain(..) {
+                    cond_cache::store_encoded_raw(companion, segment_id, fp, &payload);
+                }
             }
-            results
-        } else {
-            // Single scope — original path (or lazy already detoasted above)
-            let claim = std::sync::atomic::AtomicUsize::new(0);
-            let segs: &[SegmentData] = all_segments;
-            std::thread::scope(|s| {
-                let n_threads = n_workers.min(segs.len()).max(1);
-                let handles: Vec<_> = (0..n_threads)
-                    .map(|_| {
-                        let cfg = &config;
-                        let claim = &claim;
-                        s.spawn(move || process_segments_compact(segs, claim, cfg))
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            })
-        };
+        }
 
         // The counting filter (up to 1 GiB) is dead after pass 2 — free it
         // off the query critical path.

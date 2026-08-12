@@ -120,6 +120,12 @@ struct BlobCacheCtl {
     evictions_total: AtomicU64,
     insert_failures_total: AtomicU64,
 
+    /// Condition-cache (KEY_KIND_CONDITION) counters, kept separate from
+    /// the blob counters so hit ratios stay interpretable per family.
+    cond_hits_total: AtomicU64,
+    cond_misses_total: AtomicU64,
+    cond_inserts_total: AtomicU64,
+
     /// Our own LWLock storage. Each shard has one LWLock, padded to a
     /// cache line by `LWLockPadded`. We allocate inline rather than via
     /// `RequestNamedLWLockTranche` so we control initialization
@@ -167,7 +173,6 @@ const _: () = {
 #[repr(C)]
 struct Entry {
     key: BlobCacheKey,
-    _pad1: u32,
 
     /// dsa_pointer to the payload bytes.
     data_ptr: AtomicU64,
@@ -197,9 +202,9 @@ struct Entry {
 }
 
 const _: () = {
-    // 16 bytes key+pad, 16 data ptr/len/pad, 8 pin+pad, 8 last_used,
+    // 24 bytes key, 16 data ptr/len/pad, 8 pin+pad, 8 last_used,
     // 8 bucket_next, 8 lru_prev, 8 lru_next.
-    assert!(std::mem::size_of::<Entry>() == 72);
+    assert!(std::mem::size_of::<Entry>() == 80);
 };
 
 // ---------------------------------------------------------------------------
@@ -243,6 +248,15 @@ static RESERVATION_SHARDS: AtomicU32 = AtomicU32::new(0);
 /// Used by `get_pinned` / `insert` to fast-fail when the cache failed
 /// to initialise (e.g. shmem reservation was insufficient).
 static CACHE_USABLE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the cache exists and is reachable in this process: sized
+/// non-zero AND the shmem startup hook completed (postmaster preload).
+/// False in session-preload mode, where the hooks never run. Lets
+/// callers skip building keys/payloads that `get_pinned`/`insert`
+/// would discard anyway.
+pub(super) fn is_usable() -> bool {
+    super::configured_bytes() != 0 && CACHE_USABLE.load(Ordering::Acquire)
+}
 
 // ---------------------------------------------------------------------------
 // Pin handle plumbing
@@ -306,11 +320,12 @@ pub(super) fn get_pinned(key: &BlobCacheKey) -> Option<PinInner> {
         let lock = shard_lwlock(shard_idx);
         pg_sys::LWLockAcquire(lock, pg_sys::LWLockMode::LW_SHARED);
 
+        let is_cond = key.kind == super::KEY_KIND_CONDITION;
         let shard = &ctl.shards[shard_idx];
         let buckets_dp = shard.bucket_array.load(Ordering::Acquire);
         if buckets_dp == 0 {
             pg_sys::LWLockRelease(lock);
-            ctl.misses_total.fetch_add(1, Ordering::Relaxed);
+            miss_counter(ctl, is_cond).fetch_add(1, Ordering::Relaxed);
             return None;
         }
 
@@ -322,15 +337,33 @@ pub(super) fn get_pinned(key: &BlobCacheKey) -> Option<PinInner> {
                 let tick = ctl.last_used_counter.fetch_add(1, Ordering::Relaxed);
                 (*entry).last_used.store(tick, Ordering::Relaxed);
                 pg_sys::LWLockRelease(lock);
-                ctl.hits_total.fetch_add(1, Ordering::Relaxed);
+                hit_counter(ctl, is_cond).fetch_add(1, Ordering::Relaxed);
                 return Some(PinInner { entry_dp });
             }
             entry_dp = (*entry).bucket_next.load(Ordering::Acquire);
         }
 
         pg_sys::LWLockRelease(lock);
-        ctl.misses_total.fetch_add(1, Ordering::Relaxed);
+        miss_counter(ctl, is_cond).fetch_add(1, Ordering::Relaxed);
         None
+    }
+}
+
+#[inline]
+fn hit_counter(ctl: &BlobCacheCtl, is_cond: bool) -> &AtomicU64 {
+    if is_cond {
+        &ctl.cond_hits_total
+    } else {
+        &ctl.hits_total
+    }
+}
+
+#[inline]
+fn miss_counter(ctl: &BlobCacheCtl, is_cond: bool) -> &AtomicU64 {
+    if is_cond {
+        &ctl.cond_misses_total
+    } else {
+        &ctl.misses_total
     }
 }
 
@@ -483,6 +516,9 @@ pub(super) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
         ctl.n_entries.fetch_add(1, Ordering::Relaxed);
         ctl.total_bytes
             .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        if key.kind == super::KEY_KIND_CONDITION {
+            ctl.cond_inserts_total.fetch_add(1, Ordering::Relaxed);
+        }
 
         pg_sys::LWLockRelease(lock);
     }
@@ -563,6 +599,9 @@ pub(super) fn stats() -> BlobCacheStats {
             misses_total: ctl.misses_total.load(Ordering::Relaxed),
             evictions_total: ctl.evictions_total.load(Ordering::Relaxed),
             insert_failures_total: ctl.insert_failures_total.load(Ordering::Relaxed),
+            cond_hits_total: ctl.cond_hits_total.load(Ordering::Relaxed),
+            cond_misses_total: ctl.cond_misses_total.load(Ordering::Relaxed),
+            cond_inserts_total: ctl.cond_inserts_total.load(Ordering::Relaxed),
         }
     }
 }
@@ -799,6 +838,8 @@ fn hash_key(k: &BlobCacheKey) -> u64 {
     let mut h = (k.companion_oid as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     h ^= (k.segment_id as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     h ^= (k.col_idx as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= (k.kind as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    h ^= k.qual_fp.wrapping_mul(0xA24B_AED4_963E_E407);
     h ^= h >> 32;
     h
 }
@@ -1022,7 +1063,18 @@ mod tests {
             companion_oid: oid,
             segment_id: seg,
             col_idx: col,
-            _pad: 0,
+            kind: super::super::KEY_KIND_BLOB,
+            qual_fp: 0,
+        }
+    }
+
+    fn mk_cond_key(oid: u32, seg: u32, fp: u64) -> BlobCacheKey {
+        BlobCacheKey {
+            companion_oid: oid,
+            segment_id: seg,
+            col_idx: 0,
+            kind: super::super::KEY_KIND_CONDITION,
+            qual_fp: fp,
         }
     }
 
@@ -1055,9 +1107,14 @@ mod tests {
         assert_ne!(h0, hash_key(&mk_key(99, 2, 3)));
         assert_ne!(h0, hash_key(&mk_key(1, 99, 3)));
         assert_ne!(h0, hash_key(&mk_key(1, 2, 9)));
-        // `_pad` is structurally present but semantically irrelevant —
-        // never set by `BlobCacheKey::new`. We don't assert anything
-        // about it because changing it shouldn't be a meaningful test.
+        // Condition-kind keys must not alias blob keys for the same
+        // (oid, segment), and distinct fingerprints must not alias.
+        let c0 = mk_cond_key(1, 2, 0);
+        assert_ne!(hash_key(&c0), hash_key(&mk_key(1, 2, 0)));
+        assert_ne!(
+            hash_key(&mk_cond_key(1, 2, 7)),
+            hash_key(&mk_cond_key(1, 2, 8))
+        );
     }
 
     #[test]

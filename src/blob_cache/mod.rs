@@ -37,17 +37,29 @@ use pgrx::prelude::*;
 
 mod storage;
 
-/// Cache key: 12 bytes, trivially hashable. The companion OID changes on
-/// `deltax_compress_partition` re-run (table dropped + recreated), so
-/// stale entries become unreachable and age out via LRU without explicit
-/// invalidation.
+/// Entry kind discriminant carried in the key. `Blob` entries hold
+/// detoasted compressed column bytes; `Condition` entries hold a packed
+/// qual-selection bitmap for a (segment, qual-fingerprint) pair (see
+/// `dev/docs/CONDITION_CACHE.md`).
+pub(crate) const KEY_KIND_BLOB: u16 = 0;
+pub(crate) const KEY_KIND_CONDITION: u16 = 1;
+
+/// Cache key: 24 bytes, trivially hashable. The companion OID changes on
+/// `deltax_compress_partition` re-run (table dropped + recreated), and
+/// compressed-DML compaction allocates segment ids above a catalog
+/// high-water mark, so stale entries become unreachable and age out via
+/// LRU without explicit invalidation.
+///
+/// `kind` selects the entry family; `qual_fp` is the condition-cache
+/// qual fingerprint and is zero for blob entries.
 #[repr(C)]
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
 pub(crate) struct BlobCacheKey {
     pub(crate) companion_oid: u32,
     pub(crate) segment_id: u32,
     pub(crate) col_idx: u16,
-    pub(crate) _pad: u16,
+    pub(crate) kind: u16,
+    pub(crate) qual_fp: u64,
 }
 
 impl BlobCacheKey {
@@ -56,7 +68,24 @@ impl BlobCacheKey {
             companion_oid: companion_oid.to_u32(),
             segment_id: segment_id as u32,
             col_idx: col_idx as u16,
-            _pad: 0,
+            kind: KEY_KIND_BLOB,
+            qual_fp: 0,
+        }
+    }
+
+    /// Key for a condition-cache entry: per (segment, qual-fingerprint)
+    /// selection bitmap. `col_idx` is unused for this kind.
+    pub(crate) fn new_condition(
+        companion_oid: pgrx::pg_sys::Oid,
+        segment_id: i32,
+        qual_fp: u64,
+    ) -> Self {
+        Self {
+            companion_oid: companion_oid.to_u32(),
+            segment_id: segment_id as u32,
+            col_idx: 0,
+            kind: KEY_KIND_CONDITION,
+            qual_fp,
         }
     }
 }
@@ -94,6 +123,9 @@ pub(crate) struct BlobCacheStats {
     pub(crate) misses_total: u64,
     pub(crate) evictions_total: u64,
     pub(crate) insert_failures_total: u64,
+    pub(crate) cond_hits_total: u64,
+    pub(crate) cond_misses_total: u64,
+    pub(crate) cond_inserts_total: u64,
 }
 
 /// Process-local counter incremented at startup for each session that
@@ -124,6 +156,13 @@ pub(crate) fn insert(key: &BlobCacheKey, bytes: &[u8]) {
 /// Snapshot of global stats. Used by the SRF and tests.
 pub(crate) fn stats() -> BlobCacheStats {
     storage::stats()
+}
+
+/// Whether the cache is live in this process (sized non-zero and the
+/// postmaster shmem hooks completed). Always false in session-preload
+/// mode. Cheap: one memoised size read + one atomic load.
+pub(crate) fn is_usable() -> bool {
+    storage::is_usable()
 }
 
 /// Called from `_PG_init`. Registers the shmem request + startup hooks
@@ -217,6 +256,7 @@ pub(crate) fn configured_shards() -> usize {
 /// Negative values are not possible — internal counters are `u64` and
 /// will saturate before overflowing `i64::MAX` (~9 EiB / hits ~9 quintillion).
 #[pg_extern]
+#[allow(clippy::type_complexity)] // pgrx pg_extern macros don't expand type aliases.
 fn pg_deltax_blob_cache_stats() -> TableIterator<
     'static,
     (
@@ -227,6 +267,9 @@ fn pg_deltax_blob_cache_stats() -> TableIterator<
         name!(misses_total, i64),
         name!(evictions_total, i64),
         name!(insert_failures_total, i64),
+        name!(cond_hits_total, i64),
+        name!(cond_misses_total, i64),
+        name!(cond_inserts_total, i64),
     ),
 > {
     let s = stats();
@@ -238,6 +281,9 @@ fn pg_deltax_blob_cache_stats() -> TableIterator<
         s.misses_total as i64,
         s.evictions_total as i64,
         s.insert_failures_total as i64,
+        s.cond_hits_total as i64,
+        s.cond_misses_total as i64,
+        s.cond_inserts_total as i64,
     ))
 }
 
