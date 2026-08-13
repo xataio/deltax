@@ -383,6 +383,52 @@ previously dominated at 143ms.
 
 ---
 
+### 57. Condition cache: shared-memory per-segment qual-selection bitmaps [DONE]
+
+Imported from ClickHouse's QueryConditionCache (via pgrust's condcache
+rebuild). The survivor bitmap of a segment under a given WHERE filter
+set is cached in the blob cache's DSA, keyed by
+`(companion_oid, segment_id, qual fingerprint)`; later queries with the
+same filters skip predicate evaluation and the decompression of
+filter-only columns. Design + full validation:
+`dev/docs/CONDITION_CACHE.md`.
+
+EC2 same-box A/B (full queries-only protocol, `ALTER SYSTEM SET
+pg_deltax.condition_cache`): Q21 −53% (0.745 → 0.347 s), Q22 −26%,
+Q40 −19%, Q20 −15%, Q19 −13%; every non-engaging query within ±4% and
+cold sums identical. Hot geomean −3.7%.
+
+**Files touched:** `src/blob_cache/{mod,storage}.rs` (key widened with
+kind + qual_fp, cond counters), `src/scan/exec/cond_cache.rs` (new),
+`src/scan/exec/decompress.rs`, `src/scan/exec/agg/{serial,
+parallel_mixed,parallel_compact}.rs`, `src/scan/exec/agg/callbacks.rs`,
+`src/scan/explain.rs`, GUC `pg_deltax.condition_cache`.
+
+### 58. Software prefetch for the count-floor filter probe loops [DONE]
+
+perf on ClickBench Q32 showed 83% of the pass-2 loop's samples on a
+single byte load — the blocked-Bloom `CountingFilter` probe, a random
+access into a ~1 GiB structure, one serialized DRAM miss per row. The
+probe loops now issue software prefetches ahead of use
+(micro-batched pass-1 loops on both agg paths; rolling 16-row lookahead
+in compact pass 2 and in the mixed dict fast path, whose per-entry
+mixed-key hashes are precomputed — hoisting the string digests, not
+duplicating them). x86 `_mm_prefetch` / aarch64 `prfm`; GUC
+`pg_deltax.agg_prefetch` (userset, default on).
+
+EC2 same-box A/B (full queries-only protocol): Q32 −13.4%, Q33 −4.7%,
+Q34 −4.0%, Q16 −3.9%, Q18 −3.4%; everything else within noise, cold
+unchanged. A lookahead for the multikey-dict floor probe was measured
+WORSE (Q18 +7%: recomputing two int digests per lookahead row costs
+more than the miss it hides) and removed — see the in-code note.
+
+**Files touched:** `src/scan/exec/prefetch.rs` (new),
+`src/scan/exec/agg/parallel_compact.rs`
+(`CountingFilter::prefetch_hashed`, micro-batched pass 1, pass-2
+lookahead), `src/scan/exec/agg/parallel_mixed.rs` (micro-batched
+pass 1, dict fast-path entry-hash memo + lookahead),
+`src/scan/exec/agg/callbacks.rs` (config plumbing).
+
 ## Regression Queries (Compressed Slower Than Uncompressed)
 
 Several queries were slower with compression. Many have been addressed:

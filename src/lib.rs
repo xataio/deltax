@@ -109,6 +109,11 @@ pub(crate) static BLOB_CACHE_SHARDS: GucSetting<i32> = GucSetting::<i32>::new(64
 /// otherwise. Userset so A/B runs can toggle it per session.
 pub(crate) static CONDITION_CACHE: GucSetting<bool> = GucSetting::<bool>::new(true);
 
+/// When ON, the DRAM-bound aggregation probe loops (count-floor filter)
+/// issue software prefetches a few rows ahead so the cache misses overlap
+/// instead of serializing. Userset so A/B runs can toggle it per session.
+pub(crate) static AGG_PREFETCH: GucSetting<bool> = GucSetting::<bool>::new(true);
+
 /// When ON, internal columnar-blob companion tables (`_blobs`, `_blooms`,
 /// `_text_lengths`, `_valbitmap`) are declared with `BYTEA COMPRESSION lz4`.
 /// The actual columnar compression happens in Rust regardless; this flag
@@ -345,6 +350,14 @@ pub extern "C-unwind" fn _PG_init() {
         c"TESTING: compress natively-coded fallback types via the legacy text codecs",
         c"When ON, time/uuid/bytea/inet/cidr/numeric columns compress through the legacy ::text rendering codecs instead of their native binary codecs. Produces legacy-format blobs for mixed-generation read testing; never needed in production.",
         &FORCE_TEXT_FALLBACK,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_deltax.agg_prefetch",
+        c"Software-prefetch the aggregation hash probe loops",
+        c"When ON, the count-floor filter probe loops issue cache prefetches a few rows ahead, overlapping the DRAM misses that dominate high-cardinality GROUP BY queries.",
+        &AGG_PREFETCH,
         GucContext::Userset,
         GucFlags::default(),
     );

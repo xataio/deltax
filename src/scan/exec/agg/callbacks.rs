@@ -1375,6 +1375,7 @@ unsafe fn run_leader_merge_and_finalise(state: &mut AggScanState) {
                 time_max: ctx.time_max,
                 topn_spec: ctx.topn_spec,
                 reserve_groups: 0,
+                prefetch: crate::AGG_PREFETCH.get(),
             };
 
             // Condition cache: fingerprint the numeric filter set and
@@ -1616,6 +1617,7 @@ unsafe fn run_partial_aggregate_in_process(state: &mut AggScanState) {
                 time_max: ctx.time_max,
                 topn_spec: None,
                 reserve_groups: 0,
+                prefetch: crate::AGG_PREFETCH.get(),
             };
             // Condition cache: fingerprint the numeric filter set and
             // prefetch cached selections (this is a backend thread).
@@ -1748,6 +1750,7 @@ unsafe fn run_worker_partial_aggregate(state: &mut AggScanState) {
                 time_max: ctx.time_max,
                 topn_spec: ctx.topn_spec,
                 reserve_groups: 0,
+                prefetch: crate::AGG_PREFETCH.get(),
             };
 
             // Condition cache: fingerprint the numeric filter set and

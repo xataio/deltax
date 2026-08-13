@@ -6,6 +6,7 @@ mod cond_cache;
 pub(crate) mod count_minmax;
 pub(in crate::scan) mod datum_utils;
 mod decompress;
+mod prefetch;
 pub(in crate::scan) mod segments;
 mod text_col;
 

@@ -375,6 +375,9 @@ pub(super) struct ParallelMixedConfig<'a> {
     /// reserve. Avoids repeated rehash growth on multi-million-group
     /// aggregations; capped so a bad over-estimate stays bounded.
     pub(super) reserve_groups: usize,
+    /// `pg_deltax.agg_prefetch`, read on the backend thread at config
+    /// build time (GUC access is not audited for scope threads).
+    pub(super) prefetch: bool,
 }
 
 // SAFETY: see equivalent impl on `ParallelCompactConfig` for the
@@ -774,6 +777,7 @@ fn process_segments_mixed_count_filter(
     missing_values: &[Option<(pg_sys::Datum, bool)>],
     text_group_col_flags: &[bool],
     filter: &CountingFilter,
+    prefetch: bool,
 ) -> hashbrown::HashMap<u128, u32> {
     let mut sample: hashbrown::HashMap<u128, u32> = hashbrown::HashMap::new();
 
@@ -887,9 +891,8 @@ fn process_segments_mixed_count_filter(
             .collect();
 
         let row_count = seg.row_count as usize;
-        for row in 0..row_count {
+        let digest_for_row = |row: usize| -> Option<u128> {
             // Int key components in group-spec order.
-            let mut has_null = false;
             let mut acc = MIX_SEED;
             for (gi, gs) in group_specs.iter().enumerate() {
                 if is_text_group_col(gs) {
@@ -900,8 +903,7 @@ fn process_segments_mixed_count_filter(
                 } else {
                     let col = &numeric_cols[gs.col_idx as usize];
                     if col.is_empty() || col[row].1 {
-                        has_null = true;
-                        break;
+                        return None;
                     }
                     match &gs.expr {
                         GroupByExpr::DateTrunc { unit_usecs, .. } => {
@@ -917,9 +919,6 @@ fn process_segments_mixed_count_filter(
                     }
                 };
                 acc = mix_digest(acc, digest_int(v));
-            }
-            if has_null {
-                continue;
             }
             // Text key components, in group-spec order after all ints —
             // matching hash_mixed_key's fold order.
@@ -937,12 +936,39 @@ fn process_segments_mixed_count_filter(
                 };
                 acc = mix_str_digest(acc, d);
             }
+            Some(acc)
+        };
 
-            let h = CountingFilter::key_hash(acc);
-            filter.bump_hashed(h);
-            if CountingFilter::is_sampled_hashed(h) {
-                *sample.entry(acc).or_insert(0) += 1;
+        // Micro-batched: digest a block of rows while issuing filter-line
+        // prefetches, then bump — overlapping the one-DRAM-miss-per-row
+        // that otherwise serializes (the filter is ~1 GiB at ClickBench
+        // scale). NULL-keyed rows are skipped exactly as before.
+        const PF_BLOCK: usize = 32;
+        let mut keys = [0u128; PF_BLOCK];
+        let mut hashes = [0u64; PF_BLOCK];
+        let mut base = 0usize;
+        while base < row_count {
+            let end = (base + PF_BLOCK).min(row_count);
+            let mut n = 0;
+            for row in base..end {
+                let Some(acc) = digest_for_row(row) else {
+                    continue;
+                };
+                let h = CountingFilter::key_hash(acc);
+                if prefetch {
+                    filter.prefetch_hashed(h);
+                }
+                keys[n] = acc;
+                hashes[n] = h;
+                n += 1;
             }
+            for i in 0..n {
+                filter.bump_hashed(hashes[i]);
+                if CountingFilter::is_sampled_hashed(hashes[i]) {
+                    *sample.entry(keys[i]).or_insert(0) += 1;
+                }
+            }
+            base = end;
         }
     }
     sample
@@ -1409,6 +1435,28 @@ pub(super) fn process_segments_mixed(
             _ => Vec::new(),
         };
 
+        // Count-floor probe prefetch state (floor mode is unfiltered by
+        // definition, so eager per-entry work is never wasted on filtered
+        // rows). For the single-text-key dict fast path the full mixed-key
+        // hash is precomputed per entry: the first-seen probe reuses it
+        // (hoisting the digest, not duplicating it) and the rolling
+        // lookaheads below prefetch the filter line for upcoming rows —
+        // the dominant stall on high-cardinality keys.
+        const PF_DIST: usize = 16;
+        let floor_prefetch = config.prefetch && config.count_floor.is_some();
+        let fast_entry_hash_keys: Vec<u128> = match (text_key_fast, config.count_floor) {
+            (
+                Some(SegTextColumn::Dict {
+                    buf, entry_ranges, ..
+                }),
+                Some(_),
+            ) => entry_ranges
+                .iter()
+                .map(|&r| hash_mixed_key(&[], &[Some(dict_entry_str(buf, r))]))
+                .collect(),
+            _ => Vec::new(),
+        };
+
         for row in 0..row_count {
             if !selection.is_empty() && !selection[row] {
                 continue;
@@ -1510,6 +1558,22 @@ pub(super) fn process_segments_mixed(
                 // caching a skip sentinel so below-floor entries cost one
                 // branch per subsequent row.
                 let e = row_to_entry[row];
+                // Rolling lookahead: prefetch the count-floor filter line
+                // for an upcoming first-seen entry.
+                if floor_prefetch && !fast_entry_hash_keys.is_empty() {
+                    let pf_row = row + PF_DIST;
+                    if pf_row < row_count {
+                        let e2 = row_to_entry[pf_row];
+                        if e2 != u32::MAX
+                            && dict_gidx_cache[e2 as usize] == u32::MAX
+                            && let Some((filter, _)) = config.count_floor
+                        {
+                            filter.prefetch_hashed(CountingFilter::key_hash(
+                                fast_entry_hash_keys[e2 as usize],
+                            ));
+                        }
+                    }
+                }
                 if e == u32::MAX {
                     if text_null_gidx == GIDX_SKIP {
                         continue;
@@ -1546,7 +1610,11 @@ pub(super) fn process_segments_mixed(
                         cached
                     } else {
                         let s = dict_entry_str(buf, entry_ranges[e as usize]);
-                        let hash_key = hash_mixed_key(&[], &[Some(s)]);
+                        let hash_key = if fast_entry_hash_keys.is_empty() {
+                            hash_mixed_key(&[], &[Some(s)])
+                        } else {
+                            fast_entry_hash_keys[e as usize]
+                        };
                         if let Some((filter, _)) = config.count_floor
                             && !filter.above_floor(hash_key)
                         {
@@ -1571,6 +1639,11 @@ pub(super) fn process_segments_mixed(
                     }
                 }
             } else {
+                // NOTE: a lookahead prefetch for this multikey-dict floor
+                // probe was tried and measured WORSE (ClickBench Q18 +7%):
+                // recomputing the two int-key digests per lookahead row
+                // costs more than the probe stall it hides. Do not rebuild
+                // without new evidence.
                 let hash_key = if let Some(dict_col) = multikey_dict {
                     let acc = hash_int_part(&int_keys[..n_int_keys]);
                     let d = match dict_col.dict_local_id(row) {
@@ -4120,6 +4193,9 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
         // Count-floor pass 1: every segment is already detoasted here —
         // floor_mode requires empty batch_quals, which forces the
         // non-pipeline detoast-all branch above.
+        // Read once on the backend thread; scope workers receive the value
+        // (GUC access is not audited for non-backend threads).
+        let agg_prefetch = crate::AGG_PREFETCH.get();
         let count_floor_filter: Option<CountingFilter> = if floor_mode {
             // 2^25 slots (32 MB) keeps the filter (mostly) cache-resident —
             // the full-size filter's DRAM misses cost ~0.5s per pass at
@@ -4151,6 +4227,7 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
                                 &meta.missing_values,
                                 text_group_col_flags,
                                 filter_ref,
+                                agg_prefetch,
                             )
                         })
                     })
@@ -4247,6 +4324,7 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
                     0
                 }
             },
+            prefetch: agg_prefetch,
         };
 
         let mut pipeline_detoast_us: u64 = 0;

@@ -22,6 +22,7 @@ All settings are PostgreSQL GUCs and follow the usual scoping rules (`SET`, `ALT
 
 | GUC | Default | Context | Description |
 |---|---|---|---|
+| `pg_deltax.agg_prefetch` | `on` | userset | Software-prefetch the count-floor filter probe loops in high-cardinality `GROUP BY` aggregation. The filter reaches ~1 GiB at ClickBench scale, so unprefetched probes serialize one DRAM miss per row; prefetching a few rows ahead overlaps them (measured: ClickBench Q32 −14%, Q18/Q33/Q34 −4–5% warm). Purely a performance toggle — results are identical either way. |
 | `pg_deltax.bloom_filters` | `on` | userset | Build per-segment bloom filters during compression for equality / `IN` predicate pushdown. Size is proportional to column cardinality (~2–5% storage overhead). Turning off applies to *new* compressions only. |
 | `pg_deltax.disable_meta_agg_fastpath` | `off` | userset | When ON, `DeltaXCount` / `DeltaXMinMax` fast paths are skipped for queries with `WHERE` clauses; those queries fall through to the generic `DeltaXAgg` path instead. Used for A/B correctness comparisons. |
 | `pg_deltax.disable_parallel_agg` | `off` | userset | When ON, the partial+Gather+FinalAgg path for `DeltaXAgg` is disabled and the planner only sees the complete CustomScan `DeltaXAgg`. Escape hatch for bisecting suspected regressions on the partial path; internal-Rust parallelism still runs. |

@@ -411,6 +411,9 @@ pub(super) struct ParallelCompactConfig<'a> {
     /// Pre-size for each worker partial's group map — see
     /// `ParallelMixedConfig::reserve_groups`.
     pub(super) reserve_groups: usize,
+    /// `pg_deltax.agg_prefetch`, read on the backend thread at config
+    /// build time (GUC access is not audited for scope threads).
+    pub(super) prefetch: bool,
 }
 
 // SAFETY: ParallelCompactConfig holds a `&[Option<(Datum, bool)>]` for
@@ -592,6 +595,16 @@ impl CountingFilter {
         let (s1, s2) = self.slot_pair_hashed(Self::key_hash(key));
         s1.load(Relaxed) >= self.threshold && s2.load(Relaxed) >= self.threshold
     }
+
+    /// Hint the cache to load the (single, blocked-layout) line both of
+    /// this hash's slots live in. Issued a few rows ahead of
+    /// `bump_hashed` / `above_floor` so the DRAM misses overlap — at
+    /// ClickBench scale the filter is ~1 GiB, so every probe is a miss.
+    #[inline(always)]
+    pub(super) fn prefetch_hashed(&self, h: u64) {
+        let block = ((h as usize) & self.mask) & !63;
+        super::super::prefetch::prefetch_read(self.slots.as_ptr().cast::<u8>().wrapping_add(block));
+    }
 }
 
 /// Pick the count floor from the merged pass-1 sample: the exact count of
@@ -724,14 +737,36 @@ pub(super) fn process_segments_count_filter(
             continue;
         }
         let decompressed = decompress_segment_cols(seg, config, key_cols);
-        for row in 0..seg.row_count as usize {
-            if let Some(packed) = build_packed_key(config.group_specs, &decompressed, row) {
-                let h = CountingFilter::key_hash(packed);
-                filter.bump_hashed(h);
-                if CountingFilter::is_sampled_hashed(h) {
-                    *sample.entry(packed).or_insert(0) += 1;
+        // Micro-batched: compute a block of key hashes while issuing
+        // filter-line prefetches, then bump. Each bump is a random
+        // access into a filter that reaches ~1 GiB at ClickBench scale,
+        // so an unbatched loop serializes one DRAM miss per row.
+        const PF_BLOCK: usize = 32;
+        let mut keys = [0u128; PF_BLOCK];
+        let mut hashes = [0u64; PF_BLOCK];
+        let row_count = seg.row_count as usize;
+        let mut base = 0usize;
+        while base < row_count {
+            let end = (base + PF_BLOCK).min(row_count);
+            let mut n = 0;
+            for row in base..end {
+                if let Some(packed) = build_packed_key(config.group_specs, &decompressed, row) {
+                    let h = CountingFilter::key_hash(packed);
+                    if config.prefetch {
+                        filter.prefetch_hashed(h);
+                    }
+                    keys[n] = packed;
+                    hashes[n] = h;
+                    n += 1;
                 }
             }
+            for i in 0..n {
+                filter.bump_hashed(hashes[i]);
+                if CountingFilter::is_sampled_hashed(hashes[i]) {
+                    *sample.entry(keys[i]).or_insert(0) += 1;
+                }
+            }
+            base = end;
         }
     }
     sample
@@ -893,6 +928,22 @@ pub(super) fn process_segments_compact_filtered(
 
         // Compact aggregation loop (identical to single-threaded path)
         for row in 0..row_count {
+            // Rolling lookahead: issue the count-floor filter prefetch
+            // for a row ahead of use. Repacking the key for the
+            // lookahead row costs a few cycles; the miss it hides costs
+            // hundreds.
+            if let Some((filter, _)) = singleton
+                && config.prefetch
+            {
+                const PF_DIST: usize = 16;
+                let pf_row = row + PF_DIST;
+                if pf_row < row_count
+                    && (selection.is_empty() || selection[pf_row])
+                    && let Some(pk) = build_packed_key(config.group_specs, &decompressed, pf_row)
+                {
+                    filter.prefetch_hashed(CountingFilter::key_hash(pk));
+                }
+            }
             if !selection.is_empty() && !selection[row] {
                 continue;
             }
@@ -3056,6 +3107,7 @@ pub(super) unsafe fn dispatch_parallel_compact_path(
                     0
                 }
             },
+            prefetch: crate::AGG_PREFETCH.get(),
         };
 
         if use_lazy {
