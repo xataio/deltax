@@ -448,6 +448,40 @@ pass 1, pass-2 lookahead), `src/scan/exec/agg/parallel_mixed.rs`
 `src/scan/exec/agg/callbacks.rs` (config plumbing), `Cargo.toml`
 (libc).
 
+### 59. Filter-only decode skip: gate on qual extraction coverage, not plan-list null [DONE]
+
+The condition cache's filter-only column skip (#57) was gated on
+`where_quals.is_null()`. The planner retains the qual list on DeltaXAgg
+for gating other optimizations even when every qual was extracted into
+batch/text quals — and the agg paths never re-evaluate it per row — so
+the conservative gate poisoned the skip: warm ClickBench Q20
+(`COUNT(*) WHERE URL LIKE`) hit the cache on every segment yet still
+decoded the full URL column (259 ms) for no consumer. The gate now
+accepts full extraction coverage (`handled == list length`, using the
+count `extract_batch_quals` already returns).
+
+Full-protocol A/B on EC2 (two runs, reproducible): Q20 −59%
+(0.648 → 0.266 s), Q37 −36%, Q38 −25%, Q36 −21%; Q30/Q31 ≈ −11% warm
+(their `SearchPhrase <> ''` column is filter-only). Hot geomean ≈ −2.5%.
+Correctness gated by the 43-query result-equality harness plus the full
+unit/integration suites.
+
+**Files touched:** `src/scan/exec/agg/parallel_mixed.rs` (the
+`filter_only_cols` gate in the mixed dispatch).
+
+### 60. Merge-phase worker-storage prefetch — tried and rejected
+
+The post-#58 stall survey showed the merge phase dominating Q13/Q15/Q35
+with a strong single-load signature in `merge_group_into`. A rolling
+lookahead prefetching the worker-storage group (via
+`CompactAccStorage::prefetch_group`) measured mixed on a verified-clean
+box: Q35 −4.7% but Q13 +2.8% / Q15 +3.1% — it only pays when most keys
+are dups (every entry merges); singles-dominated merges never read
+worker storage, making the lookahead pure cost. Net-negative without
+dup-rate-adaptive gating; reverted. Untried angle for the (real) merge
+stall: huge pages for worker-side storage, which needs growth-aware
+allocation (the bufs grow by realloc, defeating pre-touch madvise).
+
 ## Regression Queries (Compressed Slower Than Uncompressed)
 
 Several queries were slower with compression. Many have been addressed:
