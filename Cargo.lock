@@ -1221,6 +1221,7 @@ dependencies = [
  "cardinality-estimator",
  "glob",
  "hashbrown 0.15.5",
+ "libc",
  "lz4_flex",
  "memchr",
  "num_cpus",

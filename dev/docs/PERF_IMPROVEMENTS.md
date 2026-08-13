@@ -422,12 +422,31 @@ unchanged. A lookahead for the multikey-dict floor probe was measured
 WORSE (Q18 +7%: recomputing two int digests per lookahead row costs
 more than the miss it hides) and removed — see the in-code note.
 
+Follow-up finding: with the probe lines prefetched, Q32's dominant
+residual stall moved to **dTLB page walks** — the ~1 GiB filter on
+4 KiB pages means every random probe misses a few-thousand-entry TLB
+(perf put the stall directly after the `prefetcht0`; flipping THP to
+`always` took warm Q32 from 2.18 s to 1.55 s). Fixed in code with
+`madvise(MADV_HUGEPAGE)` on the filter slots, issued before first
+touch so huge pages materialize at fault time under the default
+`madvise` THP policy. Full-protocol A/B (queries-only, true cold
+cycle per query) for the combined prefetch+hugepage change vs
+`agg_prefetch=off`: Q32 −37% (2.60 → 1.64 s), Q16 −14%, Q18 −13%,
+Q33 −10%, Q34 −9%; hot sum 23.10 → 21.49 s, hot geomean −2.0%, cold
+unchanged. A custom prefetchable group map
+(ProbeMap) was also built and measured net-NEGATIVE (geomean +0.6%,
+Q13 +10% — scalar probe vs hashbrown SIMD, mix rehash vs the fold
+hasher) and rejected; map probes are not the stall (floor mode
+probes them for a minority of rows; non-floor keys correlate with
+sort order and stay cache-resident).
+
 **Files touched:** `src/scan/exec/prefetch.rs` (new),
 `src/scan/exec/agg/parallel_compact.rs`
-(`CountingFilter::prefetch_hashed`, micro-batched pass 1, pass-2
-lookahead), `src/scan/exec/agg/parallel_mixed.rs` (micro-batched
-pass 1, dict fast-path entry-hash memo + lookahead),
-`src/scan/exec/agg/callbacks.rs` (config plumbing).
+(`CountingFilter::prefetch_hashed`, `madvise_hugepage`, micro-batched
+pass 1, pass-2 lookahead), `src/scan/exec/agg/parallel_mixed.rs`
+(micro-batched pass 1, dict fast-path entry-hash memo + lookahead),
+`src/scan/exec/agg/callbacks.rs` (config plumbing), `Cargo.toml`
+(libc).
 
 ## Regression Queries (Compressed Slower Than Uncompressed)
 
