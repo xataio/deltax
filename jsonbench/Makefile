@@ -1,7 +1,7 @@
 # EC2 JSONBench benchmark workflow
 #
 # Lifecycle:
-#   make launch-ec2                    # launch EC2 m6i.8xlarge, prints export EC2=<ip>
+#   make launch-ec2 KEY_NAME=<key>     # launch EC2 m6i.8xlarge, prints export EC2=<ip>
 #   make setup EC2=<ip>                # default 100m rows
 #   make setup EC2=<ip> SCALE=1        # 1m smoke test
 #   make setup EC2=<ip> SCALE=1000     # full 1B rows (slow)
@@ -17,7 +17,18 @@
 #   make psql EC2=<ip>
 
 EC2 ?=
-EC2_KEY ?= ~/.ssh/tsg.pem
+# SSH key for the EC2 instance. No personal default — provide either:
+#   KEY_NAME=<ec2-key-pair>  -> uses ~/.ssh/<ec2-key-pair>.pem, same convention
+#                               as launch-ec2.sh
+#   EC2_KEY=<path-to-pem>    -> explicit path
+# Targets that don't ssh/rsync (launch-ec2, destroy-ec2, ...) work without it.
+KEY_NAME ?=
+ifneq ($(strip $(KEY_NAME)),)
+EC2_KEY ?= ~/.ssh/$(KEY_NAME).pem
+endif
+ifeq ($(origin EC2_KEY),undefined)
+EC2_KEY = $(error EC2_KEY is not set. Pass KEY_NAME=<your-ec2-key-pair> to use ~/.ssh/<key>.pem, or EC2_KEY=<path-to-pem> directly)
+endif
 EC2_USER ?= ubuntu
 SCALE ?= 100
 EC2_SSH = ssh -i $(EC2_KEY) -o StrictHostKeyChecking=no $(EC2_USER)@$(EC2)
@@ -28,16 +39,22 @@ PG_DELTAX_SRC = $(CURDIR)/..
 
 RESULTS_DIR = results
 HISTORY_DIR = $(RESULTS_DIR)/history
-JSONBENCH_DIR ?= /Users/tsg/src/JSONBench
+# Path of a local JSONBench checkout (https://github.com/ClickHouse/JSONBench).
+# When it exists, `make bench` copies the result JSON in and regenerates the
+# upstream HTML dashboard. Sibling-checkout convention, same shape as
+# CLICKBENCH_DIR / RTABENCH_DIR; override via env for a different location.
+JSONBENCH_DIR ?= $(CURDIR)/../../../JSONBench
 
+# Xata account default (shared org infra) — override for other AWS accounts.
 AWS_PROFILE ?= management
 AWS_NAME = jsonbench-pg-deltax
 
 .PHONY: launch-ec2 destroy-ec2 ssh setup deploy bench query query-cold sql psql
 
-# Launch a new EC2 instance (terminates any existing one with the same name)
+# Launch a new EC2 instance (terminates any existing one with the same name).
+# Usage: make launch-ec2 KEY_NAME=<your-ec2-key-pair>
 launch-ec2:
-	@bash launch-ec2.sh
+	@KEY_NAME="$(KEY_NAME)" bash launch-ec2.sh
 
 # Terminate the EC2 instance
 destroy-ec2:

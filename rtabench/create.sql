@@ -1,5 +1,5 @@
 -- RTABench schema (5 tables).
--- Mirrors /Users/tsg/src/rtabench/postgres/create.sql, with one change:
+-- Mirrors upstream rtabench's postgres/create.sql, with one change:
 -- orders.order_id is plain integer (not serial) since the CSV provides IDs.
 
 CREATE TABLE customers (
