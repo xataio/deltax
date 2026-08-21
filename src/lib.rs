@@ -308,6 +308,26 @@ EXCEPTION WHEN OTHERS THEN
     -- until the origin exists.
     NULL;
 END $$;
+
+-- The ProcessUtility and executor hooks read this catalog through SPI, which
+-- runs as the *current user*. `deltax` is an ordinary schema owned by whoever
+-- ran CREATE EXTENSION, and its default ACL grants nothing to PUBLIC, so
+-- without these grants any role lacking USAGE hit
+--     ERROR:  permission denied for schema deltax
+-- on the first hook query — turning an unrelated ALTER TABLE, GRANT or
+-- whole-database ANALYZE into a hard error in a deltax-enabled database.
+--
+-- Read-only, and only over metadata that is already discoverable through
+-- pg_class/pg_namespace. Everything that *mutates* the catalog still goes
+-- through the deltax.* functions, whose own privileges are unchanged.
+GRANT USAGE ON SCHEMA deltax TO PUBLIC;
+GRANT SELECT ON deltax.deltax_deltatable, deltax.deltax_partition TO PUBLIC;
+
+-- Deliberately NOT extended to `_deltax_compressed`: companion tables hold
+-- user data, and the DDL hook mirrors GRANT/REVOKE from the parent deltatable
+-- onto them. A blanket PUBLIC grant there would defeat that mirroring —
+-- REVOKE SELECT on the parent would leave the compressed rows readable via
+-- PUBLIC (caught by TestCascadeToCompanions::test_revoke_select_cascades_to_companions).
 "#,
     name = "create_catalog_tables",
 );
