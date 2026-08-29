@@ -9,6 +9,17 @@ use crate::compression::{self, CompressedColumnRef, CompressionType};
 // so they are not available via FFI — we re-implement them here).
 // ============================================================================
 
+/// Resolve a decoded text span to `&str` without re-validating UTF-8.
+/// SAFETY argument (same as `text_col::dict_entry_str`, PERF #54/#61):
+/// the bytes are decompressed PG text our own compressor wrote — valid
+/// UTF-8 by construction. The debug assert keeps dev builds honest.
+#[inline]
+fn text_span_str(buf: &[u8], off: usize, len: usize) -> &str {
+    let s = &buf[off..off + len];
+    debug_assert!(std::str::from_utf8(s).is_ok());
+    unsafe { std::str::from_utf8_unchecked(s) }
+}
+
 pub(super) const TTS_FLAG_EMPTY: u16 = 1 << 1;
 
 /// Re-implementation of PostgreSQL's static inline `ExecProject`.
@@ -757,8 +768,7 @@ pub(super) unsafe fn decompress_text_blob_with_like_filter(
                     ranges
                         .iter()
                         .map(|&(off, len)| {
-                            let text = std::str::from_utf8(&buf[off..off + len])
-                                .expect("invalid UTF-8 in LZ4 data");
+                            let text = text_span_str(&buf, off, len);
                             matches_like(text)
                         })
                         .collect()
@@ -770,9 +780,7 @@ pub(super) unsafe fn decompress_text_blob_with_like_filter(
                 .iter()
                 .zip(sel.iter())
                 .filter(|&(_, &pass)| pass)
-                .map(|(&(off, len), _)| {
-                    std::str::from_utf8(&buf[off..off + len]).expect("invalid UTF-8 in LZ4 data")
-                })
+                .map(|(&(off, len), _)| text_span_str(&buf, off, len))
                 .collect();
             let matched_datums =
                 unsafe { str_slices_to_text_datums_arena(&matched_slices, type_oid, typmod) };
@@ -872,11 +880,7 @@ pub(super) fn decompress_text_blob_to_raw_strings(
             let (buf, ranges) = compression::lz4::decode_to_ranges(cc.data, non_null_count);
             let strings: Vec<String> = ranges
                 .iter()
-                .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len])
-                        .unwrap_or("")
-                        .to_string()
-                })
+                .map(|&(off, len)| text_span_str(&buf, off, len).to_string())
                 .collect();
             let sel: Vec<bool> = if has_ne_empty {
                 ranges.iter().map(|&(_off, len)| len > 0).collect()
@@ -890,11 +894,7 @@ pub(super) fn decompress_text_blob_to_raw_strings(
                 compression::lz4::decode_to_ranges_blocked(cc.data, non_null_count, None);
             let strings: Vec<String> = ranges
                 .iter()
-                .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len])
-                        .unwrap_or("")
-                        .to_string()
-                })
+                .map(|&(off, len)| text_span_str(&buf, off, len).to_string())
                 .collect();
             let sel: Vec<bool> = if has_ne_empty {
                 ranges.iter().map(|&(_off, len)| len > 0).collect()
@@ -1038,9 +1038,7 @@ pub(super) unsafe fn decompress_text_blob_with_eq_filter(
 
             let slices: Vec<&str> = ranges
                 .iter()
-                .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len]).expect("invalid UTF-8 in LZ4 data")
-                })
+                .map(|&(off, len)| text_span_str(&buf, off, len))
                 .collect();
             let sel: Vec<bool> = slices.iter().map(|s| matches_eq(s)).collect();
 
@@ -1176,9 +1174,7 @@ pub(super) unsafe fn decompress_text_blob_with_in_filter(
 
             let slices: Vec<&str> = ranges
                 .iter()
-                .map(|&(off, len)| {
-                    std::str::from_utf8(&buf[off..off + len]).expect("invalid UTF-8 in LZ4 data")
-                })
+                .map(|&(off, len)| text_span_str(&buf, off, len))
                 .collect();
             let sel: Vec<bool> = slices.iter().map(|s| matches_in(s)).collect();
 
@@ -1288,7 +1284,7 @@ pub(super) fn decompress_text_blob_to_lengths(
             let lengths: Vec<i32> = ranges
                 .iter()
                 .map(|&(off, len)| {
-                    let s = std::str::from_utf8(&buf[off..off + len]).unwrap_or("");
+                    let s = text_span_str(&buf, off, len);
                     s.chars().count() as i32
                 })
                 .collect();
@@ -1305,7 +1301,7 @@ pub(super) fn decompress_text_blob_to_lengths(
             let lengths: Vec<i32> = ranges
                 .iter()
                 .map(|&(off, len)| {
-                    let s = std::str::from_utf8(&buf[off..off + len]).unwrap_or("");
+                    let s = text_span_str(&buf, off, len);
                     s.chars().count() as i32
                 })
                 .collect();
@@ -1898,8 +1894,7 @@ unsafe fn text_ranges_to_datums(
             ranges
                 .iter()
                 .map(|&(off, len)| {
-                    let s = std::str::from_utf8(&buf[off..off + len])
-                        .expect("invalid UTF-8 in LZ4 data");
+                    let s = text_span_str(buf, off, len);
                     input_fn.call(s)
                 })
                 .collect()
@@ -1935,8 +1930,7 @@ unsafe fn matched_text_ranges_to_datums(
                 .zip(nn_selection.iter())
                 .filter(|&(_, &sel)| sel)
                 .map(|(&(off, len), _)| {
-                    let s = std::str::from_utf8(&buf[off..off + len])
-                        .expect("invalid UTF-8 in LZ4 data");
+                    let s = text_span_str(buf, off, len);
                     input_fn.call(s)
                 })
                 .collect()

@@ -457,8 +457,12 @@ batch/text quals — and the agg paths never re-evaluate it per row — so
 the conservative gate poisoned the skip: warm ClickBench Q20
 (`COUNT(*) WHERE URL LIKE`) hit the cache on every segment yet still
 decoded the full URL column (259 ms) for no consumer. The gate now
-accepts full extraction coverage (`handled == list length`, using the
-count `extract_batch_quals` already returns).
+accepts full extraction coverage: `batch_quals.len() == list length`,
+reusing the caller's extraction (every converted qual node pushes
+exactly one `BatchQual`). It deliberately does not use the `handled`
+count `extract_batch_quals` returns, which undercounts IN lists and bare
+boolean `Var`s — the same predicate the parallel worker already uses to
+clear `ps.qual`.
 
 Full-protocol A/B on EC2 (two runs, reproducible): Q20 −59%
 (0.648 → 0.266 s), Q37 −36%, Q38 −25%, Q36 −21%; Q30/Q31 ≈ −11% warm
@@ -2016,6 +2020,14 @@ This is why Q28's agg phase (per-row `MIN(Referer)` get_str +
 
 **Files touched:** `src/scan/exec/text_col.rs`,
 `src/scan/exec/agg/compact.rs`, `src/scan/exec/agg/regex.rs`.
+
+*2026-08-14 follow-up:* the nine remaining checked `from_utf8` sites in
+`datum_utils.rs` (serial/row-path decode-with-filter loops) got the same
+treatment (`text_span_str` helper, debug-assert guarded). Measured
+**neutral** on the bench protocol — by then the condition cache (#57/#59)
+already skips the validating decode path on warm hits, and cold runs are
+I/O-bound. Kept as cleanup: it still pays in cache-off contexts
+(first-run queries, session-preload mode, non-repeating filters).
 
 **Bench-level for #52–#54 combined (best-of-3 hot, history
 `20260610_114934` → `20260610_131038`):** Q28 7.918 → 2.769 s,

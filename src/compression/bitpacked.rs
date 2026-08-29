@@ -73,15 +73,15 @@ fn unpack_bits_u32(data: &[u8], count: usize, bits: u8) -> Vec<u32> {
         }
         16 => {
             let mut result = Vec::with_capacity(count);
-            for chunk in data[..count * 2].chunks_exact(2) {
-                result.push(u16::from_le_bytes(chunk.try_into().unwrap()) as u32);
+            for chunk in data[..count * 2].as_chunks::<2>().0 {
+                result.push(u16::from_le_bytes(*chunk) as u32);
             }
             return result;
         }
         32 => {
             let mut result = Vec::with_capacity(count);
-            for chunk in data[..count * 4].chunks_exact(4) {
-                result.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+            for chunk in data[..count * 4].as_chunks::<4>().0 {
+                result.push(u32::from_le_bytes(*chunk));
             }
             return result;
         }
@@ -168,22 +168,22 @@ fn unpack_bits_u64(data: &[u8], count: usize, bits: u8) -> Vec<u64> {
         }
         16 => {
             let mut result = Vec::with_capacity(count);
-            for chunk in data[..count * 2].chunks_exact(2) {
-                result.push(u16::from_le_bytes(chunk.try_into().unwrap()) as u64);
+            for chunk in data[..count * 2].as_chunks::<2>().0 {
+                result.push(u16::from_le_bytes(*chunk) as u64);
             }
             return result;
         }
         32 => {
             let mut result = Vec::with_capacity(count);
-            for chunk in data[..count * 4].chunks_exact(4) {
-                result.push(u32::from_le_bytes(chunk.try_into().unwrap()) as u64);
+            for chunk in data[..count * 4].as_chunks::<4>().0 {
+                result.push(u32::from_le_bytes(*chunk) as u64);
             }
             return result;
         }
         64 => {
             let mut result = Vec::with_capacity(count);
-            for chunk in data[..count * 8].chunks_exact(8) {
-                result.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+            for chunk in data[..count * 8].as_chunks::<8>().0 {
+                result.push(u64::from_le_bytes(*chunk));
             }
             return result;
         }

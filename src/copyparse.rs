@@ -801,7 +801,7 @@ pub(crate) fn parse_bytea_bytes(s: &str) -> Result<Vec<u8>, String> {
             return Err(format!("invalid bytea hex: {}", s));
         }
         let mut out = Vec::with_capacity(hex.len() / 2);
-        for pair in hex.chunks_exact(2) {
+        for pair in hex.as_chunks::<2>().0 {
             let hi = (pair[0] as char)
                 .to_digit(16)
                 .ok_or_else(|| format!("invalid bytea hex: {}", s))?;

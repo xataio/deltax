@@ -229,8 +229,8 @@ fn decode_payload(bytes: &[u8], expected_row_count: usize) -> Option<CachedSelec
                 return None;
             }
             let mut sel = vec![false; row_count];
-            for (w, chunk) in body.chunks_exact(8).enumerate() {
-                let word = u64::from_le_bytes(chunk.try_into().ok()?);
+            for (w, chunk) in body.as_chunks::<8>().0.iter().enumerate() {
+                let word = u64::from_le_bytes(*chunk);
                 if word == 0 {
                     continue;
                 }
