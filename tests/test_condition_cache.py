@@ -28,7 +28,7 @@ def _setup_compressed_table(conn, n_devices=20, n_points=200, segment_size=None)
             label TEXT NOT NULL,
             value DOUBLE PRECISION,
             code INT,
-            flag BOOLEAN NOT NULL
+            flag BOOLEAN NOT NULL DEFAULT false
         )
     """)
     conn.execute(
@@ -171,11 +171,6 @@ def test_condition_cache_agg_uncounted_qual_shapes_filter_only_parity(db):
                 )
         assert expected, "test predicate selects no rows"
 
-        plan = "\n".join(
-            r[0] for r in db.execute(f"EXPLAIN (COSTS OFF) {q}").fetchall()
-        )
-        assert "DeltaXAgg" in plan, plan
-
         before = _cond_stats(db)
         cold = db.execute(q).fetchall()
         after_cold = _cond_stats(db)
@@ -190,6 +185,13 @@ def test_condition_cache_agg_uncounted_qual_shapes_filter_only_parity(db):
         db.execute("SET pg_deltax.condition_cache = off")
         assert db.execute(q).fetchall() == expected
         db.execute("RESET pg_deltax.condition_cache")
+
+        # Path check last: DeltaXAgg runs the scan even under plan-only
+        # EXPLAIN, which would otherwise pre-warm the cache before `before`.
+        plan = "\n".join(
+            r[0] for r in db.execute(f"EXPLAIN (COSTS OFF) {q}").fetchall()
+        )
+        assert "DeltaXAgg" in plan, plan
 
 
 def test_condition_cache_nonepass_segments(db):
