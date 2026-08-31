@@ -4022,7 +4022,23 @@ pub(super) unsafe fn dispatch_parallel_mixed_path(
             let cond_case_when = group_specs
                 .iter()
                 .any(|gs| matches!(gs.expr, GroupByExpr::CaseWhen(_)));
-            if where_quals.is_null() && !cond_case_when {
+            // Filter-only decode skip is safe when every WHERE qual was
+            // extracted into batch/text quals (the row-level filters this
+            // path applies — and the condition cache fingerprints). The
+            // planner keeps `where_quals` for gating other optimizations,
+            // but it is never re-evaluated per row here, so a non-null
+            // list with full extraction coverage must not poison the
+            // skip (ClickBench Q20: COUNT(*) + URL LIKE decoded the full
+            // URL column on every warm hit for no consumer at all).
+            // `batch_quals` is the caller's extraction of this same list and
+            // every converted node pushes exactly one BatchQual, so
+            // `len == list length` ⟺ full coverage. Deliberately not the
+            // `handled` count `extract_batch_quals` returns: it skips IN
+            // lists and bare-bool Vars (same predicate the parallel worker
+            // uses to clear `ps.qual` in callbacks.rs, and segments.rs).
+            let quals_fully_handled =
+                where_quals.is_null() || batch_quals.len() as i32 == (*where_quals).length;
+            if quals_fully_handled && !cond_case_when {
                 let mut used = vec![false; meta.col_names.len()];
                 for gs in &group_specs {
                     if let Some(u) = used.get_mut(gs.col_idx as usize) {

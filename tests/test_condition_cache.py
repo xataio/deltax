@@ -11,12 +11,14 @@ MOCK_NOW = "2025-01-15 12:00:00+00"
 BASE_TS = "2025-01-15 00:00:00+00"
 
 
-def _setup_compressed_table(conn, n_devices=20, n_points=200):
-    """Partitioned + fully compressed table with numeric and text columns.
+def _setup_compressed_table(conn, n_devices=20, n_points=200, segment_size=None):
+    """Partitioned + fully compressed table with numeric, text and bool columns.
 
     `code` is a unique int per row (`d * 1000 + p`), so single-row DML with
     an integer-equality predicate is exactly evaluable (tombstone fast
-    path); `value` is `d * 100 + p` (float8, non-unique).
+    path); `value` is `d * 100 + p` (float8, non-unique); `flag` is
+    `p % 2 == 0`. `segment_size` (rows per compressed segment) defaults to
+    the extension default; pass a small value to get many segments.
     """
     conn.execute(f"SET pg_deltax.mock_now = '{MOCK_NOW}'")
     conn.execute("""
@@ -25,7 +27,8 @@ def _setup_compressed_table(conn, n_devices=20, n_points=200):
             device_id TEXT NOT NULL,
             label TEXT NOT NULL,
             value DOUBLE PRECISION,
-            code INT
+            code INT,
+            flag BOOLEAN NOT NULL DEFAULT false
         )
     """)
     conn.execute(
@@ -37,12 +40,14 @@ def _setup_compressed_table(conn, n_devices=20, n_points=200):
             ts = f"'{BASE_TS}'::timestamptz + interval '{p} minutes'"
             values.append(
                 f"({ts}, 'device-{d:03d}', "
-                f"repeat(md5('{d}-{p}'), 4), {d * 100 + p}, {d * 1000 + p})"
+                f"repeat(md5('{d}-{p}'), 4), {d * 100 + p}, {d * 1000 + p}, "
+                f"{'true' if p % 2 == 0 else 'false'})"
             )
     conn.execute(f"INSERT INTO metrics VALUES {','.join(values)}")
+    seg = f", segment_size => {segment_size}" if segment_size else ""
     conn.execute(
         "SELECT deltax.deltax_enable_compression('metrics', "
-        "segment_by => ARRAY[]::text[], order_by => ARRAY['ts'])"
+        f"segment_by => ARRAY[]::text[], order_by => ARRAY['ts']{seg})"
     )
     conn.execute("""
         DO $$
@@ -120,6 +125,73 @@ def test_condition_cache_agg_text_filter_parity(db):
     assert after_off["hits"] == after_warm["hits"]
     assert after_off["misses"] == after_warm["misses"]
     db.execute("RESET pg_deltax.condition_cache")
+
+
+def test_condition_cache_agg_uncounted_qual_shapes_filter_only_parity(db):
+    """Agg path with the qual shapes `extract_batch_quals` converts but does
+    not include in its `handled` count (IN list, bare boolean Var, NOT Var):
+    the filter-only decode skip is gated on `batch_quals.len() == qual list
+    length` (PERF #59), so warm hits skip decoding `label`/`code`/`flag`
+    (referenced only by filters). Results must match an independent oracle,
+    the cold run and a cache-off run. Small segments + an explicit worker
+    count so the parallel mixed dispatch (not the serial path) runs."""
+    import hashlib
+
+    _setup_compressed_table(db, segment_size=500)
+    db.execute("SET pg_deltax.parallel_workers = 4")
+
+    def label_of(d, p):
+        return hashlib.md5(f"{d}-{p}".encode()).hexdigest() * 4
+
+    codes = [1004, 1006, 2004, 2006, 3004, 4004, 5004, 6004, 7004, 12345]
+    queries = [
+        # IN list + bare bool Var + LIKE; device_id grouped, rest filter-only.
+        (
+            "SELECT device_id, count(*), sum(value) FROM metrics "
+            f"WHERE flag AND label LIKE '%a%' AND code IN ({', '.join(map(str, codes))}) "
+            "GROUP BY device_id ORDER BY device_id",
+            lambda d, p: p % 2 == 0 and "a" in label_of(d, p) and d * 1000 + p in codes,
+        ),
+        # NOT Var + LIKE.
+        (
+            "SELECT device_id, count(*), sum(value) FROM metrics "
+            "WHERE NOT flag AND label LIKE '%ab%' "
+            "GROUP BY device_id ORDER BY device_id",
+            lambda d, p: p % 2 == 1 and "ab" in label_of(d, p),
+        ),
+    ]
+
+    for q, pred in queries:
+        expected = []
+        for d in range(20):
+            pts = [p for p in range(200) if pred(d, p)]
+            if pts:
+                expected.append(
+                    (f"device-{d:03d}", len(pts), float(sum(d * 100 + p for p in pts)))
+                )
+        assert expected, "test predicate selects no rows"
+
+        before = _cond_stats(db)
+        cold = db.execute(q).fetchall()
+        after_cold = _cond_stats(db)
+        warm = db.execute(q).fetchall()
+        after_warm = _cond_stats(db)
+
+        assert cold == expected
+        assert warm == expected
+        assert after_cold["inserts"] > before["inserts"]
+        assert after_warm["hits"] > after_cold["hits"]
+
+        db.execute("SET pg_deltax.condition_cache = off")
+        assert db.execute(q).fetchall() == expected
+        db.execute("RESET pg_deltax.condition_cache")
+
+        # Path check last: DeltaXAgg runs the scan even under plan-only
+        # EXPLAIN, which would otherwise pre-warm the cache before `before`.
+        plan = "\n".join(
+            r[0] for r in db.execute(f"EXPLAIN (COSTS OFF) {q}").fetchall()
+        )
+        assert "DeltaXAgg" in plan, plan
 
 
 def test_condition_cache_nonepass_segments(db):

@@ -2749,7 +2749,7 @@ fn flush_partition_blobs(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
         let blobs_oid = *buf
             .blobs_oid_cached
             .get_or_insert_with(|| resolve_relation_oid(blobs_fqn));
-        let drained: Vec<_> = buf.blob_buffer.drain(..).collect();
+        let drained = std::mem::take(&mut buf.blob_buffer);
         unsafe {
             bulk_heap_insert(
                 blobs_oid,
@@ -2772,7 +2772,7 @@ fn flush_partition_blobs(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
         let blooms_oid = *buf
             .blooms_oid_cached
             .get_or_insert_with(|| resolve_relation_oid(blooms_fqn));
-        let drained: Vec<_> = buf.bloom_buffer.drain(..).collect();
+        let drained = std::mem::take(&mut buf.bloom_buffer);
         unsafe {
             bulk_heap_insert(
                 blooms_oid,
@@ -2796,7 +2796,7 @@ fn flush_partition_blobs(buf: &mut PartitionBuffer, columns: &[ColumnMeta]) {
         let text_lengths_oid = *buf
             .text_lengths_oid_cached
             .get_or_insert_with(|| resolve_relation_oid(text_lengths_fqn));
-        let drained: Vec<_> = buf.text_length_buffer.drain(..).collect();
+        let drained = std::mem::take(&mut buf.text_length_buffer);
         unsafe {
             bulk_heap_insert(
                 text_lengths_oid,
