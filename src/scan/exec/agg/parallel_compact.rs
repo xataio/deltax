@@ -625,11 +625,11 @@ impl CountingFilter {
 fn madvise_hugepage(ptr: *const u8, len: usize) {
     #[cfg(target_os = "linux")]
     {
-        const PAGE: usize = 4096;
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = if page > 0 { page as usize } else { 4096 };
         let addr = ptr as usize;
-        let start = addr.next_multiple_of(PAGE);
-        let end = (addr + len) & !(PAGE - 1);
-        if end > start {
+        let start = addr.next_multiple_of(page);
+        let end = addr.saturating_add(len) / page * page;
             unsafe {
                 libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE);
             }
