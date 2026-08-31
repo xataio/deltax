@@ -513,6 +513,15 @@ impl CountingFilter {
             .clamp(1 << 22, 1usize << max_log2);
         // calloc-backed zeroed alloc; AtomicU8 is repr(transparent) over u8.
         let zeroed = vec![0u8; size].into_boxed_slice();
+        // The filter is probed at a random slot per row, so at the 1 GiB
+        // cap every access misses the dTLB and pays a page walk on 4 KiB
+        // pages — measured as the dominant residual stall on ClickBench
+        // Q32 even with the probe lines software-prefetched (THP=always
+        // took warm Q32 from 2.18 s to 1.55 s). Ask for huge pages
+        // explicitly so the win doesn't depend on the system THP policy.
+        // Must happen before first touch: the calloc'd pages are still
+        // unfaulted here, so huge pages materialize at fault time.
+        madvise_hugepage(zeroed.as_ptr(), size);
         let slots =
             unsafe { Box::from_raw(Box::into_raw(zeroed) as *mut [std::sync::atomic::AtomicU8]) };
         Self {
@@ -604,6 +613,31 @@ impl CountingFilter {
     pub(super) fn prefetch_hashed(&self, h: u64) {
         let block = ((h as usize) & self.mask) & !63;
         super::super::prefetch::prefetch_read(self.slots.as_ptr().cast::<u8>().wrapping_add(block));
+    }
+}
+
+/// Advise the kernel to back `[ptr, ptr+len)` with transparent huge
+/// pages (`MADV_HUGEPAGE`). Best-effort: the range is rounded inward to
+/// page boundaries (large allocations are mmap-backed but not
+/// necessarily page-aligned at the start), and errors are ignored — the
+/// allocation works identically on 4 KiB pages, just slower to probe.
+/// No-op on non-Linux.
+fn madvise_hugepage(ptr: *const u8, len: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = if page > 0 { page as usize } else { 4096 };
+        let addr = ptr as usize;
+        let start = addr.next_multiple_of(page);
+        let end = addr.saturating_add(len) / page * page;
+            unsafe {
+                libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_HUGEPAGE);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (ptr, len);
     }
 }
 
